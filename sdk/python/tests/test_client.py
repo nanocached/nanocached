@@ -2758,6 +2758,21 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_touch_many_and_get_many_and_touch_answer_under_every_spelling(self):
+        # "a" and b"a" encode identically; the key is touched once and the
+        # result carries both spellings, so a lookup by either finds it.
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1"}, ttl_seconds=10)
+            self.assertEqual(
+                await client.touch_many(["a", b"a"], 100), {"a": True, b"a": True}
+            )
+            self.assertEqual(
+                await client.get_many_and_touch([b"a", "a"], 100), {"a": "1", b"a": "1"}
+            )
+        finally:
+            await client.close()
+
     async def test_touch_many_with_none_removes_the_ttl_and_zero_expires_at_once(self):
         client = await self.connect()
         try:
@@ -2804,12 +2819,12 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
-    async def test_a_key_given_twice_is_touched_once_and_keyed_by_its_first_occurrence(self):
+    async def test_a_key_given_twice_is_touched_once_and_keyed_under_each_spelling(self):
         client = await self.connect()
         try:
             await client.set("a", "1")
-            self.assertEqual(await client.touch_many(["a", b"a", "a"], 30), {"a": True})
-            self.assertEqual(await client.get_many_and_touch(["a", b"a"], 30), {"a": "1"})
+            self.assertEqual(await client.touch_many(["a", b"a", "a"], 30), {"a": True, b"a": True})
+            self.assertEqual(await client.get_many_and_touch(["a", b"a"], 30), {"a": "1", b"a": "1"})
             self.assertEqual([frame[1] for frame in self.node.multi_touch_frames], [[b"a"], [b"a"]])
         finally:
             await client.close()
@@ -8017,10 +8032,13 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
             await client.set("b", "vb")
             self.node.multi_get_count = 0
             self.assertEqual(
-                await client.get_many(["a", b"a", "a", "b", "b"]), {"a": "va", "b": "vb"}
+                await client.get_many(["a", b"a", "a", "b", "b"]),
+                {"a": "va", b"a": "va", "b": "vb"},
             )
             self.assertEqual(self.node.multi_get_count, 1)
-            self.assertEqual(await client.get_many_bytes([b"a", "a"]), {b"a": b"va"})
+            self.assertEqual(
+                await client.get_many_bytes([b"a", "a"]), {b"a": b"va", "a": b"va"}
+            )
             # A list that is nothing but copies of one key costs one
             # key's worth of request and reply.
             self.node.multi_get_frame_sizes.clear()
@@ -8110,7 +8128,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         client = await self.connect()
         try:
             await client.set("a", "va")
-            self.assertEqual(await client.get_many(["a", b"a"]), {"a": "va"})
+            self.assertEqual(await client.get_many(["a", b"a"]), {"a": "va", b"a": "va"})
             with self.assertRaisesRegex(ValueError, "duplicate key after encoding"):
                 await client.set_many({"a": "1", b"a": "2"})
         finally:

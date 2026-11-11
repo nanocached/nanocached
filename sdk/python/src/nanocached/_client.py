@@ -1530,7 +1530,8 @@ class NanocachedClient:
     # object the caller passed, indexed by position rather than by
     # encoded bytes, so a batch may freely mix the two. A key given more
     # than once (the same str twice, or "a" and b"a", which encode
-    # identically) is read once and keyed by its first occurrence: a
+    # identically) is read once and the result is keyed under every
+    # spelling the caller used ("a" and b"a" both find it): a
     # batched read is a set query, which is what the other five SDKs
     # do, and sending every copy to the node would also retain one
     # reply per copy — 20,000 copies of one key naming a large value is
@@ -1538,17 +1539,24 @@ class NanocachedClient:
 
     def _dedupe_batch_keys(
         self, keys: Sequence[str | bytes], namespace: bytes
-    ) -> tuple[list[str | bytes], list[bytes]]:
-        originals: list[str | bytes] = []
+    ) -> tuple[list[tuple[str | bytes, ...]], list[bytes]]:
+        # Each entry of the first list holds every distinct spelling the
+        # caller used for that key (one, or two for "a" and b"a"), so the
+        # result is keyed under each of them: a lookup by either the str
+        # or the bytes form the caller passed finds the value.
+        originals: list[tuple[str | bytes, ...]] = []
         key_bytes_list: list[bytes] = []
-        seen: set[bytes] = set()
+        seen: dict[bytes, int] = {}
         for original in keys:
             key_bytes = _to_bytes(original)
             _check_key(key_bytes, namespace)
-            if key_bytes in seen:
+            idx = seen.get(key_bytes)
+            if idx is not None:
+                if original not in originals[idx]:
+                    originals[idx] += (original,)
                 continue
-            seen.add(key_bytes)
-            originals.append(original)
+            seen[key_bytes] = len(originals)
+            originals.append((original,))
             key_bytes_list.append(key_bytes)
         return originals, key_bytes_list
 
@@ -1656,7 +1664,9 @@ class NanocachedClient:
             values: dict[str | bytes, bytes] = {}
             for original, entry in zip(originals, entries):
                 if isinstance(entry, (bytes, bytearray)):
-                    values[original] = self._decompress_for_batch(entry, budget)
+                    value = self._decompress_for_batch(entry, budget)
+                    for spelling in original:
+                        values[spelling] = value
             if error is not None:
                 # issue #411: single-node/proxy mode never retries a
                 # chunk failure (no ring to refresh against — see
@@ -1796,7 +1806,7 @@ class NanocachedClient:
     async def _multi_get_pass(
         self,
         namespace: bytes,
-        originals: list[str | bytes],
+        originals: list[tuple[str | bytes, ...]],
         key_bytes_list: list[bytes],
         values: dict[str | bytes, bytes],
         retry_indices: list[int] | None,
@@ -1858,7 +1868,9 @@ class NanocachedClient:
                     if entry is WRONG_NODE:
                         wrong_node.append(idx)
                     elif entry is not None:
-                        values[originals[idx]] = self._decompress_for_batch(entry, budget)
+                        value = self._decompress_for_batch(entry, budget)
+                        for spelling in originals[idx]:
+                            values[spelling] = value
                 if error is not None:
                     last_error = error
                     for idx in group_indices[resolved:]:
@@ -2308,9 +2320,13 @@ class NanocachedClient:
             for idx in sorted(results):
                 entry = results[idx]
                 if not get:
-                    out[originals[idx]] = entry
+                    value = entry
                 elif entry is not None:
-                    out[originals[idx]] = self._decompress_for_batch(entry, budget)  # type: ignore[arg-type]
+                    value = self._decompress_for_batch(entry, budget)  # type: ignore[arg-type]
+                else:
+                    continue
+                for spelling in originals[idx]:
+                    out[spelling] = value
             return out
 
         if self._ring is None:
