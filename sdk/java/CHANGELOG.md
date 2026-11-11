@@ -21,6 +21,12 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A multi-key operation still running when `close()` was called (`close()`
+  lets it finish) ran its forced node-list refresh after a failed leg: a
+  discovery round trip and dials of new nodes on a closed client (with slow
+  discovery, the operation returned seconds after `close()`). A closed client
+  no longer refreshes, as in the Python and TypeScript SDKs (#1738).
+
 - At the initial cluster connect, a listed address that identified as a discovery server or a proxy (an IP reused by another process) failed the whole `connect()` with "discovery server returned a non-node address", while running clients carried on. It is now a dead member with a reconnect cooldown, a not-sent `ConnectionLost` ("does not identify as a cache node"), the class the redial path already used, like a listed address that fails to dial. `connect()` fails only when no listed node is reachable, and then still with the plain "discovery server returned a non-node address" exception when the last failure was such an answer. (#1802)
 - `stats().refreshFailures()` counted once per failed discovery address and per failed dial of a newly listed node, and not at all for an empty roster, so one outage gave different numbers per SDK. It now counts once per refresh that did not produce a usable node list (every address unreachable, an empty roster, or a node-target answer), as the Go and Rust SDKs do; a failed dial of a new node during an otherwise successful refresh is not counted. Proxy-mode roster fetches count the same way. (#1735)
 - A node-list refresh removed members that had left the roster first, then dialed the new nodes (up to the connect timeout), and only then swapped the ring. For that whole window the old ring still routed keys to the removed members and requests failed with a "no connection" `ConnectionLost`. The refresh now removes departed members, adds the new ones and swaps the ring in one step, as the Go and Rust SDKs do. (#1733)
