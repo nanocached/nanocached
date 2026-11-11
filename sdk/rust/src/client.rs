@@ -1746,11 +1746,38 @@ impl NanocachedClient {
                         let mut members = HashMap::new();
                         let mut reachable = 0usize;
                         let mut dial_last_error: Option<Error> = None;
-                        let mut hard_error: Option<Error> = None;
 
                         for (node, outcome) in nodes.iter().zip(outcomes) {
+                            // A listed address that identifies as something
+                            // other than a cache node (its IP reused by a
+                            // discovery or proxy process; every dial here
+                            // uses `DiscoveryQuery::Nodes`, so `Proxies` is
+                            // only reachable that way) is the dial's failure
+                            // like an unreachable one: the same lost
+                            // connection a redial gives it, so one such
+                            // address cannot keep every new client from
+                            // starting. Nothing was written to it.
+                            // What `connect()` returns when nothing is
+                            // reachable stays the protocol error it was for
+                            // this answer; the cooldown entry carries the
+                            // lost connection.
+                            let mut connect_error: Option<Error> = None;
+                            let outcome = match outcome {
+                                Ok(Identified::Cluster { .. }) | Ok(Identified::Proxies { .. }) => {
+                                    connect_error = Some(Error::Protocol(format!(
+                                        "nanocached: discovery server returned a non-node address: {}",
+                                        node.address
+                                    )));
+                                    Err(Error::ConnectionLost(format!(
+                                        "nanocached: {} does not identify as a cache node",
+                                        node.address
+                                    )))
+                                }
+                                Ok(Identified::Node { stream, tagged }) => Ok((stream, tagged)),
+                                Err(error) => Err(error),
+                            };
                             match outcome {
-                                Ok(Identified::Node { stream, tagged }) => {
+                                Ok((stream, tagged)) => {
                                     members.insert(
                                         node.name.clone(),
                                         Member {
@@ -1765,22 +1792,6 @@ impl NanocachedClient {
                                         },
                                     );
                                     reachable += 1;
-                                }
-                                Ok(Identified::Cluster { .. }) | Ok(Identified::Proxies { .. }) => {
-                                    // The same wrong answer would come back
-                                    // from every replica of this address, so
-                                    // there's no point tolerating it or trying
-                                    // another discovery address — a hard
-                                    // error, same as before issue #67. Every
-                                    // dial here uses `DiscoveryQuery::Nodes`,
-                                    // so `Proxies` is only reachable if a
-                                    // discovery-listed node address somehow
-                                    // answers as a discovery server itself.
-                                    hard_error = Some(Error::Protocol(format!(
-                                    "nanocached: discovery server returned a non-node address: {}",
-                                    node.address
-                                )));
-                                    break;
                                 }
                                 Err(error) => {
                                     // Issue #67: a node discovery still lists
@@ -1811,20 +1822,9 @@ impl NanocachedClient {
                                             connection: Arc::new(Connection::dead()),
                                         },
                                     );
-                                    dial_last_error = Some(error);
+                                    dial_last_error = Some(connect_error.unwrap_or(error));
                                 }
                             }
-                        }
-
-                        if let Some(error) = hard_error {
-                            // Close whatever real connections already opened
-                            // so they aren't leaked (and stay counted forever
-                            // in open_targets); a dead placeholder has none to
-                            // close, but close() on it is a harmless no-op.
-                            for member in members.values() {
-                                member.connection.close();
-                            }
-                            return Err(error);
                         }
 
                         if reachable == 0 {
