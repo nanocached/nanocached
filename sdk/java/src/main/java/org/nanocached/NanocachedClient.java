@@ -2532,9 +2532,23 @@ public final class NanocachedClient implements AutoCloseable {
      * key's own contribution can never overflow the budget on its own
      * (see {@link #validateKey}). */
     private static int multiGetChunkEnd(int namespaceLength, byte[][] keys, int start) {
+        return multiGetChunkEnd(namespaceLength, keys, start, MAX_BATCH_KEYS);
+    }
+
+    /** The node rejects an {@code o}/{@code y} frame whose namespace length
+     * times key count exceeds 64 MiB (and closes the connection), so a
+     * chunk of those holds at most this many keys: {@code min(400,
+     * floor(64 MiB / namespace length))}. A namespace is at most 1 MiB,
+     * so this is never below 64. */
+    static int maxKeysPerNamespaceChunk(int namespaceLength) {
+        if (namespaceLength <= 0) return MAX_BATCH_KEYS;
+        return (int) Math.min(MAX_BATCH_KEYS, (64L * 1024 * 1024) / namespaceLength);
+    }
+
+    private static int multiGetChunkEnd(int namespaceLength, byte[][] keys, int start, int maxKeys) {
         int end = start + 1;
         long frameBytes = namespaceLength + multiGetEntryWireBytes(keys[start]);
-        while (end < keys.length && end - start < MAX_BATCH_KEYS) {
+        while (end < keys.length && end - start < maxKeys) {
             long next = frameBytes + multiGetEntryWireBytes(keys[end]);
             if (next > MAX_REQUEST_BYTES) break;
             frameBytes = next;
@@ -3457,7 +3471,7 @@ public final class NanocachedClient implements AutoCloseable {
         boolean expiring = expiresAtOnce(wireTtl);
         int start = 0;
         while (start < keys.length) {
-            int end = multiGetChunkEnd(namespace.length, keys, start);
+            int end = multiGetChunkEnd(namespace.length, keys, start, maxKeysPerNamespaceChunk(namespace.length));
             byte[][] chunk = Arrays.copyOfRange(keys, start, end);
             List<Connection.MultiEntry> chunkEntries;
             ConnectionOp<List<Connection.MultiEntry>> chunkOp = connection -> get
@@ -3960,7 +3974,8 @@ public final class NanocachedClient implements AutoCloseable {
     private static int multiSetChunkEnd(int namespaceLength, byte[][] keys, byte[][] values, int start) {
         int end = start + 1;
         long frameBytes = namespaceLength + multiSetEntryWireBytes(keys[start], values[start]);
-        while (end < keys.length && end - start < MAX_BATCH_KEYS) {
+        int maxKeys = maxKeysPerNamespaceChunk(namespaceLength);
+        while (end < keys.length && end - start < maxKeys) {
             long next = frameBytes + multiSetEntryWireBytes(keys[end], values[end]);
             if (next > MAX_REQUEST_BYTES) break;
             frameBytes = next;
@@ -6652,30 +6667,14 @@ public final class NanocachedClient implements AutoCloseable {
         // dedupeDiscoveredNodes's doc).
         List<DiscoveredNode> discovered = dedupeDiscoveredNodes(cluster.nodes());
         List<DiscoveredNode> toOpen = new ArrayList<>();
+        Map<String, DiscoveredNode> byName = new LinkedHashMap<>();
+        for (DiscoveredNode node : discovered) byName.put(node.name(), node);
+        // Nodes that left the roster are NOT removed here but in the final
+        // swap below, together with the ring (issue #1733): removing them
+        // now, then dialing for up to CONNECT_TIMEOUT_MS, left the old ring
+        // routing keys to members already gone ("no connection") for the
+        // whole dial phase. Go and Rust publish members and ring together.
         synchronized (stateLock) {
-            Map<String, DiscoveredNode> byName = new LinkedHashMap<>();
-            for (DiscoveredNode node : discovered) byName.put(node.name(), node);
-
-            members.entrySet().removeIf(entry -> {
-                if (!byName.containsKey(entry.getKey())) {
-                    // null for a member that was never reached (issue #67)
-                    // — nothing to close in that case.
-                    Connection stale = entry.getValue().connection;
-                    if (stale != null) stale.close();
-                    // Node names are per-process UUIDs; a departed node's
-                    // redial gate would otherwise leak forever (issue #12).
-                    redialLocks.remove(entry.getKey());
-                    // Same leak, for the same reason, on the per-address
-                    // cooldown map: a departed node's address is never
-                    // reused, so its cooldown entry (if any) would
-                    // otherwise linger forever (audit finding,
-                    // unpruned reconnectCooldowns).
-                    reconnectCooldowns.remove(entry.getValue().address);
-                    return true;
-                }
-                return false;
-            });
-
             for (DiscoveredNode node : discovered) {
                 Member existing = members.get(node.name());
                 if (existing != null) {
@@ -6703,6 +6702,25 @@ public final class NanocachedClient implements AutoCloseable {
                 }
                 return;
             }
+            members.entrySet().removeIf(entry -> {
+                if (!byName.containsKey(entry.getKey())) {
+                    // null for a member that was never reached (issue #67)
+                    // — nothing to close in that case.
+                    Connection stale = entry.getValue().connection;
+                    if (stale != null) stale.close();
+                    // Node names are per-process UUIDs; a departed node's
+                    // redial gate would otherwise leak forever (issue #12).
+                    redialLocks.remove(entry.getKey());
+                    // Same leak, for the same reason, on the per-address
+                    // cooldown map: a departed node's address is never
+                    // reused, so its cooldown entry (if any) would
+                    // otherwise linger forever (audit finding,
+                    // unpruned reconnectCooldowns).
+                    reconnectCooldowns.remove(entry.getValue().address);
+                    return true;
+                }
+                return false;
+            });
             for (int i = 0; i < toOpen.size(); i++) {
                 DiscoveredNode node = toOpen.get(i);
                 DialOutcome outcome = outcomes.get(i);
@@ -6739,12 +6757,10 @@ public final class NanocachedClient implements AutoCloseable {
                     armReconnectCooldown(node.address(), outcome.error);
                 }
             }
-        }
-
-        synchronized (stateLock) {
             ring = new HashRing(new ArrayList<>(members.keySet()));
             replication = cluster.replication();
         }
+
     }
 
     /** Walks every address (discovery HA); {@code null} means keep the
