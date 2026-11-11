@@ -7479,7 +7479,9 @@ async fn order_wait(mut wait: OrderWait) {
 /// one hash lookup per request. A request that waits is itself registered
 /// until it is dispatched, so a third request on the key waits for it in
 /// turn: waiting for the latest registration is waiting for all earlier
-/// ones. `m`/`o`/`y` touch every key they carry; `c` covers every key of its
+/// ones. `m`/`o`/`y` touch every key they carry (a batch of more than
+/// `ORDER_MULTI_KEYS_MAX` keys is registered for its whole namespace, to
+/// bound what the connection keeps); `c` covers every key of its
 /// namespace and `F` every key, and later requests in that scope wait for
 /// the clear in the same way.
 ///
@@ -7511,6 +7513,11 @@ struct ConnectionOrder {
 struct NamespaceOrder {
     /// The latest registered `c` of the namespace.
     clear: Option<OrderWait>,
+    /// The latest registered `m`/`o`/`y` with more than
+    /// `ORDER_MULTI_KEYS_MAX` keys: registered for the namespace as a whole
+    /// instead of per key, so what a connection keeps of it does not grow
+    /// with the request. A request on any key of the namespace waits for it.
+    wide: Option<OrderWait>,
     /// Keyed by `order_hash` of the key.
     keys: HashMap<u64, Registration>,
 }
@@ -7605,6 +7612,15 @@ impl OrderTicket {
 /// Registrations between sweeps of released entries, at least.
 const ORDER_SWEEP_MIN: usize = 1024;
 
+/// The most keys of one `m`/`o`/`y` that `ConnectionOrder` registers one by
+/// one. The entries outlive the request until the next sweep (or the end of
+/// the connection), outside every in-flight budget, so a batch of a million
+/// short keys would leave tens of megabytes behind per connection. A wider
+/// batch registers for its namespace as a whole (`NamespaceOrder::wide`):
+/// a later request on any key of that namespace waits for it, which only a
+/// connection that pipelines behind such a batch notices.
+const ORDER_MULTI_KEYS_MAX: usize = 64;
+
 impl ConnectionOrder {
     fn new() -> Self {
         Self {
@@ -7689,6 +7705,9 @@ impl ConnectionOrder {
         if let Some(wait) = &order.clear {
             pending.push(wait, false);
         }
+        if let Some(wait) = &order.wide {
+            pending.push(wait, false);
+        }
         for key in keys {
             if let Some(registration) = order.keys.get(&order_hash(key)) {
                 pending.push(&registration.wait, registration.inline_primary);
@@ -7725,16 +7744,23 @@ impl ConnectionOrder {
             | Request::MultiTouch {
                 namespace, keys, ..
             } => {
-                self.registered += keys.len();
                 let order = self.namespaces.entry(order_hash(namespace)).or_default();
-                for key in keys {
-                    order.keys.insert(
-                        order_hash(key),
-                        Registration {
-                            wait: wait.clone(),
-                            inline_primary: false,
-                        },
-                    );
+                if keys.len() > ORDER_MULTI_KEYS_MAX {
+                    // Whatever this request waited for is behind `wide`
+                    // too: it waited for every earlier registration it
+                    // touched, and later requests wait for this one.
+                    order.wide = Some(wait);
+                } else {
+                    self.registered += keys.len();
+                    for key in keys {
+                        order.keys.insert(
+                            order_hash(key),
+                            Registration {
+                                wait: wait.clone(),
+                                inline_primary: false,
+                            },
+                        );
+                    }
                 }
             }
             // The clear waited for everything in its scope, so waiting for
@@ -7742,6 +7768,7 @@ impl ConnectionOrder {
             Request::Clear { namespace } => {
                 let order = self.namespaces.entry(order_hash(namespace)).or_default();
                 order.keys.clear();
+                order.wide = None;
                 order.clear = Some(wait);
             }
             Request::ClearAll => {
@@ -7769,8 +7796,11 @@ impl ConnectionOrder {
             {
                 order.clear = None;
             }
+            if order.wide.as_ref().is_some_and(|wait| !order_pending(wait)) {
+                order.wide = None;
+            }
             live += order.keys.len();
-            !order.keys.is_empty() || order.clear.is_some()
+            !order.keys.is_empty() || order.clear.is_some() || order.wide.is_some()
         });
         if self
             .everything
@@ -7787,6 +7817,9 @@ impl ConnectionOrder {
 impl NamespaceOrder {
     fn push_all(&self, pending: &mut Pending) {
         if let Some(wait) = &self.clear {
+            pending.push(wait, false);
+        }
+        if let Some(wait) = &self.wide {
             pending.push(wait, false);
         }
         for registration in self.keys.values() {
@@ -16247,6 +16280,48 @@ mod tests {
         timeout(Duration::from_secs(5), order_wait(behind.waits[0].clone()))
             .await
             .expect("the wait ends once the first incr's signal does");
+    }
+
+    #[test]
+    fn a_wide_multi_key_request_does_not_leave_an_entry_per_key_behind() {
+        // An `i`, then a 300,000-key `m` of the same namespace deferred
+        // behind it: both over, the connection idle. The entries used to
+        // stay until a later registration crossed the sweep threshold.
+        let mut order = ConnectionOrder::new();
+        let incr = order.admit(&order_request("incr", "k"));
+        let mut keys: Vec<Bytes> = (0..300_000)
+            .map(|index| Bytes::from(format!("key-{index}")))
+            .collect();
+        keys.push(Bytes::from_static(b"k"));
+        let wide = order.admit(&Request::MultiGet {
+            namespace: Bytes::new(),
+            keys,
+        });
+        assert_eq!(wide.waits.len(), 1);
+        assert!(wide.defer);
+        let entries: usize = order.namespaces.values().map(|n| n.keys.len()).sum();
+        assert!(entries <= ORDER_MULTI_KEYS_MAX + 1, "{entries} entries");
+
+        // Any key of the namespace still waits for the batch, and for the
+        // `i` behind which it waits; a key of another namespace does not.
+        let behind = order.admit(&order_request("get", "unrelated"));
+        assert_eq!(behind.waits.len(), 1);
+        let elsewhere = order.admit(&Request::Get {
+            namespace: Bytes::from_static(b"elsewhere"),
+            key: Bytes::from_static(b"unrelated"),
+        });
+        assert!(elsewhere.waits.is_empty());
+        drop(incr);
+        assert!(order_pending(&behind.waits[0]));
+        drop(wide);
+        assert!(!order_pending(&behind.waits[0]));
+
+        // A batch of a few keys is still tracked per key.
+        let mut order = ConnectionOrder::new();
+        let _incr = order.admit(&order_request("incr", "k"));
+        let _small = order.admit(&order_request("multi-get", "k"));
+        let other = order.admit(&order_request("get", "unrelated"));
+        assert!(other.waits.is_empty());
     }
 
     #[test]
