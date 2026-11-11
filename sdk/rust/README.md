@@ -426,10 +426,13 @@ the `G`/`S`/`D` frames to their lowercase `g`/`s`/`d` counterparts,
 which carry the namespace's length and bytes alongside the key's; the
 default (empty) namespace always sends the exact legacy `G`/`S`/`D`
 bytes, so code that never touches namespaces is unaffected and keeps
-working against an older server. A namespace has no length limit of its
-own beyond the request-size bound this crate already applies to
-key+value, and — like a key — may contain any bytes; there is no
-delimiter, no escaping, no hierarchy. Namespaced frames need a
+working against an older server. A namespace's length is bounded by the
+request-size limit this crate already applies to key+value, and — like a
+key — it may contain any bytes; there is no delimiter, no escaping, no
+hierarchy. The node also refuses an `o` or `y` frame whose namespace
+length times key count exceeds 64 MiB, so `set_many` and `touch_many` on
+a long namespace send fewer than 400 keys per sub-frame (a 170,000-byte
+namespace, say, gets at most 394). Namespaced frames need a
 namespace-aware server; talking to an older one, don't use them.
 
 ### Clearing a namespace, or everything

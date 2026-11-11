@@ -138,6 +138,8 @@ struct NodeState {
     /// `multi_get_frame_bytes`'s `o`-frame twin (namespace plus every key
     /// and value, issue #222).
     multi_set_frame_bytes: Mutex<Vec<usize>>,
+    /// The key count of every `o` frame received, in order.
+    multi_set_frame_keys: Mutex<Vec<usize>>,
     /// Issue #411's regression knob: `0` (the default) never triggers.
     /// Once set to N, the Nth `m` (multi-get) frame this node ever
     /// receives — counting `multi_gets` itself — answers normally, but
@@ -1103,6 +1105,7 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     .lock()
                     .unwrap()
                     .push(frame_bytes);
+                state.multi_set_frame_keys.lock().unwrap().push(n);
                 if take_one(&state.retryable_replies) {
                     let reply = format!("R{tag_suffix}\n");
                     if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
@@ -4363,6 +4366,61 @@ async fn get_many_bytes_batch_over_the_byte_cap_splits_into_multiple_m_subframes
         assert!(
             *frame_bytes < 1024 * 1024,
             "sub-frame of {frame_bytes} bytes exceeds the server's 1 MiB cap"
+        );
+    }
+
+    client.close().await;
+    node.stop();
+}
+
+// ── o/y namespace x keys limit (64 MiB) ─────────────────────────────
+
+// A namespace just over 64 MiB / 400 = 167,772 bytes: 400 keys of it in one
+// `o` or `y` frame would make the node answer `En` and close the connection.
+const LONG_NAMESPACE_LEN: usize = 170_000;
+
+#[tokio::test]
+async fn set_many_keeps_namespace_length_times_keys_within_64_mib_per_o_frame() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let ns = client.namespace("n".repeat(LONG_NAMESPACE_LEN));
+
+    let values: HashMap<String, String> = (0..400)
+        .map(|i| (format!("key{i:03}"), format!("v{i}")))
+        .collect();
+    ns.set_many(&values, 0).await.unwrap();
+
+    let frame_keys = node.state.multi_set_frame_keys.lock().unwrap().clone();
+    assert!(frame_keys.len() >= 2, "frames: {frame_keys:?}");
+    assert_eq!(frame_keys.iter().sum::<usize>(), 400);
+    for n in frame_keys {
+        assert!(
+            LONG_NAMESPACE_LEN * n <= 64 * 1024 * 1024,
+            "an `o` frame of {n} keys exceeds the node's namespace x keys limit"
+        );
+    }
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn touch_many_keeps_namespace_length_times_keys_within_64_mib_per_y_frame() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let ns = client.namespace("n".repeat(LONG_NAMESPACE_LEN));
+
+    let keys: Vec<String> = (0..400).map(|i| format!("key{i:03}")).collect();
+    ns.touch_many(&keys, Some(60)).await.unwrap();
+
+    let frames = node.state.multi_touch_frames.lock().unwrap().clone();
+    assert!(frames.len() >= 2, "frames: {}", frames.len());
+    assert_eq!(frames.iter().map(|f| f.keys.len()).sum::<usize>(), 400);
+    for frame in frames {
+        assert!(
+            LONG_NAMESPACE_LEN * frame.keys.len() <= 64 * 1024 * 1024,
+            "a `y` frame of {} keys exceeds the node's namespace x keys limit",
+            frame.keys.len()
         );
     }
 
