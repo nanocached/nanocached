@@ -957,14 +957,20 @@ func (c *Client) connectViaProxy() error {
 // that same random order, exactly as the initial connect's own
 // seed-iteration does for discovery addresses; every candidate
 // unreachable (or, oddly, no longer identifying as a node/proxy) returns
-// the last such failure.
+// the last such failure. When that failure is a dial or handshake error,
+// address is the candidate it came from, so a caller that rewrites a
+// handshake failure (handshakeFailureAsLost) names the right proxy; for the
+// other two failures (no proxies listed, a candidate that is no longer a
+// proxy) address is empty and the error is not a handshake reply's.
 func (c *Client) dialRandomProxy(proxies []discoveredNode) (conn *connection, address string, err error) {
 	var lastError error
+	var lastDialed string
 	for _, i := range rand.Perm(len(proxies)) {
 		candidate := proxies[i].Address
 		result, dialErr := connectAndIdentify(candidate, c.authSecret, c.tlsConfig)
 		if dialErr != nil {
 			lastError = dialErr
+			lastDialed = candidate
 			continue
 		}
 		if result.conn == nil {
@@ -973,6 +979,7 @@ func (c *Client) dialRandomProxy(proxies []discoveredNode) (conn *connection, ad
 			// other unreachable candidate rather than erroring out
 			// early — another registered proxy may still be reachable.
 			lastError = protocolErrorf("nanocached: %s no longer identifies as a proxy", candidate)
+			lastDialed = ""
 			continue
 		}
 		return c.trackedConnection(result.conn, result.tagged), candidate, nil
@@ -980,7 +987,7 @@ func (c *Client) dialRandomProxy(proxies []discoveredNode) (conn *connection, ad
 	if lastError == nil {
 		lastError = protocolError("nanocached: no proxies registered with discovery")
 	}
-	return nil, "", lastError
+	return nil, lastDialed, lastError
 }
 
 // fetchProxyList walks every configured discovery address (discovery HA)
@@ -3475,7 +3482,12 @@ func (c *Client) reconnectAnotherProxy(deadAddress string) (*connection, string,
 	}
 	conn, address, err := c.dialRandomProxy(candidates)
 	if err != nil {
-		return nil, "", handshakeFailureAsLost(deadAddress, err)
+		// Only a failed dial of a candidate is a handshake failure, and it
+		// names that candidate; the other errors are returned as they are.
+		if address != "" {
+			err = handshakeFailureAsLost(address, err)
+		}
+		return nil, "", err
 	}
 	return conn, address, nil
 }
