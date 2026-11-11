@@ -3482,10 +3482,16 @@ func (c *Client) reconnectAnotherProxy(deadAddress string) (*connection, string,
 	}
 	conn, address, err := c.dialRandomProxy(candidates)
 	if err != nil {
-		// Only a failed dial of a candidate is a handshake failure, and it
-		// names that candidate; the other errors are returned as they are.
+		// A failed dial of a candidate may be a handshake failure, and
+		// names that candidate. The other protocol errors (a roster
+		// entry that no longer identifies as a proxy, no proxies
+		// registered) are not about a handshake, but they are cured the
+		// same way, so they stay a lost connection that was never used
+		// with a message that says what happened.
 		if address != "" {
 			err = handshakeFailureAsLost(address, err)
+		} else if errors.Is(err, ErrProtocol) {
+			err = notSent(connectionLost("nanocached: no proxy to reconnect to", err))
 		}
 		return nil, "", err
 	}

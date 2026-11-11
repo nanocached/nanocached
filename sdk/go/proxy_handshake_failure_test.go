@@ -43,19 +43,23 @@ func TestReconnectAnotherProxyNamesTheProxyThatFailedTheHandshake(t *testing.T) 
 	}
 }
 
-// A candidate that no longer identifies as a proxy is a protocol error of
-// its own, not a failed handshake reply: it keeps its message and type.
-func TestReconnectAnotherProxyKeepsTheNoLongerAProxyError(t *testing.T) {
+// A candidate that no longer identifies as a proxy is not a failed
+// handshake reply, but it is still a lost connection that was never used
+// (the client moves on to another proxy), with a message that says so.
+func TestReconnectAnotherProxyReportsANoLongerAProxyAccurately(t *testing.T) {
 	client := proxyClientWithRoster(t, func(discovery *mockDiscovery) []discoveredNode {
 		// A discovery server identifies as discovery, not as a proxy.
 		return []discoveredNode{{Name: "proxy-not-a-proxy", Address: discovery.address()}}
 	})
 
 	_, _, err := client.reconnectAnotherProxy("dead-proxy.invalid:1")
-	if !errors.Is(err, ErrProtocol) || errors.Is(err, ErrConnectionLost) {
-		t.Fatalf("reconnectAnotherProxy = %v, want the ErrProtocol it raised, not a lost connection", err)
+	if !errors.Is(err, ErrConnectionLost) || !errors.Is(err, errRequestNotSent) {
+		t.Fatalf("reconnectAnotherProxy = %v, want ErrConnectionLost marked not sent", err)
 	}
 	if !strings.Contains(err.Error(), "no longer identifies as a proxy") {
 		t.Errorf("error %q lost its own message", err)
+	}
+	if strings.Contains(err.Error(), "did not complete the handshake") {
+		t.Errorf("error %q calls it a failed handshake", err)
 	}
 }
