@@ -605,7 +605,20 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
                     pass
                 writer.close()
 
-            garbage = await asyncio.start_server(handle, "127.0.0.1", port)
+            # Re-binding a just-stopped node's port can briefly fail while its
+            # listener and accepted sockets finish closing: bind with
+            # SO_REUSEADDR and retry within a short bounded deadline.
+            rebind_deadline = time.monotonic() + 5.0
+            while True:
+                try:
+                    garbage = await asyncio.start_server(
+                        handle, "127.0.0.1", port, reuse_address=True
+                    )
+                    break
+                except OSError:
+                    if time.monotonic() >= rebind_deadline:
+                        raise
+                    await asyncio.sleep(0.05)
             try:
                 # Still within the cooldown window: rejects with the
                 # cached failure near-instantly, without dialing the
