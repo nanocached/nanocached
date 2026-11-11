@@ -866,7 +866,7 @@ func (c *Client) openCluster(result *identified) error {
 			cooldownError = handshakeFailureAsLost(node.Address, outcome.err)
 		} else if outcome.result.conn == nil {
 			cooldownError = notSent(connectionLost(
-				"nanocached: "+node.Address+" no longer identifies as a cache node", nil))
+				"nanocached: "+node.Address+" does not identify as a cache node", nil))
 			outcome.err = cooldownError
 		}
 
