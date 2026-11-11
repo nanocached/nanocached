@@ -82,6 +82,10 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e/freshjoin.sh`: a mistyped `MODE` fell through the `case`, so
+  only the join ran and the script reported PASS. An unknown `MODE` now
+  exits 2 with the list of valid modes before anything is started (#1743).
+
 - `tests/e2e/restart.sh`: unlike the other scenarios it had no minimum number
   of load operations, ignored the result of `verify.py seed`, and only
   printed the untouched-range `verify.py check` (without a time bound). It
