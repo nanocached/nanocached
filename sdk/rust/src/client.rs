@@ -145,7 +145,8 @@ fn set_entry_cost(key: &[u8], value: &[u8]) -> usize {
 /// Batch chunking's byte bound (issue #222): splits `entry_count`
 /// entries — each priced by `entry_cost(i)` (see [`get_entry_cost`]/
 /// [`set_entry_cost`]) — into contiguous sub-frame chunks, returning each
-/// chunk's length. A chunk never exceeds `MAX_BATCH_KEYS` entries or
+/// chunk's length. A chunk never exceeds `max_keys` entries (`MAX_BATCH_KEYS`,
+/// or [`max_keys_per_ns_frame`] for `o`/`y`) or
 /// `MAX_REQUEST_BYTES` total bytes (`namespace_len` once per chunk, plus
 /// [`MULTI_FRAME_FIXED_OVERHEAD_BYTES`], plus every entry's own cost) —
 /// except that a chunk always holds at least one entry:
@@ -159,6 +160,7 @@ fn set_entry_cost(key: &[u8], value: &[u8]) -> usize {
 fn chunk_lengths(
     namespace_len: usize,
     entry_count: usize,
+    max_keys: usize,
     entry_cost: impl Fn(usize) -> usize,
 ) -> Vec<usize> {
     let mut lengths = Vec::new();
@@ -167,8 +169,7 @@ fn chunk_lengths(
     let mut chunk_bytes = 0usize;
     for i in 0..entry_count {
         let cost = entry_cost(i);
-        if chunk_len > 0
-            && (chunk_len == MAX_BATCH_KEYS || base + chunk_bytes + cost > MAX_REQUEST_BYTES)
+        if chunk_len > 0 && (chunk_len == max_keys || base + chunk_bytes + cost > MAX_REQUEST_BYTES)
         {
             lengths.push(chunk_len);
             chunk_len = 0;
@@ -181,6 +182,20 @@ fn chunk_lengths(
         lengths.push(chunk_len);
     }
     lengths
+}
+
+/// The node refuses an `o` or `y` frame whose namespace length times key
+/// count exceeds 64 MiB (`En`, then closes the connection, failing every
+/// other request in flight on it). The most keys one such sub-frame may
+/// hold for a namespace of `namespace_len` bytes: [`MAX_BATCH_KEYS`], or
+/// fewer when a long namespace would take the frame past that product.
+/// `validate_key` bounds the namespace under 1 MiB, so at least 64.
+fn max_keys_per_ns_frame(namespace_len: usize) -> usize {
+    const MAX_NAMESPACE_TIMES_KEYS: usize = 64 * 1024 * 1024;
+    if namespace_len == 0 {
+        return MAX_BATCH_KEYS;
+    }
+    MAX_BATCH_KEYS.min((MAX_NAMESPACE_TIMES_KEYS / namespace_len).max(1))
 }
 
 /// The default namespace — always the empty byte string. Every
@@ -2908,7 +2923,12 @@ impl NanocachedClient {
         replay_safe: bool,
     ) -> std::result::Result<Vec<MultiEntry>, MultiTouchChunkFailure> {
         let mut entries = Vec::with_capacity(keys.len());
-        let lengths = chunk_lengths(namespace.len(), keys.len(), |i| get_entry_cost(&keys[i]));
+        let lengths = chunk_lengths(
+            namespace.len(),
+            keys.len(),
+            max_keys_per_ns_frame(namespace.len()),
+            |i| get_entry_cost(&keys[i]),
+        );
         let mut start = 0;
         for len in lengths {
             let chunk = &keys[start..start + len];
@@ -3523,7 +3543,9 @@ impl NanocachedClient {
         keys: &[Vec<u8>],
     ) -> std::result::Result<Vec<MultiEntry>, (Vec<MultiEntry>, Error)> {
         let mut entries = Vec::with_capacity(keys.len());
-        let lengths = chunk_lengths(namespace.len(), keys.len(), |i| get_entry_cost(&keys[i]));
+        let lengths = chunk_lengths(namespace.len(), keys.len(), MAX_BATCH_KEYS, |i| {
+            get_entry_cost(&keys[i])
+        });
         let mut start = 0;
         for len in lengths {
             let chunk = &keys[start..start + len];
@@ -3894,9 +3916,12 @@ impl NanocachedClient {
         ttl_seconds: u64,
     ) -> std::result::Result<Vec<MultiEntry>, (Vec<MultiEntry>, Error)> {
         let mut entries = Vec::with_capacity(keys.len());
-        let lengths = chunk_lengths(namespace.len(), keys.len(), |i| {
-            set_entry_cost(keys[i].as_ref(), values[i].as_ref())
-        });
+        let lengths = chunk_lengths(
+            namespace.len(),
+            keys.len(),
+            max_keys_per_ns_frame(namespace.len()),
+            |i| set_entry_cost(keys[i].as_ref(), values[i].as_ref()),
+        );
         let mut start = 0;
         for len in lengths {
             let key_chunk = &keys[start..start + len];
@@ -5574,17 +5599,20 @@ impl NanocachedClient {
             DiscoveryQuery::Nodes,
         )
         .await
-        // A `Protocol` error from the dial is the handshake's (an address
-        // that answers `A` with something that is no handshake reply, an
-        // HTTP server's `400 Bad Request`, say): raised before any frame of
-        // the caller's request exists, so it is the dial's failure like a
+        // The dial's `Protocol` error for an `A` reply that is no handshake
+        // reply (an address that answers with an HTTP server's `400 Bad
+        // Request`, say); any other `Protocol` error (a panicked TLS setup
+        // task, say) is not the handshake's and passes through. Raised before
+        // any frame of the caller's request exists, so it is the dial's failure like a
         // refused connection, not a protocol violation of an established
         // one. `ConnectionLost` lets `with_cluster_retry` refresh the node
         // list and reroute, and the reconnect-cooldown entry made from it
         // fails the next operation the same way. The first `connect()`
         // does not come through here and keeps `Protocol`.
         .map_err(|error| match error {
-            Error::Protocol(message) => Error::ConnectionLost(message),
+            Error::Protocol(message) if message == crate::identify::UNEXPECTED_A_REPLY => {
+                Error::ConnectionLost(message)
+            }
             other => other,
         })?;
         match identified {
