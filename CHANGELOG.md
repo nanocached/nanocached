@@ -45,6 +45,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e/reclaim970.sh`: the exit codes of `reclaim970.py seed` and
+  `apply` were not checked, and the PASS test was "some class reports 0 keys",
+  so a failed seed could still pass; it also printed its FAIL line twice when
+  keys were left and had no `EXIT` trap. A failed or timed-out seed or apply
+  now fails the run, all three classes (r, e, k) must report 0, each failure
+  is printed once, and the containers are removed on exit (#1741).
+
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a
