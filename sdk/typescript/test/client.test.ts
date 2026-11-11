@@ -9304,6 +9304,58 @@ describe("a listed address that answers as a discovery server instead of a node"
   }
 });
 
+describe("a listed address that answers as a discovery server at the initial connect", () => {
+  const goodName = "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6";
+  const otherName = "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47";
+
+  function keyOwnedBy(name: string, names: string[]): string {
+    for (let i = 0; ; i++) {
+      const key = `bootstrap-${i}`;
+      if (new HashRing(names).owners(Buffer.from(key), 1)[0] === name) return key;
+    }
+  }
+
+  it("connects, installing it as a dead member whose keys report a lost connection", async () => {
+    const good = await startMockNode();
+    const impostor = await startMockDiscovery([]);
+    const discovery = await startMockDiscovery([
+      { name: goodName, address: good.address },
+      { name: otherName, address: impostor.address },
+    ]);
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+      try {
+        assert.equal((client as any).target.members.get(otherName).connection, null);
+        const cooldown = (client as any).reconnectCooldowns.get(impostor.address);
+        assert.ok(cooldown.error instanceof ConnectionLostError);
+        assert.equal(cooldown.error.requestWasSent, false);
+
+        const goodKey = keyOwnedBy(goodName, [goodName, otherName]);
+        await client.set(goodKey, "v");
+        assert.ok(good.store.has(goodKey));
+        await assert.rejects(client.set(keyOwnedBy(otherName, [goodName, otherName]), "v"), ConnectionLostError);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await Promise.all([good.close(), impostor.close(), discovery.close()]);
+    }
+  });
+
+  it("still fails connect() when no listed address is a node", async () => {
+    const impostor = await startMockDiscovery([]);
+    const discovery = await startMockDiscovery([{ name: otherName, address: impostor.address }]);
+    try {
+      await assert.rejects(
+        NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] }),
+        /non-node address/,
+      );
+    } finally {
+      await Promise.all([impostor.close(), discovery.close()]);
+    }
+  });
+});
+
 describe("a listed address that does not complete the A handshake", () => {
   // The address is real and listening, but it is some other protocol's
   // server (an HTTP server answering `400 Bad Request`), or a listener with
