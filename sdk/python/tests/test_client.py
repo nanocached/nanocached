@@ -6738,7 +6738,7 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
                 except Exception:
                     pass
 
-    async def test_counts_a_swallowed_refresh_failure_for_an_unreachable_discovery_seed(self):
+    async def test_a_refresh_that_a_later_discovery_address_answers_is_not_a_failure(self):
         node = await MockNode().start()
         discovery = await MockDiscovery([(NAMES[0], node.address)]).start()
         dead = await unused_port()
@@ -6748,11 +6748,47 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 self.assertEqual(client.stats().refresh_failures, 0)
-                # Forces a fresh _fetch_node_list walk: the dead port fails
-                # first, counted as a refresh failure, before discovery
-                # answers.
+                # The dead seed fails first, but discovery answers on the
+                # next address: the refresh produced a node list.
+                await client._refresh_node_list()
+                self.assertEqual(client.stats().refresh_failures, 0)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await node.close()
+
+    async def test_a_refresh_counts_once_however_many_discovery_addresses_failed(self):
+        node = await MockNode().start()
+        discovery = await MockDiscovery([(NAMES[0], node.address)]).start()
+        dead = await unused_port()
+        other = await unused_port()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", dead), ("127.0.0.1", discovery.port), ("127.0.0.1", other)]
+            )
+            try:
+                await discovery.close()
                 await client._refresh_node_list()
                 self.assertEqual(client.stats().refresh_failures, 1)
+                await client._refresh_node_list()
+                self.assertEqual(client.stats().refresh_failures, 2)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_a_refresh_answered_with_an_empty_roster_is_counted(self):
+        node = await MockNode().start()
+        discovery = await MockDiscovery([(NAMES[0], node.address)]).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                discovery.nodes = []
+                await client._refresh_node_list()
+                self.assertEqual(client.stats().refresh_failures, 1)
+                # The last-known list is kept.
+                self.assertIn(NAMES[0], client._members)
             finally:
                 await client.close()
         finally:

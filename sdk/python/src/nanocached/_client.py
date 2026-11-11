@@ -175,8 +175,9 @@ class ClientStats:
     ``read_repair_failures``: failures swallowed while probing owners or
     writing back the repaired value during read repair (read repair).
 
-    ``refresh_failures``: node-list refresh attempts that failed, and
-    per-node connect failures swallowed while reconciling a refresh's
+    ``refresh_failures``: node-list refreshes that produced no usable node
+    list (counted once per refresh, however many discovery addresses it
+    tried; an empty roster counts), and per-node connect failures swallowed while reconciling a refresh's
     member list — discovery outages degrade only topology updates, never
     already-established cache traffic.
 
@@ -1139,17 +1140,18 @@ class NanocachedClient:
         found" — the caller (_reconnect_via_new_proxy) turns an empty
         result into the same clear error an empty initial roster would
         raise at connect(). Each failed address is counted in
-        stats().refresh_failures — the same counter _fetch_node_list
-        itself uses, since both are "the node/proxy list this client
-        routes with just went stale" (per the spec: reuse the SDK's
-        existing counters rather than adding a proxy-only one)."""
+        stats().refresh_failures — once per fetch that produced no usable
+        roster (every address failed, or none listed a proxy), the same
+        counter _refresh_node_list uses, since both are "the node/proxy
+        list this client routes with just went stale" (per the spec:
+        reuse the SDK's existing counters rather than adding a
+        proxy-only one)."""
         for address_host, address_port in self._addresses:
             try:
                 identified = await connect_and_identify_proxy(
                     address_host, address_port, self._auth_secret, self._ssl_context
                 )
             except _SWALLOWABLE_ERRORS:
-                self._refresh_failures += 1
                 continue
             if isinstance(identified, NodeTarget):
                 identified.writer.close()
@@ -1157,6 +1159,7 @@ class NanocachedClient:
             if not identified:
                 continue
             return identified
+        self._refresh_failures += 1
         return []
 
     # ── Public API ───────────────────────────────────────────────────
@@ -3828,6 +3831,10 @@ class NanocachedClient:
         cluster = await self._fetch_node_list()
         self._last_fetch = time.monotonic()
         if cluster is None:
+            # No address produced a usable node list (unreachable, not a
+            # discovery server, or an empty roster): one failed refresh,
+            # however many addresses were tried, as in the Go and Rust SDKs.
+            self._refresh_failures += 1
             return
 
         nodes = _dedupe_discovered_nodes(cluster.nodes)
@@ -3931,8 +3938,9 @@ class NanocachedClient:
         list. Failures here are silent by design — refresh is
         opportunistic/best-effort and must never fail the caller's
         operation (client-side replication's eventual-consistency model), so behavior is
-        unchanged either way, it just happens without a warning. Each
-        failed address is counted in stats().refresh_failures."""
+        unchanged either way, it just happens without a warning. A None
+        result is counted once in stats().refresh_failures by
+        _refresh_node_list, however many addresses failed."""
         for address_host, address_port in self._addresses:
             try:
                 identified = await connect_and_identify(
@@ -3940,7 +3948,6 @@ class NanocachedClient:
                 )
             except _SWALLOWABLE_ERRORS:
                 # A genuine programming error still propagates.
-                self._refresh_failures += 1
                 continue
             if isinstance(identified, NodeTarget):
                 identified.writer.close()
