@@ -42,6 +42,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the SDKs page said nothing about the limit on an `o` or `y` frame
+  (namespace length times the number of keys, at most 64 MiB), and the
+  protocol page said the SDKs reach it only with a namespace over 167,772
+  bytes. Both now say that the SDKs cap the keys per frame at
+  min(400, floor(64 MiB / namespace length)), so a long namespace means more,
+  smaller frames and never a refused batch (#1730).
+
 - Docs: the accepted-behaviour list now names a touch forwarded as a `U`
   to a leaving node that only moves the TTL: it is not relayed to the
   node's entrant, since it cannot be told apart from the delayed echo of
