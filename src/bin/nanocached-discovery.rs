@@ -1345,7 +1345,7 @@ struct ConnectionConfig {
     /// When set, this process's own outbound connections to a node
     /// (sending `M`/`X`) upgrade to TLS; see `connect_client_stream`.
     tls_connector: Option<TlsConnector>,
-    /// Guards new (not refreshing) registry insertions via `P` — see
+    /// Guards new (not refreshing) registry insertions via `P` and `Y` — see
     /// `AnnounceLimiter`.
     announce_limiter: AnnounceLimiter,
 }
@@ -4463,6 +4463,15 @@ fn log_announce(line: std::fmt::Arguments<'_>) {
     log_info_limited(&ANNOUNCE_LOG, "node announces", line);
 }
 
+/// Issue #1716: the `INFO proxy deregistered` line a `Z` writes, on its
+/// own budget so that a loop of `Y`/`Z` never hides another line.
+static PROXY_DEREGISTER_LOG: LogLimiter =
+    LogLimiter::new(PEER_LOG_LINES_PER_SECOND, Duration::from_secs(1));
+
+fn log_proxy_deregistered(line: std::fmt::Arguments<'_>) {
+    log_info_limited(&PROXY_DEREGISTER_LOG, "proxy deregistrations", line);
+}
+
 /// The standard-output counterpart of `log_limited`.
 fn log_info_limited(limiter: &LogLimiter, what: &str, line: std::fmt::Arguments<'_>) {
     let Some(suppressed) = limiter.admit() else {
@@ -5869,7 +5878,10 @@ async fn handle_connection(
                 match outcome {
                     Ok(removed) => {
                         if removed {
-                            println!("INFO proxy deregistered: {name}");
+                            // Issue #1716: one line per `Z` for a name the
+                            // peer registered a moment before, so it is
+                            // bounded like the node register/announce lines.
+                            log_proxy_deregistered(format_args!("INFO proxy deregistered: {name}"));
                         }
                         write_response(&mut stream, b"R\n").await?;
                         continue;
@@ -5891,6 +5903,7 @@ async fn handle_connection(
                 // `P` — that is exactly when a restarted replica needs
                 // re-announces to refill this map.
                 let addr = format!("{peer_ip}:{port}");
+                let mut limited = false;
                 let accepted = {
                     let mut proxies = registry
                         .proxies
@@ -5912,6 +5925,17 @@ async fn handle_connection(
                         // refresh — see `ProxyInfo::token`.
                         Some(_) => false,
                         None if at_capacity => false,
+                        // Issue #1716: a new name is gated like a new `P`
+                        // (only here, so a refresh above is never gated,
+                        // and a name refused for capacity spends no
+                        // token). One connection can loop `Y` under fresh
+                        // names, so without this it fills the 1024-entry
+                        // map in milliseconds. The limiter has its own
+                        // mutex and never takes this one.
+                        None if !announce_insert_allowed(&config.announce_limiter, peer_ip) => {
+                            limited = true;
+                            false
+                        }
                         None => {
                             proxies.insert(
                                 name.clone(),
@@ -5930,6 +5954,19 @@ async fn handle_connection(
                 if accepted {
                     write_response(&mut stream, b"R\n").await?;
                     continue;
+                }
+                if limited {
+                    log_rejection(format_args!(
+                        "WARN rejected proxy announce for {name} from {peer_ip}: more than \
+                         {ANNOUNCE_INSERT_BURST} new registrations from this source at once; \
+                         one more is allowed every {}s (see ANNOUNCE_INSERT_BURST / \
+                         ANNOUNCE_INSERT_COOLDOWN)",
+                        ANNOUNCE_INSERT_COOLDOWN.as_secs()
+                    ));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "too many new proxy announces from this source",
+                    ));
                 }
                 log_rejection(format_args!(
                     "WARN rejected proxy announce for {name} from {peer_ip}: token mismatch \
@@ -10634,6 +10671,59 @@ mod tests {
             response.contains("proxy-a127.0.0.1:8358"),
             "got {response:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proxy_announce_rate_limits_new_names_from_one_source_but_not_refreshes() {
+        // Issue #1716: `Y` under a fresh name each time, on one connection,
+        // used to fill `MAX_PROXY_ENTRIES` in milliseconds and lock real
+        // proxies out. New names are now gated per source like `P`'s; a
+        // refresh of a known name never is.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut client, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::clone(&current_join),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+
+        async fn announce(client: &mut TcpStream, name: &str) -> bool {
+            let frame = format!("Y {} 8358 2\n{name}tk", name.len());
+            client.write_all(frame.as_bytes()).await.unwrap();
+            let mut reply = [0u8; 2];
+            match client.read_exact(&mut reply).await {
+                Ok(_) => {
+                    assert_eq!(&reply, b"R\n");
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+
+        for index in 0..ANNOUNCE_INSERT_BURST {
+            assert!(announce(&mut client, &format!("fake-{index}")).await);
+        }
+        // A refresh of a registered name is never gated.
+        assert!(announce(&mut client, "fake-0").await);
+        // The next new name is refused and the connection closed.
+        assert!(!announce(&mut client, "fake-over").await);
+        let proxies = registry.proxies.lock().unwrap();
+        assert_eq!(proxies.len(), ANNOUNCE_INSERT_BURST as usize);
+        assert!(!proxies.contains_key("fake-over"));
     }
 
     #[tokio::test(flavor = "current_thread")]
