@@ -142,14 +142,22 @@ export class ConnectionLostError extends NanocachedError {
    * between "definitely sent" and "ambiguous" isn't tracked separately. */
   readonly requestWasSent: boolean;
 
+  /** Whether this is the request deadline expiring (the node accepted the
+   * frame and never answered). Such a request is not redialed and resent:
+   * the same hung node would stall the retry for another full window, so
+   * a call would take twice the timeout. Matches the Go, Rust, Java and
+   * .NET SDKs. */
+  readonly requestTimedOut: boolean;
+
   /** `cause` is the Node system error (ECONNREFUSED, ENOTFOUND, a TLS
    * handshake failure, ...) a failed dial wraps — see `connectSocket` —
    * so a caller that needs the platform's `code` still has it, under
    * this SDK's own class. */
-  constructor(message: string, options?: { requestWasSent?: boolean; cause?: unknown }) {
+  constructor(message: string, options?: { requestWasSent?: boolean; requestTimedOut?: boolean; cause?: unknown }) {
     super(message);
     this.name = "ConnectionLostError";
     this.requestWasSent = options?.requestWasSent ?? true;
+    this.requestTimedOut = options?.requestTimedOut ?? false;
     if (options?.cause !== undefined) this.cause = options.cause;
   }
 }
@@ -955,6 +963,7 @@ export class Connection {
       this.poison(
         new ConnectionLostError(
           `nanocached: no response from server within ${REQUEST_TIMEOUT_TUNING.timeoutMs}ms (request timed out)`,
+          { requestTimedOut: true },
         ),
       );
     }, REQUEST_TIMEOUT_TUNING.timeoutMs);
