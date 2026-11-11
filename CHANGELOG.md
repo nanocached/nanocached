@@ -82,6 +82,8 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tools/conformance`: `scenarios.sh v6` only printed `secret appears in N output files` when the auth secret leaked, and `compare.py` (the last step of `run.sh`) printed FAIL/DIFF cells without a failing exit, so both exited 0 on a violation. `scenarios.sh v6` now exits 1 when `secret_leaks.txt` is not empty and `compare.py` (so `run.sh`) exits 1 when any cell is FAIL or DIFF (#1739).
+
 - `nanocached-node`: a forwarded handoff write (`U`, `u`, `f`) answered `R`
   was treated as a generic failure. Each forward to that address dialed it
   `KEY_TRANSFER_ATTEMPTS` times and every later one once more, until the

@@ -153,6 +153,11 @@ def main(run_dir):
     text = "\n".join(lines) + "\n"
     open(os.path.join(run_dir, "report.md"), "w").write(text)
     print(text)
+    # a cell the oracle rejected (FAIL) or that disagrees with the other SDKs (DIFF) fails the run
+    bad_cells = total["FAIL"] + total["DIFF"]
+    if bad_cells:
+        print(f"{bad_cells} FAIL/DIFF cells", file=sys.stderr)
+        sys.exit(1)
 
 
 main(sys.argv[1])
