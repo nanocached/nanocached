@@ -11586,6 +11586,11 @@ mod tests {
         /// instead of replying — the reply lost after the node executed
         /// it. A touch is idempotent, so the proxy must re-send it.
         close_after_touch_apply_once: Arc<AtomicBool>,
+        /// Applies the next `D`/`d` to the store, then drops the connection
+        /// instead of replying: the delete took effect at the node and its
+        /// answer was lost. The proxy re-sends it, and the second attempt
+        /// finds nothing to delete.
+        close_after_delete_apply_once: Arc<AtomicBool>,
         /// The markers (`"W"`, `"E"`) the next `t` frames are refused with,
         /// one per frame in order, before any is applied — a stale ring
         /// that is still stale after a refresh, or a node that refuses the
@@ -11655,6 +11660,7 @@ mod tests {
                 touches: Arc::new(StdMutex::new(Vec::new())),
                 multi_set_sizes: Arc::new(StdMutex::new(Vec::new())),
                 close_after_touch_apply_once: Arc::new(AtomicBool::new(false)),
+                close_after_delete_apply_once: Arc::new(AtomicBool::new(false)),
                 refuse_touches: Arc::new(StdMutex::new(std::collections::VecDeque::new())),
                 get_delay: Arc::new(StdMutex::new(Duration::ZERO)),
                 auth_count: Arc::new(AtomicUsize::new(0)),
@@ -11684,6 +11690,7 @@ mod tests {
             let touches = Arc::clone(&node.touches);
             let multi_set_sizes = Arc::clone(&node.multi_set_sizes);
             let close_after_touch_apply_once = Arc::clone(&node.close_after_touch_apply_once);
+            let close_after_delete_apply_once = Arc::clone(&node.close_after_delete_apply_once);
             let refuse_touches = Arc::clone(&node.refuse_touches);
             let delay = Arc::clone(&node.get_delay);
             let auth_count = Arc::clone(&node.auth_count);
@@ -11723,6 +11730,9 @@ mod tests {
                             touches: Arc::clone(&touches),
                             multi_set_sizes: Arc::clone(&multi_set_sizes),
                             close_after_touch_apply_once: Arc::clone(&close_after_touch_apply_once),
+                            close_after_delete_apply_once: Arc::clone(
+                                &close_after_delete_apply_once,
+                            ),
                             refuse_touches: Arc::clone(&refuse_touches),
                             delay: Arc::clone(&delay),
                             auth_count: Arc::clone(&auth_count),
@@ -11805,6 +11815,7 @@ mod tests {
         /// instead of replying — the reply lost after the node executed
         /// it. A touch is idempotent, so the proxy must re-send it.
         close_after_touch_apply_once: Arc<AtomicBool>,
+        close_after_delete_apply_once: Arc<AtomicBool>,
         refuse_touches: Arc<StdMutex<std::collections::VecDeque<&'static str>>>,
         delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
@@ -11870,6 +11881,7 @@ mod tests {
             touches,
             multi_set_sizes,
             close_after_touch_apply_once,
+            close_after_delete_apply_once,
             refuse_touches,
             delay,
             auth_count,
@@ -12521,6 +12533,9 @@ mod tests {
                             continue;
                         }
                         let existed = store.lock().unwrap().remove(&(namespace, key)).is_some();
+                        if close_after_delete_apply_once.swap(false, Ordering::SeqCst) {
+                            return Ok(());
+                        }
                         let marker = if existed { "D" } else { "N" };
                         stream
                             .write_all(format!("{marker} {}\n", tag(&fields)).as_bytes())
@@ -16781,6 +16796,27 @@ mod tests {
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 1");
         read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
         assert_eq!(&buf.split_to(2)[..], b"vv");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_whose_reply_was_lost_is_re_sent_and_answers_what_the_retry_found() {
+        // A delete is idempotent, so the proxy sends it again when the
+        // answer never arrived. If the first attempt had already removed
+        // the key, the retry finds nothing and the client is told `N`: the
+        // proxy cannot tell that from a key that never existed, so it
+        // reports what the attempt that answered found (an accepted
+        // behaviour, as for an SDK's own retry). The key is gone either way.
+        let (nodes, proxy) = cluster(1).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"S 1 1\nkv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        nodes[0]
+            .close_after_delete_apply_once
+            .store(true, Ordering::SeqCst);
+        stream.write_all(b"D 1\nk").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+        assert!(nodes[0].entry(b"", b"k").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -765,6 +765,12 @@ here.</p>
   <code>i</code>, <code>k</code> or <code>x</code> result is in the
   order (a later request on the same key waits for it to be enqueued); a
   re-sent replica write is not.</li>
+  <li>A delete whose answer was lost after the proxy wrote it is sent again,
+  and when the first attempt had already removed the key the client is told
+  <code>N</code> (not found) although the key existed. The proxy cannot tell
+  that from a key that never existed, so no fixed answer is right for both;
+  it reports what the attempt that answered found, as an SDK&rsquo;s own
+  retry of a delete does. The key is gone either way.</li>
   <li>A ring change pauses a node about 25&nbsp;ms per million live keys
   (a snapshot walk on the single cache task), with a transient allocation
   of 64 bytes per key; a staged handoff&rsquo;s count of the entries to
