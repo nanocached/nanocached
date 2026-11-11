@@ -5250,7 +5250,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
 
     private async Task MaybeRefreshAsync(bool force)
     {
-        if (_ring is null) return;
+        // A closed client never refreshes: Close() does not wait for an
+        // operation already in flight, and a multi-key one whose leg failed
+        // would otherwise run its forced refresh anyway — a discovery round
+        // trip (up to the connect timeout) and dials of new nodes after
+        // Close().
+        if (_closed || _ring is null) return;
         if (!force && Elapsed(_lastFetch) < NodeListStaleAfter) return;
 
         // Forced refreshes are single-flight: a forced caller that waited
@@ -5283,6 +5288,9 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         }
         try
         {
+            // Checked again under the gate for a caller that queued behind a
+            // refresh while Close() ran.
+            if (_closed) return;
             if (!force && Elapsed(_lastFetch) < NodeListStaleAfter) return;
             if (force)
             {

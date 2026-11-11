@@ -142,4 +142,42 @@ public class ForcedRefreshTests
             watch.Elapsed >= TimeSpan.FromMilliseconds(600 - 150) + NanocachedClient.ForcedRefreshMinInterval,
             $"the follow-up refresh started too early: {watch.Elapsed}");
     }
+
+    [Fact]
+    public async Task AnOperationStillRunningAfterCloseDoesNotRefreshTheNodeList()
+    {
+        // A multi-key read still in flight when Close() runs, with one leg
+        // failed (its node is down), used to run its forced refresh anyway:
+        // a discovery round trip (here 4 s of slow discovery) on a closed
+        // client.
+        var nodeA = new MockNode();
+        var nodeB = new MockNode();
+        using var _b = nodeB;
+        using var discovery = new MockDiscovery(
+            new List<(string, string)> { (Names[0], nodeA.Address), (Names[1], nodeB.Address) }, 1);
+        NanocachedClient client = await NanocachedClient.ConnectAsync(
+            new() { Addresses = { ("127.0.0.1", discovery.Port) } });
+        string onA = KeyWhosePrimaryIs(Names[0]);
+        string onB = KeyWhosePrimaryIs(Names[1]);
+        await client.SetAsync(onA, "a");
+        await client.SetAsync(onB, "b");
+        nodeB.DelayGets(1500);
+        nodeA.Dispose();
+        await Task.Delay(100);
+        discovery.LaterListDelayMillis = 4000;
+        int fetchesBefore = discovery.ConnectionCount;
+
+        Task call = Task.Run(async () =>
+        {
+            try { await client.GetManyAsync(new[] { onA, onB }); } catch (NanocachedException) { }
+        });
+        await Task.Delay(300);
+        var sinceClose = Stopwatch.StartNew();
+        client.Close();
+        await call.WaitAsync(TimeSpan.FromSeconds(15));
+        sinceClose.Stop();
+
+        Assert.Equal(fetchesBefore, discovery.ConnectionCount);
+        Assert.True(sinceClose.Elapsed < TimeSpan.FromSeconds(3), $"GetManyAsync finished {sinceClose.Elapsed} after Close()");
+    }
 }
