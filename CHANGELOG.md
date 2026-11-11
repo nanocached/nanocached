@@ -82,6 +82,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e/reclaim970.sh`: the exit codes of `reclaim970.py seed` and
+  `apply` were not checked, and the PASS test was "some class reports 0 keys",
+  so a failed seed could still pass; it also printed its FAIL line twice when
+  keys were left and had no `EXIT` trap. A failed or timed-out seed or apply
+  now fails the run, all three classes (r, e, k) must report 0, each failure
+  is printed once, and the containers are removed on exit (#1741).
+
 - `tests/e2e/steady582.sh`: the header required the load's misses, the
   untouched range's misses, the `k0..k19999` misses and the versioned writer's
   stale/miss counts to be 0, but the script only echoed them (it failed only
