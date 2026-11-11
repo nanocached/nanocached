@@ -1760,7 +1760,7 @@ impl NanocachedClient {
                             let outcome = match outcome {
                                 Ok(Identified::Cluster { .. }) | Ok(Identified::Proxies { .. }) => {
                                     Err(Error::ConnectionLost(format!(
-                                        "nanocached: {} no longer identifies as a cache node",
+                                        "nanocached: {} does not identify as a cache node",
                                         node.address
                                     )))
                                 }
