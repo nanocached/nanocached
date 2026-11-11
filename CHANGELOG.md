@@ -14,6 +14,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Discovery: `Y` (proxy announce) registered new proxy names with no
+  limiter, so one connection looping `Y` under fresh names filled the
+  1024-entry proxy registry in milliseconds and real proxies with new names
+  were refused until the fakes timed out. New names now share the per-source
+  limiter `P` uses (a burst of 64, then one per 2 s); a refresh of a known
+  name is never gated. The `INFO proxy deregistered` line a `Z` writes is
+  now rate limited like the node register and announce lines (#1716).
+
+### Fixed
+
 - Node, discovery: the number of rejected connections lingering in their
   busy-reply drain (up to 200 ms each, for a peer that does not close) was
   bounded only by the accept rate, since a connection turned away by the
