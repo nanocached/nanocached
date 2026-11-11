@@ -42,6 +42,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the accepted-behaviour list now names a touch forwarded as a `U`
+  to a leaving node that only moves the TTL: it is not relayed to the
+  node's entrant, since it cannot be told apart from the delayed echo of
+  the node's own drain and relaying it would make the loop depend on timing
+  (#1719).
+
 - Docs: the accepted-behaviour list now says that a proxied delete whose
   answer was lost after the write, and which is then sent again, answers `N`
   when the first attempt had already removed the key (#1714). A test pins it.
