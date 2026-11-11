@@ -1001,52 +1001,53 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
             silent.close()
             await silent.wait_closed()
 
-    async def test_open_cluster_rejects_a_nested_discovery_address_without_leaking(self):
-        # Regression (pass-7 audit): if a roster entry points at another
-        # discovery server, dialing it returns a ClusterTarget, not a
-        # NodeTarget. _open_cluster's non-node-address cleanup must (1)
-        # raise NanocachedError, not the AttributeError that closing a
-        # writer-less ClusterTarget used to throw, and (2) still close the
-        # sockets it already opened to the genuine nodes this round.
-        from nanocached import _identify
-        from nanocached._client import ClusterTarget, DiscoveredNode, NodeTarget
+    async def test_a_listed_address_that_answers_as_a_discovery_server_is_a_dead_member_at_connect(self):
+        # A roster address whose IP another kind of process has reused
+        # (here a discovery server) must not keep a new client from
+        # starting: it is installed like a failed dial, with its cooldown
+        # armed with a never-sent ConnectionError, and the healthy node's
+        # connection is left open and usable.
+        good = "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6"
+        bad = "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"
+        node = await MockNode().start()
+        impostor = await MockDiscovery([]).start()
+        discovery = await MockDiscovery(
+            [(good, node.address), (bad, f"127.0.0.1:{impostor.port}")], replication=1
+        ).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                self.assertIsNotNone(client._members[good].connection)
+                self.assertIsNone(client._members[bad].connection)
+                stored = client._redial_cooldowns[f"127.0.0.1:{impostor.port}"][1]
+                self.assertIsInstance(stored, ConnectFailedError)
 
-        class SpyWriter:
-            def __init__(self):
-                self.closed = False
+                good_key = next(
+                    f"k{i}" for i in range(1000) if client._ring.owners(f"k{i}".encode(), 1)[0] == good
+                )
+                bad_key = next(
+                    f"k{i}" for i in range(1000) if client._ring.owners(f"k{i}".encode(), 1)[0] == bad
+                )
+                await client.set(good_key, "v")
+                self.assertEqual(await client.get(good_key), "v")
+                with self.assertRaises(ConnectionError):
+                    await client.set(bad_key, "v")
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await impostor.close()
+            await node.close()
 
-            def close(self):
-                self.closed = True
-
-        node_writer = SpyWriter()
-        node_target = NodeTarget(reader=object(), writer=node_writer, tagged=True)
-        nested = ClusterTarget(nodes=[], replication=1)
-
-        async def fake_identify(host, port, secret, ssl_context):
-            # First address is a genuine node, second is a nested discovery.
-            return node_target if port == 9001 else nested
-
-        client = NanocachedClient.__new__(NanocachedClient)
-        client._auth_secret = None
-        client._ssl_context = None
-        identified = ClusterTarget(
-            nodes=[
-                DiscoveredNode(name="real", address="127.0.0.1:9001"),
-                DiscoveredNode(name="nested", address="127.0.0.1:9002"),
-            ],
-            replication=1,
-        )
-
-        with mock.patch.object(_identify, "connect_and_identify", fake_identify), mock.patch(
-            "nanocached._client.connect_and_identify", fake_identify
-        ):
-            with self.assertRaises(NanocachedError):
-                await client._open_cluster(identified)
-
-        self.assertTrue(
-            node_writer.closed,
-            "the genuine node's socket must be closed during non-node-address cleanup",
-        )
+    async def test_connect_still_fails_when_every_listed_address_answers_as_a_non_node(self):
+        impostor = await MockDiscovery([]).start()
+        discovery = await MockDiscovery([("only", f"127.0.0.1:{impostor.port}")]).start()
+        try:
+            with self.assertRaisesRegex(NanocachedError, "non-node address"):
+                await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        finally:
+            await discovery.close()
+            await impostor.close()
 
     async def test_a_refresh_finishing_after_close_installs_no_connections(self):
         # Regression for issue #10.

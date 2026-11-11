@@ -1017,26 +1017,29 @@ class NanocachedClient:
 
         outcomes = await _dial_roster(nodes, dial)
 
-        # A non-node answer is a configuration error, not a liveness one:
-        # checked across every outcome first so the sockets this same
-        # round already opened are closed rather than leaked. Only a
-        # NodeTarget owns a writer to close — a ClusterTarget (the
-        # non-node answer itself) has none, so it must be matched by type
-        # rather than "not an Exception", or closing it raises
-        # AttributeError, which both masks the intended NanocachedError and
-        # aborts the cleanup loop, leaking every socket after it.
-        for node, outcome in outcomes:
-            if not isinstance(outcome, (Exception, NodeTarget)):
-                for _, other in outcomes:
-                    if isinstance(other, NodeTarget):
-                        other.writer.close()
-                raise NanocachedError(
-                    f"nanocached: discovery server returned a non-node address: {node.address}"
-                )
-
         reachable = 0
         last_error: Exception | None = None
         for node, outcome in outcomes:
+            if not isinstance(outcome, (Exception, NodeTarget)):
+                # A listed address that answers as a discovery server or a
+                # proxy (an IP another kind of process has since reused) is
+                # one more unreachable member, like after a redial: a dead
+                # member with its cooldown armed, so one such address does
+                # not keep every new client from starting while running
+                # clients carry on. A ClusterTarget owns no socket to close.
+                # The cooldown error is a ConnectFailedError (never sent),
+                # which is what makes an operation routed here refresh and
+                # reroute; connect() itself, when nothing else is reachable,
+                # still raises the non-node message.
+                self._members[node.name] = _Member(node.address, None)
+                self._redial_cooldowns[node.address] = (
+                    time.monotonic() + self._reconnect_cooldown,
+                    ConnectFailedError(f"nanocached: {node.address} does not identify as a cache node"),
+                )
+                last_error = NanocachedError(
+                    f"nanocached: discovery server returned a non-node address: {node.address}"
+                )
+                continue
             if isinstance(outcome, Exception):
                 self._members[node.name] = _Member(node.address, None)
                 # What connect() raises (last_error) stays what the handshake
