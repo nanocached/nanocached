@@ -12,6 +12,15 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- Discovery: the replication-factor dissent WARN written when `L` rebuilds
+  its cached answer was not rate limited and listed every dissenting node,
+  so a flood of fake nodes with generation bumps between `L` calls produced
+  one multi-megabyte line per `L` (65,000 names, about 2.4 MB). It is now
+  limited to one line per 10 s (the rest counted in a summary) and lists the
+  first 5 names followed by a count (#1717).
+
 ### Changed
 
 - Docs: the decommission section said an attempt's connect and its send are

@@ -4838,6 +4838,64 @@ fn cached_heartbeat_ack(registry: &Registry, replication: usize) -> Arc<[u8]> {
     )
 }
 
+/// Issue #1717: the dissent WARN gets its own budget. Every `L` rebuild
+/// writes one while a dissenter is present, and generation bumps
+/// interleaved with `L` make a rebuild per request.
+static DISSENT_LOG: LogLimiter = LogLimiter::new(1, Duration::from_secs(10));
+
+/// How many dissenting names the WARN lists; the rest are counted. With
+/// many fake nodes the full list was one line of megabytes (65k names).
+const DISSENT_NAMES_LISTED: usize = 5;
+
+fn dissenter_names(dissenting: &[String]) -> String {
+    let listed = dissenting
+        .iter()
+        .take(DISSENT_NAMES_LISTED)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match dissenting.len().checked_sub(DISSENT_NAMES_LISTED) {
+        Some(rest) if rest > 0 => format!("{listed} and {rest} more"),
+        _ => listed,
+    }
+}
+
+/// Writes the replication-factor dissent WARN for `snapshot` if the
+/// limiter admits one; returns whether it did. Nothing is formatted when
+/// the line is suppressed.
+fn log_dissent(limiter: &LogLimiter, snapshot: &RosterSnapshot, replication: usize) -> bool {
+    if snapshot.dissenting.is_empty() {
+        return false;
+    }
+    let Some(suppressed) = limiter.admit() else {
+        return false;
+    };
+    if suppressed > 0 {
+        eprintln!("WARN {suppressed} more replication dissent warnings (not logged individually)");
+    }
+    let dissenting = snapshot.dissenting.len();
+    let voting = dissenting + snapshot.agreeing;
+    let names = dissenter_names(&snapshot.dissenting);
+    if snapshot.refuse() {
+        eprintln!(
+            "WARN refusing L: {dissenting} of {voting} voting Joined nodes report a \
+             replication factor different from this replica's own \
+             --replication-factor {replication} (a strict majority) — dissenting: {names} — \
+             discovery replicas have drifted out of alignment; the operator \
+             must align --replication-factor across every replica (see \
+             Discovery HA)"
+        );
+    } else {
+        eprintln!(
+            "WARN L served despite {dissenting} of {voting} voting Joined nodes reporting a \
+             replication factor different from this replica's own \
+             --replication-factor {replication} — not yet a strict majority, so still \
+             served, but worth investigating: {names}"
+        );
+    }
+    true
+}
+
 /// The `L` response, cached and rebuilt only when the registry's
 /// `generation` has moved since the last build (issue #298) —
 /// `cached_heartbeat_ack`'s sibling for `L`. Before this, every `L` re-ran
@@ -4873,38 +4931,7 @@ fn cached_list_response(registry: &Registry, replication: usize) -> Arc<[u8]> {
             // strict-majority vote rather than refusing on any dissent.
             // Logged here, on rebuild only, rather than on every request
             // as the un-cached handler used to.
-            if !snapshot.dissenting.is_empty() {
-                if snapshot.refuse() {
-                    eprintln!(
-                        "WARN refusing L: {} of {} voting Joined nodes report a \
-                         replication factor different from this replica's own \
-                         --replication-factor {} (a strict majority) — dissenting: {} — \
-                         discovery replicas have drifted out of alignment; the operator \
-                         must align --replication-factor across every replica (see \
-                         Discovery HA)",
-                        snapshot.dissenting.len(),
-                        snapshot.dissenting.len() + snapshot.agreeing,
-                        replication,
-                        snapshot.dissenting.join(", ")
-                    );
-                } else {
-                    // Logged on rebuild rather than rate-limited or
-                    // deduplicated against a remembered dissenter set:
-                    // simpler, and with the cache in place a persistent
-                    // single dissenter now logs only as often as
-                    // membership actually changes, not per `L` call.
-                    eprintln!(
-                        "WARN L served despite {} of {} voting Joined nodes reporting a \
-                         replication factor different from this replica's own \
-                         --replication-factor {} — not yet a strict majority, so still \
-                         served, but worth investigating: {}",
-                        snapshot.dissenting.len(),
-                        snapshot.dissenting.len() + snapshot.agreeing,
-                        replication,
-                        snapshot.dissenting.join(", ")
-                    );
-                }
-            }
+            log_dissent(&DISSENT_LOG, &snapshot, replication);
 
             if snapshot.refuse() {
                 Arc::from(b"B\n".as_slice())
@@ -10634,6 +10661,29 @@ mod tests {
             response.contains("proxy-a127.0.0.1:8358"),
             "got {response:?}"
         );
+    }
+
+    #[test]
+    fn the_dissent_warn_is_rate_limited_and_lists_a_bounded_number_of_names() {
+        // Issue #1717: one line per `L` rebuild, naming every dissenter.
+        let dissenting: Vec<String> = (0..65_000).map(|i| format!("fake-node-{i}")).collect();
+        let names = dissenter_names(&dissenting);
+        assert!(names.starts_with("fake-node-0, fake-node-1"), "{names}");
+        assert!(names.ends_with("and 64995 more"), "{names}");
+        assert!(names.len() < 200, "{} bytes", names.len());
+        let few: Vec<String> = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(dissenter_names(&few), "a, b");
+
+        let snapshot = RosterSnapshot {
+            nodes: Vec::new(),
+            dissenting,
+            agreeing: 1,
+        };
+        let limiter = LogLimiter::new(1, Duration::from_secs(3600));
+        let written = (0..1000)
+            .filter(|_| log_dissent(&limiter, &snapshot, 2))
+            .count();
+        assert_eq!(written, 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
