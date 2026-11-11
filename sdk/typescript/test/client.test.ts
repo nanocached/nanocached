@@ -7142,7 +7142,7 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
     }
   });
 
-  it("counts a swallowed refresh failure for an unreachable discovery seed", async () => {
+  it("does not count a refresh failure when another discovery seed answers", async () => {
     const node = await startMockNode();
     const discovery = await startMockDiscovery([{ name: names[0], address: node.address }]);
     const deadPort = unreachablePort();
@@ -7156,14 +7156,42 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
       try {
         assert.equal(client.stats().refreshFailures, 0);
         // Forces a fresh fetchNodeList walk: the dead port fails first,
-        // counted as a refresh failure, before discovery answers.
+        // then discovery answers. The refresh produced a node list, so it
+        // is not a refresh failure.
         await (client as any).refreshNodeList();
-        assert.equal(client.stats().refreshFailures, 1);
+        assert.equal(client.stats().refreshFailures, 0);
       } finally {
         await client.close();
       }
     } finally {
       await Promise.all([discovery.close(), node.close()]);
+    }
+  });
+
+  it("counts one refresh failure per refresh, not per unreachable discovery address", async () => {
+    const node = await startMockNode();
+    const discovery = await startMockDiscovery([{ name: names[0], address: node.address }]);
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [
+          { host: "127.0.0.1", port: discovery.port },
+          { host: "127.0.0.1", port: unreachablePort() },
+          { host: "127.0.0.1", port: unreachablePort() },
+        ],
+      });
+      try {
+        await discovery.close();
+        assert.equal(client.stats().refreshFailures, 0);
+        // Three configured addresses, none usable: one refresh, one failure.
+        await (client as any).refreshNodeList();
+        assert.equal(client.stats().refreshFailures, 1);
+        await (client as any).refreshNodeList();
+        assert.equal(client.stats().refreshFailures, 2);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
     }
   });
 
@@ -8701,8 +8729,9 @@ describe("NanocachedClient refreshNodeList dials new nodes concurrently (issue #
         // Go/Rust/.NET SDKs. Dropping it would make this client's HashRing
         // rank keys near it differently from every peer that reached it
         // until the next refresh; kept, its keys fail over per request and
-        // its cooldown is armed.
-        assert.equal(client.stats().refreshFailures, 1);
+        // its cooldown is armed. The refresh did produce a node list, so a
+        // failed dial of one new node is not a refresh failure.
+        assert.equal(client.stats().refreshFailures, 0);
         const members = (client as any).target.members as Map<string, { connection: unknown; address: string }>;
         assert.ok(members.get("node-a")?.connection !== null, "node-a was not installed");
         assert.ok(members.get("node-b")?.connection !== null, "node-b was not installed");
@@ -8918,7 +8947,7 @@ describe("a malformed roster address is one unreachable node, not a failed round
           const members = (client as any).target.members as Map<string, { connection: unknown }>;
           assert.notEqual(members.get("a-good")?.connection, null);
           assert.equal(members.get("b-bad")?.connection, null);
-          assert.equal(client.stats().refreshFailures, 1);
+          assert.equal(client.stats().refreshFailures, 0);
         } finally {
           await client.close();
         }
