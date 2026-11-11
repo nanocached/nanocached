@@ -45,6 +45,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: a deferred `m`/`o`/`y` (one pipelined behind an `i`/`k`/`x` on a key it
+  carries) registered an entry per key in the connection's ordering map, and
+  they stayed until a later registration crossed the sweep threshold, so an
+  idle connection kept tens of megabytes (about 25 MB for a 1 MiB batch of
+  short keys) outside `--max-in-flight-bytes`. A batch of more than 64 keys now
+  registers for its namespace as a whole: a later request on any key of that
+  namespace waits for it. (#1711)
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a
