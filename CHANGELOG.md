@@ -12,6 +12,34 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- Discovery: the replication-factor dissent WARN written when `L` rebuilds
+  its cached answer was not rate limited and listed every dissenting node,
+  so a flood of fake nodes with generation bumps between `L` calls produced
+  one multi-megabyte line per `L` (65,000 names, about 2.4 MB). It is now
+  limited to one line per 10 s (the rest counted in a summary) and lists the
+  first 5 names followed by a count (#1717).
+
+### Fixed
+
+- Discovery: `Y` (proxy announce) registered new proxy names with no
+  limiter, so one connection looping `Y` under fresh names filled the
+  1024-entry proxy registry in milliseconds and real proxies with new names
+  were refused until the fakes timed out. New names now share the per-source
+  limiter `P` uses (a burst of 64, then one per 2 s); a refresh of a known
+  name is never gated. The `INFO proxy deregistered` line a `Z` writes is
+  now rate limited like the node register and announce lines (#1716).
+
+### Fixed
+
+- Node, discovery: the number of rejected connections lingering in their
+  busy-reply drain (up to 200 ms each, for a peer that does not close) was
+  bounded only by the accept rate, since a connection turned away by the
+  per-IP cap no longer holds a global slot (#1664). At most 128 rejected
+  connections now drain at once; past that a rejected connection gets a
+  non-blocking busy reply and is closed at once, with no drain (#1720).
+
 ### Changed
 
 - Docs: the accepted-behaviour list now names a touch forwarded as a `U`
@@ -20,6 +48,9 @@ framework adapters at one version, whether or not a component changed.
   the node's own drain and relaying it would make the loop depend on timing
   (#1719).
 
+- Docs: the accepted-behaviour list now says that a proxied delete whose
+  answer was lost after the write, and which is then sent again, answers `N`
+  when the first attempt had already removed the key (#1714). A test pins it.
 - Docs: the decommission section said an attempt's connect and its send are
   each bounded by 10 s, and that the leave notification adds nothing to the
   budget while also giving it 2 s when the handoff used the budget up. An
@@ -51,6 +82,31 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a forwarded handoff write (`U`, `u`, `f`) answered `R`
+  was treated as a generic failure. Each forward to that address dialed it
+  `KEY_TRANSFER_ATTEMPTS` times and every later one once more, until the
+  30 s window closed, although the drain, the re-replication and the
+  handoff paths write such an address off at once. A forward that gets `R`
+  now stops retrying, and the forwards that follow inside the window do not
+  dial the address; the same goes for the join transfer's retries (#1718).
+
+- Proxy: a deferred `m`/`o`/`y` (one pipelined behind an `i`/`k`/`x` on a key it
+  carries) registered an entry per key in the connection's ordering map, and
+  they stayed until a later registration crossed the sweep threshold, so an
+  idle connection kept tens of megabytes (about 25 MB for a 1 MiB batch of
+  short keys) outside `--max-in-flight-bytes`. A batch of more than 64 keys now
+  registers for its namespace as a whole: a later request on any key of that
+  namespace waits for it. (#1711)
+- Proxy: an `i`/`k`/`x` dispatched inline behind an earlier one that returned
+  early (no roster, or no owner for its key) released its ordering signal at
+  once instead of after the earlier command's, so a pipelined same-key
+  request could be enqueued on the replica ahead of that command's result.
+  The signal now waits for the earlier command as it would have after a
+  normal return. (#1713)
+- Proxy: a backend that closes each connection right after the handshake (so
+  the redial backoff resets every time) logged its exit line once per
+  request. The lines are now limited per backend address (3 per 10 s), with
+  the number dropped reported ahead of the next line written. (#1715)
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a
