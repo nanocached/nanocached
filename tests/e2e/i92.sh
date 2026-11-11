@@ -2,10 +2,11 @@
 # #92: point a real node at a hostile discovery that floods the heartbeat
 # ack with a newline-less roster line. Watch the node's RSS.
 # No verdict: it prints the node's state every 3 s and exits 0 whatever it saw.
+#   NODE=nanocached-node:<tag> ./i92.sh [flood|honest] [secs]   (default image: nanocached-node:dev)
 MODE=${1:-flood}; SECS=${2:-40}
 export NET=e2e-92
 E="$(cd "$(dirname "$0")" && pwd)"
-NODE=nanocached-node:0.3.0
+NODE=${NODE:-nanocached-node:dev}
 P=n92; F=$P-disc:8357
 T(){ echo "### $(date +%T) [$P] $*"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }

@@ -11,6 +11,11 @@ export NET=e2e-fresh
 E="$(cd "$(dirname "$0")" && pwd)"
 source "$E/cl.sh"
 P=nfr; D=$P-disc:8357; MODE=${MODE:-decom-fresh}; GAP=${GAP:-3}
+# a mistyped MODE would skip every leave/kill step and still report PASS
+case $MODE in
+  decom-fresh|decom-fresh-rejoin|decom-lingering|decom-lingering-rejoin|kill-fresh|kill-fresh-rejoin|kill-lingering|kill-lingering-rejoin|decom-join) ;;
+  *) echo "freshjoin.sh: unknown MODE '$MODE'; valid modes: decom-fresh decom-lingering kill-fresh kill-lingering (each also as <mode>-rejoin) and decom-join" >&2; exit 2;;
+esac
 T(){ echo "### $(date -u +%T.%N | cut -c1-12) [$P] $*"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
 trap cleanup EXIT  # Ctrl-C or a failed step must not leave the run's containers behind

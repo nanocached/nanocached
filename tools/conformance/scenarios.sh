@@ -3,7 +3,7 @@
 #
 #   tools/conformance/scenarios.sh <v6|v5|v7|v4> [sdk ...]
 #
-#   v6  connection failures, auth, busy, retryable, secret hygiene     (verify: server statuses / connection failures)
+#   v6  connection failures, auth, busy, retryable, secret hygiene     (verify: server statuses / connection failures; exits 1 when the secret leaks into any output)
 #   v5  join / decommission / kill under load: error windows per SDK    (verify: convergence on topology change)
 #   v7  close, after-close, abandon, create/close cycles, restart, ...  (verify: client lifecycle)
 #   v4  a node dies between seeding and get_many                        (verify: multi-get owner fallback)
@@ -82,7 +82,8 @@ v6)
   docker rm -f $P-a $P-b >/dev/null; sleep 1
   each_sdk retryable_proxy  $P-disc:8357 1 "" 60 conn
   # secret hygiene: the distinctive secret must appear in none of the outputs
-  grep -l -F -- "$SECRET" "$OUT"/*.jsonl "$OUT"/*.err 2>/dev/null > "$OUT/secret_leaks.txt"; echo "secret appears in $(wc -l < "$OUT/secret_leaks.txt") output files (secret=$SECRET)" ;;
+  grep -l -F -- "$SECRET" "$OUT"/*.jsonl "$OUT"/*.err 2>/dev/null > "$OUT/secret_leaks.txt"; echo "secret appears in $(wc -l < "$OUT/secret_leaks.txt") output files (secret=$SECRET)"
+  [ -s "$OUT/secret_leaks.txt" ] && VERDICT=1 ;;
 v4)
   cluster 3 && sleep 2
   PFX="fo:$RUN:"
