@@ -1019,36 +1019,42 @@ static PENDING_FORWARD_WAITERS: AtomicUsize = AtomicUsize::new(0);
 /// incarnation — see that field's own doc comment) tells the two apart:
 /// a restart always registers with a new token, so keying on both means a
 /// new incarnation always starts with a clean slate.
-static RECENT_FORWARD_FAILURES: std::sync::OnceLock<Mutex<HashMap<(String, String), Instant>>> =
+static RECENT_FORWARD_FAILURES: std::sync::OnceLock<Mutex<RecentForwardFailures>> =
     std::sync::OnceLock::new();
+/// `(failed at, answered R)` per `(address, token)`.
+type RecentForwardFailures = HashMap<(String, String), (Instant, bool)>;
 const FORWARD_FAIL_FAST_WINDOW: Duration = Duration::from_secs(30);
 
-fn recent_forward_failures() -> &'static Mutex<HashMap<(String, String), Instant>> {
+fn recent_forward_failures() -> &'static Mutex<RecentForwardFailures> {
     RECENT_FORWARD_FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// How many attempts the next forward to `(addr, token)` gets — see
-/// `RECENT_FORWARD_FAILURES`.
+/// `RECENT_FORWARD_FAILURES`. Zero for a target that answered `R` within
+/// the window: it refuses every handoff frame, so there is nothing to try.
 fn forward_attempts_for(addr: &str, token: &str) -> u32 {
-    let failed_recently = recent_forward_failures()
+    let recent = recent_forward_failures()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&(addr.to_string(), token.to_string()))
-        .is_some_and(|failed_at| failed_at.elapsed() < FORWARD_FAIL_FAST_WINDOW);
-    if failed_recently {
-        1
-    } else {
-        KEY_TRANSFER_ATTEMPTS
+        .copied()
+        .filter(|(failed_at, _)| failed_at.elapsed() < FORWARD_FAIL_FAST_WINDOW);
+    match recent {
+        Some((_, true)) => 0,
+        Some((_, false)) => 1,
+        None => KEY_TRANSFER_ATTEMPTS,
     }
 }
 
-fn record_forward_failure(addr: &str, token: &str) {
+/// Records a permanent failure; `refused` for a target that answered `R`
+/// (see `forward_attempts_for`).
+fn record_forward_failure(addr: &str, token: &str, refused: bool) {
     let now = Instant::now();
     let mut failures = recent_forward_failures()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    failures.retain(|_, failed_at| now.duration_since(*failed_at) < FORWARD_FAIL_FAST_WINDOW);
-    failures.insert((addr.to_string(), token.to_string()), now);
+    failures.retain(|_, (failed_at, _)| now.duration_since(*failed_at) < FORWARD_FAIL_FAST_WINDOW);
+    failures.insert((addr.to_string(), token.to_string()), (now, refused));
 }
 
 fn clear_forward_failure(addr: &str, token: &str) {
@@ -7672,6 +7678,11 @@ async fn transfer_with_retries(
                      (attempt {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
                 );
                 *stream = None;
+                // `R`: another process answers at this address; the
+                // remaining attempts would meet the same answer.
+                if classify_handoff_failure(&error) == HandoffFailure::AddressRefused {
+                    break;
+                }
             }
         }
     }
@@ -10397,6 +10408,18 @@ impl ClearScope {
     }
 }
 
+/// The error for a handoff frame answered with something other than its
+/// ack. An `R` (membership token mismatch, sent together with closing the
+/// connection) is tagged as `HandoffRejected::Address` so
+/// `classify_handoff_failure` can tell it from a connection failure.
+fn unacknowledged(ack: &[u8; 2], message: &'static str) -> io::Error {
+    if ack == b"R\n" {
+        io::Error::new(io::ErrorKind::InvalidData, HandoffRejected::Address)
+    } else {
+        io::Error::new(io::ErrorKind::InvalidData, message)
+    }
+}
+
 impl ForwardedWrite<'_> {
     fn timed_out_message(&self) -> &'static str {
         match self {
@@ -10429,8 +10452,8 @@ impl ForwardedWrite<'_> {
                 stream.read_exact(&mut ack).await?;
 
                 if &ack != b"S\n" {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Err(unacknowledged(
+                        &ack,
                         "peer did not acknowledge the handed-off entry",
                     ));
                 }
@@ -10449,8 +10472,8 @@ impl ForwardedWrite<'_> {
                 // of the drain's own transfer of the key) both mean the
                 // entrant won't serve a stale copy.
                 if &ack != b"D\n" && &ack != b"N\n" {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Err(unacknowledged(
+                        &ack,
                         "peer did not acknowledge the forwarded delete",
                     ));
                 }
@@ -10479,8 +10502,8 @@ impl ForwardedWrite<'_> {
                 stream.read_exact(&mut ack).await?;
 
                 if &ack != b"C\n" {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Err(unacknowledged(
+                        &ack,
                         "joining node did not acknowledge the forwarded clear",
                     ));
                 }
@@ -11360,6 +11383,7 @@ async fn forward_with_retries(
     // Issue #1161: fewer attempts than the full budget means this target
     // already failed permanently recently, so a failure here is a repeat.
     let repeat = attempts < KEY_TRANSFER_ATTEMPTS;
+    let mut refused = false;
 
     for attempt in 1..=attempts {
         // Issue #474: re-checked before every attempt, not just once —
@@ -11383,11 +11407,21 @@ async fn forward_with_retries(
                         target.addr
                     ),
                 );
+                // An `R` says the address is another process now: every
+                // attempt, and every later forward, meets the same answer.
+                if classify_handoff_failure(&error) == HandoffFailure::AddressRefused {
+                    refused = true;
+                    break;
+                }
             }
         }
     }
 
-    record_forward_failure(&target.addr, &target.token);
+    if attempts == 0 {
+        // Written off by an earlier `R` and still inside the window.
+        return;
+    }
+    record_forward_failure(&target.addr, &target.token, refused);
     log_failure(
         repeat,
         format_args!(
@@ -13859,6 +13893,22 @@ mod tests {
                 let mut reply = vec![0u8; 2 + 2 * 100_000];
                 client.read_exact(&mut reply).await.unwrap();
                 assert_eq!(&reply[..2], b"S\n");
+                // The rest of the reply: a hit is the value as stored, and
+                // whichever connection's store landed last decides its
+                // size (usually the 600,000-byte one, so a reply is 1.2
+                // MB). Left unread it fills the socket buffers and the
+                // connection's write blocks while it holds the overdraft
+                // token, which the other connection's frame then waits
+                // for until WRITE_TIMEOUT, as designed. A client that
+                // reads its reply does not hold it up.
+                let mut rest = vec![0u8; 64 * 1024];
+                while let Ok(Ok(read)) =
+                    timeout(Duration::from_millis(300), client.read(&mut rest)).await
+                {
+                    if read == 0 {
+                        break;
+                    }
+                }
                 client
             }));
         }
@@ -14761,6 +14811,112 @@ mod tests {
             3 * KEY_TRANSFER_ATTEMPTS as usize + 1,
             "after the marker clears, the full budget is back"
         );
+
+        peer_task.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn forwards_to_an_address_that_answers_r_are_written_off_at_once() {
+        // The handoff, drain and re-replication paths write an address off
+        // as soon as it answers `R` (membership token mismatch, sent with
+        // closing the connection). A forwarded `U`/`u`/`f` used to treat
+        // the `R` as a generic failure: every forward re-dialed the
+        // address `KEY_TRANSFER_ATTEMPTS` times, then one time each until
+        // the window closed. Now the first forward stops at the `R` and
+        // the later ones do not dial at all.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_for_task = Arc::clone(&accepts);
+        let peer_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut connection, _)) = listener.accept().await else {
+                    return;
+                };
+                accepts_for_task.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = [0u8; 256];
+                let _ = connection.read(&mut buffer).await;
+                let _ = connection.write_all(b"R\n").await;
+                // dropped: closed together with the rejection
+            }
+        });
+
+        let node_context = NodeContext {
+            gates: Default::default(),
+            name: "ready-node".to_string(),
+            token: "tk-ready-node".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: mpsc::channel(1).0,
+            leaving: Arc::new(Mutex::new(None)),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+            drain: DrainState::default(),
+        };
+        let target = |token: &str| ForwardTarget {
+            addr: addr.clone(),
+            connection: Arc::new(AsyncMutex::new(None)),
+            token: token.to_string(),
+            revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: true,
+        };
+        let set = || OwnedForwardedWrite::HandoffSet {
+            key: key(b"name"),
+            value: Bytes::from_static(b"v"),
+            ttl: None,
+            if_absent: false,
+        };
+
+        forward_with_retries(node_context.clone(), target("tok-r"), set()).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "the first forward stops at the `R`"
+        );
+        forward_with_retries(node_context.clone(), target("tok-r"), set()).await;
+        forward_with_retries(
+            node_context.clone(),
+            target("tok-r"),
+            OwnedForwardedWrite::HandoffDelete { key: key(b"name") },
+        )
+        .await;
+        forward_with_retries(
+            node_context.clone(),
+            target("tok-r"),
+            OwnedForwardedWrite::Clear(ClearScope::All),
+        )
+        .await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "later forwards inside the window do not dial the address"
+        );
+
+        // The delete and the clear stop at the `R` too, on a target that
+        // has not been written off yet.
+        forward_with_retries(
+            node_context.clone(),
+            target("tok-r-delete"),
+            OwnedForwardedWrite::HandoffDelete { key: key(b"name") },
+        )
+        .await;
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+        forward_with_retries(
+            node_context,
+            target("tok-r-clear"),
+            OwnedForwardedWrite::Clear(ClearScope::All),
+        )
+        .await;
+        assert_eq!(accepts.load(Ordering::SeqCst), 3);
 
         peer_task.abort();
     }
@@ -22559,6 +22715,185 @@ mod tests {
             frames,
             vec![expected_v1, expected_v2, expected_del],
             "the echo of v1 and the delete of an absent key are not relayed"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_leaver_does_not_relay_a_handoff_that_only_moved_the_ttl_but_relays_a_new_value() {
+        // A touch forwarded to a leaving node as a `U` (same value, a new
+        // TTL) is not relayed to its entrant: it cannot be told apart from
+        // the delayed echo of the node's own drain (the same value, the
+        // TTL it left with), and relaying one makes the echo circle between
+        // the node and its entrant for as long as the delays last. This is
+        // an accepted limit (see the accepted-behaviour list in
+        // docs/architecture.html); the test pins it. A new value is relayed.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let before_ring = Arc::new(HashRing::new(vec![
+            "leaver".to_string(),
+            "peer".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec!["peer".to_string()]));
+
+        let mut owned_keys = Vec::new();
+        let mut index = 0u32;
+        while owned_keys.len() < 3 {
+            let name = format!("key-{index}");
+            if before_ring.is_owner(&key(name.as_bytes()), "leaver", 1) {
+                owned_keys.push(name);
+            }
+            index += 1;
+            assert!(index < 1000, "expected at least three owned keys in range");
+        }
+
+        let mut addresses = HashMap::new();
+        addresses.insert("peer".to_string(), peer_addr);
+        let mut tokens = HashMap::new();
+        tokens.insert("peer".to_string(), "tok-peer".to_string());
+
+        let node_context = NodeContext {
+            gates: Default::default(),
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(Some(LeaveState {
+                before_ring,
+                after_ring,
+                replication: 1,
+                addresses,
+                tokens,
+                connections: Mutex::new(HashMap::new()),
+            }))),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            drain: DrainState::default(),
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        // The leaver's own token ("tk-leaver") authorizes each inbound
+        // frame (issue #295): an unconditional `U`, a put-if-absent `U`,
+        // and a `u` for a key this node never held.
+        // The drain of this leaving node reaches the entrant, which
+        // applies it and relays it to its join targets — this node, still
+        // inside the entrant's forwarding window for its own join. The
+        // echo (`U` of the value this node holds) must not go back out,
+        // or the two keep circling the drained value and overwrite, on
+        // each pass, what a client wrote to the entrant in between. A
+        // handoff that does change something here (a client write that
+        // landed on a lingering joiner's old owner after the snapshot)
+        // still goes on, as does a delete that found the key.
+        let name_a = &owned_keys[0];
+        let n = name_a.len();
+        // One frame at a time, each followed by its reply and by the
+        // entrant's view settling, so the queue's per-key coalescing
+        // never folds two of them together.
+        let relayed = |expected: usize| {
+            let frames = Arc::clone(&frames);
+            async move {
+                for _ in 0..500 {
+                    if frames.lock().unwrap().len() >= expected {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                frames.lock().unwrap().len()
+            }
+        };
+        let mut reply = [0_u8; 2];
+        for (frame, expected_reply, expected_relayed) in [
+            (format!("U 0 {n} 2 9 10\ntk-leaver{name_a}v1"), b"S\n", 1),
+            // The echo: the value this node holds with the TTL it has left.
+            (format!("U 0 {n} 2 9 10\ntk-leaver{name_a}v1"), b"S\n", 1),
+            // A touch, or an echo delayed for long: the same value, only
+            // the TTL moved (longer, then shorter).
+            (format!("U 0 {n} 2 9 1000\ntk-leaver{name_a}v1"), b"S\n", 1),
+            (format!("U 0 {n} 2 9 5\ntk-leaver{name_a}v1"), b"S\n", 1),
+            // A new value is relayed.
+            (format!("U 0 {n} 2 9 5\ntk-leaver{name_a}v2"), b"S\n", 2),
+        ] {
+            client.write_all(frame.as_bytes()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+                .await
+                .expect("a reply within 5 s")
+                .unwrap();
+            assert_eq!(&reply, expected_reply, "{frame:?}");
+            if expected_relayed > frames.lock().unwrap().len() {
+                assert_eq!(
+                    relayed(expected_relayed).await,
+                    expected_relayed,
+                    "{frame:?}"
+                );
+            } else {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert_eq!(
+                    frames.lock().unwrap().len(),
+                    expected_relayed,
+                    "{frame:?} was relayed"
+                );
+            }
+        }
+        client.shutdown().await.unwrap();
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(forward_relay);
+        peer_task.abort();
+
+        let frames = frames.lock().unwrap().clone();
+        let headers: Vec<String> = frames
+            .iter()
+            .map(|frame| {
+                let frame = String::from_utf8_lossy(frame);
+                frame.lines().next().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec![format!("U 0 {n} 2 8 10"), format!("U 0 {n} 2 8 5")],
+            "only the first write and the new value are relayed"
         );
     }
 
