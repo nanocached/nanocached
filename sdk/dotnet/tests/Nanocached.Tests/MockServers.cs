@@ -1004,6 +1004,10 @@ public sealed class MockNode : IDisposable
                             keys[i] = await Wire.ReadExactlyAsync(stream, int.Parse(parts[3 + i], CultureInfo.InvariantCulture));
                         }
                         int multiGetRequestNumber = Interlocked.Increment(ref _multiGetRequestCount);
+                        if (_getDelayMillis > 0)
+                        {
+                            await Task.Delay(_getDelayMillis);
+                        }
                         // issue #222: namespace + every key's bytes — the
                         // same total MultiGetChunkedAsync's cumulative
                         // bound tracks, minus its header allowance.
