@@ -12,6 +12,15 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- Node, discovery: the number of rejected connections lingering in their
+  busy-reply drain (up to 200 ms each, for a peer that does not close) was
+  bounded only by the accept rate, since a connection turned away by the
+  per-IP cap no longer holds a global slot (#1664). At most 128 rejected
+  connections now drain at once; past that a rejected connection gets a
+  non-blocking busy reply and is closed at once, with no drain (#1720).
+
 ### Changed
 
 - Docs: the decommission section said an attempt's connect and its send are
