@@ -5382,7 +5382,7 @@ async fn connect_tolerates_a_listed_address_that_answers_as_discovery() {
 }
 
 #[tokio::test]
-async fn connect_fails_with_a_lost_connection_when_every_listed_address_answers_as_discovery() {
+async fn connect_fails_with_the_protocol_error_when_every_listed_address_answers_as_discovery() {
     let impostor = MockDiscovery::start(Vec::new(), 1).await;
     let discovery = MockDiscovery::start(
         vec![(NAMES[0].to_string(), format!("127.0.0.1:{}", impostor.port))],
@@ -5392,7 +5392,7 @@ async fn connect_fails_with_a_lost_connection_when_every_listed_address_answers_
 
     let result = NanocachedClient::connect(options(discovery.port)).await;
     assert!(
-        matches!(result, Err(Error::ConnectionLost(_))),
+        matches!(&result, Err(Error::Protocol(message)) if message.contains("returned a non-node address")),
         "result = {:?}",
         result.err()
     );

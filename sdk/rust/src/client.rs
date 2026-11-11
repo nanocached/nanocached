@@ -1757,8 +1757,17 @@ impl NanocachedClient {
                             // connection a redial gives it, so one such
                             // address cannot keep every new client from
                             // starting. Nothing was written to it.
+                            // What `connect()` returns when nothing is
+                            // reachable stays the protocol error it was for
+                            // this answer; the cooldown entry carries the
+                            // lost connection.
+                            let mut connect_error: Option<Error> = None;
                             let outcome = match outcome {
                                 Ok(Identified::Cluster { .. }) | Ok(Identified::Proxies { .. }) => {
+                                    connect_error = Some(Error::Protocol(format!(
+                                        "nanocached: discovery server returned a non-node address: {}",
+                                        node.address
+                                    )));
                                     Err(Error::ConnectionLost(format!(
                                         "nanocached: {} does not identify as a cache node",
                                         node.address
@@ -1813,7 +1822,7 @@ impl NanocachedClient {
                                             connection: Arc::new(Connection::dead()),
                                         },
                                     );
-                                    dial_last_error = Some(error);
+                                    dial_last_error = Some(connect_error.unwrap_or(error));
                                 }
                             }
                         }
