@@ -257,8 +257,13 @@ await client.get_many_and_touch(["a", "b", "missing"], 300)
 
 The TTL is one value for the whole batch and means what it means for
 `touch`: no default, `None` removes it, `0` expires the keys at once. A key
-given twice is touched once (the result holds it under each spelling used, `"a"` and `b"a"` both), and a batch
-of more than 400 keys is split into several frames, as for `get_many`.
+given twice is touched once (the result holds it under each spelling used,
+`"a"` and `b"a"` both), and a batch of more than 400 keys is split into
+several frames, as for `get_many`. The same holds for `set_many`: besides the
+400-key and 1 MiB limits, a frame's namespace length times its key count may
+not exceed 64 MiB (the node refuses such a `set_many` or `touch_many` frame
+and closes the connection), so a namespace over 167,772 bytes gets fewer keys
+per frame (at least 64).
 `Namespace` has all three.
 
 Like `touch` it goes to every owner of each key and the primary's answer

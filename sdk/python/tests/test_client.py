@@ -2648,6 +2648,22 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
             await self.stop(client, discovery, nodes)
 
 
+class BatchChunkBoundsTests(unittest.TestCase):
+    def test_o_and_y_chunks_stay_within_the_namespace_times_keys_limit(self):
+        from nanocached._client import _MAX_MULTI_NAMESPACE_KEY_BYTES, _batch_chunk_bounds
+
+        for namespace_len in (167_772, 167_773, 170_000, 1_048_576):
+            namespace = b"n" * namespace_len
+            bounds = _batch_chunk_bounds(namespace, [2] * 1000, [1] * 1000, True)
+            self.assertEqual(sum(end - start for start, end in bounds), 1000)
+            for start, end in bounds:
+                self.assertLessEqual(namespace_len * (end - start), _MAX_MULTI_NAMESPACE_KEY_BYTES)
+        # At the threshold a full chunk is still 400 keys; `m` is uncapped.
+        self.assertEqual(_batch_chunk_bounds(b"n" * 167_772, [2] * 400, [1] * 400, True), [(0, 400)])
+        self.assertEqual(_batch_chunk_bounds(b"n" * 170_000, [2] * 400, None), [(0, 400)])
+        self.assertEqual(_batch_chunk_bounds(b"", [2] * 400, None, True), [(0, 400)])
+
+
 class MultiTouchEncodingTests(unittest.TestCase):
     # Batched touch (issue #871): docs/protocol.html "y — batched touch" is
     # the wire spec these pin. Always namespaced; an omitted TTL removes the
@@ -2836,6 +2852,27 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
             )
             # A plain touch never reads a value, so compression is moot.
             self.assertEqual(await client.touch_many(["a", "b"], 30), {"a": True, "b": True})
+        finally:
+            await client.close()
+
+    async def test_touch_many_chunks_keep_namespace_length_times_keys_within_64_mib(self):
+        # The node refuses an o/y frame whose namespace length x key count
+        # exceeds 64 MiB (En and close). 170,000 B x 400 keys is over it.
+        from nanocached._client import _MAX_MULTI_NAMESPACE_KEY_BYTES
+
+        namespace = b"n" * 170_000
+        client = await self.connect()
+        try:
+            handle = client.namespace(namespace)
+            keys = [f"k{i}" for i in range(400)]
+            result = await handle.touch_many(keys, 30)
+            self.assertEqual(set(result), set(keys))
+            frames = self.node.multi_touch_frames
+            self.assertGreater(len(frames), 1)
+            for frame_namespace, frame_keys, _ttl, _get in frames:
+                self.assertEqual(frame_namespace, namespace)
+                self.assertLessEqual(len(namespace) * len(frame_keys), _MAX_MULTI_NAMESPACE_KEY_BYTES)
+            self.assertEqual(sum(len(f[1]) for f in frames), 400)
         finally:
             await client.close()
 

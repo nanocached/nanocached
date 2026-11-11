@@ -370,9 +370,20 @@ _MAX_BATCH_KEYS = 400
 # reasoning, just per entry instead of for the whole header).
 _MAX_MULTI_ENTRY_HEADER_BYTES = 32
 
+# The node (and the proxy, client side) refuse an ``o``/``y`` frame whose
+# namespace length times its key count exceeds 64 MiB with ``En`` and a
+# close, which takes every other request on the shared connection down.
+# _batch_chunk_bounds() caps the keys per such sub-frame at
+# floor(this / namespace length), which only bites for a namespace over
+# 167,772 bytes (``m`` is not subject to the limit).
+_MAX_MULTI_NAMESPACE_KEY_BYTES = 64 * 1024 * 1024
+
 
 def _batch_chunk_bounds(
-    namespace: bytes, key_lens: Sequence[int], value_lens: Sequence[int] | None
+    namespace: bytes,
+    key_lens: Sequence[int],
+    value_lens: Sequence[int] | None,
+    namespace_capped: bool = False,
 ) -> list[tuple[int, int]]:
     """Splits a batch of ``len(key_lens)`` entries into sub-frame
     ``(start, end)`` bounds honoring both _MAX_BATCH_KEYS and
@@ -385,7 +396,13 @@ def _batch_chunk_bounds(
     alone (each was already validated against _MAX_REQUEST_BYTES by
     _check_key/_check_key_and_value before this ever runs), so a chunk
     is only ever split *before* the entry that would overflow it, never
-    leaving an empty chunk behind."""
+    leaving an empty chunk behind. ``namespace_capped`` (``o`` and ``y``
+    frames) also keeps namespace length times key count within
+    _MAX_MULTI_NAMESPACE_KEY_BYTES, a namespace being at most 1 MiB so at
+    least 64 keys always fit."""
+    max_keys = _MAX_BATCH_KEYS
+    if namespace_capped and namespace:
+        max_keys = max(1, min(max_keys, _MAX_MULTI_NAMESPACE_KEY_BYTES // len(namespace)))
     bounds: list[tuple[int, int]] = []
     start = 0
     count = 0
@@ -394,7 +411,7 @@ def _batch_chunk_bounds(
         entry_bytes = key_len + _MAX_MULTI_ENTRY_HEADER_BYTES
         if value_lens is not None:
             entry_bytes += value_lens[i]
-        if count > 0 and (count >= _MAX_BATCH_KEYS or total + entry_bytes > _MAX_REQUEST_BYTES):
+        if count > 0 and (count >= max_keys or total + entry_bytes > _MAX_REQUEST_BYTES):
             bounds.append((start, i))
             start = i
             count = 0
@@ -2032,7 +2049,9 @@ class NanocachedClient:
         an entry a completed chunk genuinely reported apart from one
         never attempted, without needing failed_at at all."""
         entries: list[bool | object] = [False] * len(keys)
-        bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], [len(value) for value in values])
+        bounds = _batch_chunk_bounds(
+            namespace, [len(key) for key in keys], [len(value) for value in values], True
+        )
         for start, end in bounds:
             try:
                 connection = await connection_getter()
@@ -2442,7 +2461,7 @@ class NanocachedClient:
         ``failed_at`` up to ``sent_end`` are the failed chunk's; the ones
         from ``sent_end`` on were never sent."""
         entries: list[object] = [None] * len(keys)
-        bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], None)
+        bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], None, True)
         for start, end in bounds:
             chunk = keys[start:end]
             try:
