@@ -1446,6 +1446,19 @@ async fn read_loop(
             return;
         };
 
+        // A `B` (busy) while requests are waiting: the server hit its
+        // connection limit and is closing the connection, so it answers
+        // none of them. Report it as the connection loss it is, tagged
+        // or not (mirrors Go), instead of a tag mismatch or a `Protocol`
+        // error depending on whether the connection negotiated tags.
+        if marker == b'B' {
+            let message = "nanocached: server is at its connection limit (busy)".to_string();
+            shared.mark_closed(&shutdown_tx);
+            let _ = slot.tx.send(Err(Error::ConnectionLost(message.clone())));
+            drain_pending(&shared, Some(Error::ConnectionLost(message))).await;
+            return;
+        }
+
         // Echoed response tags: on a tagged connection, verify the echoed tag against
         // the request this response is about to answer — *before* it can
         // reach any caller. A mismatch means the streams are misaligned;
