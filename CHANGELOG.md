@@ -14,6 +14,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the accepted-behaviour list now names a touch forwarded as a `U`
+  to a leaving node that only moves the TTL: it is not relayed to the
+  node's entrant, since it cannot be told apart from the delayed echo of
+  the node's own drain and relaying it would make the loop depend on timing
+  (#1719).
+
 - Docs: the decommission section said an attempt's connect and its send are
   each bounded by 10 s, and that the leave notification adds nothing to the
   budget while also giving it 2 s when the handoff used the budget up. An

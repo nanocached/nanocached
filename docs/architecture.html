@@ -805,6 +805,17 @@ here.</p>
   keys whose TTL was removed ended missing on an owner in the CI runs that showed
   it (2,000 keys, two-core runners), and in one run 46 of 2,000 expired keys
   lingered on a copy; on a laptop it showed in a handful of runs.</li>
+  <li>A touch forwarded as a <code>U</code> to a leaving node that only
+  moves the TTL of the value it holds (same value, a longer or shorter
+  TTL) is not relayed to the node&rsquo;s entrant, which keeps the TTL it
+  had. Such a frame cannot be told apart from the delayed echo of the
+  node&rsquo;s own drain, which carries the same value with the TTL it left
+  with, and relaying it as a change makes the echo circle between the node
+  and its entrant for as long as the delays last, so how long it circles
+  would depend on timing. It needs an old-list client that touches only
+  the lingering joiner&rsquo;s old owner while that joiner decommissions,
+  and is the same class as a touch that reaches one owner but not the
+  other. A new value is relayed.</li>
   <li>A batched touch with <code>G</code> leaves a value that does not fit
   the 16&nbsp;MiB reply untouched on the primary, but the plain form its
   other owners receive has no such bound, so their copies of that key get

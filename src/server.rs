@@ -22562,6 +22562,185 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_leaver_does_not_relay_a_handoff_that_only_moved_the_ttl_but_relays_a_new_value() {
+        // A touch forwarded to a leaving node as a `U` (same value, a new
+        // TTL) is not relayed to its entrant: it cannot be told apart from
+        // the delayed echo of the node's own drain (the same value, the
+        // TTL it left with), and relaying one makes the echo circle between
+        // the node and its entrant for as long as the delays last. This is
+        // an accepted limit (see the accepted-behaviour list in
+        // docs/architecture.html); the test pins it. A new value is relayed.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let before_ring = Arc::new(HashRing::new(vec![
+            "leaver".to_string(),
+            "peer".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec!["peer".to_string()]));
+
+        let mut owned_keys = Vec::new();
+        let mut index = 0u32;
+        while owned_keys.len() < 3 {
+            let name = format!("key-{index}");
+            if before_ring.is_owner(&key(name.as_bytes()), "leaver", 1) {
+                owned_keys.push(name);
+            }
+            index += 1;
+            assert!(index < 1000, "expected at least three owned keys in range");
+        }
+
+        let mut addresses = HashMap::new();
+        addresses.insert("peer".to_string(), peer_addr);
+        let mut tokens = HashMap::new();
+        tokens.insert("peer".to_string(), "tok-peer".to_string());
+
+        let node_context = NodeContext {
+            gates: Default::default(),
+            name: "leaver".to_string(),
+            token: "tk-leaver".to_string(),
+            discovery_addr: "127.0.0.1:0".to_string(),
+            active_migration: Arc::new(Mutex::new(None)),
+            known_ring: Arc::new(Mutex::new(None)),
+            promoted: Arc::new(AtomicBool::new(true)),
+            auth_secret: None,
+            tls_connector: None,
+            request_tx: request_tx.clone(),
+            leaving: Arc::new(Mutex::new(Some(LeaveState {
+                before_ring,
+                after_ring,
+                replication: 1,
+                addresses,
+                tokens,
+                connections: Mutex::new(HashMap::new()),
+            }))),
+            active_rereplication: Arc::new(Mutex::new(None)),
+            ring_history: RingHistory::default(),
+            rereplication_tx: mpsc::channel(1).0,
+            rereplication_forward: Arc::new(Mutex::new(None)),
+            shutdown_rx: watch::channel(false).1,
+            latest_published: Arc::new(Mutex::new(None)),
+            roster_refresh: Arc::default(),
+            drain: DrainState::default(),
+        };
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        // The leaver's own token ("tk-leaver") authorizes each inbound
+        // frame (issue #295): an unconditional `U`, a put-if-absent `U`,
+        // and a `u` for a key this node never held.
+        // The drain of this leaving node reaches the entrant, which
+        // applies it and relays it to its join targets — this node, still
+        // inside the entrant's forwarding window for its own join. The
+        // echo (`U` of the value this node holds) must not go back out,
+        // or the two keep circling the drained value and overwrite, on
+        // each pass, what a client wrote to the entrant in between. A
+        // handoff that does change something here (a client write that
+        // landed on a lingering joiner's old owner after the snapshot)
+        // still goes on, as does a delete that found the key.
+        let name_a = &owned_keys[0];
+        let n = name_a.len();
+        // One frame at a time, each followed by its reply and by the
+        // entrant's view settling, so the queue's per-key coalescing
+        // never folds two of them together.
+        let relayed = |expected: usize| {
+            let frames = Arc::clone(&frames);
+            async move {
+                for _ in 0..500 {
+                    if frames.lock().unwrap().len() >= expected {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                frames.lock().unwrap().len()
+            }
+        };
+        let mut reply = [0_u8; 2];
+        for (frame, expected_reply, expected_relayed) in [
+            (format!("U 0 {n} 2 9 10\ntk-leaver{name_a}v1"), b"S\n", 1),
+            // The echo: the value this node holds with the TTL it has left.
+            (format!("U 0 {n} 2 9 10\ntk-leaver{name_a}v1"), b"S\n", 1),
+            // A touch, or an echo delayed for long: the same value, only
+            // the TTL moved (longer, then shorter).
+            (format!("U 0 {n} 2 9 1000\ntk-leaver{name_a}v1"), b"S\n", 1),
+            (format!("U 0 {n} 2 9 5\ntk-leaver{name_a}v1"), b"S\n", 1),
+            // A new value is relayed.
+            (format!("U 0 {n} 2 9 5\ntk-leaver{name_a}v2"), b"S\n", 2),
+        ] {
+            client.write_all(frame.as_bytes()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+                .await
+                .expect("a reply within 5 s")
+                .unwrap();
+            assert_eq!(&reply, expected_reply, "{frame:?}");
+            if expected_relayed > frames.lock().unwrap().len() {
+                assert_eq!(
+                    relayed(expected_relayed).await,
+                    expected_relayed,
+                    "{frame:?}"
+                );
+            } else {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert_eq!(
+                    frames.lock().unwrap().len(),
+                    expected_relayed,
+                    "{frame:?} was relayed"
+                );
+            }
+        }
+        client.shutdown().await.unwrap();
+
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(forward_relay);
+        peer_task.abort();
+
+        let frames = frames.lock().unwrap().clone();
+        let headers: Vec<String> = frames
+            .iter()
+            .map(|frame| {
+                let frame = String::from_utf8_lossy(frame);
+                frame.lines().next().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec![format!("U 0 {n} 2 8 10"), format!("U 0 {n} 2 8 5")],
+            "only the first write and the new value are relayed"
+        );
+    }
+
     /// A node with a join slot for `joiner-0` (confirmed or not, window
     /// open), serving one connection; returns the frames the joiner saw.
     #[tokio::test(flavor = "current_thread")]
