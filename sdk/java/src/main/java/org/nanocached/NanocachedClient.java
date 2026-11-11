@@ -1110,11 +1110,24 @@ public final class NanocachedClient implements AutoCloseable {
         final Connection connection;
         final RuntimeException error;
         final boolean hard;
+        /** Set when the address identified as something other than a cache
+         * node: the dead member's error is a not-sent lost connection, but
+         * a connect that reaches no node reports the plain exception. */
+        final String nonNodeAddress;
 
         private DialOutcome(Connection connection, RuntimeException error, boolean hard) {
+            this(connection, error, hard, null);
+        }
+
+        private DialOutcome(Connection connection, RuntimeException error, boolean hard, String nonNodeAddress) {
             this.connection = connection;
             this.error = error;
             this.hard = hard;
+            this.nonNodeAddress = nonNodeAddress;
+        }
+
+        static DialOutcome nonNode(RuntimeException error, String address) {
+            return new DialOutcome(null, error, false, address);
         }
 
         static DialOutcome success(Connection connection) {
@@ -1171,8 +1184,8 @@ public final class NanocachedClient implements AutoCloseable {
             // (issue #1802): an address whose IP was reused by a discovery
             // or proxy process is a dead member with a reconnect cooldown,
             // not a reason to fail every new client's connect.
-            return DialOutcome.tolerable(new NanocachedException.ConnectionLost(
-                    "nanocached: " + address + " does not identify as a cache node", null, true));
+            return DialOutcome.nonNode(new NanocachedException.ConnectionLost(
+                    "nanocached: " + address + " does not identify as a cache node", null, true), address);
         }
 
         try {
@@ -1308,6 +1321,7 @@ public final class NanocachedClient implements AutoCloseable {
         List<String> names = new ArrayList<>(nodes.size());
         int reachable = 0;
         RuntimeException lastError = null;
+        String lastNonNodeAddress = null;
         for (int i = 0; i < nodes.size(); i++) {
             DiscoveredNode node = nodes.get(i);
             DialOutcome outcome = outcomes.get(i);
@@ -1319,10 +1333,18 @@ public final class NanocachedClient implements AutoCloseable {
                 members.put(node.name(), new Member(node.address(), null));
                 armReconnectCooldown(node.address(), outcome.error);
                 lastError = outcome.error;
+                lastNonNodeAddress = outcome.nonNodeAddress;
             }
         }
 
         if (reachable == 0) {
+            if (lastNonNodeAddress != null) {
+                // No node reachable and the last failure was a non-node
+                // answer: a configuration error, as before (the dead
+                // members keep the not-sent lost-connection error).
+                throw new NanocachedException(
+                        "nanocached: discovery server returned a non-node address: " + lastNonNodeAddress);
+            }
             throw lastError != null
                     ? lastError
                     : new NanocachedException("nanocached: could not reach any node in the cluster");

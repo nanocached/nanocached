@@ -3549,11 +3549,11 @@ class NanocachedClientTest {
         try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
             discovery.nodes = List.of(new DiscoveredNode(NAMES.get(0), "127.0.0.1:" + discovery.port()));
             // Listed nodes that are all non-nodes: nothing is reachable, so the
-            // connect fails with the last dial error (the not-sent lost
-            // connection the redial path uses), not a configuration error.
-            NanocachedException.ConnectionLost error = assertThrows(NanocachedException.ConnectionLost.class,
+            // connect still fails with the configuration error it always did.
+            NanocachedException error = assertThrows(NanocachedException.class,
                     () -> connect("127.0.0.1", discovery.port()));
-            assertTrue(error.getMessage().contains("does not identify as a cache node"), error.getMessage());
+            assertEquals(NanocachedException.class, error.getClass());
+            assertTrue(error.getMessage().contains("non-node address"), error.getMessage());
         }
     }
 
