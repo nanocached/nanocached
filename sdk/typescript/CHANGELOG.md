@@ -11,6 +11,7 @@ tag: 0.4.3 was a server-only release.
 
 ### Changed
 
+- `stats().refreshFailures` now counts one failure per node-list refresh that did not produce a usable list (every discovery address unreachable, warming up, not a discovery server, or knowing no nodes or proxies), as in the Go and Rust SDKs. It used to add one per failed discovery address, so a single refresh could add several, and it also counted a failed dial of a newly listed node or proxy and a listed address that is not a node, none of which fail the refresh. (#1777)
 - **Breaking:** `MAX_BATCH_KEYS` is no longer exported (it was exported only so tests could assert on it; the cache-manager adapter now holds its own copy of the number). `client.url` is no longer reachable (it was an undocumented public field) and `client.nodeUrls` is read-only.
 - **Breaking:** the option mistakes `connect()` catches before dialing (an empty `addresses`, a bad `readHedgeAfterMs` or `reconnectCooldownMs`, `readHedgeAfterMs` with `viaProxy`, `ca` without `tls`) now throw a builtin `RangeError` instead of a `NanocachedError`, as the README already said caller mistakes do. Python raises `ValueError` for the same mistakes, Java `IllegalArgumentException`.
 - `readHedgeAfterMs` above 24 hours is now rejected. Above 2^31-1 the timer overflowed and fired after about a millisecond, so hedging sent a second request at once.
