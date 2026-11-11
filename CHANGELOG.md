@@ -82,6 +82,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e/steady582.sh`: the header required the load's misses, the
+  untouched range's misses, the `k0..k19999` misses and the versioned writer's
+  stale/miss counts to be 0, but the script only echoed them (it failed only
+  when the load did not finish) and had no `EXIT` trap, so Ctrl-C left the
+  containers behind. It now asserts those zeros and the load's minimum ops,
+  treats a missing result line as a failure, and removes the containers on
+  exit (#1740).
+
 - `tools/conformance`: `scenarios.sh v6` only printed `secret appears in N output files` when the auth secret leaked, and `compare.py` (the last step of `run.sh`) printed FAIL/DIFF cells without a failing exit, so both exited 0 on a violation. `scenarios.sh v6` now exits 1 when `secret_leaks.txt` is not empty and `compare.py` (so `run.sh`) exits 1 when any cell is FAIL or DIFF (#1739).
 
 - `nanocached-node`: a forwarded handoff write (`U`, `u`, `f`) answered `R`
