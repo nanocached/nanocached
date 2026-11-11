@@ -1292,6 +1292,30 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task SetManyAndTouchManyKeepNamespaceTimesKeysWithin64MiB()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        // 170,000 B x 400 keys is over 64 MiB (the node answers En and closes);
+        // floor(64 MiB / 170,000) = 394 keys fit in one frame.
+        string ns = new('n', 170_000);
+        var values = new Dictionary<string, string>();
+        for (int i = 0; i < 400; i++) values[$"k{i}"] = "v";
+        var nsClient = client.Namespace(ns);
+
+        await nsClient.SetManyAsync(values);
+        Assert.Equal(2, node.MultiSetRequestCount);
+        Assert.Equal(400, node.MultiSetKeyCount);
+
+        var touched = await nsClient.TouchManyAsync(values.Keys.ToList(), 60);
+        Assert.Equal(400, touched.Count);
+        var frames = node.MultiTouchFrames;
+        Assert.Equal(2, frames.Count);
+        Assert.All(frames, frame => Assert.True((long)frame.Namespace.Length * frame.Keys.Count <= 64L * 1024 * 1024));
+    }
+
+    [Fact]
     public async Task SetManyTtlZeroMeansNoExpiryAndNegativeIsRejected()
     {
         using var node = new MockNode();

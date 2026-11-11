@@ -258,6 +258,17 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     // not tight, since undercounting here reproduces the exact bug this
     // fixes.
     private const int MultiGetHeaderAllowance = 12;
+
+    // The node rejects an `o`/`y` frame whose namespace length x key count
+    // exceeds 64 MiB (`En`, then it closes the connection, failing every
+    // other request in flight on it). Keys per such chunk are therefore
+    // capped at floor(64 MiB / namespace length); a namespace is at most
+    // 1 MiB, so at least 64 keys fit.
+    private const long MaxNamespaceTimesKeys = 64L * 1024 * 1024;
+
+    private static int MaxKeysPerNamespaceFrame(int namespaceLength) =>
+        namespaceLength == 0 ? MaxBatchKeys : (int)Math.Min(MaxBatchKeys, MaxNamespaceTimesKeys / namespaceLength);
+
     private const int MultiSetHeaderAllowance = 24;
 
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
@@ -1726,7 +1737,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     private async Task<List<Connection.MultiEntry>> MultiKeysChunkedAsync(
         string? slot, byte[] namespaceBytes, byte[][] keys,
         Func<Connection, IReadOnlyList<byte[]>, Task<List<Connection.MultiEntry>>> send,
-        bool expiring = false)
+        bool expiring = false, int maxKeys = MaxBatchKeys)
     {
         var entries = new List<Connection.MultiEntry>(new Connection.MultiEntry[keys.Length]);
         int start = 0;
@@ -1734,7 +1745,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         {
             long total = namespaceBytes.Length + MultiGetHeaderAllowance + keys[start].Length;
             int end = start + 1;
-            while (end < keys.Length && end - start < MaxBatchKeys)
+            while (end < keys.Length && end - start < maxKeys)
             {
                 long next = MultiGetHeaderAllowance + keys[end].Length;
                 if (total + next > MaxRequestBytes) break;
@@ -2608,7 +2619,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         MultiKeysChunkedAsync(
             slot, namespaceBytes, keys,
             (connection, chunk) => connection.MultiTouchAsync(namespaceBytes, chunk, ttlSeconds, get),
-            expiring: ttlSeconds == 0);
+            expiring: ttlSeconds == 0, maxKeys: MaxKeysPerNamespaceFrame(namespaceBytes.Length));
 
     /// <summary>One pass of <see cref="MultiTouchAsync"/>'s cluster
     /// routing: every key still needing resolution (every key when
@@ -3019,12 +3030,13 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         string? slot, byte[] namespaceBytes, byte[][] keys, byte[][] values, long ttlSeconds)
     {
         var entries = new List<Connection.MultiEntry>(new Connection.MultiEntry[keys.Length]);
+        int maxKeys = MaxKeysPerNamespaceFrame(namespaceBytes.Length);
         int start = 0;
         while (start < keys.Length)
         {
             long total = namespaceBytes.Length + MultiSetHeaderAllowance + keys[start].Length + values[start].Length;
             int end = start + 1;
-            while (end < keys.Length && end - start < MaxBatchKeys)
+            while (end < keys.Length && end - start < maxKeys)
             {
                 long next = MultiSetHeaderAllowance + keys[end].Length + values[end].Length;
                 if (total + next > MaxRequestBytes) break;
