@@ -45,6 +45,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e/steady582.sh`: the header required the load's misses, the
+  untouched range's misses, the `k0..k19999` misses and the versioned writer's
+  stale/miss counts to be 0, but the script only echoed them (it failed only
+  when the load did not finish) and had no `EXIT` trap, so Ctrl-C left the
+  containers behind. It now asserts those zeros and the load's minimum ops,
+  treats a missing result line as a failure, and removes the containers on
+  exit (#1740).
+
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a
