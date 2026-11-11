@@ -8926,4 +8926,44 @@ class NanocachedClientTest {
             Connection.requestTimeoutMillis = defaultTimeout;
         }
     }
+
+    // ── o/y namespace x keys cap (issue #1728) ──────────────────────
+
+    @Test
+    void multiSetAndTouchChunksStayUnderTheNodes64MiBNamespaceTimesKeysLimit() throws Exception {
+        // A node closes the connection over an `o`/`y` frame whose namespace
+        // length x key count exceeds 64 MiB. A 170,000-byte namespace with a
+        // full 400-key chunk is 68,000,000 bytes: it must go as two frames.
+        String ns = "n".repeat(170_000);
+        int limit = 64 * 1024 * 1024 / ns.length();
+        assertEquals(394, limit);
+        Map<String, String> values = new java.util.LinkedHashMap<>();
+        List<String> keys = new ArrayList<>();
+        for (int i = 0; i < 400; i++) {
+            keys.add("key-" + i);
+            values.put("key-" + i, "v");
+        }
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedClient.Namespace handle = client.namespace(ns);
+                handle.setMany(values);
+                assertEquals(2, node.multiSetCount.get(), "400 keys under a 170,000 B namespace need two `o` frames");
+
+                handle.touchMany(keys, 60);
+                assertEquals(2, node.multiTouchFrames.size());
+                for (MockNode.MultiTouchFrame frame : node.multiTouchFrames) {
+                    assertTrue((long) frame.keys().size() * ns.length() <= 64L * 1024 * 1024,
+                            "a `y` frame of " + frame.keys().size() + " keys exceeds 64 MiB");
+                }
+            }
+        }
+    }
+
+    @Test
+    void maxKeysPerNamespaceChunkIsBoundedByTheOwnLimitAndNeverBelow64() {
+        assertEquals(400, NanocachedClient.maxKeysPerNamespaceChunk(0));
+        assertEquals(400, NanocachedClient.maxKeysPerNamespaceChunk(167_772));
+        assertEquals(399, NanocachedClient.maxKeysPerNamespaceChunk(168_000));
+        assertEquals(64, NanocachedClient.maxKeysPerNamespaceChunk(1024 * 1024));
+    }
 }
