@@ -12,8 +12,45 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- Discovery: the replication-factor dissent WARN written when `L` rebuilds
+  its cached answer was not rate limited and listed every dissenting node,
+  so a flood of fake nodes with generation bumps between `L` calls produced
+  one multi-megabyte line per `L` (65,000 names, about 2.4 MB). It is now
+  limited to one line per 10 s (the rest counted in a summary) and lists the
+  first 5 names followed by a count (#1717).
+
+### Fixed
+
+- Discovery: `Y` (proxy announce) registered new proxy names with no
+  limiter, so one connection looping `Y` under fresh names filled the
+  1024-entry proxy registry in milliseconds and real proxies with new names
+  were refused until the fakes timed out. New names now share the per-source
+  limiter `P` uses (a burst of 64, then one per 2 s); a refresh of a known
+  name is never gated. The `INFO proxy deregistered` line a `Z` writes is
+  now rate limited like the node register and announce lines (#1716).
+
+### Fixed
+
+- Node, discovery: the number of rejected connections lingering in their
+  busy-reply drain (up to 200 ms each, for a peer that does not close) was
+  bounded only by the accept rate, since a connection turned away by the
+  per-IP cap no longer holds a global slot (#1664). At most 128 rejected
+  connections now drain at once; past that a rejected connection gets a
+  non-blocking busy reply and is closed at once, with no drain (#1720).
+
 ### Changed
 
+- Docs: the accepted-behaviour list now names a touch forwarded as a `U`
+  to a leaving node that only moves the TTL: it is not relayed to the
+  node's entrant, since it cannot be told apart from the delayed echo of
+  the node's own drain and relaying it would make the loop depend on timing
+  (#1719).
+
+- Docs: the accepted-behaviour list now says that a proxied delete whose
+  answer was lost after the write, and which is then sent again, answers `N`
+  when the first attempt had already removed the key (#1714). A test pins it.
 - Docs: the decommission section said an attempt's connect and its send are
   each bounded by 10 s, and that the leave notification adds nothing to the
   budget while also giving it 2 s when the handoff used the budget up. An
@@ -51,6 +88,59 @@ framework adapters at one version, whether or not a component changed.
   `:dev` tags the scenario headers tell you to build, which fail at once when
   the image does not exist (#1744).
 
+- `tests/e2e/freshjoin.sh`: a mistyped `MODE` fell through the `case`, so
+  only the join ran and the script reported PASS. An unknown `MODE` now
+  exits 2 with the list of valid modes before anything is started (#1743).
+
+- `tests/e2e/restart.sh`: unlike the other scenarios it had no minimum number
+  of load operations, ignored the result of `verify.py seed`, and only
+  printed the untouched-range `verify.py check` (without a time bound). It
+  now fails when the load did fewer than `MIN_OPS_S` (10) ops per second,
+  when the seed fails or times out, and when the check (bounded to 300 s)
+  is not clean or gives no result (#1742).
+
+- `tests/e2e/reclaim970.sh`: the exit codes of `reclaim970.py seed` and
+  `apply` were not checked, and the PASS test was "some class reports 0 keys",
+  so a failed seed could still pass; it also printed its FAIL line twice when
+  keys were left and had no `EXIT` trap. A failed or timed-out seed or apply
+  now fails the run, all three classes (r, e, k) must report 0, each failure
+  is printed once, and the containers are removed on exit (#1741).
+
+- `tests/e2e/steady582.sh`: the header required the load's misses, the
+  untouched range's misses, the `k0..k19999` misses and the versioned writer's
+  stale/miss counts to be 0, but the script only echoed them (it failed only
+  when the load did not finish) and had no `EXIT` trap, so Ctrl-C left the
+  containers behind. It now asserts those zeros and the load's minimum ops,
+  treats a missing result line as a failure, and removes the containers on
+  exit (#1740).
+
+- `tools/conformance`: `scenarios.sh v6` only printed `secret appears in N output files` when the auth secret leaked, and `compare.py` (the last step of `run.sh`) printed FAIL/DIFF cells without a failing exit, so both exited 0 on a violation. `scenarios.sh v6` now exits 1 when `secret_leaks.txt` is not empty and `compare.py` (so `run.sh`) exits 1 when any cell is FAIL or DIFF (#1739).
+
+- `nanocached-node`: a forwarded handoff write (`U`, `u`, `f`) answered `R`
+  was treated as a generic failure. Each forward to that address dialed it
+  `KEY_TRANSFER_ATTEMPTS` times and every later one once more, until the
+  30 s window closed, although the drain, the re-replication and the
+  handoff paths write such an address off at once. A forward that gets `R`
+  now stops retrying, and the forwards that follow inside the window do not
+  dial the address; the same goes for the join transfer's retries (#1718).
+
+- Proxy: a deferred `m`/`o`/`y` (one pipelined behind an `i`/`k`/`x` on a key it
+  carries) registered an entry per key in the connection's ordering map, and
+  they stayed until a later registration crossed the sweep threshold, so an
+  idle connection kept tens of megabytes (about 25 MB for a 1 MiB batch of
+  short keys) outside `--max-in-flight-bytes`. A batch of more than 64 keys now
+  registers for its namespace as a whole: a later request on any key of that
+  namespace waits for it. (#1711)
+- Proxy: an `i`/`k`/`x` dispatched inline behind an earlier one that returned
+  early (no roster, or no owner for its key) released its ordering signal at
+  once instead of after the earlier command's, so a pipelined same-key
+  request could be enqueued on the replica ahead of that command's result.
+  The signal now waits for the earlier command as it would have after a
+  normal return. (#1713)
+- Proxy: a backend that closes each connection right after the handshake (so
+  the redial backoff resets every time) logged its exit line once per
+  request. The lines are now limited per backend address (3 per 10 s), with
+  the number dropped reported ahead of the next line written. (#1715)
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a

@@ -11,7 +11,9 @@
 #   measured per node. Then n4 is killed (the only other holder of what the
 #   reclaim removed from the old nodes is gone), and after its eviction
 #   every seeded key is read back: load misses, untouched misses (k20000..),
-#   k0..k19999 misses and the writer's stale/miss must all be 0.
+#   k0..k19999 misses and the writer's stale/miss must all be 0, and the load
+#   must have run (>= MIN_OPS_S, default 10, ops per second); the script exits
+#   1 when any of them is not (the reclaim delays are printed, not asserted).
 #
 #   NODE=nanocached-node:<tag> DISC=nanocached-discovery:<tag> [WATCH=360] ./steady582.sh
 export NET=e2e-steady
@@ -24,6 +26,7 @@ LOAD_SECS=$(( STABLE + WATCH + 150 ))
 T(){ echo "### $(date +%T.%N | cut -c1-12) [$P] $*"; }
 tmo(){ perl -e 'alarm shift; exec @ARGV' "$@"; }
 cleanup(){ docker rm -f $(docker ps -aq --filter "name=^/$P-") >/dev/null 2>&1; docker network rm $NET >/dev/null 2>&1; }
+trap cleanup EXIT  # Ctrl-C or a failed step must not leave the run's containers behind
 client(){ docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python "$@"; }
 entries_of(){ docker run --rm --network $NET e2e-client python -c "import urllib.request;print([l.split()[1] for l in urllib.request.urlopen('http://$1:9100/metrics',timeout=5).read().decode().splitlines() if l.startswith('nanocached_node_entries ')][0])" 2>/dev/null || echo "?"; }
 reclaims_of(){ docker logs $1 2>&1 | grep -c "INFO reclaimed"; }
@@ -89,6 +92,13 @@ seq 0 19999 | sed 's/^/k/' > "$L/kload.txt"
 client read_keys.py --addr $D --keys-file /w/logs/steady-$RUN/kload.txt | tee "$L/read-kload.json"
 client verify.py check --addr $D,$D --n 10000 --start 20000 --size 256 | tail -1 | tee "$L/untouched.json"
 save_logs
+# the zeros the header requires; a missing result line (loader, writer or check that did not run to the end) fails too
+echo "$load" | grep -q '"miss": 0' || { T "FAIL: load saw misses or printed no result line"; fail=1; }
+echo "$load" | grep -q '"corrupt": 0' || { T "FAIL: load saw corrupt values or printed no result line"; fail=1; }
+ops=$(load_ops "$load"); [ "${ops:-0}" -ge $(( LOAD_SECS * ${MIN_OPS_S:-10} )) ] || { T "FAIL: load completed only ${ops:-0} ops in ${LOAD_SECS}s (want >= ${MIN_OPS_S:-10}/s: it did not run for the whole scenario)"; fail=1; }
+{ echo "$versioned" | grep -q '"stale": 0' && echo "$versioned" | grep -q '"miss": 0'; } || { T "FAIL: the versioned writer's check has stale or missing keys, or printed no result"; fail=1; }
+{ grep -q '"miss": 0' "$L/read-kload.json" && grep -q '"err": 0' "$L/read-kload.json"; } || { T "FAIL: k0..k19999 misses or read errors, or read_keys.py printed no result"; fail=1; }
+grep -q '"miss": 0, "corrupt": 0, "err": 0' "$L/untouched.json" || { T "FAIL: untouched range (k20000..k29999) has misses/corruption/errors, or verify.py printed no result"; fail=1; }
 echo "=== entries:"; cat "$L/entries.txt"
 echo "=== reclaim WARN/ERROR lines:"; grep -h "WARN\|ERROR" "$L"/n?.log | grep -v "accepted connection" | sed 's/[0-9.]*:[0-9]*:/X:/' | sort | uniq -c | sort -rn | head -8
 cleanup
