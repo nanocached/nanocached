@@ -3581,6 +3581,49 @@ describe("NanocachedClient batch chunking cumulative byte bound (issue #222)", (
   });
 });
 
+describe("NanocachedClient o/y chunks stay under the 64 MiB namespace x keys limit (issue #1726)", () => {
+  // The node rejects an `o`/`y` frame whose namespace length times key count
+  // exceeds 64 MiB (`En`, then closes the connection). 170,000 x 400 keys is
+  // 68,000,000 > 67,108,864, so the 400-key chunk has to be split at 394.
+  const LIMIT = 64 * 1024 * 1024;
+  const namespace = "n".repeat(170_000);
+  const keys = Array.from({ length: 400 }, (_, i) => `key-${i}`);
+
+  it("splits a multi-set so no o frame passes the limit", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.namespace(namespace).setMany(Object.fromEntries(keys.map((k) => [k, "v"])));
+        const counts = node.multiSetKeyCounts();
+        assert.equal(counts.reduce((a, b) => a + b, 0), 400);
+        for (const count of counts) assert.ok(count * 170_000 <= LIMIT, `o frame of ${count} keys passes the limit`);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("splits a touch-many so no y frame passes the limit", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        await client.namespace(namespace).touchMany(keys, 60);
+        const frames = node.multiTouchFrames();
+        assert.equal(frames.reduce((a, f) => a + f.keys.length, 0), 400);
+        for (const frame of frames) assert.ok(frame.keys.length * 170_000 <= LIMIT, `y frame of ${frame.keys.length} keys passes the limit`);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+});
+
 describe("NanocachedClient chunked batch partial success on connection loss (issue #411)", () => {
   // A batch that spans more than one m/o sub-frame (see the two describe
   // blocks above) used to silently discard every earlier, already-

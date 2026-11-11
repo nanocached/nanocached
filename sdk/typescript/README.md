@@ -529,7 +529,9 @@ await client.getManyAndTouch(["a", "b", "missing"], 300);
 The TTL is one value for the whole batch and means what it means for
 `touch`: no default, `null` removes it, `0` expires the keys at once. A key
 given twice is touched once, and a batch of more than 400 keys is split into
-several frames, as for `getMany`. `NanocachedNamespace` has all three.
+several frames, as for `getMany`. With a namespace longer than 167,772 bytes
+the frames hold fewer keys, because the node refuses a `y` or `o` frame whose
+namespace length times key count passes 64 MiB; `setMany` is split the same way. `NanocachedNamespace` has all three.
 
 Like `touch` it goes to every owner of each key and the primary's answer
 decides. `getManyAndTouch` asks only a key's primary for the value, so a node
