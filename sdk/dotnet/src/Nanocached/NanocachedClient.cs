@@ -841,9 +841,9 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// over per request instead of the whole <see cref="ConnectAsync"/>
     /// failing. Only a cluster with <em>no</em> reachable node fails,
     /// with the last such dial error. A listed address that answers but no
-    /// longer identifies as a cache node — or fails for any other reason
-    /// that isn't a connection-level failure — remains a hard error, as
-    /// before this fix: every dial outcome is gathered first (so any
+    /// longer identifies as a cache node counts as such an unreachable
+    /// node; one that fails for any other reason that isn't a
+    /// connection-level failure remains a hard error: every dial outcome is gathered first (so any
     /// connections opened for other, reachable nodes are still recorded in
     /// <see cref="_members"/> and get torn down by
     /// <see cref="ConnectAsync"/>'s catch-and-<see cref="Teardown"/>,
@@ -855,6 +855,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         var outcomes = await DialNodesAsync(nodes).ConfigureAwait(false);
 
         Exception? lastError = null;
+        string? lastNonNodeAddress = null;
         Exception? fatal = null;
         int reachable = 0;
         foreach (var (node, connection, error) in outcomes)
@@ -867,15 +868,20 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             }
 
             // A listed node that answers the handshake with a non-handshake
-            // reply (an HTTP server that reused the address) is a dead
-            // member like a refused dial, as in the other SDKs; one that
-            // answers as discovery/proxy stays a hard error.
-            if (error is ConnectionLostException and (not NotACacheNodeException
-                or NotACacheNodeException { IsUnexpectedReply: true }))
+            // reply (an HTTP server that reused the address), or as
+            // discovery/proxy (an IP reused by another process), is a dead
+            // member like a refused dial, as in the other SDKs: the
+            // redial path treats the same answer as a lost connection
+            // that was never sent.
+            if (error is ConnectionLostException)
             {
+                Exception dead = error is NotACacheNodeException { IsUnexpectedReply: false }
+                    ? NotACacheNodeException.NeverIdentified(node.Address)
+                    : error;
                 _members[node.Name] = new Member(node.Address, null);
-                ArmReconnectCooldown(node.Address, error);
-                lastError = error;
+                ArmReconnectCooldown(node.Address, dead);
+                lastError = dead;
+                lastNonNodeAddress = error is NotACacheNodeException { IsUnexpectedReply: false } ? node.Address : null;
             }
             else
             {
@@ -883,12 +889,6 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             }
         }
 
-        if (fatal is NotACacheNodeException)
-        {
-            // A listed address that answers as a non-node stays the plain
-            // configuration error it was at connect time.
-            throw new NanocachedException(fatal.Message);
-        }
         if (fatal is not null)
         {
             ExceptionDispatchInfo.Capture(fatal).Throw();
@@ -898,10 +898,13 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         {
             if (lastError is NotACacheNodeException notANode)
             {
-                // No node reachable and the last failure was a garbage
-                // handshake: the plain configuration error, never the
-                // internal type.
-                throw new NanocachedException(notANode.Message);
+                // No node reachable and the last failure was a non-node
+                // answer: the plain exception, never the internal type. A
+                // discovery/proxy answer keeps the configuration error's
+                // text; a garbage handshake keeps its own message.
+                throw new NanocachedException(lastNonNodeAddress is null
+                    ? notANode.Message
+                    : $"nanocached: discovery server returned a non-node address: {lastNonNodeAddress}");
             }
             ExceptionDispatchInfo.Capture(lastError!).Throw();
         }

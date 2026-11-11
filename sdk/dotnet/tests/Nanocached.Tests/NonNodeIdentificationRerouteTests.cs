@@ -86,7 +86,28 @@ public class NonNodeIdentificationRerouteTests
     }
 
     [Fact]
-    public async Task AListedNonNodeStillFailsTheInitialConnectAsAConfigurationError()
+    public async Task AListedAddressThatAnswersAsDiscoveryIsADeadMemberWhileAnotherNodeIsUp()
+    {
+        using var notANode = new MockDiscovery(new List<(string, string)>(), 1);
+        using var node = new MockNode();
+        using var discovery = new MockDiscovery(
+            new List<(string, string)> { (Names[0], $"127.0.0.1:{notANode.Port}"), (Names[1], node.Address) }, 2);
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            new() { Addresses = { ("127.0.0.1", discovery.Port) } });
+
+        // A read of a key owned by the non-node address fails over to the
+        // live replica; a write to it reports the not-sent lost connection.
+        string key = KeyWhosePrimaryIs(Names[0]);
+        node.Store[MockNode.KeyOf(Encoding.UTF8.GetBytes(key))] = Encoding.UTF8.GetBytes("replica copy");
+        Assert.Equal("replica copy", await client.GetAsync(key));
+        var lost = await Assert.ThrowsAnyAsync<ConnectionLostException>(() => client.SetAsync(key, "v"));
+        Assert.True(lost.RequestNotSent);
+        Assert.Contains("does not identify as a cache node", lost.Message);
+    }
+
+    [Fact]
+    public async Task AListedNonNodeFailsTheInitialConnectWithAPlainExceptionWhenNoNodeIsReachable()
     {
         using var notANode = new MockDiscovery(new List<(string, string)>(), 1);
         using var discovery = new MockDiscovery(
@@ -95,6 +116,6 @@ public class NonNodeIdentificationRerouteTests
         var error = await Assert.ThrowsAsync<NanocachedException>(() => NanocachedClient.ConnectAsync(
             new() { Addresses = { ("127.0.0.1", discovery.Port) } }));
         Assert.IsNotType<ConnectionLostException>(error);
-        Assert.Contains("no longer identifies as a cache node", error.Message);
+        Assert.Contains("discovery server returned a non-node address", error.Message);
     }
 }
