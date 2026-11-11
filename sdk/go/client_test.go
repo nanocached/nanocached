@@ -897,6 +897,9 @@ func (m *mockNode) serve(conn net.Conn) {
 			}
 			m.mCount.Add(1)
 			m.dataRequestCount.Add(1)
+			if delay := time.Duration(m.getDelay.Load()); delay > 0 {
+				time.Sleep(delay)
+			}
 			if m.takeOne(&m.retryableLeft) { // issue #125
 				if _, err := conn.Write([]byte("R" + tagSuffix + "\n")); err != nil {
 					return
@@ -3860,6 +3863,49 @@ func TestAForcedRefreshDoesNotReuseARefreshThatStartedBeforeItsFailure(t *testin
 	// The bootstrap fetch, the first caller's, and the second caller's own.
 	if got := discovery.lCount.Load(); got != 3 {
 		t.Fatalf("discovery saw %d L fetches, want 3: the second caller must not reuse a refresh that started before its failure", got)
+	}
+}
+
+func TestAnOperationStillRunningAfterCloseDoesNotRefreshTheNodeList(t *testing.T) {
+	// A multi-key read still in flight when Close() runs, with one leg
+	// failed (its node is down), used to run its forced refresh anyway: a
+	// discovery round trip (here 4 s of slow discovery) on a closed client.
+	nodes, discovery := startCluster(t, 1)
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	onA := keyWithPrimary(t, testNames[0])
+	onB := keyWithPrimary(t, testNames[1])
+	if err := client.Set(onA, "a", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set(onB, "b", 0); err != nil {
+		t.Fatal(err)
+	}
+	nodes[testNames[1]].delayGets(1500 * time.Millisecond)
+	nodes[testNames[0]].close()
+	discovery.laterListDelay.Store(int64(4 * time.Second))
+	fetchesBefore := discovery.lCount.Load()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = client.GetMany([]string{onA, onB})
+	}()
+	time.Sleep(300 * time.Millisecond)
+	closedAt := time.Now()
+	client.Close()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("GetMany did not return")
+	}
+	if got := discovery.lCount.Load(); got != fetchesBefore {
+		t.Fatalf("discovery saw %d node-list fetches after Close()", got-fetchesBefore)
+	}
+	if elapsed := time.Since(closedAt); elapsed > 3*time.Second {
+		t.Fatalf("GetMany finished %v after Close()", elapsed)
 	}
 }
 

@@ -3600,7 +3600,11 @@ func (c *Client) openNodeConnection(address string) (*connection, error) {
 
 func (c *Client) maybeRefresh(force bool) {
 	c.mu.Lock()
-	skip := c.ring == nil || (!force && time.Since(c.lastFetch) < nodeListStaleAfter)
+	// A closed client never refreshes: Close() does not wait for an
+	// operation already in flight, and a multi-key one whose leg failed
+	// would otherwise run its forced refresh anyway — a discovery round trip
+	// (up to the connect timeout) and dials of new nodes after Close().
+	skip := c.closed || c.ring == nil || (!force && time.Since(c.lastFetch) < nodeListStaleAfter)
 	// When the caller decided to refresh: a forced refresh that *started*
 	// after this moment and completes while this caller waits for the
 	// gate serves it too. One that started earlier does not — it fetched
@@ -3626,7 +3630,9 @@ func (c *Client) maybeRefresh(force bool) {
 	// full fetch against discovery (5 s each when discovery is slow), and
 	// the last caller waited for all of them. A forced caller now reuses
 	// a refresh that started after it observed its failure.
-	skip = (!force && time.Since(c.lastFetch) < nodeListStaleAfter) || (force && !c.lastFetchStarted.Before(observed))
+	// Checked again under the gate for a caller that queued behind a
+	// refresh while Close() ran.
+	skip = c.closed || (!force && time.Since(c.lastFetch) < nodeListStaleAfter) || (force && !c.lastFetchStarted.Before(observed))
 	// Minimum interval between forced refreshes (issue #1531). A caller that
 	// found the gate free and a refresh finished within the window reuses
 	// it: the roster it installed is the freshest discovery will hand out at
