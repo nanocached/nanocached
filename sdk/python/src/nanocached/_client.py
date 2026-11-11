@@ -177,9 +177,9 @@ class ClientStats:
 
     ``refresh_failures``: node-list refreshes that produced no usable node
     list (counted once per refresh, however many discovery addresses it
-    tried; an empty roster counts), and per-node connect failures swallowed while reconciling a refresh's
-    member list — discovery outages degrade only topology updates, never
-    already-established cache traffic.
+    tried; an empty roster counts). A failed dial of a newly listed node is
+    not a refresh failure. Discovery outages degrade only topology updates,
+    never already-established cache traffic.
 
     ``transient_retries``: every retryable-error status (``R``, issue
     #125) received on any connection this client owns — counted whether
@@ -3889,8 +3889,8 @@ class NanocachedClient:
             # Refresh is opportunistic/best-effort and must never fail the
             # caller's operation (client-side replication's
             # eventual-consistency model), so a node that can't be dialed
-            # here is counted in stats().refresh_failures but still
-            # installed — without a connection and with its reconnect
+            # here is not a refresh failure (the node list itself was
+            # fetched) and is still installed — without a connection and with its reconnect
             # cooldown armed, exactly like _open_cluster (issue #67): the
             # ring must hold every listed node, or this client routes the
             # keys near it differently from every peer that did reach it
@@ -3898,7 +3898,6 @@ class NanocachedClient:
             # listed owner). Its next use redials it once the cooldown has
             # passed.
             if not isinstance(outcome, NodeTarget):
-                self._refresh_failures += 1
                 error = (
                     outcome
                     if isinstance(outcome, Exception)

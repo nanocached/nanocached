@@ -6028,7 +6028,7 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 await client._refresh_node_list()
 
-                self.assertEqual(client.stats().refresh_failures, 1)
+                self.assertEqual(client.stats().refresh_failures, 0)
                 self.assertIn(new, client._members)
                 self.assertIsNone(client._members[new].connection)
                 self.assertIn(dead_address, client._redial_cooldowns)
@@ -6075,7 +6075,7 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 await client._refresh_node_list()
 
-                self.assertEqual(client.stats().refresh_failures, 1)
+                self.assertEqual(client.stats().refresh_failures, 0)
                 self.assertIsNone(client._members[new].connection)
                 self.assertIn(f"127.0.0.1:{other.port}", client._redial_cooldowns)
                 self.assertIn(new, client._ring._nodes)
