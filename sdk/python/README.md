@@ -616,7 +616,8 @@ observable instead of silently invisible:
 stats = client.stats()
 stats.replica_write_failures  # swallowed dead/disagreeing replica legs (client-side replication)
 stats.read_repair_failures    # swallowed read-repair write-back failures
-stats.refresh_failures        # failed node-list refresh attempts / per-node reconnects
+stats.refresh_failures        # node-list refreshes that produced no usable list (once per
+                               # refresh, an empty roster included; a failed dial of a new node is not one)
 stats.transient_retries       # every `R` received, whether the retry that followed succeeded
                                # or, after 3 attempts running, raised RetryableError
 ```
