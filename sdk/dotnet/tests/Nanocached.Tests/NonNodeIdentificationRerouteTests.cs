@@ -116,6 +116,6 @@ public class NonNodeIdentificationRerouteTests
         var error = await Assert.ThrowsAsync<NanocachedException>(() => NanocachedClient.ConnectAsync(
             new() { Addresses = { ("127.0.0.1", discovery.Port) } }));
         Assert.IsNotType<ConnectionLostException>(error);
-        Assert.Contains("does not identify as a cache node", error.Message);
+        Assert.Contains("discovery server returned a non-node address", error.Message);
     }
 }

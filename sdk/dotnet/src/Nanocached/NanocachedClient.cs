@@ -855,6 +855,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         var outcomes = await DialNodesAsync(nodes).ConfigureAwait(false);
 
         Exception? lastError = null;
+        string? lastNonNodeAddress = null;
         Exception? fatal = null;
         int reachable = 0;
         foreach (var (node, connection, error) in outcomes)
@@ -880,6 +881,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 _members[node.Name] = new Member(node.Address, null);
                 ArmReconnectCooldown(node.Address, dead);
                 lastError = dead;
+                lastNonNodeAddress = error is NotACacheNodeException { IsUnexpectedReply: false } ? node.Address : null;
             }
             else
             {
@@ -897,8 +899,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             if (lastError is NotACacheNodeException notANode)
             {
                 // No node reachable and the last failure was a non-node
-                // answer: the plain exception, never the internal type.
-                throw new NanocachedException(notANode.Message);
+                // answer: the plain exception, never the internal type. A
+                // discovery/proxy answer keeps the configuration error's
+                // text; a garbage handshake keeps its own message.
+                throw new NanocachedException(lastNonNodeAddress is null
+                    ? notANode.Message
+                    : $"nanocached: discovery server returned a non-node address: {lastNonNodeAddress}");
             }
             ExceptionDispatchInfo.Capture(lastError!).Throw();
         }
