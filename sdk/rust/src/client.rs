@@ -5650,6 +5650,14 @@ impl NanocachedClient {
     /// held at a time — `state` is always dropped before awaiting
     /// `refresh_gate` or any I/O, matching every other lock in this file.
     async fn maybe_refresh(&self, force: bool) {
+        // A closed client never refreshes: close() does not wait for an
+        // operation already in flight, and a multi-key one whose leg failed
+        // would otherwise run its forced refresh anyway — a discovery round
+        // trip (up to the connect timeout) and dials of new nodes after
+        // close().
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
         {
             let state = self.inner.state.lock().await;
             if matches!(state.target, Target::Single { .. }) {
@@ -5691,6 +5699,11 @@ impl NanocachedClient {
             Ok(gate) => (gate, false),
             Err(_) => (self.inner.refresh_gate.lock().await, true),
         };
+        // Checked again under the gate for a caller that queued behind a
+        // refresh while close() ran.
+        if self.inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
         let wait = {
             let state = self.inner.state.lock().await;
             if !force

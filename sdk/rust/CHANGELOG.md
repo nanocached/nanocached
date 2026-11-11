@@ -16,6 +16,7 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Fixed
 
+- A multi-key operation still running when `close()` was called (`close()` does not wait for it) ran its forced node-list refresh after a failed leg: a discovery round trip (with slow discovery, seconds) and dials of new nodes on a closed client. A closed client no longer refreshes, as in the Python, TypeScript and Java SDKs. (#1814)
 - At the initial connect, a listed address that answers as a discovery server or a proxy (its IP reused by another process) failed the whole `connect()` with `Error::Protocol`, while running clients carried on and an address that failed to dial was already tolerated. It is now installed as a dead member with a reconnect cooldown, carrying an `Error::ConnectionLost` ("does not identify as a cache node") like the one a redial gives it; `connect()` fails only when no listed node is reachable, and then with the same `Error::Protocol` as before for a non-node address. (#1801)
 - A forced node-list refresh or redial turned every `Error::Protocol` from the dial into `ConnectionLost`, including ones unrelated to the handshake (a failed TLS setup task, a malformed node list). Only the unexpected reply to `A` is converted now. (#1732)
 - A `B` (busy) reply while requests were waiting on the connection was reported as `Error::Protocol` on an untagged connection and as a tag-mismatch `ConnectionLost` on a tagged one. It is now one `ConnectionLost` (busy) either way, as in the Go SDK. (#1731)
