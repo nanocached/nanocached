@@ -4009,6 +4009,10 @@ export class NanocachedClient {
           ? error instanceof ConnectionLostError && error.requestWasSent === false
           : isConnectionError(error));
       if (!retryable || this.target.kind === "single") throw error;
+      // The request's own timeout is not the node-death case this retry
+      // exists for: a hung node would stall the resend for another full
+      // window, so the call would take twice the timeout.
+      if (error instanceof ConnectionLostError && error.requestTimedOut) throw error;
       await this.maybeRefreshNodeList({ force: true });
       return await operation();
     }

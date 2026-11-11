@@ -2178,9 +2178,7 @@ describe("NanocachedClient request timeout (issue #42)", () => {
         node.goSilentAfterHandshake();
 
         const started = Date.now();
-        // The client's retry layer redials once after the first timeout;
-        // the redialed connection times out too, so this settles after
-        // roughly two windows — still bounded.
+        // A request timeout is not redialed and resent (see the test below).
         await assert.rejects(
           client.get("k"),
           (error: unknown) =>
@@ -2192,6 +2190,38 @@ describe("NanocachedClient request timeout (issue #42)", () => {
       }
     } finally {
       await node.close();
+    }
+  });
+
+  it("does not redial and resend a request that hit the request timeout", async () => {
+    // A request whose failure was its own timeout is not resent on a new
+    // connection (Go/Rust/Java/.NET do not either): a hung node would
+    // otherwise hold the call for two windows. Connection loss still is.
+    const node = await startMockNode();
+    const discovery = await startMockDiscovery([{ name: "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", address: node.address }]);
+    try {
+      REQUEST_TIMEOUT_TUNING.timeoutMs = 200;
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: discovery.port }],
+      });
+      try {
+        await client.set("k", "v");
+        node.goSilentAfterHandshake();
+        const connectionsBefore = node.connectionCount();
+
+        const started = Date.now();
+        await assert.rejects(
+          client.get("k"),
+          (error: unknown) => error instanceof Error && /request timed out/.test(error.message),
+        );
+        const elapsed = Date.now() - started;
+        assert.ok(elapsed < 350, `get() took ${elapsed}ms: it was resent after the timeout`);
+        assert.equal(node.connectionCount(), connectionsBefore, "no redial after a request timeout");
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), node.close()]);
     }
   });
 
