@@ -76,6 +76,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a forwarded handoff write (`U`, `u`, `f`) answered `R`
+  was treated as a generic failure. Each forward to that address dialed it
+  `KEY_TRANSFER_ATTEMPTS` times and every later one once more, until the
+  30 s window closed, although the drain, the re-replication and the
+  handoff paths write such an address off at once. A forward that gets `R`
+  now stops retrying, and the forwards that follow inside the window do not
+  dial the address; the same goes for the join transfer's retries (#1718).
+
 - Proxy: a deferred `m`/`o`/`y` (one pipelined behind an `i`/`k`/`x` on a key it
   carries) registered an entry per key in the connection's ordering map, and
   they stayed until a later registration crossed the sweep threshold, so an
