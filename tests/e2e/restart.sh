@@ -5,12 +5,15 @@
 # seed -> load -> join n4 -> join n5 -> SIGKILL n5 -> eviction -> docker
 # start n5 at once. Records container IPs and the restart time so each
 # MISS line can be placed against the node logs (analyze_restart.py).
-# PASS: miss 0 and every membership step reached (exit 1 otherwise). Before #570, 150-870 misses per run: clients whose
+# PASS: miss 0, every membership step reached, the load ran to the end with at
+# least MIN_OPS_S (default 10) ops per second, and the untouched range
+# (k20000..k29999) reads back clean; exit 1 otherwise, as it does when the
+# seed fails or times out. Before #570, 150-870 misses per run: clients whose
 # bootstrap dial to the dead member was still pending connected to the
 # restarted process under the dead name and read N from it before its
 # promotion. NEWIP=1 blocks the old IP with a placeholder container (the
 # restart lands elsewhere), DELAY=n delays the restart by n seconds.
-#   NODE=... DISC=... RUN=x1 ./repro_diag.sh
+#   NODE=... DISC=... RUN=x1 ./restart.sh
 export NET=e2e-rdiag
 E="$(cd "$(dirname "$0")" && pwd)"
 source "$E/cl.sh"
@@ -26,7 +29,7 @@ live=(); seq_no=0
 spawn(){ seq_no=$((seq_no+1)); spawned=$P-n$seq_no; node_up $spawned $D --drain-timeout 20; live+=("$spawned"); }
 ipmap(){ for c in $(docker ps -q --filter "name=^/$P-"); do docker inspect -f '{{.Name}} {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $c | tr -d /; done | sort > "$L/${1:-ipmap}.txt"; }
 for _ in 1 2 3; do spawn; wait_members ${#live[@]} $D 120 || { T "FAIL: bootstrap"; cleanup; exit 1; }; done
-docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1
+tmo 300 docker run --rm --name $P-seed --network $NET -v "$E:/w" -w /w e2e-client python verify.py seed --addr $D,$D --n 30000 --size 256 | tail -1; [ "${PIPESTATUS[0]}" = 0 ] || { T "FAIL: verify.py seed failed or timed out (300s)"; cleanup; exit 1; }
 LOAD_SECS=${LOAD_SECS:-75}
 docker run -d --name $P-load --network $NET -v "$E:/w" -w /w e2e-client python load_diag.py --addr $D --conns 8 --duration $LOAD_SECS --keyspace 20000 --value-size 256 --label rdiag --reconnect-on-error --hedge 0.01 --report-every 5 --probe-max ${PROBE_MAX:-60} >/dev/null
 sleep 3
@@ -49,8 +52,10 @@ tmo $(( LOAD_SECS + 60 )) docker wait $P-load >/dev/null || { T "FAIL: load did 
 docker logs -t $P-load > "$L/load.log" 2>&1; load=$(grep '"label"' "$L/load.log" | tail -1)
 echo "=== load: $load"
 [ -n "$load" ] || { T "FAIL: the load printed no result line (it did not run to the end)"; fail=1; }
-check=$(docker run --rm --network $NET -v "$E:/w" -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
+check=$(tmo 300 docker run --rm --name $P-check --network $NET -v "$E:/w" -w /w e2e-client python verify.py check --addr $D,$D --start 20000 --n 10000 --size 256 | tail -1)
 echo "=== check: $check"
+echo "$check" | grep -q '"miss": 0, "corrupt": 0, "err": 0' || { T "FAIL: untouched-range verify not clean (or it gave no result within 300s)"; fail=1; }
+ops=$(load_ops "$load"); [ "${ops:-0}" -ge $(( LOAD_SECS * ${MIN_OPS_S:-10} )) ] || { T "FAIL: load completed only ${ops:-0} ops in ${LOAD_SECS}s (want >= ${MIN_OPS_S:-10}/s: it did not run for the whole scenario)"; fail=1; }
 docker logs -t $P-disc > "$L/disc.log" 2>&1
 for c in $(docker ps -aq --filter "name=^/$P-"); do n=$(docker inspect -f "{{.Name}}" $c | tr -d /); docker logs -t $c > "$L/$n.log" 2>&1; done
 miss=$(grep -c '^.*MISS ' "$L/load.log")

@@ -82,6 +82,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e/restart.sh`: unlike the other scenarios it had no minimum number
+  of load operations, ignored the result of `verify.py seed`, and only
+  printed the untouched-range `verify.py check` (without a time bound). It
+  now fails when the load did fewer than `MIN_OPS_S` (10) ops per second,
+  when the seed fails or times out, and when the check (bounded to 300 s)
+  is not clean or gives no result (#1742).
+
 - `tests/e2e/reclaim970.sh`: the exit codes of `reclaim970.py seed` and
   `apply` were not checked, and the PASS test was "some class reports 0 keys",
   so a failed seed could still pass; it also printed its FAIL line twice when
