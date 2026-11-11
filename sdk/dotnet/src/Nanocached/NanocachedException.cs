@@ -153,7 +153,16 @@ internal sealed class NotACacheNodeException : ConnectionLostException
         : base($"nanocached: {address} no longer identifies as a cache node", requestNotSent: true) { }
 
     private NotACacheNodeException(string message, bool unexpectedReply)
-        : base(message, requestNotSent: true) { }
+        : base(message, requestNotSent: true)
+    {
+        IsUnexpectedReply = unexpectedReply;
+    }
+
+    /// <summary>True when the address answered the handshake with something
+    /// that is not a handshake reply at all (see
+    /// <see cref="UnexpectedHandshakeReply"/>); false when it answered as
+    /// discovery or a proxy.</summary>
+    internal bool IsUnexpectedReply { get; }
 
     /// <summary>The handshake reply from <paramref name="address"/> was not
     /// a handshake reply.</summary>

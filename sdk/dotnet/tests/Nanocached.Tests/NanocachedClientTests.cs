@@ -1292,6 +1292,30 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task SetManyAndTouchManyKeepNamespaceTimesKeysWithin64MiB()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        // 170,000 B x 400 keys is over 64 MiB (the node answers En and closes);
+        // floor(64 MiB / 170,000) = 394 keys fit in one frame.
+        string ns = new('n', 170_000);
+        var values = new Dictionary<string, string>();
+        for (int i = 0; i < 400; i++) values[$"k{i}"] = "v";
+        var nsClient = client.Namespace(ns);
+
+        await nsClient.SetManyAsync(values);
+        Assert.Equal(2, node.MultiSetRequestCount);
+        Assert.Equal(400, node.MultiSetKeyCount);
+
+        var touched = await nsClient.TouchManyAsync(values.Keys.ToList(), 60);
+        Assert.Equal(400, touched.Count);
+        var frames = node.MultiTouchFrames;
+        Assert.Equal(2, frames.Count);
+        Assert.All(frames, frame => Assert.True((long)frame.Namespace.Length * frame.Keys.Count <= 64L * 1024 * 1024));
+    }
+
+    [Fact]
     public async Task SetManyTtlZeroMeansNoExpiryAndNegativeIsRejected()
     {
         using var node = new MockNode();
@@ -3738,7 +3762,9 @@ public class NanocachedClientTests
 
         await client.SetAsync(key, "v");
         Assert.Equal("v", await client.GetAsync(key));
-        Assert.True(client.Stats().RefreshFailures >= 1);
+        // The refresh produced a usable list (the real discovery server
+        // answered after the dead address), so it is not a failure.
+        Assert.Equal(0, client.Stats().RefreshFailures);
     }
 
     // A minimal Stream whose writes throw a plain programming-error
@@ -6638,6 +6664,32 @@ public class TolerantBootstrapTests
         return (System.Collections.IDictionary)field.GetValue(client)!;
     }
 
+    [Fact]
+    public async Task RefreshFailuresCountOncePerRefreshWithoutAUsableList()
+    {
+        using var seed = new MockNode();
+        using var discovery = new MockDiscovery(new[] { ("seed", seed.Address) }, replication: 1);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses =
+            {
+                ("127.0.0.1", discovery.Port), ("127.0.0.1", Wire.DeadNodePort()), ("127.0.0.1", Wire.DeadNodePort()),
+            },
+        });
+        Assert.Equal(0, client.Stats().RefreshFailures);
+
+        // An empty roster is not a usable list.
+        discovery.SetNodes(Array.Empty<(string, string)>());
+        await ForceRefreshAsync(client);
+        Assert.Equal(1, client.Stats().RefreshFailures);
+
+        // Every address unreachable: one failure for the refresh, not one
+        // per address.
+        discovery.Dispose();
+        await ForceRefreshAsync(client);
+        Assert.Equal(2, client.Stats().RefreshFailures);
+    }
+
     private static Task ForceRefreshAsync(NanocachedClient client)
     {
         MethodInfo method = typeof(NanocachedClient)
@@ -6851,7 +6903,8 @@ public class TolerantBootstrapTests
         Assert.True(HasMember(client, "bad"), "an unreachable new node must stay in the ring");
         Assert.Null(GetMemberConnection(client, "bad"));
         Assert.True(GetCooldowns(client).Contains(badAddress), "its reconnect cooldown must be armed");
-        Assert.Equal(before + 1, client.Stats().RefreshFailures);
+        // a failed dial of a new node is not a failed refresh
+        Assert.Equal(before, client.Stats().RefreshFailures);
     }
 
     [Fact]
@@ -7007,7 +7060,8 @@ public class TolerantBootstrapTests
         Assert.True(HasMember(client, "bad"));
         Assert.Null(GetMemberConnection(client, "bad"));
         Assert.True(GetCooldowns(client).Contains(badNew.Address));
-        Assert.Equal(before + 1, client.Stats().RefreshFailures);
+        // a failed dial of a new node is not a failed refresh
+        Assert.Equal(before, client.Stats().RefreshFailures);
     }
 
     [Fact]

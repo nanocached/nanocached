@@ -227,4 +227,21 @@ public class HandshakeGarbageRerouteTests
             new() { Addresses = { ("127.0.0.1", discovery.Port) }, ViaProxy = true }));
         Assert.Contains("unexpected response to A", proxy.Message);
     }
+
+    [Fact]
+    public async Task AListedNodeThatAnswersGarbageIsADeadMemberWhileAnotherNodeIsUp()
+    {
+        using var http = new HttpGarbageListener();
+        using var node = new MockNode();
+        using var discovery = new MockDiscovery(
+            new List<(string, string)> { (Names[0], http.Address), (Names[1], node.Address) }, 1);
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            new() { Addresses = { ("127.0.0.1", discovery.Port) } });
+
+        string key = KeyWhosePrimaryIs(Names[1]);
+        await client.SetAsync(key, "v");
+        Assert.Equal("v", await client.GetAsync(key));
+        Assert.True(http.Connections >= 1, "the garbage listener was never dialed");
+    }
 }

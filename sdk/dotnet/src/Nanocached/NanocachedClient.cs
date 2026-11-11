@@ -258,6 +258,17 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     // not tight, since undercounting here reproduces the exact bug this
     // fixes.
     private const int MultiGetHeaderAllowance = 12;
+
+    // The node rejects an `o`/`y` frame whose namespace length x key count
+    // exceeds 64 MiB (`En`, then it closes the connection, failing every
+    // other request in flight on it). Keys per such chunk are therefore
+    // capped at floor(64 MiB / namespace length); a namespace is at most
+    // 1 MiB, so at least 64 keys fit.
+    private const long MaxNamespaceTimesKeys = 64L * 1024 * 1024;
+
+    private static int MaxKeysPerNamespaceFrame(int namespaceLength) =>
+        namespaceLength == 0 ? MaxBatchKeys : (int)Math.Min(MaxBatchKeys, MaxNamespaceTimesKeys / namespaceLength);
+
     private const int MultiSetHeaderAllowance = 24;
 
     private static readonly TimeSpan NodeListStaleAfter = TimeSpan.FromSeconds(30);
@@ -855,7 +866,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 continue;
             }
 
-            if (error is ConnectionLostException and not NotACacheNodeException)
+            // A listed node that answers the handshake with a non-handshake
+            // reply (an HTTP server that reused the address) is a dead
+            // member like a refused dial, as in the other SDKs; one that
+            // answers as discovery/proxy stays a hard error.
+            if (error is ConnectionLostException and (not NotACacheNodeException
+                or NotACacheNodeException { IsUnexpectedReply: true }))
             {
                 _members[node.Name] = new Member(node.Address, null);
                 ArmReconnectCooldown(node.Address, error);
@@ -880,6 +896,13 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
 
         if (reachable == 0)
         {
+            if (lastError is NotACacheNodeException notANode)
+            {
+                // No node reachable and the last failure was a garbage
+                // handshake: the plain configuration error, never the
+                // internal type.
+                throw new NanocachedException(notANode.Message);
+            }
             ExceptionDispatchInfo.Capture(lastError!).Throw();
         }
 
@@ -1714,7 +1737,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     private async Task<List<Connection.MultiEntry>> MultiKeysChunkedAsync(
         string? slot, byte[] namespaceBytes, byte[][] keys,
         Func<Connection, IReadOnlyList<byte[]>, Task<List<Connection.MultiEntry>>> send,
-        bool expiring = false)
+        bool expiring = false, int maxKeys = MaxBatchKeys)
     {
         var entries = new List<Connection.MultiEntry>(new Connection.MultiEntry[keys.Length]);
         int start = 0;
@@ -1722,7 +1745,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         {
             long total = namespaceBytes.Length + MultiGetHeaderAllowance + keys[start].Length;
             int end = start + 1;
-            while (end < keys.Length && end - start < MaxBatchKeys)
+            while (end < keys.Length && end - start < maxKeys)
             {
                 long next = MultiGetHeaderAllowance + keys[end].Length;
                 if (total + next > MaxRequestBytes) break;
@@ -2596,7 +2619,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         MultiKeysChunkedAsync(
             slot, namespaceBytes, keys,
             (connection, chunk) => connection.MultiTouchAsync(namespaceBytes, chunk, ttlSeconds, get),
-            expiring: ttlSeconds == 0);
+            expiring: ttlSeconds == 0, maxKeys: MaxKeysPerNamespaceFrame(namespaceBytes.Length));
 
     /// <summary>One pass of <see cref="MultiTouchAsync"/>'s cluster
     /// routing: every key still needing resolution (every key when
@@ -3007,12 +3030,13 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         string? slot, byte[] namespaceBytes, byte[][] keys, byte[][] values, long ttlSeconds)
     {
         var entries = new List<Connection.MultiEntry>(new Connection.MultiEntry[keys.Length]);
+        int maxKeys = MaxKeysPerNamespaceFrame(namespaceBytes.Length);
         int start = 0;
         while (start < keys.Length)
         {
             long total = namespaceBytes.Length + MultiSetHeaderAllowance + keys[start].Length + values[start].Length;
             int end = start + 1;
-            while (end < keys.Length && end - start < MaxBatchKeys)
+            while (end < keys.Length && end - start < maxKeys)
             {
                 long next = MultiSetHeaderAllowance + keys[end].Length + values[end].Length;
                 if (total + next > MaxRequestBytes) break;
@@ -5293,7 +5317,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         _lastRefreshStarted = MonotonicNow();
         Identify.ClusterTarget? cluster = await FetchNodeListAsync().ConfigureAwait(false);
         _lastFetch = MonotonicNow();
-        if (cluster is null) return;
+        if (cluster is null)
+        {
+            // One failure per refresh that produced no usable node list
+            // (every address unreachable, an empty roster or a node-target
+            // answer), as the Go and Rust SDKs count it.
+            Interlocked.Increment(ref _refreshFailures);
+            return;
+        }
 
         // Dedupe first (issue #461): a duplicated name in cluster.Nodes
         // would otherwise crash ToDictionary below with an
@@ -5368,7 +5399,6 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                     continue;
                 }
 
-                Interlocked.Increment(ref _refreshFailures);
                 // Install the just-discovered node with a null connection and
                 // arm its cooldown, rather than leaving it out of the ring
                 // (issue #67, matching OpenClusterAsync and the Go/Rust SDKs).
@@ -5418,7 +5448,6 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             catch (Exception error) when (error is NanocachedException or IOException
                 or System.Net.Sockets.SocketException or AuthenticationException)
             {
-                Interlocked.Increment(ref _refreshFailures);
                 // Silent by design — refresh is opportunistic/best-effort
                 // and must never fail the caller's operation, consistent
                 // with client-side replication's eventual-consistency model. The next
@@ -5457,7 +5486,6 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             catch (Exception error) when (error is NanocachedException or IOException
                 or System.Net.Sockets.SocketException or AuthenticationException)
             {
-                Interlocked.Increment(ref _refreshFailures);
                 lastError = error is NotACacheNodeException
                     ? new NanocachedException(error.Message)
                     : error;
@@ -5468,6 +5496,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             {
                 case Identify.NodeTarget node:
                     node.Stream.Dispose();
+                    Interlocked.Increment(ref _refreshFailures);
                     throw new NanocachedException(
                         $"nanocached: ViaProxy requires discovery addresses, but {host}:{port} "
                         + "identifies as a cache node");
@@ -5476,6 +5505,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                     return proxies.Proxies;
             }
         }
+        Interlocked.Increment(ref _refreshFailures);
         throw lastError ?? new NanocachedException(
             "nanocached: could not reach any discovery address for the proxy roster");
     }
