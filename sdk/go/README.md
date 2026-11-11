@@ -377,7 +377,10 @@ values, err := client.GetManyAndTouch([]string{"a", "b", "missing"}, 300)
 The TTL is one value for the whole batch and means what it means for `Touch`:
 `RemoveTTL` removes it, `0` expires the keys at once. A key given twice is
 touched once, and a batch of more than 400 keys is split into several frames,
-as for `GetMany`. `Namespace` has all three.
+as for `GetMany`. With a namespace longer than 167,772 bytes the frames hold
+fewer keys, because the node refuses a `y` or `o` frame whose namespace length
+times key count passes 64 MiB; `SetMany` is split the same way. `Namespace` has
+all three.
 
 Like `Touch` it goes to every owner of each key and the primary's answer
 decides. `GetManyAndTouch` asks only a key's primary for the value, so a node
