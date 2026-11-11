@@ -142,11 +142,13 @@ public class ConnectionLostException : NanocachedException
 /// handshake reply at all (an HTTP server's error page). Never sent (the
 /// handshake is all that ran), so the retry layers refresh the roster and
 /// reroute, as for a refused dial. A distinct type only so the initial
-/// connect can keep treating a listed non-node as a configuration error
-/// instead of an unreachable node (<c>OpenClusterAsync</c>); every path
-/// that can raise it for the initial connect converts it to a plain
+/// connect can tell a seed address that is no cache node, and a cluster
+/// whose every listed node is one, from an unreachable node
+/// (<c>ConnectAsync</c>, <c>OpenClusterAsync</c>); every path that can
+/// raise it for the initial connect converts it to a plain
 /// <see cref="NanocachedException"/>, so it never reaches a caller as this
-/// type from <c>ConnectAsync</c>.</summary>
+/// type from <c>ConnectAsync</c>. A listed node that answers so while
+/// another is reachable is a dead member with a reconnect cooldown.</summary>
 internal sealed class NotACacheNodeException : ConnectionLostException
 {
     internal NotACacheNodeException(string address)
@@ -163,6 +165,12 @@ internal sealed class NotACacheNodeException : ConnectionLostException
     /// <see cref="UnexpectedHandshakeReply"/>); false when it answered as
     /// discovery or a proxy.</summary>
     internal bool IsUnexpectedReply { get; }
+
+    /// <summary>A listed address answered the initial connect's handshake as
+    /// discovery or a proxy: it never was a cache node (unlike the
+    /// "no longer" of a redial).</summary>
+    internal static NotACacheNodeException NeverIdentified(string address) =>
+        new($"nanocached: {address} does not identify as a cache node", unexpectedReply: false);
 
     /// <summary>The handshake reply from <paramref name="address"/> was not
     /// a handshake reply.</summary>
