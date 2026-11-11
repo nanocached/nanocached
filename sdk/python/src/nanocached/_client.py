@@ -175,10 +175,11 @@ class ClientStats:
     ``read_repair_failures``: failures swallowed while probing owners or
     writing back the repaired value during read repair (read repair).
 
-    ``refresh_failures``: node-list refresh attempts that failed, and
-    per-node connect failures swallowed while reconciling a refresh's
-    member list — discovery outages degrade only topology updates, never
-    already-established cache traffic.
+    ``refresh_failures``: node-list refreshes that produced no usable node
+    list (counted once per refresh, however many discovery addresses it
+    tried; an empty roster counts). A failed dial of a newly listed node is
+    not a refresh failure. Discovery outages degrade only topology updates,
+    never already-established cache traffic.
 
     ``transient_retries``: every retryable-error status (``R``, issue
     #125) received on any connection this client owns — counted whether
@@ -370,9 +371,20 @@ _MAX_BATCH_KEYS = 400
 # reasoning, just per entry instead of for the whole header).
 _MAX_MULTI_ENTRY_HEADER_BYTES = 32
 
+# The node (and the proxy, client side) refuse an ``o``/``y`` frame whose
+# namespace length times its key count exceeds 64 MiB with ``En`` and a
+# close, which takes every other request on the shared connection down.
+# _batch_chunk_bounds() caps the keys per such sub-frame at
+# floor(this / namespace length), which only bites for a namespace over
+# 167,772 bytes (``m`` is not subject to the limit).
+_MAX_MULTI_NAMESPACE_KEY_BYTES = 64 * 1024 * 1024
+
 
 def _batch_chunk_bounds(
-    namespace: bytes, key_lens: Sequence[int], value_lens: Sequence[int] | None
+    namespace: bytes,
+    key_lens: Sequence[int],
+    value_lens: Sequence[int] | None,
+    namespace_capped: bool = False,
 ) -> list[tuple[int, int]]:
     """Splits a batch of ``len(key_lens)`` entries into sub-frame
     ``(start, end)`` bounds honoring both _MAX_BATCH_KEYS and
@@ -385,7 +397,13 @@ def _batch_chunk_bounds(
     alone (each was already validated against _MAX_REQUEST_BYTES by
     _check_key/_check_key_and_value before this ever runs), so a chunk
     is only ever split *before* the entry that would overflow it, never
-    leaving an empty chunk behind."""
+    leaving an empty chunk behind. ``namespace_capped`` (``o`` and ``y``
+    frames) also keeps namespace length times key count within
+    _MAX_MULTI_NAMESPACE_KEY_BYTES, a namespace being at most 1 MiB so at
+    least 64 keys always fit."""
+    max_keys = _MAX_BATCH_KEYS
+    if namespace_capped and namespace:
+        max_keys = max(1, min(max_keys, _MAX_MULTI_NAMESPACE_KEY_BYTES // len(namespace)))
     bounds: list[tuple[int, int]] = []
     start = 0
     count = 0
@@ -394,7 +412,7 @@ def _batch_chunk_bounds(
         entry_bytes = key_len + _MAX_MULTI_ENTRY_HEADER_BYTES
         if value_lens is not None:
             entry_bytes += value_lens[i]
-        if count > 0 and (count >= _MAX_BATCH_KEYS or total + entry_bytes > _MAX_REQUEST_BYTES):
+        if count > 0 and (count >= max_keys or total + entry_bytes > _MAX_REQUEST_BYTES):
             bounds.append((start, i))
             start = i
             count = 0
@@ -1139,17 +1157,18 @@ class NanocachedClient:
         found" — the caller (_reconnect_via_new_proxy) turns an empty
         result into the same clear error an empty initial roster would
         raise at connect(). Each failed address is counted in
-        stats().refresh_failures — the same counter _fetch_node_list
-        itself uses, since both are "the node/proxy list this client
-        routes with just went stale" (per the spec: reuse the SDK's
-        existing counters rather than adding a proxy-only one)."""
+        stats().refresh_failures — once per fetch that produced no usable
+        roster (every address failed, or none listed a proxy), the same
+        counter _refresh_node_list uses, since both are "the node/proxy
+        list this client routes with just went stale" (per the spec:
+        reuse the SDK's existing counters rather than adding a
+        proxy-only one)."""
         for address_host, address_port in self._addresses:
             try:
                 identified = await connect_and_identify_proxy(
                     address_host, address_port, self._auth_secret, self._ssl_context
                 )
             except _SWALLOWABLE_ERRORS:
-                self._refresh_failures += 1
                 continue
             if isinstance(identified, NodeTarget):
                 identified.writer.close()
@@ -1157,6 +1176,7 @@ class NanocachedClient:
             if not identified:
                 continue
             return identified
+        self._refresh_failures += 1
         return []
 
     # ── Public API ───────────────────────────────────────────────────
@@ -1513,7 +1533,8 @@ class NanocachedClient:
     # object the caller passed, indexed by position rather than by
     # encoded bytes, so a batch may freely mix the two. A key given more
     # than once (the same str twice, or "a" and b"a", which encode
-    # identically) is read once and keyed by its first occurrence: a
+    # identically) is read once and the result is keyed under every
+    # spelling the caller used ("a" and b"a" both find it): a
     # batched read is a set query, which is what the other five SDKs
     # do, and sending every copy to the node would also retain one
     # reply per copy — 20,000 copies of one key naming a large value is
@@ -1521,17 +1542,24 @@ class NanocachedClient:
 
     def _dedupe_batch_keys(
         self, keys: Sequence[str | bytes], namespace: bytes
-    ) -> tuple[list[str | bytes], list[bytes]]:
-        originals: list[str | bytes] = []
+    ) -> tuple[list[tuple[str | bytes, ...]], list[bytes]]:
+        # Each entry of the first list holds every distinct spelling the
+        # caller used for that key (one, or two for "a" and b"a"), so the
+        # result is keyed under each of them: a lookup by either the str
+        # or the bytes form the caller passed finds the value.
+        originals: list[tuple[str | bytes, ...]] = []
         key_bytes_list: list[bytes] = []
-        seen: set[bytes] = set()
+        seen: dict[bytes, int] = {}
         for original in keys:
             key_bytes = _to_bytes(original)
             _check_key(key_bytes, namespace)
-            if key_bytes in seen:
+            idx = seen.get(key_bytes)
+            if idx is not None:
+                if original not in originals[idx]:
+                    originals[idx] += (original,)
                 continue
-            seen.add(key_bytes)
-            originals.append(original)
+            seen[key_bytes] = len(originals)
+            originals.append((original,))
             key_bytes_list.append(key_bytes)
         return originals, key_bytes_list
 
@@ -1639,7 +1667,9 @@ class NanocachedClient:
             values: dict[str | bytes, bytes] = {}
             for original, entry in zip(originals, entries):
                 if isinstance(entry, (bytes, bytearray)):
-                    values[original] = self._decompress_for_batch(entry, budget)
+                    value = self._decompress_for_batch(entry, budget)
+                    for spelling in original:
+                        values[spelling] = value
             if error is not None:
                 # issue #411: single-node/proxy mode never retries a
                 # chunk failure (no ring to refresh against — see
@@ -1779,7 +1809,7 @@ class NanocachedClient:
     async def _multi_get_pass(
         self,
         namespace: bytes,
-        originals: list[str | bytes],
+        originals: list[tuple[str | bytes, ...]],
         key_bytes_list: list[bytes],
         values: dict[str | bytes, bytes],
         retry_indices: list[int] | None,
@@ -1841,7 +1871,9 @@ class NanocachedClient:
                     if entry is WRONG_NODE:
                         wrong_node.append(idx)
                     elif entry is not None:
-                        values[originals[idx]] = self._decompress_for_batch(entry, budget)
+                        value = self._decompress_for_batch(entry, budget)
+                        for spelling in originals[idx]:
+                            values[spelling] = value
                 if error is not None:
                     last_error = error
                     for idx in group_indices[resolved:]:
@@ -2020,7 +2052,9 @@ class NanocachedClient:
         an entry a completed chunk genuinely reported apart from one
         never attempted, without needing failed_at at all."""
         entries: list[bool | object] = [False] * len(keys)
-        bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], [len(value) for value in values])
+        bounds = _batch_chunk_bounds(
+            namespace, [len(key) for key in keys], [len(value) for value in values], True
+        )
         for start, end in bounds:
             try:
                 connection = await connection_getter()
@@ -2289,9 +2323,13 @@ class NanocachedClient:
             for idx in sorted(results):
                 entry = results[idx]
                 if not get:
-                    out[originals[idx]] = entry
+                    value = entry
                 elif entry is not None:
-                    out[originals[idx]] = self._decompress_for_batch(entry, budget)  # type: ignore[arg-type]
+                    value = self._decompress_for_batch(entry, budget)  # type: ignore[arg-type]
+                else:
+                    continue
+                for spelling in originals[idx]:
+                    out[spelling] = value
             return out
 
         if self._ring is None:
@@ -2426,7 +2464,7 @@ class NanocachedClient:
         ``failed_at`` up to ``sent_end`` are the failed chunk's; the ones
         from ``sent_end`` on were never sent."""
         entries: list[object] = [None] * len(keys)
-        bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], None)
+        bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], None, True)
         for start, end in bounds:
             chunk = keys[start:end]
             try:
@@ -3828,17 +3866,14 @@ class NanocachedClient:
         cluster = await self._fetch_node_list()
         self._last_fetch = time.monotonic()
         if cluster is None:
+            # No address produced a usable node list (unreachable, not a
+            # discovery server, or an empty roster): one failed refresh,
+            # however many addresses were tried, as in the Go and Rust SDKs.
+            self._refresh_failures += 1
             return
 
         nodes = _dedupe_discovered_nodes(cluster.nodes)
         by_name = {node.name: node for node in nodes}
-
-        for name in list(self._members):
-            if name not in by_name:
-                stale = self._members[name].connection
-                if stale is not None:
-                    stale.close()
-                del self._members[name]
 
         new_nodes = []
         for node in nodes:
@@ -3878,12 +3913,26 @@ class NanocachedClient:
                     outcome.writer.close()
             return
 
+        # Departed members are dropped here, in the same await-free section
+        # that installs the new ones and swaps the ring, not before the
+        # dials above: removing them first left the old ring routing keys
+        # to members that were no longer there for as long as the dials
+        # took (up to the connect timeout), failing those requests with
+        # "no connection". Until this point the old members and the old
+        # ring stay consistent with each other and keep serving.
+        for name in list(self._members):
+            if name not in by_name:
+                stale = self._members[name].connection
+                if stale is not None:
+                    stale.close()
+                del self._members[name]
+
         for node, outcome in outcomes:
             # Refresh is opportunistic/best-effort and must never fail the
             # caller's operation (client-side replication's
             # eventual-consistency model), so a node that can't be dialed
-            # here is counted in stats().refresh_failures but still
-            # installed — without a connection and with its reconnect
+            # here is not a refresh failure (the node list itself was
+            # fetched) and is still installed — without a connection and with its reconnect
             # cooldown armed, exactly like _open_cluster (issue #67): the
             # ring must hold every listed node, or this client routes the
             # keys near it differently from every peer that did reach it
@@ -3891,7 +3940,6 @@ class NanocachedClient:
             # listed owner). Its next use redials it once the cooldown has
             # passed.
             if not isinstance(outcome, NodeTarget):
-                self._refresh_failures += 1
                 error = (
                     outcome
                     if isinstance(outcome, Exception)
@@ -3931,8 +3979,9 @@ class NanocachedClient:
         list. Failures here are silent by design — refresh is
         opportunistic/best-effort and must never fail the caller's
         operation (client-side replication's eventual-consistency model), so behavior is
-        unchanged either way, it just happens without a warning. Each
-        failed address is counted in stats().refresh_failures."""
+        unchanged either way, it just happens without a warning. A None
+        result is counted once in stats().refresh_failures by
+        _refresh_node_list, however many addresses failed."""
         for address_host, address_port in self._addresses:
             try:
                 identified = await connect_and_identify(
@@ -3940,7 +3989,6 @@ class NanocachedClient:
                 )
             except _SWALLOWABLE_ERRORS:
                 # A genuine programming error still propagates.
-                self._refresh_failures += 1
                 continue
             if isinstance(identified, NodeTarget):
                 identified.writer.close()
