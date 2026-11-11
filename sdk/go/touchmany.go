@@ -314,10 +314,11 @@ func (c *Client) multiTouchChunked(slot string, namespace []byte, keys [][]byte,
 		apply = c.applyExpiring
 	}
 	budget := maxRequestBytes - len(namespace) - multiFrameHeaderSlack
+	maxKeys := maxKeysPerOYChunk(namespace)
 	for start := 0; start < len(keys); {
 		end := start
 		total := 0
-		for end < len(keys) && end-start < maxBatchKeys {
+		for end < len(keys) && end-start < maxKeys {
 			cost := multiGetEntryCost(keys[end])
 			if end > start && total+cost > budget {
 				break

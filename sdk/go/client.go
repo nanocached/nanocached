@@ -256,6 +256,22 @@ const maxRequestBytes = 1024*1024 - 256
 // — large keys/values hit that bound long before 400 keys would.
 const maxBatchKeys = 400
 
+// maxNamespaceKeyProduct is the most a node accepts of an `o`/`y` frame's
+// namespace length times key count; past it the node answers `En` and
+// closes the connection, failing every other request pipelined on it.
+const maxNamespaceKeyProduct = 64 * 1024 * 1024
+
+// maxKeysPerOYChunk is the key count an `o`/`y` sub-frame for namespace may
+// carry: maxBatchKeys, or fewer when a long namespace would push 400 keys
+// past maxNamespaceKeyProduct. A namespace is at most 1 MiB, so the result
+// is never under 64.
+func maxKeysPerOYChunk(namespace []byte) int {
+	if len(namespace) == 0 {
+		return maxBatchKeys
+	}
+	return max(1, min(maxBatchKeys, maxNamespaceKeyProduct/len(namespace)))
+}
+
 // validateKey rejects an empty key, or a namespace+key pair that alone
 // already exceeds maxRequestBytes, before any network I/O: the server
 // has no way to answer either shape except by closing the connection
@@ -1919,11 +1935,12 @@ func dedupeKeys(keys []string) []string {
 // alongside.
 func (c *Client) multiSetChunked(slot string, namespace []byte, keys, values [][]byte, ttlSeconds int64) ([]multiEntry, error) {
 	entries := make([]multiEntry, len(keys))
+	maxKeys := maxKeysPerOYChunk(namespace)
 	budget := maxRequestBytes - len(namespace) - multiFrameHeaderSlack
 	for start := 0; start < len(keys); {
 		end := start
 		total := 0
-		for end < len(keys) && end-start < maxBatchKeys {
+		for end < len(keys) && end-start < maxKeys {
 			cost := multiSetEntryCost(keys[end], values[end])
 			if end > start && total+cost > budget {
 				break
