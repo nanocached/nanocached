@@ -6003,7 +6003,7 @@ class NanocachedClientTest {
     }
 
     @Test
-    void anUnreachableAddressDuringRefreshIncrementsRefreshFailuresStat() throws Exception {
+    void anUnreachableAddressDuringRefreshDoesNotCountWhileAnotherAddressAnswers() throws Exception {
         try (Cluster cluster = startCluster(1)) {
             int dead = MockServers.unusedPort();
             try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
@@ -6021,7 +6021,7 @@ class NanocachedClientTest {
                 refreshNodeList.setAccessible(true);
                 refreshNodeList.invoke(client);
 
-                assertTrue(client.stats().refreshFailures() >= 1);
+                assertEquals(0, client.stats().refreshFailures());
             }
         }
     }
@@ -8015,7 +8015,7 @@ class NanocachedClientTest {
                 // Serial: 4 x 400ms = 1.6s+. Concurrent: about one timeout.
                 assertTrue(elapsedMillis < 1_200,
                         "4 blackholed new nodes should be dialed concurrently, refresh took " + elapsedMillis + "ms");
-                assertEquals(4, client.stats().refreshFailures());
+                assertEquals(0, client.stats().refreshFailures(), "a failed dial of a listed node is not a failed refresh");
             }
         } finally {
             Identify.connectTimeoutMillis = originalTimeout;
@@ -8054,7 +8054,7 @@ class NanocachedClientTest {
                 cooldownsField.setAccessible(true);
                 assertTrue(((Map<?, ?>) cooldownsField.get(client)).containsKey(deadAddress),
                         "its reconnect cooldown must be armed");
-                assertEquals(1, client.stats().refreshFailures());
+                assertEquals(0, client.stats().refreshFailures());
             }
         }
     }
@@ -8199,7 +8199,7 @@ class NanocachedClientTest {
                 Map<?, ?> cooldowns = (Map<?, ?>) cooldownsField.get(client);
                 assertTrue(cooldowns.containsKey("no-port-here"), "the unparseable address has its cooldown armed");
                 assertTrue(cooldowns.containsKey(notACacheNode), "the non-node address has its cooldown armed");
-                assertEquals(2, client.stats().refreshFailures());
+                assertEquals(0, client.stats().refreshFailures());
 
                 // The next use of such a node surfaces the error the dial
                 // produced, without dialing again inside the cooldown.
@@ -8924,6 +8924,33 @@ class NanocachedClientTest {
             }
         } finally {
             Connection.requestTimeoutMillis = defaultTimeout;
+        }
+    }
+
+    // ── refresh_failures counts per refresh (issue #1735) ───────────
+
+    @Test
+    void refreshFailuresCountsOncePerRefreshWithNoUsableNodeList() throws Exception {
+        try (Cluster cluster = startCluster(1)) {
+            int dead = MockServers.unusedPort();
+            int dead2 = MockServers.unusedPort();
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(
+                            new Address("127.0.0.1", dead),
+                            new Address("127.0.0.1", dead2),
+                            new Address("127.0.0.1", cluster.discovery().port()))))) {
+                // A working address later in the list: no failure.
+                forceRefresh(client);
+                assertEquals(0, client.stats().refreshFailures());
+
+                // An empty roster is a refresh without a usable node list.
+                List<DiscoveredNode> roster = cluster.discovery().nodes;
+                cluster.discovery().nodes = List.of();
+                forceRefresh(client);
+                assertEquals(1, client.stats().refreshFailures(),
+                        "two dead addresses plus an empty roster are one failed refresh");
+                cluster.discovery().nodes = roster;
+            }
         }
     }
 }
