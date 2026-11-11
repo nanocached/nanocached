@@ -6344,7 +6344,6 @@ public final class NanocachedClient implements AutoCloseable {
             try {
                 identified = Identify.connectAndIdentify(address.host(), address.port(), authSecret, tls, true);
             } catch (IOException | RuntimeException error) {
-                refreshFailures.incrementAndGet();
                 continue;
             }
             if (identified instanceof Identify.NodeTarget node) {
@@ -6356,7 +6355,6 @@ public final class NanocachedClient implements AutoCloseable {
                 } catch (IOException ignored) {
                     // Best-effort cleanup.
                 }
-                refreshFailures.incrementAndGet();
                 continue;
             }
             List<DiscoveredNode> proxies = ((Identify.ProxyRosterTarget) identified).proxies();
@@ -6364,6 +6362,10 @@ public final class NanocachedClient implements AutoCloseable {
             // An empty roster from this seed: try the next one, mirroring
             // fetchNodeList's identical treatment of an empty node list.
         }
+        // One failure per fetch that produced no usable roster, however
+        // many addresses were tried (the definition fetchNodeList's caller
+        // counts by too).
+        refreshFailures.incrementAndGet();
         return null;
     }
 
@@ -6640,7 +6642,14 @@ public final class NanocachedClient implements AutoCloseable {
     private void refreshNodeList() {
         Identify.ClusterTarget cluster = fetchNodeList();
         lastFetchNanos = System.nanoTime();
-        if (cluster == null) return;
+        if (cluster == null) {
+            // Every address was unreachable, not a discovery server, or
+            // listed no node: one failure for this refresh, as in the Go
+            // and Rust SDKs (stats().refreshFailures counts refreshes that
+            // did not produce a usable node list).
+            refreshFailures.incrementAndGet();
+            return;
+        }
 
         // Dialing newly listed nodes happens *outside* stateLock
         // (mirroring .NET's RefreshNodeListAsync): every get/set/delete
@@ -6723,9 +6732,9 @@ public final class NanocachedClient implements AutoCloseable {
                 // removed by the #25/#27 API-unification work — not issue
                 // #12, which is only the redial-gate pruning above — since
                 // a per-node connect failure here changes no behavior and
-                // isn't worth a warning on every refresh. Counted via
-                // stats().refreshFailures instead.
-                refreshFailures.incrementAndGet();
+                // isn't worth a warning on every refresh. Not counted in
+                // stats().refreshFailures: the node list itself was usable,
+                // and the node stays a member that is dialed again on use.
                 // Install the just-discovered node without a connection and
                 // arm its cooldown instead of leaving it out of the ring
                 // (issue #67, matching openCluster and the Go/Rust/.NET/
@@ -6765,8 +6774,8 @@ public final class NanocachedClient implements AutoCloseable {
                 // Silent by design — refresh is opportunistic/best-effort
                 // and must never fail the caller's operation, consistent
                 // with client-side replication's eventual-consistency model. The next
-                // refresh retries; counted via stats().refreshFailures.
-                refreshFailures.incrementAndGet();
+                // refresh retries; counted via stats().refreshFailures (once
+                // per refresh, by refreshNodeList).
                 continue;
             }
             if (identified instanceof Identify.NodeTarget node) {
