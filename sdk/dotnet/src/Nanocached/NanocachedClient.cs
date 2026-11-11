@@ -866,7 +866,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 continue;
             }
 
-            if (error is ConnectionLostException and not NotACacheNodeException)
+            // A listed node that answers the handshake with a non-handshake
+            // reply (an HTTP server that reused the address) is a dead
+            // member like a refused dial, as in the other SDKs; one that
+            // answers as discovery/proxy stays a hard error.
+            if (error is ConnectionLostException and (not NotACacheNodeException
+                or NotACacheNodeException { IsUnexpectedReply: true }))
             {
                 _members[node.Name] = new Member(node.Address, null);
                 ArmReconnectCooldown(node.Address, error);
@@ -891,6 +896,13 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
 
         if (reachable == 0)
         {
+            if (lastError is NotACacheNodeException notANode)
+            {
+                // No node reachable and the last failure was a garbage
+                // handshake: the plain configuration error, never the
+                // internal type.
+                throw new NanocachedException(notANode.Message);
+            }
             ExceptionDispatchInfo.Capture(lastError!).Throw();
         }
 
