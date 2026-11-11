@@ -31,6 +31,7 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf,
 };
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -765,6 +766,40 @@ const BUSY_REPLY_DRAIN_LIMIT: usize = 8 * 1024;
 /// connection (2,934 for 3,000 connections measured), each a blocking write
 /// on the runtime thread.
 pub async fn reject_over_limit(
+    stream: TcpStream,
+    address: SocketAddr,
+    tls_acceptor: &Option<TlsAcceptor>,
+    tls_handshake_timeout: Duration,
+    busy_reply: &[u8],
+    log: fn(std::fmt::Arguments<'_>),
+) {
+    reject_over_limit_with(
+        &REJECT_SLOTS,
+        stream,
+        address,
+        tls_acceptor,
+        tls_handshake_timeout,
+        busy_reply,
+        log,
+    )
+    .await;
+}
+
+/// How many rejected connections may be inside `reject_over_limit`'s reply
+/// and drain at once. A rejected connection holds no slot of the
+/// connection cap it was turned away by (a per-IP rejection returns the
+/// global permit first, so a source cannot keep global slots by leaving
+/// rejected connections open), which leaves the number lingering in their
+/// drain, up to `BUSY_REPLY_DRAIN_WINDOW` each, bounded only by the accept
+/// rate. This bounds it separately: past it a rejected connection gets a
+/// best-effort non-blocking busy reply and is closed at once, with no
+/// drain (so a client that had already sent its first frame may see a reset
+/// rather than the reply).
+const MAX_CONCURRENT_REJECTS: usize = 128;
+static REJECT_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_REJECTS);
+
+async fn reject_over_limit_with(
+    slots: &Semaphore,
     mut stream: TcpStream,
     address: SocketAddr,
     tls_acceptor: &Option<TlsAcceptor>,
@@ -773,6 +808,10 @@ pub async fn reject_over_limit(
     log: fn(std::fmt::Arguments<'_>),
 ) {
     if tls_acceptor.is_none() {
+        let Ok(_slot) = slots.try_acquire() else {
+            let _ = stream.try_write(busy_reply);
+            return;
+        };
         match timeout(tls_handshake_timeout, stream.write_all(busy_reply)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -1355,5 +1394,76 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("rather than treated as unset"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn rejections_past_the_reject_slots_are_closed_at_once_without_a_drain() {
+        // Issue #1720: a rejected connection holds no connection-cap
+        // permit, so the number inside the reply and drain is bounded here
+        // instead. One slot, held by a rejected peer that never closes
+        // (inside its drain window): the next rejection must get its busy
+        // reply and be closed at once, not queue behind the first.
+        async fn pair() -> (TcpStream, TcpStream) {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            (client, server)
+        }
+        fn quiet(_: std::fmt::Arguments<'_>) {}
+        let slots = Arc::new(Semaphore::new(1));
+        let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        let (mut first_client, first_server) = pair().await;
+        let first = tokio::spawn({
+            let slots = Arc::clone(&slots);
+            async move {
+                reject_over_limit_with(
+                    &slots,
+                    first_server,
+                    address,
+                    &None,
+                    Duration::from_secs(5),
+                    b"B\n",
+                    quiet,
+                )
+                .await;
+            }
+        });
+        let mut reply = [0_u8; 2];
+        first_client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"B\n");
+        // The first rejection is now in its drain; it holds the slot.
+        assert_eq!(slots.available_permits(), 0);
+
+        let (mut second_client, second_server) = pair().await;
+        let started = std::time::Instant::now();
+        reject_over_limit_with(
+            &slots,
+            second_server,
+            address,
+            &None,
+            Duration::from_secs(5),
+            b"B\n",
+            quiet,
+        )
+        .await;
+        assert!(
+            started.elapsed() < BUSY_REPLY_DRAIN_WINDOW / 2,
+            "the over-slot rejection waited {:?}",
+            started.elapsed()
+        );
+        let mut second_reply = Vec::new();
+        second_client.read_to_end(&mut second_reply).await.unwrap();
+        assert_eq!(second_reply, b"B\n");
+        assert!(!first.is_finished(), "the first drain should still run");
+
+        // The slot comes back once the first rejection finishes.
+        drop(first_client);
+        first.await.unwrap();
+        assert_eq!(slots.available_permits(), 1);
     }
 }

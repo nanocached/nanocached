@@ -2792,6 +2792,7 @@ impl BackendHandle {
         slot: Arc<tokio::sync::Mutex<Option<BackendHandle>>>,
         dialed: Arc<std::sync::atomic::AtomicUsize>,
         keepalive_interval: Duration,
+        exit_log: Arc<LogLimiter>,
     ) -> io::Result<Self> {
         let mut stream = timeout(UPSTREAM_IO_TIMEOUT, connect_upstream(addr, tls_connector))
             .await
@@ -2838,6 +2839,7 @@ impl BackendHandle {
                 dialed,
                 own_id: id,
                 keepalive_interval,
+                exit_log,
             },
         ));
         Ok(Self { id, sender })
@@ -2854,6 +2856,10 @@ struct BackendIdentity {
     dialed: Arc<std::sync::atomic::AtomicUsize>,
     own_id: u64,
     keepalive_interval: Duration,
+    /// The budget for this address's exit lines (shared by every
+    /// connection dialed to it, so a node that closes each connection
+    /// right after the handshake does not log once per redial).
+    exit_log: Arc<LogLimiter>,
 }
 
 /// The shared backend connection's writer half (issue #110): assigns
@@ -2896,6 +2902,7 @@ async fn run_backend(
         dialed,
         own_id,
         keepalive_interval,
+        exit_log,
     } = identity;
     let (mut read_half, mut write_half) = tokio::io::split(stream);
     // Issue #514: the reply sender is `None` for a keep-alive probe the
@@ -2926,6 +2933,7 @@ async fn run_backend(
     let clients_affected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_clients_affected = Arc::clone(&clients_affected);
     let reader_addr = addr.clone();
+    let reader_exit_log = Arc::clone(&exit_log);
 
     // The reader half: resolves pending replies in FIFO order. The
     // per-reply timeout is a *progress* bound (each reply must arrive
@@ -2954,8 +2962,12 @@ async fn run_backend(
                     // Nothing was pending, so no client request is on
                     // this connection: the writer's next reservation
                     // fails before it writes (`not_sent`, redialled).
-                    eprintln!(
-                        "INFO backend connection to {reader_addr} {idle}; will redial on next request"
+                    log_backend_exit(
+                        &reader_exit_log,
+                        &reader_addr,
+                        format!(
+                            "INFO backend connection to {reader_addr} {idle}; will redial on next request"
+                        ),
                     );
                     pending_rx.close();
                     while let Some((_, _, reply)) = pending_rx.recv().await {
@@ -3140,13 +3152,14 @@ async fn run_backend(
     // "backend connection is gone" error with no address attached. A
     // clean drain (every sender dropped, e.g. prune retired the address)
     // is expected teardown, not a fault, so it is logged differently.
-    eprintln!(
-        "{}",
+    log_backend_exit(
+        &exit_log,
+        &addr,
         backend_exit_log_line(
             &addr,
             poisoned_exit,
             clients_affected.load(std::sync::atomic::Ordering::Relaxed),
-        )
+        ),
     );
 
     // issue #192: eagerly clear this connection's slot and decrement the
@@ -3195,6 +3208,47 @@ async fn watch_idle_backend<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut Byte
             "sent data with no request pending".to_string()
         }
         Err(error) => format!("failed while idle ({error})"),
+    }
+}
+
+/// Lines a backend address may log about its connections going away, per
+/// `BACKEND_EXIT_LOG_WINDOW`. A node that closes every connection right
+/// after the handshake resets the redial backoff each time, so without a
+/// budget the line was written once per request.
+const BACKEND_EXIT_LOG_LINES: u32 = 3;
+const BACKEND_EXIT_LOG_WINDOW: Duration = Duration::from_secs(10);
+
+fn new_backend_exit_limiter() -> LogLimiter {
+    LogLimiter::new(BACKEND_EXIT_LOG_LINES, BACKEND_EXIT_LOG_WINDOW)
+}
+
+/// What to write for one backend exit line at `now`: nothing when the
+/// address's budget is spent (the line is counted), otherwise the line,
+/// preceded by a summary of the lines dropped since the last one written.
+fn backend_exit_lines(
+    limiter: &LogLimiter,
+    addr: &str,
+    line: String,
+    now: tokio::time::Instant,
+) -> Vec<String> {
+    let Some(suppressed) = limiter.admit_at(now) else {
+        return Vec::new();
+    };
+    if suppressed > 0 {
+        vec![
+            format!(
+                "WARN {suppressed} more backend connection lines for {addr} (not logged individually)"
+            ),
+            line,
+        ]
+    } else {
+        vec![line]
+    }
+}
+
+fn log_backend_exit(limiter: &LogLimiter, addr: &str, line: String) {
+    for line in backend_exit_lines(limiter, addr, line, tokio::time::Instant::now()) {
+        eprintln!("{line}");
     }
 }
 
@@ -3887,6 +3941,10 @@ struct SharedBackends {
     /// `BACKEND_KEEPALIVE_INTERVAL` in production, shortened only by
     /// tests that exercise the keep-alive itself (`with_keepalive_interval`).
     keepalive_interval: Duration,
+    /// Per address, the budget of its backend exit lines. It has to
+    /// outlive the connection: the one that flaps is replaced by a new
+    /// task each time.
+    exit_logs: std::sync::Mutex<HashMap<String, Arc<LogLimiter>>>,
 }
 
 impl SharedBackends {
@@ -3900,7 +3958,19 @@ impl SharedBackends {
             dialed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dial_failures: std::sync::Mutex::new(HashMap::new()),
             keepalive_interval,
+            exit_logs: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    fn exit_log(&self, addr: &str) -> Arc<LogLimiter> {
+        let mut logs = self
+            .exit_logs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            logs.entry(addr.to_string())
+                .or_insert_with(|| Arc::new(new_backend_exit_limiter())),
+        )
     }
 
     fn slot(&self, addr: &str) -> Arc<tokio::sync::Mutex<Option<BackendHandle>>> {
@@ -3970,6 +4040,13 @@ impl SharedBackends {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             failures.retain(|addr, _| live.contains(addr));
+        }
+        {
+            let mut logs = self
+                .exit_logs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            logs.retain(|addr, _| live.contains(addr));
         }
     }
 
@@ -4044,6 +4121,7 @@ impl SharedBackends {
                             Arc::clone(&slot),
                             Arc::clone(&self.dialed),
                             self.keepalive_interval,
+                            self.exit_log(addr),
                         )
                         .await
                         {
@@ -12886,6 +12964,7 @@ mod tests {
             slot,
             Arc::new(AtomicUsize::new(0)),
             Duration::from_secs(30),
+            Arc::new(new_backend_exit_limiter()),
         )
         .await
         .unwrap();
@@ -15027,6 +15106,35 @@ mod tests {
             node.auth_count.load(Ordering::SeqCst),
             2,
             "exactly one redial, made by the request"
+        );
+    }
+
+    #[test]
+    fn a_flapping_backend_does_not_log_a_line_per_redial() {
+        // The node closes every connection right after the handshake, so
+        // the backoff resets and the exit line comes once per request.
+        let flapping = new_backend_exit_limiter();
+        let other = new_backend_exit_limiter();
+        let start = tokio::time::Instant::now();
+        let written = (0..1000)
+            .map(|_| backend_exit_lines(&flapping, "10.0.0.1:8356", "INFO exit".to_string(), start))
+            .map(|lines| lines.len())
+            .sum::<usize>();
+        assert_eq!(written, BACKEND_EXIT_LOG_LINES as usize);
+        // Another address has its own budget.
+        assert_eq!(
+            backend_exit_lines(&other, "10.0.0.2:8356", "INFO exit".to_string(), start),
+            vec!["INFO exit".to_string()]
+        );
+        // The next window reports what was dropped ahead of the line.
+        let later = start + BACKEND_EXIT_LOG_WINDOW;
+        assert_eq!(
+            backend_exit_lines(&flapping, "10.0.0.1:8356", "INFO exit".to_string(), later),
+            vec![
+                "WARN 997 more backend connection lines for 10.0.0.1:8356 (not logged individually)"
+                    .to_string(),
+                "INFO exit".to_string()
+            ]
         );
     }
 

@@ -12,6 +12,15 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Fixed
+
+- Node, discovery: the number of rejected connections lingering in their
+  busy-reply drain (up to 200 ms each, for a peer that does not close) was
+  bounded only by the accept rate, since a connection turned away by the
+  per-IP cap no longer holds a global slot (#1664). At most 128 rejected
+  connections now drain at once; past that a rejected connection gets a
+  non-blocking busy reply and is closed at once, with no drain (#1720).
+
 ### Changed
 
 - Docs: the accepted-behaviour list now says that a proxied delete whose
@@ -48,6 +57,10 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: a backend that closes each connection right after the handshake (so
+  the redial backoff resets every time) logged its exit line once per
+  request. The lines are now limited per backend address (3 per 10 s), with
+  the number dropped reported ahead of the next line written. (#1715)
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a
