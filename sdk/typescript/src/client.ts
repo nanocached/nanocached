@@ -229,10 +229,14 @@ export interface ClientStats {
   /** Failures swallowed while probing owners or writing back the repaired
    * value during read repair (read repair). */
   readRepairFailures: number;
-  /** Node-list refresh attempts that failed, and per-node connect
-   * failures swallowed while reconciling a refresh's member list
-   * (refreshNodeList/fetchNodeList) — discovery outages degrade only
-   * topology updates, never already-established cache traffic. */
+  /** Node-list refreshes that did not produce a usable list: every
+   * configured discovery address was unreachable, still warming up, no
+   * longer a discovery server, or knew no live nodes (in proxy mode, no
+   * registered proxies). Counted once per such refresh, however many
+   * addresses were tried. A failed dial of a newly listed node, or of a
+   * proxy, during a refresh that did return a list is not counted —
+   * discovery outages degrade only topology updates, never
+   * already-established cache traffic. */
   refreshFailures: number;
   /** Retryable-error status (issue #125): every `R` this client has
    * received on any data command (`G`/`S`/`D`/`g`/`s`/`d`/`c`/`F`),
@@ -575,6 +579,17 @@ const FORCED_REFRESH_MIN_INTERVAL_MS = 200;
 // bound on top of this one.
 export const MAX_BATCH_KEYS = 400;
 
+// The most a node accepts of an `o`/`y` frame's namespace length x key count.
+const MAX_NAMESPACE_KEY_PRODUCT = 64 * 1024 * 1024;
+
+/** Keys per `o`/`y` chunk for `namespace`: MAX_BATCH_KEYS, or fewer when
+ * the namespace is long enough for 400 of them to pass the node's
+ * namespace-length x key-count limit. */
+function maxKeysForNamespace(namespace: Uint8Array): number {
+  if (namespace.length === 0) return MAX_BATCH_KEYS;
+  return Math.max(1, Math.min(MAX_BATCH_KEYS, Math.floor(MAX_NAMESPACE_KEY_PRODUCT / namespace.length)));
+}
+
 // Batch chunking's byte bound (issue #222): finds the largest run starting
 // at `start` — at most MAX_BATCH_KEYS entries — whose namespace, plus
 // protocol.ts's own MULTI_FRAME_HEADER_SLACK, plus per-entry wire cost
@@ -591,10 +606,22 @@ export const MAX_BATCH_KEYS = 400;
 // entry eagerly, before chunking ever starts (see
 // getManyBytesInNamespace/setManyInNamespace), so a run is never empty
 // and this always makes progress.
-function nextChunkEnd(namespace: Uint8Array, count: number, start: number, entryBytes: (index: number) => number): number {
+//
+// `o` and `y` frames have one more bound: the node rejects (`En`, then
+// closes) a frame whose namespace length times its key count exceeds 64 MiB,
+// which would also fail every other request in flight on that connection.
+// `maxKeys` is how a chunk of those stays below it; a namespace is at most
+// 1 MiB, so it is never under 64 keys.
+function nextChunkEnd(
+  namespace: Uint8Array,
+  count: number,
+  start: number,
+  entryBytes: (index: number) => number,
+  maxKeys: number = MAX_BATCH_KEYS,
+): number {
   let end = start;
   let total = namespace.length + MULTI_FRAME_HEADER_SLACK;
-  while (end < count && end - start < MAX_BATCH_KEYS) {
+  while (end < count && end - start < maxKeys) {
     const next = total + entryBytes(end);
     if (end > start && next > MAX_REQUEST_BYTES) break;
     total = next;
@@ -2090,7 +2117,7 @@ export class NanocachedClient {
   ): Promise<{ entries: TouchAnswer[]; resolved: number; sentEnd: number; error: unknown }> {
     const entries: TouchAnswer[] = [];
     for (let start = 0; start < keyBytes.length; ) {
-      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]));
+      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]), maxKeysForNamespace(namespace));
       let connected = false;
       try {
         const connection = await connectionFor();
@@ -2856,7 +2883,7 @@ export class NanocachedClient {
   ): Promise<MultiAckEntry[]> {
     const entries: MultiAckEntry[] = new Array(keyBytes.length);
     for (let start = 0; start < keyBytes.length; ) {
-      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiSetEntryCost(keyBytes[i], valueBytes[i]));
+      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiSetEntryCost(keyBytes[i], valueBytes[i]), maxKeysForNamespace(namespace));
       try {
         const connection = await connectionFor();
         const chunkEntries = await connection.multiSet(keyBytes.slice(start, end), valueBytes.slice(start, end), ttlSeconds, namespace);
@@ -4009,6 +4036,13 @@ export class NanocachedClient {
           ? error instanceof ConnectionLostError && error.requestWasSent === false
           : isConnectionError(error));
       if (!retryable || this.target.kind === "single") throw error;
+      // In proxy mode a request's own timeout is not resent: the proxy
+      // accepted the frame and never answered, so a redial would stall for
+      // another full window (Go, Rust, Java and .NET do not resend it
+      // either). In cluster mode the retry stays, as in those SDKs: it
+      // refreshes and re-resolves the owners, and a hung node may have
+      // been dropped from discovery by then.
+      if (this.target.kind === "proxy" && error instanceof ConnectionLostError && error.requestTimedOut) throw error;
       await this.maybeRefreshNodeList({ force: true });
       return await operation();
     }
@@ -4142,16 +4176,17 @@ export class NanocachedClient {
    * not already-established cache traffic — so failure here (discovery
    * unreachable, or a specific new node failing to connect) never throws
    * out to the get/set/delete call that triggered it. It fails silently
-   * (each such failure counted in stats().refreshFailures — see
-   * ClientStats), keeps the current target as-is (skipping just the node
-   * that failed to connect, if only one did), and tries again on the next
-   * stale check. */
+   * (a refresh that produced no usable node list is counted once in
+   * stats().refreshFailures — see ClientStats), keeps the current target
+   * as-is (skipping just the node that failed to connect, if only one
+   * did), and tries again on the next stale check. */
   private async refreshNodeList(): Promise<void> {
     if (this.target.kind !== "cluster") return;
     const currentMembers = this.target.members;
 
     const identified = await this.fetchNodeList();
     if (identified === null) {
+      this.refreshFailures++;
       this.lastNodeListFetch = Date.now();
       return;
     }
@@ -4256,9 +4291,8 @@ export class NanocachedClient {
         // client route keys near it differently from every peer that did
         // reach it until the next refresh. Kept, its keys fail over per
         // request; the next refresh still retries the dial. The failure
-        // stays silent to the caller and is counted in
-        // stats().refreshFailures.
-        this.refreshFailures++;
+        // stays silent to the caller and is not a refresh failure: the
+        // refresh did produce a node list.
         members.set(node.name, { address: node.address, connection: null });
         this.reconnectCooldowns.set(node.address, {
           until: Date.now() + this.reconnectCooldownMs,
@@ -4272,8 +4306,7 @@ export class NanocachedClient {
         // Discovery returned an address that identifies as a discovery/
         // proxy, not a cache node. Treated the same as a failed dial above
         // so the ring still agrees with peers (the socket was already
-        // closed by connectAndIdentify); counted in stats().refreshFailures.
-        this.refreshFailures++;
+        // closed by connectAndIdentify).
         members.set(node.name, { address: node.address, connection: null });
         this.reconnectCooldowns.set(node.address, {
           until: Date.now() + this.reconnectCooldownMs,
@@ -4324,8 +4357,8 @@ export class NanocachedClient {
    * list. Returns `null` — keep the last-known list — when none can
    * provide one: unreachable, still inside its startup grace (`B`), no
    * longer a discovery server, or knowing no live nodes. Fails silently;
-   * see the doc comment on refreshNodeList. Each unreachable/erroring
-   * address is counted in stats().refreshFailures. */
+   * see the doc comment on refreshNodeList. The caller counts the refresh
+   * in stats().refreshFailures when this returns `null`. */
   private async fetchNodeList(): Promise<{ nodes: DiscoveredNode[]; replication: number } | null> {
     for (const address of this.addresses) {
       let identified;
@@ -4334,7 +4367,6 @@ export class NanocachedClient {
       } catch (error) {
         // An actual programming bug (isSwallowable) still propagates.
         if (!isSwallowable(error)) throw error;
-        this.refreshFailures++;
         continue;
       }
 
@@ -4349,7 +4381,6 @@ export class NanocachedClient {
         // the same way, matching the initial connect() path's treatment
         // of an empty node list as a real failure (issue #47 audit item
         // 7), not a silent skip.
-        this.refreshFailures++;
         continue;
       }
 
@@ -4364,8 +4395,9 @@ export class NanocachedClient {
    * `L`. Same "keep the last-known list, never throw" contract —
    * unreachable, still warming up (`B`), no longer a discovery server, or
    * registering zero proxies are all just reasons to try the next
-   * address, counted in stats().refreshFailures; an actual programming
-   * bug (isSwallowable) still propagates. */
+   * address; the caller counts the refresh in stats().refreshFailures
+   * when this returns `null`. An actual programming bug (isSwallowable)
+   * still propagates. */
   private async fetchProxyList(): Promise<DiscoveredNode[] | null> {
     for (const address of this.addresses) {
       let result;
@@ -4373,7 +4405,6 @@ export class NanocachedClient {
         result = await connectAndListProxies({ host: address.host, port: address.port, authSecret: this.authSecret, tls: this.tls, ca: this.ca });
       } catch (error) {
         if (!isSwallowable(error)) throw error;
-        this.refreshFailures++;
         continue;
       }
 
@@ -4382,12 +4413,10 @@ export class NanocachedClient {
         // — connect() is what hard-errors on this at bootstrap (issue
         // #122); here it's just another reason this address can't serve
         // the refresh, same as an unreachable one.
-        this.refreshFailures++;
         continue;
       }
 
       if (result.proxies.length === 0) {
-        this.refreshFailures++;
         continue;
       }
 
@@ -4418,6 +4447,7 @@ export class NanocachedClient {
 
     const proxies = await this.fetchProxyList();
     if (proxies === null) {
+      this.refreshFailures++;
       this.lastNodeListFetch = Date.now();
       return;
     }
@@ -4430,7 +4460,6 @@ export class NanocachedClient {
         identified = await connectAndIdentify({ ...splitHostPort(proxy.address), authSecret: this.authSecret, tls: this.tls, ca: this.ca });
       } catch (error) {
         if (!isSwallowable(error)) throw error;
-        this.refreshFailures++;
         continue;
       }
 
@@ -4438,7 +4467,6 @@ export class NanocachedClient {
         // A listed proxy that no longer identifies as one — skip it like
         // any other bad candidate, same as fetchProxyList's own handling
         // of a stale address.
-        this.refreshFailures++;
         continue;
       }
 
