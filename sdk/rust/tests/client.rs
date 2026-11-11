@@ -4373,6 +4373,44 @@ async fn get_many_bytes_batch_over_the_byte_cap_splits_into_multiple_m_subframes
     node.stop();
 }
 
+// ── an unrelated Protocol error from the dial is not a connection loss ──
+
+#[tokio::test]
+async fn a_protocol_error_that_is_not_the_handshake_reply_is_not_turned_into_connection_lost() {
+    let node = MockNode::start().await;
+    let port = node.port;
+    let client = NanocachedClient::connect(options(port).disable_reconnect_cooldown())
+        .await
+        .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+    node.stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The address now answers `A` as a discovery server and then sends a
+    // node list that is no node list: a `Protocol` error that is not the
+    // handshake reply, so it must not be reported as a reroutable loss.
+    let listener = bind_listener(port).await;
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = socket.write_all(b"Od\nXXX\n").await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+
+    let result = tokio::time::timeout(Duration::from_secs(10), client.get("k"))
+        .await
+        .expect("get must not hang");
+    match result {
+        Err(Error::Protocol(message)) => {
+            assert!(message.contains("discovery server"), "{message}");
+        }
+        other => panic!("expected Error::Protocol, got {other:?}"),
+    }
+}
+
 // ── `B` on an established connection ────────────────────────────────
 
 /// Answers the `A` handshake, then every request with `B`, on a connection

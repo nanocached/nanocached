@@ -5599,17 +5599,20 @@ impl NanocachedClient {
             DiscoveryQuery::Nodes,
         )
         .await
-        // A `Protocol` error from the dial is the handshake's (an address
-        // that answers `A` with something that is no handshake reply, an
-        // HTTP server's `400 Bad Request`, say): raised before any frame of
-        // the caller's request exists, so it is the dial's failure like a
+        // The dial's `Protocol` error for an `A` reply that is no handshake
+        // reply (an address that answers with an HTTP server's `400 Bad
+        // Request`, say); any other `Protocol` error (a panicked TLS setup
+        // task, say) is not the handshake's and passes through. Raised before
+        // any frame of the caller's request exists, so it is the dial's failure like a
         // refused connection, not a protocol violation of an established
         // one. `ConnectionLost` lets `with_cluster_retry` refresh the node
         // list and reroute, and the reconnect-cooldown entry made from it
         // fails the next operation the same way. The first `connect()`
         // does not come through here and keeps `Protocol`.
         .map_err(|error| match error {
-            Error::Protocol(message) => Error::ConnectionLost(message),
+            Error::Protocol(message) if message == crate::identify::UNEXPECTED_A_REPLY => {
+                Error::ConnectionLost(message)
+            }
             other => other,
         })?;
         match identified {

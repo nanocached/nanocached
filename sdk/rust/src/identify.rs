@@ -122,6 +122,12 @@ pub(crate) type TlsConfig = std::convert::Infallible;
 /// work onto tokio's blocking thread pool instead (issue #47 audit item
 /// R3); the join error case only fires if that task panics, which
 /// `build_tls_config` never does on its own.
+/// The `Error::Protocol` message for an `A` reply that is no handshake
+/// reply at all. `client.rs` matches on it to tell this dial failure from
+/// the other `Protocol` errors a dial can return (a panicked TLS setup
+/// task, a malformed node list).
+pub(crate) const UNEXPECTED_A_REPLY: &str = "nanocached: unexpected response to A";
+
 #[cfg(feature = "tls")]
 pub(crate) async fn resolve_tls(
     tls: bool,
@@ -486,19 +492,19 @@ async fn do_connect_and_identify(
             .map_err(classify_auth_io_error)?;
         if terminator[0] != b'\n' {
             return Err(AuthFailure::Other(Error::Protocol(
-                "nanocached: unexpected response to A".to_string(),
+                UNEXPECTED_A_REPLY.to_string(),
             )));
         }
         true
     } else {
         return Err(AuthFailure::Other(Error::Protocol(
-            "nanocached: unexpected response to A".to_string(),
+            UNEXPECTED_A_REPLY.to_string(),
         )));
     };
 
     if !matches!(ack[0], b'O' | b'E') || !matches!(ack[1], b'n' | b'd') {
         return Err(AuthFailure::Other(Error::Protocol(
-            "nanocached: unexpected response to A".to_string(),
+            UNEXPECTED_A_REPLY.to_string(),
         )));
     }
     if ack[0] == b'E' {
