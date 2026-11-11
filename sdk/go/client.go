@@ -867,7 +867,10 @@ func (c *Client) openCluster(result *identified) error {
 		} else if outcome.result.conn == nil {
 			cooldownError = notSent(connectionLost(
 				"nanocached: "+node.Address+" does not identify as a cache node", nil))
-			outcome.err = cooldownError
+			// What Connect returns when nothing is reachable stays the
+			// protocol error it was for this answer.
+			outcome.err = protocolErrorf(
+				"nanocached: discovery server returned a non-node address: %s", node.Address)
 		}
 
 		if outcome.err != nil {

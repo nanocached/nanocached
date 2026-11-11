@@ -3,6 +3,7 @@ package nanocached
 import (
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -134,15 +135,15 @@ func TestConnectToleratesAListedAddressThatAnswersAsDiscovery(t *testing.T) {
 	}
 }
 
-// With no reachable node at all, Connect still fails, and with a lost
-// connection error rather than a protocol one.
+// With no reachable node at all, Connect still fails with the protocol
+// error it always did for a non-node address.
 func TestConnectFailsWhenEveryListedAddressAnswersAsDiscovery(t *testing.T) {
 	discovery := startMockDiscovery(t, []discoveredNode{
 		{Name: testNames[0], Address: startMockDiscovery(t, nil, 1).address()},
 	}, 1)
 	_, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
-	if !errors.Is(err, ErrConnectionLost) {
-		t.Fatalf("Connect() = %v, want ErrConnectionLost", err)
+	if !errors.Is(err, ErrProtocol) || !strings.Contains(err.Error(), "returned a non-node address") {
+		t.Fatalf("Connect() = %v, want the non-node ErrProtocol", err)
 	}
 }
 
