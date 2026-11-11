@@ -45,6 +45,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a forwarded handoff write (`U`, `u`, `f`) answered `R`
+  was treated as a generic failure. Each forward to that address dialed it
+  `KEY_TRANSFER_ATTEMPTS` times and every later one once more, until the
+  30 s window closed, although the drain, the re-replication and the
+  handoff paths write such an address off at once. A forward that gets `R`
+  now stops retrying, and the forwards that follow inside the window do not
+  dial the address; the same goes for the join transfer's retries (#1718).
+
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a
