@@ -280,7 +280,7 @@ failure is logged-and-swallowed into `Stats().ReplicaWriteFailures`,
 exactly like a plain `SetAsync`'s own replica legs.
 
 Very large batches are transparently split into more than one `m`/`o`
-sub-frame per owner — callers never need to think about this. Hedged reads and read repair do not apply to batches.
+sub-frame per owner — callers never need to think about this. A frame holds at most 400 keys, and for `o` and `y` also at most 64 MiB of namespace length times key count (the node's limit), so a very long namespace shrinks the chunk to as few as 64 keys. Hedged reads and read repair do not apply to batches.
 
 ## Compare-and-set
 
