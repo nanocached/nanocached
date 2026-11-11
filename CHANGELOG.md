@@ -67,6 +67,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: an `i`/`k`/`x` dispatched inline behind an earlier one that returned
+  early (no roster, or no owner for its key) released its ordering signal at
+  once instead of after the earlier command's, so a pipelined same-key
+  request could be enqueued on the replica ahead of that command's result.
+  The signal now waits for the earlier command as it would have after a
+  normal return. (#1713)
 - Proxy: a backend that closes each connection right after the handshake (so
   the redial backoff resets every time) logged its exit line once per
   request. The lines are now limited per backend address (3 per 10 s), with
