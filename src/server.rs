@@ -13859,6 +13859,22 @@ mod tests {
                 let mut reply = vec![0u8; 2 + 2 * 100_000];
                 client.read_exact(&mut reply).await.unwrap();
                 assert_eq!(&reply[..2], b"S\n");
+                // The rest of the reply: a hit is the value as stored, and
+                // whichever connection's store landed last decides its
+                // size (usually the 600,000-byte one, so a reply is 1.2
+                // MB). Left unread it fills the socket buffers and the
+                // connection's write blocks while it holds the overdraft
+                // token, which the other connection's frame then waits
+                // for until WRITE_TIMEOUT, as designed. A client that
+                // reads its reply does not hold it up.
+                let mut rest = vec![0u8; 64 * 1024];
+                while let Ok(Ok(read)) =
+                    timeout(Duration::from_millis(300), client.read(&mut rest)).await
+                {
+                    if read == 0 {
+                        break;
+                    }
+                }
                 client
             }));
         }
