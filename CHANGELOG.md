@@ -45,6 +45,10 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e/freshjoin.sh`: a mistyped `MODE` fell through the `case`, so
+  only the join ran and the script reported PASS. An unknown `MODE` now
+  exits 2 with the list of valid modes before anything is started (#1743).
+
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a
