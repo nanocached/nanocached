@@ -2792,6 +2792,7 @@ impl BackendHandle {
         slot: Arc<tokio::sync::Mutex<Option<BackendHandle>>>,
         dialed: Arc<std::sync::atomic::AtomicUsize>,
         keepalive_interval: Duration,
+        exit_log: Arc<LogLimiter>,
     ) -> io::Result<Self> {
         let mut stream = timeout(UPSTREAM_IO_TIMEOUT, connect_upstream(addr, tls_connector))
             .await
@@ -2838,6 +2839,7 @@ impl BackendHandle {
                 dialed,
                 own_id: id,
                 keepalive_interval,
+                exit_log,
             },
         ));
         Ok(Self { id, sender })
@@ -2854,6 +2856,10 @@ struct BackendIdentity {
     dialed: Arc<std::sync::atomic::AtomicUsize>,
     own_id: u64,
     keepalive_interval: Duration,
+    /// The budget for this address's exit lines (shared by every
+    /// connection dialed to it, so a node that closes each connection
+    /// right after the handshake does not log once per redial).
+    exit_log: Arc<LogLimiter>,
 }
 
 /// The shared backend connection's writer half (issue #110): assigns
@@ -2896,6 +2902,7 @@ async fn run_backend(
         dialed,
         own_id,
         keepalive_interval,
+        exit_log,
     } = identity;
     let (mut read_half, mut write_half) = tokio::io::split(stream);
     // Issue #514: the reply sender is `None` for a keep-alive probe the
@@ -2926,6 +2933,7 @@ async fn run_backend(
     let clients_affected = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_clients_affected = Arc::clone(&clients_affected);
     let reader_addr = addr.clone();
+    let reader_exit_log = Arc::clone(&exit_log);
 
     // The reader half: resolves pending replies in FIFO order. The
     // per-reply timeout is a *progress* bound (each reply must arrive
@@ -2954,8 +2962,12 @@ async fn run_backend(
                     // Nothing was pending, so no client request is on
                     // this connection: the writer's next reservation
                     // fails before it writes (`not_sent`, redialled).
-                    eprintln!(
-                        "INFO backend connection to {reader_addr} {idle}; will redial on next request"
+                    log_backend_exit(
+                        &reader_exit_log,
+                        &reader_addr,
+                        format!(
+                            "INFO backend connection to {reader_addr} {idle}; will redial on next request"
+                        ),
                     );
                     pending_rx.close();
                     while let Some((_, _, reply)) = pending_rx.recv().await {
@@ -3140,13 +3152,14 @@ async fn run_backend(
     // "backend connection is gone" error with no address attached. A
     // clean drain (every sender dropped, e.g. prune retired the address)
     // is expected teardown, not a fault, so it is logged differently.
-    eprintln!(
-        "{}",
+    log_backend_exit(
+        &exit_log,
+        &addr,
         backend_exit_log_line(
             &addr,
             poisoned_exit,
             clients_affected.load(std::sync::atomic::Ordering::Relaxed),
-        )
+        ),
     );
 
     // issue #192: eagerly clear this connection's slot and decrement the
@@ -3195,6 +3208,47 @@ async fn watch_idle_backend<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut Byte
             "sent data with no request pending".to_string()
         }
         Err(error) => format!("failed while idle ({error})"),
+    }
+}
+
+/// Lines a backend address may log about its connections going away, per
+/// `BACKEND_EXIT_LOG_WINDOW`. A node that closes every connection right
+/// after the handshake resets the redial backoff each time, so without a
+/// budget the line was written once per request.
+const BACKEND_EXIT_LOG_LINES: u32 = 3;
+const BACKEND_EXIT_LOG_WINDOW: Duration = Duration::from_secs(10);
+
+fn new_backend_exit_limiter() -> LogLimiter {
+    LogLimiter::new(BACKEND_EXIT_LOG_LINES, BACKEND_EXIT_LOG_WINDOW)
+}
+
+/// What to write for one backend exit line at `now`: nothing when the
+/// address's budget is spent (the line is counted), otherwise the line,
+/// preceded by a summary of the lines dropped since the last one written.
+fn backend_exit_lines(
+    limiter: &LogLimiter,
+    addr: &str,
+    line: String,
+    now: tokio::time::Instant,
+) -> Vec<String> {
+    let Some(suppressed) = limiter.admit_at(now) else {
+        return Vec::new();
+    };
+    if suppressed > 0 {
+        vec![
+            format!(
+                "WARN {suppressed} more backend connection lines for {addr} (not logged individually)"
+            ),
+            line,
+        ]
+    } else {
+        vec![line]
+    }
+}
+
+fn log_backend_exit(limiter: &LogLimiter, addr: &str, line: String) {
+    for line in backend_exit_lines(limiter, addr, line, tokio::time::Instant::now()) {
+        eprintln!("{line}");
     }
 }
 
@@ -3887,6 +3941,10 @@ struct SharedBackends {
     /// `BACKEND_KEEPALIVE_INTERVAL` in production, shortened only by
     /// tests that exercise the keep-alive itself (`with_keepalive_interval`).
     keepalive_interval: Duration,
+    /// Per address, the budget of its backend exit lines. It has to
+    /// outlive the connection: the one that flaps is replaced by a new
+    /// task each time.
+    exit_logs: std::sync::Mutex<HashMap<String, Arc<LogLimiter>>>,
 }
 
 impl SharedBackends {
@@ -3900,7 +3958,19 @@ impl SharedBackends {
             dialed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             dial_failures: std::sync::Mutex::new(HashMap::new()),
             keepalive_interval,
+            exit_logs: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    fn exit_log(&self, addr: &str) -> Arc<LogLimiter> {
+        let mut logs = self
+            .exit_logs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            logs.entry(addr.to_string())
+                .or_insert_with(|| Arc::new(new_backend_exit_limiter())),
+        )
     }
 
     fn slot(&self, addr: &str) -> Arc<tokio::sync::Mutex<Option<BackendHandle>>> {
@@ -3970,6 +4040,13 @@ impl SharedBackends {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             failures.retain(|addr, _| live.contains(addr));
+        }
+        {
+            let mut logs = self
+                .exit_logs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            logs.retain(|addr, _| live.contains(addr));
         }
     }
 
@@ -4044,6 +4121,7 @@ impl SharedBackends {
                             Arc::clone(&slot),
                             Arc::clone(&self.dialed),
                             self.keepalive_interval,
+                            self.exit_log(addr),
                         )
                         .await
                         {
@@ -4626,6 +4704,7 @@ async fn dispatch_request(
         // No roster yet: `R` for a retry-capable client (tagged — this
         // answers a specific request), the legacy bare `B` otherwise.
         let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
+        slot.release_after_waits();
         return result_rx;
     };
 
@@ -6630,6 +6709,7 @@ async fn dispatch_primary_evaluated(
     let owners = ring.owners(&namespace, &key);
     let Some(primary) = owners.first() else {
         let _ = result_tx.send(Ok(transient_reply(retry_capable, tag)));
+        slot.release_after_waits();
         return;
     };
     let pending = context
@@ -7477,6 +7557,26 @@ struct OrderSlot {
     /// replicas, and before it releases `signal` — a request waiting for
     /// `signal` is thereby behind the whole run.
     after: Vec<OrderWait>,
+}
+
+impl OrderSlot {
+    /// Ends a slot whose request returned without a command of its own to
+    /// wait for (no ring, no owner): its signal is released only once the
+    /// points in `after` are, as it would have been after the command, so a
+    /// request waiting for it is still behind the `i`/`k`/`x` dispatched
+    /// inline ahead of this one.
+    fn release_after_waits(self) {
+        let OrderSlot { signal, after } = self;
+        if after.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            for wait in after {
+                order_wait(wait).await;
+            }
+            drop(signal);
+        });
+    }
 }
 
 /// What `ConnectionOrder::admit` decided about one request.
@@ -11508,6 +11608,11 @@ mod tests {
         /// instead of replying — the reply lost after the node executed
         /// it. A touch is idempotent, so the proxy must re-send it.
         close_after_touch_apply_once: Arc<AtomicBool>,
+        /// Applies the next `D`/`d` to the store, then drops the connection
+        /// instead of replying: the delete took effect at the node and its
+        /// answer was lost. The proxy re-sends it, and the second attempt
+        /// finds nothing to delete.
+        close_after_delete_apply_once: Arc<AtomicBool>,
         /// The markers (`"W"`, `"E"`) the next `t` frames are refused with,
         /// one per frame in order, before any is applied — a stale ring
         /// that is still stale after a refresh, or a node that refuses the
@@ -11577,6 +11682,7 @@ mod tests {
                 touches: Arc::new(StdMutex::new(Vec::new())),
                 multi_set_sizes: Arc::new(StdMutex::new(Vec::new())),
                 close_after_touch_apply_once: Arc::new(AtomicBool::new(false)),
+                close_after_delete_apply_once: Arc::new(AtomicBool::new(false)),
                 refuse_touches: Arc::new(StdMutex::new(std::collections::VecDeque::new())),
                 get_delay: Arc::new(StdMutex::new(Duration::ZERO)),
                 auth_count: Arc::new(AtomicUsize::new(0)),
@@ -11606,6 +11712,7 @@ mod tests {
             let touches = Arc::clone(&node.touches);
             let multi_set_sizes = Arc::clone(&node.multi_set_sizes);
             let close_after_touch_apply_once = Arc::clone(&node.close_after_touch_apply_once);
+            let close_after_delete_apply_once = Arc::clone(&node.close_after_delete_apply_once);
             let refuse_touches = Arc::clone(&node.refuse_touches);
             let delay = Arc::clone(&node.get_delay);
             let auth_count = Arc::clone(&node.auth_count);
@@ -11645,6 +11752,9 @@ mod tests {
                             touches: Arc::clone(&touches),
                             multi_set_sizes: Arc::clone(&multi_set_sizes),
                             close_after_touch_apply_once: Arc::clone(&close_after_touch_apply_once),
+                            close_after_delete_apply_once: Arc::clone(
+                                &close_after_delete_apply_once,
+                            ),
                             refuse_touches: Arc::clone(&refuse_touches),
                             delay: Arc::clone(&delay),
                             auth_count: Arc::clone(&auth_count),
@@ -11727,6 +11837,7 @@ mod tests {
         /// instead of replying — the reply lost after the node executed
         /// it. A touch is idempotent, so the proxy must re-send it.
         close_after_touch_apply_once: Arc<AtomicBool>,
+        close_after_delete_apply_once: Arc<AtomicBool>,
         refuse_touches: Arc<StdMutex<std::collections::VecDeque<&'static str>>>,
         delay: Arc<StdMutex<Duration>>,
         auth_count: Arc<AtomicUsize>,
@@ -11792,6 +11903,7 @@ mod tests {
             touches,
             multi_set_sizes,
             close_after_touch_apply_once,
+            close_after_delete_apply_once,
             refuse_touches,
             delay,
             auth_count,
@@ -12443,6 +12555,9 @@ mod tests {
                             continue;
                         }
                         let existed = store.lock().unwrap().remove(&(namespace, key)).is_some();
+                        if close_after_delete_apply_once.swap(false, Ordering::SeqCst) {
+                            return Ok(());
+                        }
                         let marker = if existed { "D" } else { "N" };
                         stream
                             .write_all(format!("{marker} {}\n", tag(&fields)).as_bytes())
@@ -12871,6 +12986,7 @@ mod tests {
             slot,
             Arc::new(AtomicUsize::new(0)),
             Duration::from_secs(30),
+            Arc::new(new_backend_exit_limiter()),
         )
         .await
         .unwrap();
@@ -15016,6 +15132,35 @@ mod tests {
     }
 
     #[test]
+    fn a_flapping_backend_does_not_log_a_line_per_redial() {
+        // The node closes every connection right after the handshake, so
+        // the backoff resets and the exit line comes once per request.
+        let flapping = new_backend_exit_limiter();
+        let other = new_backend_exit_limiter();
+        let start = tokio::time::Instant::now();
+        let written = (0..1000)
+            .map(|_| backend_exit_lines(&flapping, "10.0.0.1:8356", "INFO exit".to_string(), start))
+            .map(|lines| lines.len())
+            .sum::<usize>();
+        assert_eq!(written, BACKEND_EXIT_LOG_LINES as usize);
+        // Another address has its own budget.
+        assert_eq!(
+            backend_exit_lines(&other, "10.0.0.2:8356", "INFO exit".to_string(), start),
+            vec!["INFO exit".to_string()]
+        );
+        // The next window reports what was dropped ahead of the line.
+        let later = start + BACKEND_EXIT_LOG_WINDOW;
+        assert_eq!(
+            backend_exit_lines(&flapping, "10.0.0.1:8356", "INFO exit".to_string(), later),
+            vec![
+                "WARN 997 more backend connection lines for 10.0.0.1:8356 (not logged individually)"
+                    .to_string(),
+                "INFO exit".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn a_backend_that_died_with_only_a_keep_alive_on_it_is_logged_at_info() {
         // Issue #514: WARN is reserved for a poison that failed a
         // client's request; an idle-side close found by the probe is
@@ -16065,6 +16210,45 @@ mod tests {
         assert!(released.waits.is_empty());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_inline_incr_that_returns_early_keeps_the_run_it_follows_in_the_order() {
+        // `i1`, then `i2` inline behind it (`after = [i1]`): when `i2`
+        // returns early (no roster) its signal must not be released ahead of
+        // `i1`'s, or a same-key request admitted next sees nothing to wait
+        // for and is enqueued on the replica before `i1`'s result.
+        let context = Arc::new(bare_context());
+        let mut order = ConnectionOrder::new();
+        let first = order.admit(&order_request("incr", "k"));
+        let second = order.admit(&order_request("incr", "k"));
+        assert_eq!(second.waits.len(), 1);
+        assert!(!second.defer);
+
+        let budget = InFlightBudget::new(1024);
+        let charge = Arc::new(InFlightCharge::try_charge(1, [&budget, &budget, &budget]).unwrap());
+        let _reply = dispatch_request(
+            context,
+            order_request("incr", "k"),
+            None,
+            false,
+            charge,
+            second.into_slot(),
+        )
+        .await;
+
+        let behind = order.admit(&order_request("get", "k"));
+        assert_eq!(
+            behind.waits.len(),
+            1,
+            "the second incr's signal was released while the first was still pending"
+        );
+        tokio::task::yield_now().await;
+        assert!(order_pending(&behind.waits[0]));
+        drop(first);
+        timeout(Duration::from_secs(5), order_wait(behind.waits[0].clone()))
+            .await
+            .expect("the wait ends once the first incr's signal does");
+    }
+
     #[test]
     fn an_incr_behind_incrs_goes_inline_unless_something_deferred_is_in_the_way() {
         // A run of `i`: each goes inline and hands its driver the wait for
@@ -16673,6 +16857,27 @@ mod tests {
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 2 1 1");
         read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
         assert_eq!(&buf.split_to(2)[..], b"vv");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_whose_reply_was_lost_is_re_sent_and_answers_what_the_retry_found() {
+        // A delete is idempotent, so the proxy sends it again when the
+        // answer never arrived. If the first attempt had already removed
+        // the key, the retry finds nothing and the client is told `N`: the
+        // proxy cannot tell that from a key that never existed, so it
+        // reports what the attempt that answered found (an accepted
+        // behaviour, as for an SDK's own retry). The key is gone either way.
+        let (nodes, proxy) = cluster(1).await;
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"S 1 1\nkv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+
+        nodes[0]
+            .close_after_delete_apply_once
+            .store(true, Ordering::SeqCst);
+        stream.write_all(b"D 1\nk").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+        assert!(nodes[0].entry(b"", b"k").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
