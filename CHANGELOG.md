@@ -82,6 +82,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e`: the diagnostic scripts `i92.sh`, `i93.sh`, `i96.sh`, `lr.sh`,
+  `joinstale.sh` and `repro582.sh` always exit 0 after printing what they
+  measured, and the README did not say so. Its table now marks them
+  "No verdict" (and lists `joinstale.sh` and `repro582.sh`), all six remove
+  their containers on exit (`i92.sh` and `repro582.sh` had no `EXIT` trap),
+  and a setup wait that is not met (`i93.sh`'s `wait_members` and A's
+  handoff, and the membership waits of `i96.sh`, `lr.sh` and `joinstale.sh`)
+  now ends the run with exit 1 instead of printing a result that is not one
+  (#1745).
+
 - `tests/e2e`: `cl.sh` (and so every scenario that sources it) and `i92.sh`
   defaulted `NODE`, `DISC` and `PROXY` to the `:0.3.0` images, so forgetting
   to pass them ran years-old binaries without a word. They now default to the
