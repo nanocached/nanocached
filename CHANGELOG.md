@@ -45,6 +45,8 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tools/conformance`: `scenarios.sh v6` only printed `secret appears in N output files` when the auth secret leaked, and `compare.py` (the last step of `run.sh`) printed FAIL/DIFF cells without a failing exit, so both exited 0 on a violation. `scenarios.sh v6` now exits 1 when `secret_leaks.txt` is not empty and `compare.py` (so `run.sh`) exits 1 when any cell is FAIL or DIFF (#1739).
+
 - `nanocached-discovery`: a `V` (leave) from a member of the join in flight
   was answered `R` only after the abandon's fan-out, which sends `X` to every
   remaining ready member and starts the next join's `M` sends; against a
