@@ -14,6 +14,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Discovery: new node registrations (`P`) and new proxy registrations (`Y`)
+  from one source spent one shared burst of 64, so on a host, NAT address or
+  IPv6 /64 running both, proxies re-registering after a discovery restart
+  could use up the burst the nodes need inside the startup grace, and the
+  reverse. Each kind now has its own burst and pacing (#1798).
+
 - Discovery: the replication-factor dissent WARN written when `L` rebuilds
   its cached answer was not rate limited and listed every dissenting node,
   so a flood of fake nodes with generation bumps between `L` calls produced
