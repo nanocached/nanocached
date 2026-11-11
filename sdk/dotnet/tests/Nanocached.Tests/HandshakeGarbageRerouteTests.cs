@@ -34,8 +34,28 @@ public class HandshakeGarbageRerouteTests
 
         public HttpGarbageListener(int port = 0)
         {
-            _listener = new TcpListener(IPAddress.Loopback, port);
-            _listener.Start();
+            // Re-binding a just-stopped node's port can briefly fail while its
+            // listener and accepted sockets finish closing: bind with
+            // SO_REUSEADDR and retry within a short bounded deadline.
+            long deadline = Environment.TickCount64 + 5_000;
+            while (true)
+            {
+                var listener = new TcpListener(IPAddress.Loopback, port);
+                listener.Server.SetSocketOption(
+                    System.Net.Sockets.SocketOptionLevel.Socket,
+                    System.Net.Sockets.SocketOptionName.ReuseAddress, true);
+                try
+                {
+                    listener.Start();
+                    _listener = listener;
+                    break;
+                }
+                catch (System.Net.Sockets.SocketException) when (Environment.TickCount64 < deadline)
+                {
+                    listener.Stop();
+                    Thread.Sleep(50);
+                }
+            }
             _ = AcceptLoopAsync();
         }
 
