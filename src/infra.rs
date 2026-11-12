@@ -825,6 +825,17 @@ pub async fn reject_over_limit(
 /// best-effort non-blocking busy reply and is closed at once, with no
 /// drain (so a client that had already sent its first frame may see a reset
 /// rather than the reply).
+///
+/// The count is per process, not per source (node and discovery each have
+/// their own, shared by the global-cap and the per-IP rejections): a source
+/// that keeps this many rejected connections lingering (about 640 a second
+/// at the 200 ms drain, if it never closes them) makes every other
+/// connection being rejected at that moment take the no-drain path, and a
+/// client that had already sent its first frame sees a reset instead of
+/// `B`. Accepted connections are not affected, and neither is a TLS
+/// listener, which sends no reply and takes no slot. Accepted: those
+/// connections were being refused anyway, and a per-source share would only
+/// move where the limit sits.
 const MAX_CONCURRENT_REJECTS: usize = 128;
 static REJECT_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_REJECTS);
 
