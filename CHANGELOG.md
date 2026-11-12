@@ -48,6 +48,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the accepted-behaviour list and the getting-started limits now say
+  that the 128 rejected-connection slots of a node and of discovery are
+  process-wide: a source keeping 128 rejected connections lingering makes
+  other clients being turned away at that moment get a reset instead of `B`.
+  Only refused connections are affected. The code comment says the same
+  (#1830).
 - Docs: the SDKs page said nothing about the limit on an `o` or `y` frame
   (namespace length times the number of keys, at most 64 MiB), and the
   protocol page said the SDKs reach it only with a namespace over 167,772

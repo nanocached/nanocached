@@ -888,6 +888,20 @@ here.</p>
   <li>SDK production constants (timeouts, in-flight budgets) are mutable,
   documented-but-hidden test knobs so each SDK&rsquo;s own test suite can
   shrink them; not an API, and not a connect option.</li>
+  <li>A node or discovery server answers a connection turned away by a
+  connection cap (the global one or the per-IP one) with <code>B</code>
+  and keeps it open for up to 200&nbsp;ms to read what the peer has already
+  sent, so that closing does not reset the reply away. At most 128 rejected
+  connections are in that state at once, process-wide. A source that keeps
+  128 of them lingering (about 640 rejected connections a second, each
+  held for the 200&nbsp;ms) makes any other client rejected at that moment
+  get a reset instead of <code>B</code>: past the 128 a rejection gets a
+  non-blocking reply and is closed at once, and a client that has already
+  sent its first frame sees the close as a reset. Only connections that are
+  being refused anyway are affected; accepted connections, and a listener
+  with TLS (which sends no reply to a plaintext peer), are not. Per-source
+  slots were not added: the bound exists so that rejected connections cannot
+  pile up without limit, and who is refused is already decided by the caps.</li>
 </ul>
 
 <h2>Design decisions</h2>
