@@ -914,6 +914,20 @@ here.</p>
   <li>SDK production constants (timeouts, in-flight budgets) are mutable,
   documented-but-hidden test knobs so each SDK&rsquo;s own test suite can
   shrink them; not an API, and not a connect option.</li>
+  <li>A proxy&rsquo;s first registration (<code>Y</code>) under a new name is
+  paced per source like a node&rsquo;s (<code>P</code>), with an allowance of
+  its own: 64 at once, then one every 2&nbsp;seconds, and an IPv6 source
+  counts per /64. More than 64 proxies behind one NAT or SNAT address, or in
+  one /64, that all register at the same time (after a discovery restart,
+  say) are admitted one per 2&nbsp;seconds beyond the 64: discovery refuses
+  the others and closes the connection, the proxy logs a warning and sends
+  the same <code>Y</code> again at its next refresh (every 5&nbsp;seconds,
+  or sooner after a forced refresh), and the proxy list (<code>Q</code>)
+  is partial until the last one is in, about 2&nbsp;seconds per proxy
+  beyond 64. A refresh of a name already registered is never refused. The
+  pacing stops one connection from filling the proxy registry with made-up
+  names in milliseconds; a fleet larger than the burst behind one address
+  re-registers slowly here exactly as nodes do.</li>
 </ul>
 
 <h2>Design decisions</h2>
