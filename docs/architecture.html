@@ -468,6 +468,19 @@ connections incrementing one counter are not ordered against each other,
 through a proxy as in cluster-direct mode (see the accepted behaviour
 below).</p>
 
+<p>One case is wider than the key. A multi-key request (<code>m</code>,
+<code>o</code>, <code>y</code>) that has to wait and carries more than 64
+keys is not registered key by key, which would leave an entry per key on the
+connection until the next sweep, outside every in-flight budget (tens of
+megabytes for a 1&nbsp;MiB batch of short keys). It is registered for its
+whole namespace instead, and a later request on that connection in the same
+namespace waits for it whatever its key. An <code>i</code>, <code>k</code> or
+<code>x</code> that would have been sent to its primary at once is held until
+the batch has been enqueued, which lasts as long as the batch&rsquo;s own wait
+(bounded by the proxy&rsquo;s backend timeouts). Other namespaces on the
+connection and other connections are not held, and a batch of 64 keys or
+fewer, or one that waits for nothing, registers nothing of this kind.</p>
+
 <h2>Known limits</h2>
 <p><strong>A ring change stalls a node for a few tens of milliseconds
 per million keys.</strong> Re-replication, a staged handoff, a
@@ -765,6 +778,19 @@ here.</p>
   <code>i</code>, <code>k</code> or <code>x</code> result is in the
   order (a later request on the same key waits for it to be enqueued); a
   re-sent replica write is not.</li>
+  <li>A multi-key request (<code>m</code>, <code>o</code>, <code>y</code>)
+  of more than 64 keys that the proxy has to defer, because it waits for an
+  earlier <code>i</code>, <code>k</code> or <code>x</code> result or other
+  ordered request on a key it carries, is registered for its whole namespace
+  rather than key by key. A later request on the same client connection and
+  in the same namespace then waits until the batch has been enqueued, even
+  for a key the batch does not carry: an <code>i</code> that would have
+  been sent to its primary at once is deferred, for as long as the batch
+  waits (up to the proxy&rsquo;s backend timeouts). Registering each key
+  would leave an entry per key on the connection (about 25&nbsp;MB for a
+  1&nbsp;MiB batch of short keys) outside the in-flight byte budget, so the
+  bounded memory was judged worth the wait. Other namespaces, other
+  connections and batches of 64 keys or fewer are not affected.</li>
   <li>A delete whose answer was lost after the proxy wrote it is sent again,
   and when the first attempt had already removed the key the client is told
   <code>N</code> (not found) although the key existed. The proxy cannot tell
@@ -888,6 +914,34 @@ here.</p>
   <li>SDK production constants (timeouts, in-flight budgets) are mutable,
   documented-but-hidden test knobs so each SDK&rsquo;s own test suite can
   shrink them; not an API, and not a connect option.</li>
+  <li>A node or discovery server answers a connection turned away by a
+  connection cap (the global one or the per-IP one) with <code>B</code>
+  and keeps it open for up to 200&nbsp;ms to read what the peer has already
+  sent, so that closing does not reset the reply away. At most 128 rejected
+  connections are in that state at once, process-wide. A source that keeps
+  128 of them lingering (about 640 rejected connections a second, each
+  held for the 200&nbsp;ms) makes any other client rejected at that moment
+  get a reset instead of <code>B</code>: past the 128 a rejection gets a
+  non-blocking reply and is closed at once, and a client that has already
+  sent its first frame sees the close as a reset. Only connections that are
+  being refused anyway are affected; accepted connections, and a listener
+  with TLS (which sends no reply to a plaintext peer), are not. Per-source
+  slots were not added: the bound exists so that rejected connections cannot
+  pile up without limit, and who is refused is already decided by the caps.</li>
+  <li>A proxy&rsquo;s first registration (<code>Y</code>) under a new name is
+  paced per source like a node&rsquo;s (<code>P</code>), with an allowance of
+  its own: 64 at once, then one every 2&nbsp;seconds, and an IPv6 source
+  counts per /64. More than 64 proxies behind one NAT or SNAT address, or in
+  one /64, that all register at the same time (after a discovery restart,
+  say) are admitted one per 2&nbsp;seconds beyond the 64: discovery refuses
+  the others and closes the connection, the proxy logs a warning and sends
+  the same <code>Y</code> again at its next refresh (every 5&nbsp;seconds,
+  or sooner after a forced refresh), and the proxy list (<code>Q</code>)
+  is partial until the last one is in, about 2&nbsp;seconds per proxy
+  beyond 64. A refresh of a name already registered is never refused. The
+  pacing stops one connection from filling the proxy registry with made-up
+  names in milliseconds; a fleet larger than the burst behind one address
+  re-registers slowly here exactly as nodes do.</li>
 </ul>
 
 <h2>Design decisions</h2>

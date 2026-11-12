@@ -23,7 +23,9 @@ keys), `ns` (namespaces), `ctr` (incr / decr and compare-and-set), `many`
 (batched get / set) and `touch` (touch, get-and-touch and their batched forms
 with a TTL, no TTL and TTL 0).
 `compare.py` checks the reports against each step's `expect` and the six
-reports against each other.
+reports against each other. It exits 1 on a FAIL or DIFF cell, on a `--` cell
+(no record) and when an SDK produced no record at all; `run.sh` passes the SDKs
+it was asked to run, so a subset run is judged against that subset.
 
 ```sh
 tools/conformance/run.sh <single|cluster> <direct|proxy> [sdk ...]
@@ -37,7 +39,7 @@ Results land in `results/<run>/<topology>-<path>` (git-ignored).
 
 | script | what it checks |
 |---|---|
-| `scenarios.sh <v6\|v5\|v7\|v4>` | scenarios that need containers started, stopped or put behind a fixture: connection failures and auth, join / decommission / kill under load, client lifecycle, a node dying before a multi-get; `v6` exits 1 when the auth secret appears in any output file, the other sets have no verdict of their own |
+| `scenarios.sh <v6\|v5\|v7\|v4>` | scenarios that need containers started, stopped or put behind a fixture: connection failures and auth, join / decommission / kill under load, client lifecycle, a node dying before a multi-get; `v6` exits 1 when the auth secret appears in any output file or when the scan had nothing to read (no non-empty output file) or grep failed, the other sets have no verdict of their own |
 | `scenarios_dynamic.sh <v5\|v7>` | the join / decommission / kill and client-lifecycle scenarios, one run per SDK (`report_scen.py` summarises) |
 | `replica.sh` | do all owners of a key hold the same copy after the writes have finished |
 | `scenarios.sh hostile` | every SDK against a fake node that misbehaves (trickles, stalls, oversizes, bombs, backs up); `hostile_check.py` judges time and peak memory against one table; exits 1 when a cell is outside its bounds; runs nightly in CI (`hostile-conformance.yaml`) |

@@ -20,6 +20,21 @@ framework adapters at one version, whether or not a component changed.
   answered `B` with nothing in the log saying why. Each now has its own
   limiter (still 1 line per 10 s each, names capped at 5) (#1826).
 
+- Proxy: one per-address budget of 3 lines per 10 s covered every backend
+  exit line, so an address that kept closing connections cleanly used it up
+  and the WARN for a connection poisoned by a frame the node rejected, in the
+  same window, was only counted. Poison WARNs now have a budget of their own
+  (still 3 per 10 s per address). The count of lines left unwritten when the
+  flapping stopped was also never reported; it is now written by the next
+  roster refresh after its window ends, or when the address leaves the live
+  set (#1824).
+
+- `tests/e2e/lr.sh`: when a membership wait failed, the script exited and its EXIT trap removed the containers, but the backgrounded `stats.sh`, the Python load and the .NET probe subshells kept running. The trap now stops them first (TERM, at most 5 s, then KILL) and removes the load container too, which is not named with the run's prefix. `NODE`/`DISC` are exported, which clears shellcheck SC2034 (#1829).
+
+- `tools/conformance`: the `scenarios.sh v6` secret scan hid grep's errors (`2>/dev/null`), so with no output files, or only empty ones (every driver produced nothing), it reported 0 leaks and exited 0. It now exits 1 when there is nothing to scan or grep fails (status 2); the leak check itself is unchanged (#1828).
+
+- `tools/conformance`: `compare.py` (the last step of `run.sh`) exited 0 when a cell had no record (`--`: a driver crashed or never ran), and an SDK that produced no record at all disappeared from the matrix, so a run could pass with a whole column missing. It now exits 1 on `--` cells and when an expected SDK has no record; `run.sh` passes the SDKs it was asked to run (`compare.py --sdks`), so a deliberate subset still passes (#1827).
+
 - Discovery: new node registrations (`P`) and new proxy registrations (`Y`)
   from one source spent one shared burst of 64, so on a host, NAT address or
   IPv6 /64 running both, proxies re-registering after a discovery restart
@@ -54,6 +69,24 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the accepted-behaviour list and the getting-started limits now say
+  that the 128 rejected-connection slots of a node and of discovery are
+  process-wide: a source keeping 128 rejected connections lingering makes
+  other clients being turned away at that moment get a reset instead of `B`.
+  Only refused connections are affected. The code comment says the same
+  (#1830).
+- Docs: the accepted-behaviour list and the operations page now say that a
+  proxy's first registration (`Y`) is paced per source like a node's: more
+  than 64 proxies behind one NAT address or IPv6 /64 re-register at one per
+  2 s after a discovery restart, a refused `Y` closes the connection and the
+  proxy sends it again at its next refresh (every 5 s), and `Q` is partial
+  meanwhile (#1825).
+- Docs: the accepted-behaviour list and the proxy ordering section now say
+  that a deferred `m`/`o`/`y` of more than 64 keys is registered for its
+  whole namespace, so a later request on the same connection and namespace
+  waits for it even for a key it does not carry (an `i` that would have been
+  sent at once is deferred), as the price of not keeping an entry per key
+  (#1823).
 - Docs: the SDKs page said nothing about the limit on an `o` or `y` frame
   (namespace length times the number of keys, at most 64 MiB), and the
   protocol page said the SDKs reach it only with a namespace over 167,772

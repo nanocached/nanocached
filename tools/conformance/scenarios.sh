@@ -82,8 +82,16 @@ v6)
   docker rm -f $P-a $P-b >/dev/null; sleep 1
   each_sdk retryable_proxy  $P-disc:8357 1 "" 60 conn
   # secret hygiene: the distinctive secret must appear in none of the outputs
-  grep -l -F -- "$SECRET" "$OUT"/*.jsonl "$OUT"/*.err 2>/dev/null > "$OUT/secret_leaks.txt"; echo "secret appears in $(wc -l < "$OUT/secret_leaks.txt") output files (secret=$SECRET)"
-  [ -s "$OUT/secret_leaks.txt" ] && VERDICT=1 ;;
+  # A scan that read nothing proves nothing: with no output file, or only empty ones, or a grep that failed (status 2), the run fails.
+  scan=(); readable=0
+  for f in "$OUT"/*.jsonl "$OUT"/*.err; do [ -f "$f" ] || continue; scan+=("$f"); [ -s "$f" ] && readable=1; done
+  if [ $readable = 0 ]; then
+    echo "secret scan: nothing to scan (no non-empty *.jsonl / *.err in $OUT)" >&2; VERDICT=1
+  else
+    grep -l -F -- "$SECRET" "${scan[@]}" > "$OUT/secret_leaks.txt"; rc=$?
+    if [ $rc -gt 1 ]; then echo "secret scan: grep failed with status $rc" >&2; VERDICT=1
+    else echo "secret appears in $(wc -l < "$OUT/secret_leaks.txt") output files (secret=$SECRET)"; [ -s "$OUT/secret_leaks.txt" ] && VERDICT=1; fi
+  fi ;;
 v4)
   cluster 3 && sleep 2
   PFX="fo:$RUN:"

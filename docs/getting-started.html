@@ -210,6 +210,15 @@ and clustered production use identical code. See
   </tbody>
 </table>
 </div>
+<p>A connection over either connection cap is answered <code>B</code> (busy)
+and closed. At most 128 such rejections are in that reply at a time, per
+process (a short wait for the peer to close, so that the reply is not lost
+to a reset); past that a rejected connection is closed at once with a
+best-effort reply, which a client that has already sent its first frame sees
+as a reset. A source that holds 128 rejected connections open therefore
+turns the reply into a reset for the other clients being turned away at
+that moment, and for no one else. A TLS listener sends no reply and is not
+affected.</p>
 <p>The memory bound is approximate (stored key and value bytes, plus
 180 bytes per entry, and 750 bytes plus its name's length per
 non-default namespace &mdash; both measured on the container image, so a
