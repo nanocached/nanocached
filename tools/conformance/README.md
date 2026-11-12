@@ -23,7 +23,9 @@ keys), `ns` (namespaces), `ctr` (incr / decr and compare-and-set), `many`
 (batched get / set) and `touch` (touch, get-and-touch and their batched forms
 with a TTL, no TTL and TTL 0).
 `compare.py` checks the reports against each step's `expect` and the six
-reports against each other.
+reports against each other. It exits 1 on a FAIL or DIFF cell, on a `--` cell
+(no record) and when an SDK produced no record at all; `run.sh` passes the SDKs
+it was asked to run, so a subset run is judged against that subset.
 
 ```sh
 tools/conformance/run.sh <single|cluster> <direct|proxy> [sdk ...]
