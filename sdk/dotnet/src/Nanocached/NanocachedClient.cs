@@ -5512,6 +5512,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                         $"nanocached: ViaProxy requires discovery addresses, but {host}:{port} "
                         + "identifies as a cache node");
 
+                // An empty roster is not an answer: this replica may have
+                // just restarted and not heard its proxies re-register yet,
+                // so ask the next address, as ConnectAsync does.
+                case Identify.ProxyListTarget proxies when proxies.Proxies.Count == 0:
+                    lastError = new ConnectionLostException(
+                        "nanocached: no proxies registered with discovery");
+                    continue;
+
                 case Identify.ProxyListTarget proxies:
                     return proxies.Proxies;
             }

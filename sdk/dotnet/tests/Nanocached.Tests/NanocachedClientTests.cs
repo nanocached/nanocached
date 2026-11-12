@@ -6184,6 +6184,61 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task ViaProxyFailoverSkipsAnEmptyRosterAndAsksTheNextDiscoveryAddress()
+    {
+        var first = new MockNode();
+        using var second = new MockNode();
+        using var emptyDiscovery = new MockDiscovery(Array.Empty<(string, string)>());
+        using var listingDiscovery = new MockDiscovery(Array.Empty<(string, string)>());
+        listingDiscovery.SetProxies(new[] { ("proxy-1", first.Address) });
+
+        var options = new NanocachedClient.Options { ViaProxy = true };
+        options.Addresses.Add(("127.0.0.1", emptyDiscovery.Port));
+        options.Addresses.Add(("127.0.0.1", listingDiscovery.Port));
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(options);
+        Assert.Equal(first.Address, GetSingleAddress(client));
+
+        first.Dispose();
+        await Task.Delay(50);
+        listingDiscovery.SetProxies(new[] { ("proxy-2", second.Address) });
+
+        await client.SetAsync("k2", "v2");
+        Assert.Equal("v2", await client.GetAsync("k2"));
+        Assert.Equal(second.Address, GetSingleAddress(client));
+        Assert.Equal(0, client.Stats().RefreshFailures);
+    }
+
+    [Fact]
+    public async Task ViaProxyFailoverCountsOneRefreshFailureWhenEveryRosterIsEmpty()
+    {
+        var first = new MockNode();
+        using var emptyDiscovery = new MockDiscovery(Array.Empty<(string, string)>());
+        using var listingDiscovery = new MockDiscovery(Array.Empty<(string, string)>());
+        listingDiscovery.SetProxies(new[] { ("proxy-1", first.Address) });
+
+        var options = new NanocachedClient.Options { ViaProxy = true };
+        options.Addresses.Add(("127.0.0.1", emptyDiscovery.Port));
+        options.Addresses.Add(("127.0.0.1", listingDiscovery.Port));
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(options);
+        Assert.Equal(0, client.Stats().RefreshFailures);
+
+        first.Dispose();
+        await Task.Delay(50);
+        listingDiscovery.SetProxies(Array.Empty<(string, string)>());
+
+        NanocachedException error = await Assert.ThrowsAnyAsync<NanocachedException>(
+            () => client.SetAsync("k2", "v2"));
+        Assert.Contains("no proxies registered", error.Message);
+        // One failure per roster fetch that found no proxy at all, not one
+        // per address: the operation's retry fetches once more, so count
+        // the fetches from the first address's connections (the first one
+        // is ConnectAsync's own).
+        int fetches = emptyDiscovery.ConnectionCount - 1;
+        Assert.True(fetches >= 1);
+        Assert.Equal(fetches, client.Stats().RefreshFailures);
+    }
+
+    [Fact]
     public async Task ViaProxySkipsAWarmingUpDiscoverySeedAndFetchesQFromTheNext()
     {
         using var proxy = new MockNode();
