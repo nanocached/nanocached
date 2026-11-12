@@ -14,6 +14,8 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tools/conformance`: the `scenarios.sh v6` secret scan hid grep's errors (`2>/dev/null`), so with no output files, or only empty ones (every driver produced nothing), it reported 0 leaks and exited 0. It now exits 1 when there is nothing to scan or grep fails (status 2); the leak check itself is unchanged (#1828).
+
 - Discovery: new node registrations (`P`) and new proxy registrations (`Y`)
   from one source spent one shared burst of 64, so on a host, NAT address or
   IPv6 /64 running both, proxies re-registering after a discovery restart
