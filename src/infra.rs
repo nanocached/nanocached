@@ -633,6 +633,36 @@ impl LogLimiter {
             None
         }
     }
+
+    /// Like `take_suppressed`, but only when the window the dropped lines
+    /// were counted in has ended by `now`: lines still inside a running
+    /// window are left for the next admitted line to mention. For a
+    /// periodic sweep that reports the count once the flood has stopped.
+    pub fn take_suppressed_after_window(&self, now: Instant) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ended = state
+            .window_start
+            .is_some_and(|start| now.duration_since(start) >= self.window);
+        if ended {
+            std::mem::take(&mut state.suppressed)
+        } else {
+            0
+        }
+    }
+
+    /// Lines dropped and not yet mentioned in a summary, taken (the count
+    /// resets to zero). For a caller that is about to discard the limiter
+    /// and would otherwise never report them.
+    pub fn take_suppressed(&self) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut state.suppressed)
+    }
 }
 
 // ─── constant-time comparison ───────────────────────────────────────────

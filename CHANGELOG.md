@@ -14,6 +14,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: one per-address budget of 3 lines per 10 s covered every backend
+  exit line, so an address that kept closing connections cleanly used it up
+  and the WARN for a connection poisoned by a frame the node rejected, in the
+  same window, was only counted. Poison WARNs now have a budget of their own
+  (still 3 per 10 s per address). The count of lines left unwritten when the
+  flapping stopped was also never reported; it is now written by the next
+  roster refresh after its window ends, or when the address leaves the live
+  set (#1824).
+
 - `tests/e2e/lr.sh`: when a membership wait failed, the script exited and its EXIT trap removed the containers, but the backgrounded `stats.sh`, the Python load and the .NET probe subshells kept running. The trap now stops them first (TERM, at most 5 s, then KILL) and removes the load container too, which is not named with the run's prefix. `NODE`/`DISC` are exported, which clears shellcheck SC2034 (#1829).
 
 - `tools/conformance`: the `scenarios.sh v6` secret scan hid grep's errors (`2>/dev/null`), so with no output files, or only empty ones (every driver produced nothing), it reported 0 leaks and exited 0. It now exits 1 when there is nothing to scan or grep fails (status 2); the leak check itself is unchanged (#1828).
