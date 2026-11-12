@@ -5485,6 +5485,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     private async Task<IReadOnlyList<DiscoveredNode>> FetchProxyListAsync()
     {
         Exception? lastError = null;
+        bool sawEmptyRoster = false;
         foreach (var (host, port) in _addresses)
         {
             Identify.Result identified;
@@ -5516,8 +5517,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 // just restarted and not heard its proxies re-register yet,
                 // so ask the next address, as ConnectAsync does.
                 case Identify.ProxyListTarget proxies when proxies.Proxies.Count == 0:
-                    lastError = new ConnectionLostException(
-                        "nanocached: no proxies registered with discovery");
+                    sawEmptyRoster = true;
                     continue;
 
                 case Identify.ProxyListTarget proxies:
@@ -5525,6 +5525,9 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             }
         }
         Interlocked.Increment(ref _refreshFailures);
+        // Some address answered, with no proxies: hand back the empty list
+        // so the caller reports it with the same-proxy dial error attached.
+        if (sawEmptyRoster) return Array.Empty<DiscoveredNode>();
         throw lastError ?? new NanocachedException(
             "nanocached: could not reach any discovery address for the proxy roster");
     }

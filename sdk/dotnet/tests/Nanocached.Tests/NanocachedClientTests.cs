@@ -6229,6 +6229,8 @@ public class NanocachedClientTests
         NanocachedException error = await Assert.ThrowsAnyAsync<NanocachedException>(
             () => client.SetAsync("k2", "v2"));
         Assert.Contains("no proxies registered", error.Message);
+        Assert.IsType<ConnectionLostException>(error);
+        Assert.NotNull(error.InnerException);
         // One failure per roster fetch that found no proxy at all, not one
         // per address: the operation's retry fetches once more, so count
         // the fetches from the first address's connections (the first one
