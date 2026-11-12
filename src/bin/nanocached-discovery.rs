@@ -4867,7 +4867,28 @@ fn cached_heartbeat_ack(registry: &Registry, replication: usize) -> Arc<[u8]> {
 /// Issue #1717: the dissent WARN gets its own budget. Every `L` rebuild
 /// writes one while a dissenter is present, and generation bumps
 /// interleaved with `L` make a rebuild per request.
-static DISSENT_LOG: LogLimiter = LogLimiter::new(1, Duration::from_secs(10));
+///
+/// Issue #1826: "served despite dissent" and "refusing L" each have a
+/// budget of their own. The cache is rebuilt only on a generation bump, so
+/// the refusal is written once, at the rebuild where `L` starts answering
+/// `B`; with one shared budget a "served" line just before it swallowed
+/// that line and `L` answered `B` with nothing in the log saying why.
+/// Both stay bounded (one line per window each).
+struct DissentLog {
+    served: LogLimiter,
+    refusing: LogLimiter,
+}
+
+impl DissentLog {
+    const fn new() -> Self {
+        Self {
+            served: LogLimiter::new(1, Duration::from_secs(10)),
+            refusing: LogLimiter::new(1, Duration::from_secs(10)),
+        }
+    }
+}
+
+static DISSENT_LOG: DissentLog = DissentLog::new();
 
 /// How many dissenting names the WARN lists; the rest are counted. With
 /// many fake nodes the full list was one line of megabytes (65k names).
@@ -4889,10 +4910,15 @@ fn dissenter_names(dissenting: &[String]) -> String {
 /// Writes the replication-factor dissent WARN for `snapshot` if the
 /// limiter admits one; returns whether it did. Nothing is formatted when
 /// the line is suppressed.
-fn log_dissent(limiter: &LogLimiter, snapshot: &RosterSnapshot, replication: usize) -> bool {
+fn log_dissent(log: &DissentLog, snapshot: &RosterSnapshot, replication: usize) -> bool {
     if snapshot.dissenting.is_empty() {
         return false;
     }
+    let limiter = if snapshot.refuse() {
+        &log.refusing
+    } else {
+        &log.served
+    };
     let Some(suppressed) = limiter.admit() else {
         return false;
     };
@@ -10785,11 +10811,50 @@ mod tests {
             dissenting,
             agreeing: 1,
         };
-        let limiter = LogLimiter::new(1, Duration::from_secs(3600));
+        let log = DissentLog {
+            served: LogLimiter::new(1, Duration::from_secs(3600)),
+            refusing: LogLimiter::new(1, Duration::from_secs(3600)),
+        };
+        // 65,000 dissenters against 1 agreeing is a strict majority: the
+        // refusal line, bounded to one per window.
         let written = (0..1000)
-            .filter(|_| log_dissent(&limiter, &snapshot, 2))
+            .filter(|_| log_dissent(&log, &snapshot, 2))
             .count();
         assert_eq!(written, 1);
+    }
+
+    #[test]
+    fn a_refusal_right_after_a_served_dissent_warn_is_still_logged() {
+        // Issue #1826: the two WARNs shared one 1-line budget, so a
+        // "served despite dissent" line followed within the window by the
+        // rebuild that starts refusing `L` left no line saying why `L`
+        // answers `B`.
+        let log = DissentLog {
+            served: LogLimiter::new(1, Duration::from_secs(3600)),
+            refusing: LogLimiter::new(1, Duration::from_secs(3600)),
+        };
+        let served = RosterSnapshot {
+            nodes: Vec::new(),
+            dissenting: vec!["a".to_string()],
+            agreeing: 2,
+        };
+        let refusing = RosterSnapshot {
+            nodes: Vec::new(),
+            dissenting: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            agreeing: 2,
+        };
+        assert!(!served.refuse());
+        assert!(refusing.refuse());
+        assert!(log_dissent(&log, &served, 2));
+        assert!(log_dissent(&log, &refusing, 2), "the refusal was dropped");
+        // Each kind is still bounded to one line per window.
+        let written = (0..1000)
+            .filter(|i| {
+                let snapshot = if i % 2 == 0 { &served } else { &refusing };
+                log_dissent(&log, snapshot, 2)
+            })
+            .count();
+        assert_eq!(written, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
