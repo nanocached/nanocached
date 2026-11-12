@@ -10587,6 +10587,38 @@ async fn garbage_on_redial_refreshes_and_reroutes(use_incr: bool) {
 }
 
 #[tokio::test]
+async fn connect_tolerates_a_listed_address_that_answers_the_handshake_with_garbage() {
+    let (nodes, discovery) = start_cluster(1).await;
+    // NAMES[0] is listed at an address an HTTP server took over: the
+    // handshake gets an HTTP 400, not a reply to `A` (issue #1821).
+    let garbage = GarbageListener::start_on_port(0).await;
+    *discovery.nodes.lock().unwrap() = vec![
+        (NAMES[0].to_string(), format!("127.0.0.1:{}", garbage.port)),
+        (NAMES[1].to_string(), node_named(&nodes, NAMES[1]).address()),
+    ];
+
+    // The default reconnect cooldown stays on: connect() arms an entry
+    // for the garbage address, which must carry the lost connection a
+    // redial gives it, not the dial's protocol error.
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .expect("connect succeeds with one healthy node");
+
+    let bad_key = key_with_primary(NAMES[0]);
+    let result = client.set(&bad_key, "v", 0).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "result = {result:?}"
+    );
+    let good_key = key_with_primary(NAMES[1]);
+    client.set(&good_key, "v", 0).await.unwrap();
+    assert!(client.get(&good_key).await.unwrap().is_some());
+
+    garbage.stop();
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
 async fn expiring_touch_many_counts_a_dial_that_got_garbage_as_not_sent() {
     let (nodes, discovery) = start_cluster(1).await;
     let client = NanocachedClient::connect(options(discovery.port).disable_reconnect_cooldown())

@@ -1774,6 +1774,18 @@ impl NanocachedClient {
                                     )))
                                 }
                                 Ok(Identified::Node { stream, tagged }) => Ok((stream, tagged)),
+                                // Issue #1821: a node that answers the handshake
+                                // with something that is no reply to `A` (an
+                                // HTTP server on a reused address) is the same
+                                // lost connection `open_node_stream` makes of
+                                // it on a redial; `connect()` still returns the
+                                // protocol error if nothing is reachable.
+                                Err(Error::Protocol(message))
+                                    if message == crate::identify::UNEXPECTED_A_REPLY =>
+                                {
+                                    connect_error = Some(Error::Protocol(message.clone()));
+                                    Err(Error::ConnectionLost(message))
+                                }
                                 Err(error) => Err(error),
                             };
                             match outcome {
