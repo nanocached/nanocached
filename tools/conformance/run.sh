@@ -77,4 +77,4 @@ WT=""; [ "$GROUP" = basic ] && [ "$TOPO/$PATHK" = single/direct ] && WT=$P-node:
 [ -n "$WT" ] && { echo "== wire probe $WT"; docker run --rm --network "$NET" -v "$HERE:/w" -w /w e2e-client python wire_probe.py "$WT" "$TOPO-$PATHK" > "$OUT/wire.txt" 2> "$OUT/wire.err"; }
 stop_watchdog
 mkdir -p "$OUT/logs"; for c in $(docker ps -a --format "{{.Names}}" --filter "name=^/$P-"); do docker logs "$c" > "$OUT/logs/$c.log" 2>&1; done
-python3 "$HERE/compare.py" "$OUT"
+python3 "$HERE/compare.py" "$OUT" --sdks "${SDKS// /,}"
