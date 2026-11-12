@@ -5873,11 +5873,17 @@ impl NanocachedClient {
     /// which is exactly what should surface when discovery itself has
     /// nothing left to offer.
     async fn reconnect_proxy(&self) {
-        let Some((address, stream, tagged)) = self.dial_a_fresh_proxy().await else {
-            self.inner
-                .stats
-                .refresh_failures
-                .fetch_add(1, Ordering::Relaxed);
+        let (dialed, got_roster) = self.dial_a_fresh_proxy().await;
+        let Some((address, stream, tagged)) = dialed else {
+            // Issue #1822: a refresh failure is a refresh that yielded no
+            // usable proxy roster, as in the other SDKs; a roster that came
+            // back with every proxy dial failing is not counted.
+            if !got_roster {
+                self.inner
+                    .stats
+                    .refresh_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return;
         };
         let connection = Arc::new(Connection::new(
@@ -5932,8 +5938,11 @@ impl NanocachedClient {
     /// address in turn (discovery HA, mirroring `fetch_node_list`) and
     /// dials a random, reachable entry from the first non-empty roster —
     /// see `dial_random_proxy`. `None` once every address has been tried
-    /// and none yielded a reachable proxy.
-    async fn dial_a_fresh_proxy(&self) -> Option<(String, crate::identify::Stream, bool)> {
+    /// and none yielded a reachable proxy. The second value is whether any
+    /// address returned a non-empty roster, so the caller can tell a failed
+    /// refresh from a usable roster whose proxies all failed to dial.
+    async fn dial_a_fresh_proxy(&self) -> (Option<(String, crate::identify::Stream, bool)>, bool) {
+        let mut got_roster = false;
         for (host, port) in &self.inner.addresses {
             if let Ok(Identified::Proxies { proxies }) = connect_and_identify(
                 host,
@@ -5946,6 +5955,7 @@ impl NanocachedClient {
             .await
             {
                 if !proxies.is_empty() {
+                    got_roster = true;
                     if let Some(result) = dial_random_proxy(
                         &proxies,
                         self.inner.auth_secret_bytes(),
@@ -5953,12 +5963,12 @@ impl NanocachedClient {
                     )
                     .await
                     {
-                        return Some(result);
+                        return (Some(result), true);
                     }
                 }
             }
         }
-        None
+        (None, got_roster)
     }
 }
 
