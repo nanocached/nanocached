@@ -19,8 +19,9 @@ framework adapters at one version, whether or not a component changed.
   and the WARN for a connection poisoned by a frame the node rejected, in the
   same window, was only counted. Poison WARNs now have a budget of their own
   (still 3 per 10 s per address). The count of lines left unwritten when the
-  flapping stopped was also never reported; it is now written when the
-  address leaves the live set (#1824).
+  flapping stopped was also never reported; it is now written by the next
+  roster refresh after its window ends, or when the address leaves the live
+  set (#1824).
 
 - Discovery: new node registrations (`P`) and new proxy registrations (`Y`)
   from one source spent one shared burst of 64, so on a host, NAT address or

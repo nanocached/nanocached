@@ -3238,6 +3238,14 @@ impl BackendExitLog {
 
     /// The summary line for lines that were counted and never written,
     /// `None` when there are none; takes the counts.
+    /// Like `take_summary`, but only for counts whose window has ended by
+    /// `now` (a live address that stopped flapping).
+    fn take_summary_after_window(&self, addr: &str, now: tokio::time::Instant) -> Option<String> {
+        let suppressed = self.ordinary.take_suppressed_after_window(now)
+            + self.poison.take_suppressed_after_window(now);
+        (suppressed > 0).then(|| backend_exit_summary(addr, suppressed))
+    }
+
     fn take_summary(&self, addr: &str) -> Option<String> {
         let suppressed = self.ordinary.take_suppressed() + self.poison.take_suppressed();
         (suppressed > 0).then(|| backend_exit_summary(addr, suppressed))
@@ -4071,7 +4079,7 @@ impl SharedBackends {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             failures.retain(|addr, _| live.contains(addr));
         }
-        for line in self.prune_exit_logs(&live) {
+        for line in self.prune_exit_logs(&live, tokio::time::Instant::now()) {
             eprintln!("{line}");
         }
     }
@@ -4079,15 +4087,23 @@ impl SharedBackends {
     /// Drops the exit budgets of addresses not in `live`. Issue #1824:
     /// lines an address still had counted and unwritten are returned as
     /// summary lines for the caller to write, or they never would be.
-    fn prune_exit_logs(&self, live: &[String]) -> Vec<String> {
+    /// A live address whose window has ended with lines still counted
+    /// (the flapping stopped) gets its summary now too, and its count
+    /// reset; its entry stays.
+    fn prune_exit_logs(&self, live: &[String], now: tokio::time::Instant) -> Vec<String> {
         let mut logs = self
             .exit_logs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let summaries = logs
             .iter()
-            .filter(|(addr, _)| !live.contains(*addr))
-            .filter_map(|(addr, log)| log.take_summary(addr))
+            .filter_map(|(addr, log)| {
+                if live.contains(addr) {
+                    log.take_summary_after_window(addr, now)
+                } else {
+                    log.take_summary(addr)
+                }
+            })
             .collect();
         logs.retain(|addr, _| live.contains(addr));
         summaries
@@ -15300,12 +15316,42 @@ mod tests {
         // 3 admitted, 7 counted per address; only the departed address
         // is reported, and only once.
         assert_eq!(
-            backends.prune_exit_logs(&[kept.to_string()]),
+            backends.prune_exit_logs(&[kept.to_string()], start),
             vec![format!(
                 "WARN 7 more backend connection lines for {addr} (not logged individually)"
             )]
         );
-        assert!(backends.prune_exit_logs(&[kept.to_string()]).is_empty());
+        assert!(
+            backends
+                .prune_exit_logs(&[kept.to_string()], start)
+                .is_empty()
+        );
+        assert_eq!(backends.exit_logs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_last_suppressed_count_of_a_live_address_is_written_once_its_window_ends() {
+        // Issue #1824: an address that stopped flapping but stays live
+        // never admits another line to carry the summary, so the
+        // periodic prune writes it once the window has ended.
+        let backends = SharedBackends::new();
+        let addr = "10.0.0.1:8356";
+        let live = [addr.to_string()];
+        let start = tokio::time::Instant::now();
+        let log = backends.exit_log(addr);
+        for _ in 0..10 {
+            backend_exit_lines(&log, addr, "INFO exit".to_string(), false, start);
+        }
+        // Still inside the window: nothing yet, and the count is kept.
+        assert!(backends.prune_exit_logs(&live, start).is_empty());
+        let later = start + BACKEND_EXIT_LOG_WINDOW;
+        assert_eq!(
+            backends.prune_exit_logs(&live, later),
+            vec![format!(
+                "WARN 7 more backend connection lines for {addr} (not logged individually)"
+            )]
+        );
+        assert!(backends.prune_exit_logs(&live, later).is_empty());
         assert_eq!(backends.exit_logs.lock().unwrap().len(), 1);
     }
 
