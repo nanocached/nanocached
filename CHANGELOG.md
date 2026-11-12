@@ -54,6 +54,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the accepted-behaviour list and the getting-started limits now say
+  that the 128 rejected-connection slots of a node and of discovery are
+  process-wide: a source keeping 128 rejected connections lingering makes
+  other clients being turned away at that moment get a reset instead of `B`.
+  Only refused connections are affected. The code comment says the same
+  (#1830).
 - Docs: the accepted-behaviour list and the operations page now say that a
   proxy's first registration (`Y`) is paced per source like a node's: more
   than 64 proxies behind one NAT address or IPv6 /64 re-register at one per
