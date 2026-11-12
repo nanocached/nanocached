@@ -14,6 +14,8 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tools/conformance`: `compare.py` (the last step of `run.sh`) exited 0 when a cell had no record (`--`: a driver crashed or never ran), and an SDK that produced no record at all disappeared from the matrix, so a run could pass with a whole column missing. It now exits 1 on `--` cells and when an expected SDK has no record; `run.sh` passes the SDKs it was asked to run (`compare.py --sdks`), so a deliberate subset still passes (#1827).
+
 - Discovery: new node registrations (`P`) and new proxy registrations (`Y`)
   from one source spent one shared burst of 64, so on a host, NAT address or
   IPv6 /64 running both, proxies re-registering after a discovery restart
