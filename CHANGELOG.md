@@ -14,6 +14,8 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `tests/e2e/lr.sh`: when a membership wait failed, the script exited and its EXIT trap removed the containers, but the backgrounded `stats.sh`, the Python load and the .NET probe subshells kept running. The trap now stops them first (TERM, at most 5 s, then KILL) and removes the load container too, which is not named with the run's prefix. `NODE`/`DISC` are exported, which clears shellcheck SC2034 (#1829).
+
 - Discovery: new node registrations (`P`) and new proxy registrations (`Y`)
   from one source spent one shared burst of 64, so on a host, NAT address or
   IPv6 /64 running both, proxies re-registering after a discovery restart
