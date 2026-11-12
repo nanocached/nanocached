@@ -2792,7 +2792,7 @@ impl BackendHandle {
         slot: Arc<tokio::sync::Mutex<Option<BackendHandle>>>,
         dialed: Arc<std::sync::atomic::AtomicUsize>,
         keepalive_interval: Duration,
-        exit_log: Arc<LogLimiter>,
+        exit_log: Arc<BackendExitLog>,
     ) -> io::Result<Self> {
         let mut stream = timeout(UPSTREAM_IO_TIMEOUT, connect_upstream(addr, tls_connector))
             .await
@@ -2859,7 +2859,7 @@ struct BackendIdentity {
     /// The budget for this address's exit lines (shared by every
     /// connection dialed to it, so a node that closes each connection
     /// right after the handshake does not log once per redial).
-    exit_log: Arc<LogLimiter>,
+    exit_log: Arc<BackendExitLog>,
 }
 
 /// The shared backend connection's writer half (issue #110): assigns
@@ -2968,6 +2968,7 @@ async fn run_backend(
                         format!(
                             "INFO backend connection to {reader_addr} {idle}; will redial on next request"
                         ),
+                        false,
                     );
                     pending_rx.close();
                     while let Some((_, _, reply)) = pending_rx.recv().await {
@@ -3152,14 +3153,12 @@ async fn run_backend(
     // "backend connection is gone" error with no address attached. A
     // clean drain (every sender dropped, e.g. prune retired the address)
     // is expected teardown, not a fault, so it is logged differently.
+    let clients_affected = clients_affected.load(std::sync::atomic::Ordering::Relaxed);
     log_backend_exit(
         &exit_log,
         &addr,
-        backend_exit_log_line(
-            &addr,
-            poisoned_exit,
-            clients_affected.load(std::sync::atomic::Ordering::Relaxed),
-        ),
+        backend_exit_log_line(&addr, poisoned_exit, clients_affected),
+        backend_exit_is_poison(poisoned_exit, clients_affected),
     );
 
     // issue #192: eagerly clear this connection's slot and decrement the
@@ -3218,36 +3217,60 @@ async fn watch_idle_backend<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut Byte
 const BACKEND_EXIT_LOG_LINES: u32 = 3;
 const BACKEND_EXIT_LOG_WINDOW: Duration = Duration::from_secs(10);
 
-fn new_backend_exit_limiter() -> LogLimiter {
-    LogLimiter::new(BACKEND_EXIT_LOG_LINES, BACKEND_EXIT_LOG_WINDOW)
+/// One address's exit-line budgets. Issue #1824: the WARN for a connection
+/// poisoned by a frame the node rejected is the diagnosis for a real
+/// fault, so it has a budget of its own: a flapping address that closes
+/// connections cleanly spends `ordinary` and cannot hide a poisoning.
+/// Both stay bounded per window, so a flapping address still logs a
+/// bounded number of lines.
+struct BackendExitLog {
+    ordinary: LogLimiter,
+    poison: LogLimiter,
+}
+
+impl BackendExitLog {
+    fn new() -> Self {
+        Self {
+            ordinary: LogLimiter::new(BACKEND_EXIT_LOG_LINES, BACKEND_EXIT_LOG_WINDOW),
+            poison: LogLimiter::new(BACKEND_EXIT_LOG_LINES, BACKEND_EXIT_LOG_WINDOW),
+        }
+    }
+
+    /// The summary line for lines that were counted and never written,
+    /// `None` when there are none; takes the counts.
+    fn take_summary(&self, addr: &str) -> Option<String> {
+        let suppressed = self.ordinary.take_suppressed() + self.poison.take_suppressed();
+        (suppressed > 0).then(|| backend_exit_summary(addr, suppressed))
+    }
+}
+
+fn backend_exit_summary(addr: &str, suppressed: u64) -> String {
+    format!("WARN {suppressed} more backend connection lines for {addr} (not logged individually)")
 }
 
 /// What to write for one backend exit line at `now`: nothing when the
 /// address's budget is spent (the line is counted), otherwise the line,
 /// preceded by a summary of the lines dropped since the last one written.
 fn backend_exit_lines(
-    limiter: &LogLimiter,
+    log: &BackendExitLog,
     addr: &str,
     line: String,
+    poison: bool,
     now: tokio::time::Instant,
 ) -> Vec<String> {
+    let limiter = if poison { &log.poison } else { &log.ordinary };
     let Some(suppressed) = limiter.admit_at(now) else {
         return Vec::new();
     };
     if suppressed > 0 {
-        vec![
-            format!(
-                "WARN {suppressed} more backend connection lines for {addr} (not logged individually)"
-            ),
-            line,
-        ]
+        vec![backend_exit_summary(addr, suppressed), line]
     } else {
         vec![line]
     }
 }
 
-fn log_backend_exit(limiter: &LogLimiter, addr: &str, line: String) {
-    for line in backend_exit_lines(limiter, addr, line, tokio::time::Instant::now()) {
+fn log_backend_exit(log: &BackendExitLog, addr: &str, line: String, poison: bool) {
+    for line in backend_exit_lines(log, addr, line, poison, tokio::time::Instant::now()) {
         eprintln!("{line}");
     }
 }
@@ -3258,6 +3281,13 @@ fn log_backend_exit(limiter: &LogLimiter, addr: &str, line: String) {
 /// left, or stopped answering; the next request simply redials), logged
 /// at `INFO`. `WARN` is reserved for a poison that failed at least one
 /// client's request.
+/// Whether the exit line is the WARN for a poison that failed a client's
+/// request (`backend_exit_log_line` writes it at `WARN`), which has its
+/// own budget.
+fn backend_exit_is_poison(poisoned_exit: bool, clients_affected: bool) -> bool {
+    poisoned_exit && clients_affected
+}
+
 fn backend_exit_log_line(addr: &str, poisoned_exit: bool, clients_affected: bool) -> String {
     if !poisoned_exit {
         format!("INFO backend connection to {addr} closed; no callers remain")
@@ -3944,7 +3974,7 @@ struct SharedBackends {
     /// Per address, the budget of its backend exit lines. It has to
     /// outlive the connection: the one that flaps is replaced by a new
     /// task each time.
-    exit_logs: std::sync::Mutex<HashMap<String, Arc<LogLimiter>>>,
+    exit_logs: std::sync::Mutex<HashMap<String, Arc<BackendExitLog>>>,
 }
 
 impl SharedBackends {
@@ -3962,14 +3992,14 @@ impl SharedBackends {
         }
     }
 
-    fn exit_log(&self, addr: &str) -> Arc<LogLimiter> {
+    fn exit_log(&self, addr: &str) -> Arc<BackendExitLog> {
         let mut logs = self
             .exit_logs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Arc::clone(
             logs.entry(addr.to_string())
-                .or_insert_with(|| Arc::new(new_backend_exit_limiter())),
+                .or_insert_with(|| Arc::new(BackendExitLog::new())),
         )
     }
 
@@ -4041,13 +4071,26 @@ impl SharedBackends {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             failures.retain(|addr, _| live.contains(addr));
         }
-        {
-            let mut logs = self
-                .exit_logs
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            logs.retain(|addr, _| live.contains(addr));
+        for line in self.prune_exit_logs(&live) {
+            eprintln!("{line}");
         }
+    }
+
+    /// Drops the exit budgets of addresses not in `live`. Issue #1824:
+    /// lines an address still had counted and unwritten are returned as
+    /// summary lines for the caller to write, or they never would be.
+    fn prune_exit_logs(&self, live: &[String]) -> Vec<String> {
+        let mut logs = self
+            .exit_logs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let summaries = logs
+            .iter()
+            .filter(|(addr, _)| !live.contains(*addr))
+            .filter_map(|(addr, log)| log.take_summary(addr))
+            .collect();
+        logs.retain(|addr, _| live.contains(addr));
+        summaries
     }
 
     /// Enqueues one tag-checked request on `addr`'s shared connection
@@ -13019,7 +13062,7 @@ mod tests {
             slot,
             Arc::new(AtomicUsize::new(0)),
             Duration::from_secs(30),
-            Arc::new(new_backend_exit_limiter()),
+            Arc::new(BackendExitLog::new()),
         )
         .await
         .unwrap();
@@ -15168,29 +15211,102 @@ mod tests {
     fn a_flapping_backend_does_not_log_a_line_per_redial() {
         // The node closes every connection right after the handshake, so
         // the backoff resets and the exit line comes once per request.
-        let flapping = new_backend_exit_limiter();
-        let other = new_backend_exit_limiter();
+        let flapping = BackendExitLog::new();
+        let other = BackendExitLog::new();
         let start = tokio::time::Instant::now();
         let written = (0..1000)
-            .map(|_| backend_exit_lines(&flapping, "10.0.0.1:8356", "INFO exit".to_string(), start))
+            .map(|_| {
+                backend_exit_lines(
+                    &flapping,
+                    "10.0.0.1:8356",
+                    "INFO exit".to_string(),
+                    false,
+                    start,
+                )
+            })
             .map(|lines| lines.len())
             .sum::<usize>();
         assert_eq!(written, BACKEND_EXIT_LOG_LINES as usize);
         // Another address has its own budget.
         assert_eq!(
-            backend_exit_lines(&other, "10.0.0.2:8356", "INFO exit".to_string(), start),
+            backend_exit_lines(
+                &other,
+                "10.0.0.2:8356",
+                "INFO exit".to_string(),
+                false,
+                start
+            ),
             vec!["INFO exit".to_string()]
         );
         // The next window reports what was dropped ahead of the line.
         let later = start + BACKEND_EXIT_LOG_WINDOW;
         assert_eq!(
-            backend_exit_lines(&flapping, "10.0.0.1:8356", "INFO exit".to_string(), later),
+            backend_exit_lines(
+                &flapping,
+                "10.0.0.1:8356",
+                "INFO exit".to_string(),
+                false,
+                later
+            ),
             vec![
                 "WARN 997 more backend connection lines for 10.0.0.1:8356 (not logged individually)"
                     .to_string(),
                 "INFO exit".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn a_flapping_backend_cannot_hide_a_poisoned_connection() {
+        // Issue #1824: ordinary exits spend the address's whole budget;
+        // the WARN for a connection poisoned by a rejected frame still
+        // gets written in the same window.
+        let log = BackendExitLog::new();
+        let addr = "10.0.0.1:8356";
+        let start = tokio::time::Instant::now();
+        for _ in 0..100 {
+            backend_exit_lines(&log, addr, "INFO exit".to_string(), false, start);
+        }
+        let poison_line = backend_exit_log_line(addr, true, true);
+        assert!(backend_exit_is_poison(true, true));
+        assert!(!backend_exit_is_poison(true, false));
+        assert!(!backend_exit_is_poison(false, true));
+        assert_eq!(
+            backend_exit_lines(&log, addr, poison_line.clone(), true, start),
+            vec![poison_line.clone()]
+        );
+        // Poison lines are bounded too.
+        let written = (0..100)
+            .map(|_| backend_exit_lines(&log, addr, poison_line.clone(), true, start).len())
+            .sum::<usize>();
+        assert_eq!(written, BACKEND_EXIT_LOG_LINES as usize - 1);
+    }
+
+    #[test]
+    fn the_last_suppressed_count_is_written_when_the_address_leaves_the_live_set() {
+        // Issue #1824: the summary used to go out only ahead of the next
+        // admitted line, so when the flapping stopped the final count
+        // was never written.
+        let backends = SharedBackends::new();
+        let addr = "10.0.0.1:8356";
+        let kept = "10.0.0.2:8356";
+        let start = tokio::time::Instant::now();
+        for a in [addr, kept] {
+            let log = backends.exit_log(a);
+            for _ in 0..10 {
+                backend_exit_lines(&log, a, "INFO exit".to_string(), false, start);
+            }
+        }
+        // 3 admitted, 7 counted per address; only the departed address
+        // is reported, and only once.
+        assert_eq!(
+            backends.prune_exit_logs(&[kept.to_string()]),
+            vec![format!(
+                "WARN 7 more backend connection lines for {addr} (not logged individually)"
+            )]
+        );
+        assert!(backends.prune_exit_logs(&[kept.to_string()]).is_empty());
+        assert_eq!(backends.exit_logs.lock().unwrap().len(), 1);
     }
 
     #[test]

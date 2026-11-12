@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: one per-address budget of 3 lines per 10 s covered every backend
+  exit line, so an address that kept closing connections cleanly used it up
+  and the WARN for a connection poisoned by a frame the node rejected, in the
+  same window, was only counted. Poison WARNs now have a budget of their own
+  (still 3 per 10 s per address). The count of lines left unwritten when the
+  flapping stopped was also never reported; it is now written when the
+  address leaves the live set (#1824).
+
 - Discovery: new node registrations (`P`) and new proxy registrations (`Y`)
   from one source spent one shared burst of 64, so on a host, NAT address or
   IPv6 /64 running both, proxies re-registering after a discovery restart

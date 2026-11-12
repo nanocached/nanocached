@@ -633,6 +633,17 @@ impl LogLimiter {
             None
         }
     }
+
+    /// Lines dropped and not yet mentioned in a summary, taken (the count
+    /// resets to zero). For a caller that is about to discard the limiter
+    /// and would otherwise never report them.
+    pub fn take_suppressed(&self) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut state.suppressed)
+    }
 }
 
 // ─── constant-time comparison ───────────────────────────────────────────
