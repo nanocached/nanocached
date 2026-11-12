@@ -48,6 +48,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the accepted-behaviour list and the proxy ordering section now say
+  that a deferred `m`/`o`/`y` of more than 64 keys is registered for its
+  whole namespace, so a later request on the same connection and namespace
+  waits for it even for a key it does not carry (an `i` that would have been
+  sent at once is deferred), as the price of not keeping an entry per key
+  (#1823).
 - Docs: the SDKs page said nothing about the limit on an `o` or `y` frame
   (namespace length times the number of keys, at most 64 MiB), and the
   protocol page said the SDKs reach it only with a namespace over 167,772
