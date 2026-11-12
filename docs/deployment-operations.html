@@ -138,6 +138,19 @@ partial roster; the rest follow at one node per 2&nbsp;seconds. Set
 (72&nbsp;seconds for 100 nodes, since 36 nodes are beyond 64; a dead node
 is then evicted that much later too; the minimum is 15), or spread the
 nodes over more source addresses.</p>
+<p>A proxy registering with discovery (<code>Y</code>) is paced the same
+way, with an allowance of its own: 64 new names at once and one more every
+2&nbsp;seconds per source, an IPv6 source counting per /64, and a refresh of
+a name already registered never counted. With more than 64 proxies behind one
+NAT or SNAT address, or in one /64, those registering together (after a
+discovery restart) get in at one per 2&nbsp;seconds beyond the 64. Discovery
+refuses the others and closes the connection; the proxy logs
+<code>WARN proxy announce &hellip; failed</code> and announces again at its
+next refresh (every 5&nbsp;seconds), so no restart is needed, and the proxy
+list an SDK in proxy mode fetches is partial meanwhile (about 2&nbsp;seconds
+per proxy beyond 64, so 72&nbsp;seconds for 100 proxies). The startup grace
+only delays the list (<code>B</code>); it does not widen this allowance.
+Spread the proxies over more source addresses if that matters.</p>
 
 <h2 id="graceful-scale-in">Graceful scale-in</h2>
 <p>Scale-in terminates instances that are <em>not</em> dead, and

@@ -48,6 +48,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the accepted-behaviour list and the operations page now say that a
+  proxy's first registration (`Y`) is paced per source like a node's: more
+  than 64 proxies behind one NAT address or IPv6 /64 re-register at one per
+  2 s after a discovery restart, a refused `Y` closes the connection and the
+  proxy sends it again at its next refresh (every 5 s), and `Q` is partial
+  meanwhile (#1825).
 - Docs: the SDKs page said nothing about the limit on an `o` or `y` frame
   (namespace length times the number of keys, at most 64 MiB), and the
   protocol page said the SDKs reach it only with a namespace over 167,772
