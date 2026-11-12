@@ -16,6 +16,10 @@ framework adapters at one version, whether or not a component changed.
 
 - `tests/e2e/lr.sh`: when a membership wait failed, the script exited and its EXIT trap removed the containers, but the backgrounded `stats.sh`, the Python load and the .NET probe subshells kept running. The trap now stops them first (TERM, at most 5 s, then KILL) and removes the load container too, which is not named with the run's prefix. `NODE`/`DISC` are exported, which clears shellcheck SC2034 (#1829).
 
+- `tools/conformance`: the `scenarios.sh v6` secret scan hid grep's errors (`2>/dev/null`), so with no output files, or only empty ones (every driver produced nothing), it reported 0 leaks and exited 0. It now exits 1 when there is nothing to scan or grep fails (status 2); the leak check itself is unchanged (#1828).
+
+- `tools/conformance`: `compare.py` (the last step of `run.sh`) exited 0 when a cell had no record (`--`: a driver crashed or never ran), and an SDK that produced no record at all disappeared from the matrix, so a run could pass with a whole column missing. It now exits 1 on `--` cells and when an expected SDK has no record; `run.sh` passes the SDKs it was asked to run (`compare.py --sdks`), so a deliberate subset still passes (#1827).
+
 - Discovery: new node registrations (`P`) and new proxy registrations (`Y`)
   from one source spent one shared burst of 64, so on a host, NAT address or
   IPv6 /64 running both, proxies re-registering after a discovery restart

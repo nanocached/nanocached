@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""compare.py <run-dir>: build the case × SDK matrix from the drivers' JSONL.
+"""compare.py <run-dir> [--sdks a,b,...]: build the case × SDK matrix from the drivers' JSONL.
 
 Two independent checks (a shared bug passes the second and fails the first):
   oracle     each step's observation against the step's ``expect``
@@ -15,6 +15,11 @@ Cell:  PASS   matches the oracle and every other SDK
        N/A    the driver said the argument cannot be expressed in the SDK
        --     no record (driver did not run / timed out earlier in the case)
 Writes <run-dir>/report.md and prints the matrix.
+
+Exit status 1 when any cell is FAIL, DIFF or ``--``, or when an expected SDK has
+no record at all. The expected SDKs are the six unless ``--sdks`` names a subset
+(run.sh passes the SDKs it was asked to run), so a driver that crashed or never
+ran cannot pass as an absent column.
 """
 
 import collections
@@ -84,9 +89,9 @@ def oracle(expect, r):
     return None
 
 
-def main(run_dir):
+def main(run_dir, sdks):
     doc, records = load(run_dir)
-    sdks = [s for s in SDKS if any(s in v for v in records.values())]
+    silent = [s for s in sdks if not any(s in v for v in records.values())]
     rows, details = [], []
 
     def cell_for(case_id, steps):
@@ -129,7 +134,7 @@ def main(run_dir):
         status = {}
         for reader in sdks:
             ok, bad = True, []
-            for writer in SDKS:
+            for writer in sdks:
                 r = records.get((f"xsdk.read.{writer}.{item['name']}", 0), {}).get(reader)
                 if r is None:
                     ok, bad = False, bad + [f"{writer}: no record"]
@@ -153,11 +158,30 @@ def main(run_dir):
     text = "\n".join(lines) + "\n"
     open(os.path.join(run_dir, "report.md"), "w").write(text)
     print(text)
-    # a cell the oracle rejected (FAIL) or that disagrees with the other SDKs (DIFF) fails the run
-    bad_cells = total["FAIL"] + total["DIFF"]
-    if bad_cells:
-        print(f"{bad_cells} FAIL/DIFF cells", file=sys.stderr)
+    # a cell the oracle rejected (FAIL), that disagrees with the other SDKs (DIFF) or has no record (--), or an
+    # expected SDK that produced no record at all, fails the run
+    problems = []
+    if total["FAIL"] + total["DIFF"]:
+        problems.append(f"{total['FAIL'] + total['DIFF']} FAIL/DIFF cells")
+    if total["--"]:
+        problems.append(f"{total['--']} cells with no record (--)")
+    if silent:
+        problems.append("no records at all from: " + ", ".join(silent))
+    if problems:
+        print("; ".join(problems), file=sys.stderr)
         sys.exit(1)
 
 
-main(sys.argv[1])
+def parse(argv):
+    args, sdks = argv[1:], SDKS
+    if len(args) == 3 and args[1] == "--sdks":
+        sdks = [s for s in args[2].replace(",", " ").split() if s]
+        unknown = [s for s in sdks if s not in SDKS]
+        if unknown or not sdks:
+            sys.exit(f"--sdks: expected a non-empty subset of {','.join(SDKS)}, got {args[2]!r}")
+    elif len(args) != 1:
+        sys.exit("usage: compare.py <run-dir> [--sdks a,b,...]")
+    return args[0], sdks
+
+
+main(*parse(sys.argv))
