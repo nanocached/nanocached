@@ -5485,6 +5485,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     private async Task<IReadOnlyList<DiscoveredNode>> FetchProxyListAsync()
     {
         Exception? lastError = null;
+        bool sawEmptyRoster = false;
         foreach (var (host, port) in _addresses)
         {
             Identify.Result identified;
@@ -5512,11 +5513,21 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                         $"nanocached: ViaProxy requires discovery addresses, but {host}:{port} "
                         + "identifies as a cache node");
 
+                // An empty roster is not an answer: this replica may have
+                // just restarted and not heard its proxies re-register yet,
+                // so ask the next address, as ConnectAsync does.
+                case Identify.ProxyListTarget proxies when proxies.Proxies.Count == 0:
+                    sawEmptyRoster = true;
+                    continue;
+
                 case Identify.ProxyListTarget proxies:
                     return proxies.Proxies;
             }
         }
         Interlocked.Increment(ref _refreshFailures);
+        // Some address answered, with no proxies: hand back the empty list
+        // so the caller reports it with the same-proxy dial error attached.
+        if (sawEmptyRoster) return Array.Empty<DiscoveredNode>();
         throw lastError ?? new NanocachedException(
             "nanocached: could not reach any discovery address for the proxy roster");
     }
