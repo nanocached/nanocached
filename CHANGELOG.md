@@ -14,6 +14,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Discovery: the "L served despite dissent" and "refusing L" WARNs shared one
+  limiter of 1 line per 10 s, so a served WARN written just before the
+  dissent became a strict majority swallowed the refusal line, and `L` then
+  answered `B` with nothing in the log saying why. Each now has its own
+  limiter (still 1 line per 10 s each, names capped at 5) (#1826).
+
 - Proxy: one per-address budget of 3 lines per 10 s covered every backend
   exit line, so an address that kept closing connections cleanly used it up
   and the WARN for a connection poisoned by a frame the node rejected, in the
