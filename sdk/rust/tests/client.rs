@@ -9383,6 +9383,56 @@ async fn via_proxy_reconnect_re_fetches_the_roster_and_lands_on_the_survivor() {
     proxy_b.stop();
 }
 
+/// Issue #1822: proxy mode counts `refresh_failures` only for a refresh that
+/// yielded no usable roster; a roster whose proxies all fail to dial is not
+/// a refresh failure.
+async fn proxy_reconnect_refresh_failures(roster_after_loss: Vec<(String, String)>) -> u64 {
+    let proxy_a = MockNode::start().await;
+    let discovery = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-a".to_string(), proxy_a.address())],
+    )
+    .await;
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", discovery.port)])
+            .via_proxy(true),
+    )
+    .await
+    .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+
+    proxy_a.stop();
+    discovery.set_proxies(roster_after_loss);
+    // The same-address redial fails, then the roster is re-fetched and
+    // there is no proxy to land on: the call fails either way.
+    assert!(client.get("k").await.is_err());
+    let failures = client.stats().refresh_failures;
+
+    client.close().await;
+    discovery.stop();
+    failures
+}
+
+#[tokio::test]
+async fn via_proxy_reconnect_does_not_count_a_refresh_failure_when_the_roster_was_fetched() {
+    // The roster is usable (one entry) but its proxy is not listening.
+    let dead = MockNode::start().await;
+    let address = dead.address();
+    dead.stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let failures =
+        proxy_reconnect_refresh_failures(vec![("proxy-dead".to_string(), address)]).await;
+    assert_eq!(failures, 0, "a fetched roster is not a refresh failure");
+}
+
+#[tokio::test]
+async fn via_proxy_reconnect_counts_a_refresh_failure_when_the_roster_is_empty() {
+    let failures = proxy_reconnect_refresh_failures(vec![]).await;
+    assert!(failures >= 1, "an empty roster is a refresh failure");
+}
+
 #[tokio::test]
 async fn via_proxy_reconnect_purges_the_departed_proxys_cooldown_entry() {
     // Issue #296: maybe_refresh's own cooldown prune (refresh_node_list)
