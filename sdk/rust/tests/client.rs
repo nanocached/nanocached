@@ -9384,6 +9384,56 @@ async fn via_proxy_reconnect_re_fetches_the_roster_and_lands_on_the_survivor() {
 }
 
 #[tokio::test]
+async fn via_proxy_bulk_ops_fail_over_to_another_proxy() {
+    // Issue #1845: get_many / set_many / touch_many / get_many_and_touch only
+    // redialed the dead proxy's address, so a bulk-only workload never
+    // recovered while a healthy proxy existed. Each op below starts with the
+    // pinned proxy dead and must land on the survivor.
+    for op in ["get_many", "set_many", "touch_many", "get_many_and_touch"] {
+        let proxy_a = MockNode::start().await;
+        let proxy_b = MockNode::start().await;
+        let discovery = MockDiscovery::start_with_proxies(
+            vec![],
+            1,
+            vec![("proxy-a".to_string(), proxy_a.address())],
+        )
+        .await;
+        let client = NanocachedClient::connect(
+            Options::new()
+                .addresses([("127.0.0.1", discovery.port)])
+                .via_proxy(true),
+        )
+        .await
+        .unwrap();
+        client.set("k", "v", 0).await.unwrap();
+
+        proxy_a.stop();
+        discovery.set_proxies(vec![("proxy-b".to_string(), proxy_b.address())]);
+
+        let keys = ["k", "j"];
+        let result = match op {
+            "get_many" => client.get_many(&keys).await.map(|_| ()),
+            "set_many" => {
+                let values = HashMap::from([("k".to_string(), "v".to_string())]);
+                client.set_many(&values, 0).await
+            }
+            "touch_many" => client.touch_many(&keys, Some(60)).await.map(|_| ()),
+            _ => client.get_many_and_touch(&keys, Some(60)).await.map(|_| ()),
+        };
+        assert!(result.is_ok(), "{op} must fail over to proxy B: {result:?}");
+        assert_eq!(
+            proxy_b.state.connections.load(Ordering::SeqCst),
+            1,
+            "{op}: exactly one dial to the survivor"
+        );
+
+        client.close().await;
+        discovery.stop();
+        proxy_b.stop();
+    }
+}
+
+#[tokio::test]
 async fn via_proxy_failover_is_single_flight_under_concurrent_requests() {
     // Issue #1846: with 40 gets in flight when the proxy dies, each used to
     // re-fetch `Q`, dial the survivor and close the connection a sibling had

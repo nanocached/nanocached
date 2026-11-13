@@ -5456,6 +5456,31 @@ impl NanocachedClient {
     }
 
     async fn slot_connection(&self, slot: Option<&str>) -> Result<Arc<Connection>> {
+        let result = self.slot_connection_once(slot).await;
+        // Issue #1845: in proxy mode the redial of the one pinned proxy
+        // address is not the end of the road; fail over to another proxy
+        // while acquiring the connection, as the other SDKs do, so every
+        // caller of `apply_reconnecting` (the bulk ops included, which never
+        // reach `with_cluster_retry`) benefits. Nothing has been written yet
+        // at this point, so it is as safe for a non-idempotent op as the
+        // redial itself. `reconnect_proxy` is single-flight and a no-op when
+        // a sibling already installed a live connection.
+        if let Err(Error::ConnectionLost(_)) = &result {
+            if self.inner.via_proxy && slot.is_none() {
+                self.reconnect_proxy().await;
+                let current = match &self.inner.state.lock().await.target {
+                    Target::Single { connection, .. } => Some(Arc::clone(connection)),
+                    _ => None,
+                };
+                if let Some(connection) = current.filter(|connection| !connection.is_closed()) {
+                    return Ok(connection);
+                }
+            }
+        }
+        result
+    }
+
+    async fn slot_connection_once(&self, slot: Option<&str>) -> Result<Arc<Connection>> {
         let (slot_key, address, current) = {
             let state = self.inner.state.lock().await;
             match (&state.target, slot) {
