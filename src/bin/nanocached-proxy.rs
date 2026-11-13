@@ -3236,8 +3236,6 @@ impl BackendExitLog {
         }
     }
 
-    /// The summary line for lines that were counted and never written,
-    /// `None` when there are none; takes the counts.
     /// Like `take_summary`, but only for counts whose window has ended by
     /// `now` (a live address that stopped flapping).
     fn take_summary_after_window(&self, addr: &str, now: tokio::time::Instant) -> Option<String> {
@@ -3246,6 +3244,8 @@ impl BackendExitLog {
         (suppressed > 0).then(|| backend_exit_summary(addr, suppressed))
     }
 
+    /// The summary line for lines that were counted and never written,
+    /// `None` when there are none; takes the counts.
     fn take_summary(&self, addr: &str) -> Option<String> {
         let suppressed = self.ordinary.take_suppressed() + self.poison.take_suppressed();
         (suppressed > 0).then(|| backend_exit_summary(addr, suppressed))
@@ -3283,12 +3283,6 @@ fn log_backend_exit(log: &BackendExitLog, addr: &str, line: String, poison: bool
     }
 }
 
-/// `run_backend`'s exit line. Issue #514: a connection that died with
-/// only our own keep-alive probe on it — no client request was resolved
-/// with an error — is an idle-side loss (the node closed it, restarted,
-/// left, or stopped answering; the next request simply redials), logged
-/// at `INFO`. `WARN` is reserved for a poison that failed at least one
-/// client's request.
 /// Whether the exit line is the WARN for a poison that failed a client's
 /// request (`backend_exit_log_line` writes it at `WARN`), which has its
 /// own budget.
@@ -3296,6 +3290,12 @@ fn backend_exit_is_poison(poisoned_exit: bool, clients_affected: bool) -> bool {
     poisoned_exit && clients_affected
 }
 
+/// `run_backend`'s exit line. Issue #514: a connection that died with
+/// only our own keep-alive probe on it — no client request was resolved
+/// with an error — is an idle-side loss (the node closed it, restarted,
+/// left, or stopped answering; the next request simply redials), logged
+/// at `INFO`. `WARN` is reserved for a poison that failed at least one
+/// client's request.
 fn backend_exit_log_line(addr: &str, poisoned_exit: bool, clients_affected: bool) -> String {
     if !poisoned_exit {
         format!("INFO backend connection to {addr} closed; no callers remain")
