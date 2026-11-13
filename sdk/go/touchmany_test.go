@@ -43,7 +43,8 @@ func newReaderOnlyConnection(wire string, tagged bool) *connection {
 }
 
 func TestReadAckRosterParsesTheYReplyAndKeepsTheOReplyStrict(t *testing.T) {
-	// The roster reader itself, over a hand-fed reader.
+	// The roster reader itself, over a hand-fed reader. The marker byte is
+	// already consumed, so the wire starts at the header's leading space.
 	parse := func(wire string, tagged bool, tokens map[string]multiEntry, what string) ([]multiEntry, uint32, error) {
 		conn := newReaderOnlyConnection(wire, tagged)
 		return conn.readAckRoster(what, tokens)
@@ -51,7 +52,7 @@ func TestReadAckRosterParsesTheYReplyAndKeepsTheOReplyStrict(t *testing.T) {
 	y := map[string]multiEntry{"S": {ok: true}, "N": {}, "W": {wrongNode: true}}
 	o := map[string]multiEntry{"S": {ok: true}, "W": {wrongNode: true}}
 
-	entries, tag, err := parse("3 S N W\n", false, y, "multi-touch")
+	entries, tag, err := parse(" 3 S N W\n", false, y, "multi-touch")
 	if err != nil || tag != 0 {
 		t.Fatalf("parse = %v, tag %d, err %v", entries, tag, err)
 	}
@@ -61,7 +62,7 @@ func TestReadAckRosterParsesTheYReplyAndKeepsTheOReplyStrict(t *testing.T) {
 			t.Fatalf("entries[%d] = %+v, want %+v", i, entries[i], want[i])
 		}
 	}
-	if _, tag, err := parse("2 N S 9\n", true, y, "multi-touch"); err != nil || tag != 9 {
+	if _, tag, err := parse(" 2 N S 9\n", true, y, "multi-touch"); err != nil || tag != 9 {
 		t.Fatalf("tagged parse: tag %d, err %v", tag, err)
 	}
 	for _, bad := range []string{"1 -\n", "3 S S\n", "x S\n"} {
@@ -70,7 +71,7 @@ func TestReadAckRosterParsesTheYReplyAndKeepsTheOReplyStrict(t *testing.T) {
 		}
 	}
 	// `O` shares the reader: its tokens stay S and W only.
-	if _, _, err := parse("1 N\n", false, o, "multi-set"); !errors.Is(err, ErrProtocol) {
+	if _, _, err := parse(" 1 N\n", false, o, "multi-set"); !errors.Is(err, ErrProtocol) {
 		t.Errorf("an O roster with N: err = %v, want ErrProtocol", err)
 	}
 }

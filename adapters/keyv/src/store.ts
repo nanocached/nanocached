@@ -83,7 +83,11 @@ const DO_NOT_CACHE = Symbol("nanocached-keyv: do not write, delete instead");
 function wireTtlSeconds(ttlMs: number | null | undefined): number | typeof DO_NOT_CACHE {
   if (ttlMs !== null && ttlMs !== undefined && ttlMs < 0) return DO_NOT_CACHE;
   if (ttlMs === null || ttlMs === undefined || ttlMs <= 0) return 0;
-  return Math.ceil(ttlMs / 1000);
+  // Issue #1851: the SDK takes at most Number.MAX_SAFE_INTEGER seconds and
+  // throws a RangeError beyond that (Infinity included). Such a ttl never
+  // elapses, so it means no expiry, as in Django's get_backend_timeout.
+  const seconds = Math.ceil(ttlMs / 1000);
+  return seconds > Number.MAX_SAFE_INTEGER ? 0 : seconds;
 }
 
 /**
