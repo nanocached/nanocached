@@ -1322,13 +1322,13 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		// Busy is always untagged (echoed response tags) — it's an
 		// unsolicited response sent whether or not this connection
 		// negotiated tags.
-		if _, err := c.reader.ReadByte(); err != nil { // the trailing '\n'
+		if err := expectLF(c.reader); err != nil {
 			return 0, nil, 0, 0, nil, err
 		}
 		return marker, nil, 0, 0, nil, nil
 	case 'S', 'D', 'N', 'W', 'C', 'R', 'T':
 		if !c.tagged {
-			if _, err := c.reader.ReadByte(); err != nil { // the trailing '\n'
+			if err := expectLF(c.reader); err != nil {
 				return 0, nil, 0, 0, nil, err
 			}
 			return marker, nil, 0, 0, nil, nil
@@ -1500,6 +1500,22 @@ func parseTag(field string) (uint32, error) {
 		return 0, protocolError("invalid response tag")
 	}
 	return uint32(tag), nil
+}
+
+// expectLF reads the '\n' that ends an untagged no-body reply (`B\n`,
+// `S\n`, ...). Any other byte means the stream is desynchronised (a tagged
+// reply on an untagged connection, say), so it is a protocol error rather
+// than an accepted reply that leaves the byte to misalign the next one
+// (issue #1859), as in the TypeScript, Java and .NET SDKs.
+func expectLF(reader *bufio.Reader) error {
+	b, err := reader.ReadByte()
+	if err != nil {
+		return err
+	}
+	if b != '\n' {
+		return protocolError("unexpected byte after response marker (connection desynced)")
+	}
+	return nil
 }
 
 // readLine reads one '\n'-terminated line from reader, like
