@@ -5873,6 +5873,24 @@ impl NanocachedClient {
     /// which is exactly what should surface when discovery itself has
     /// nothing left to offer.
     async fn reconnect_proxy(&self) {
+        // Issue #1846: single-flight. With many requests in flight when the
+        // proxy dies, each used to re-fetch `Q`, dial, then close the
+        // connection a sibling had just installed and put its own in place,
+        // so a sibling's retry ran on a connection that had been closed
+        // under it. Failovers serialise on the "" redial gate (the one
+        // `slot_connection` dials under), and a caller that gets the gate
+        // after a sibling's failover finds the current connection alive and
+        // leaves it alone.
+        let gate = {
+            let mut redials = self.inner.redials.lock().await;
+            Arc::clone(redials.entry(String::new()).or_default())
+        };
+        let _guard = gate.lock().await;
+        if let Target::Single { connection, .. } = &self.inner.state.lock().await.target {
+            if !connection.is_closed() {
+                return;
+            }
+        }
         let (dialed, got_roster) = self.dial_a_fresh_proxy().await;
         let Some((address, stream, tagged)) = dialed else {
             // Issue #1822: a refresh failure is a refresh that yielded no
