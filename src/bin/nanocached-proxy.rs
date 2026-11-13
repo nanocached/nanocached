@@ -73,7 +73,12 @@
 //!   when the command ends without a replica write). Nothing else waits:
 //!   the reader goes on with requests on other keys, other connections have
 //!   their own `ConnectionOrder`, and a request with nothing to wait for
-//!   takes the inline path unchanged. The exception is an `i`/`k`/`x`
+//!   takes the inline path unchanged. An expiring touch (`t`/`y` with TTL
+//!   0) registers its keys the same way (issue #1847): its replica legs are
+//!   sent only after the primary has answered, so a later write on the key
+//!   would otherwise reach the replica first and be expired by the late
+//!   touch; the registration is released once those legs are enqueued. The
+//!   exception is an `i`/`k`/`x`
 //!   behind other `i`/`k`/`x` that were themselves dispatched inline: its
 //!   primary frame is enqueued inline too, so a run of increments of one
 //!   key stays pipelined at the primary (which applies and answers them in
@@ -4834,6 +4839,9 @@ async fn dispatch_request(
             get,
         } => {
             let enqueued = enqueue_touch(&context, &ring, &namespace, &key, ttl, get).await;
+            // Only an expiring touch holds its slot's signal (issue #1847):
+            // its replica legs are enqueued by `finish_touch`.
+            let signal = slot.signal;
             tokio::spawn(async move {
                 let result = finish_touch(
                     &context,
@@ -4841,8 +4849,8 @@ async fn dispatch_request(
                     &key,
                     (ttl, get),
                     enqueued,
-                    tag,
-                    retry_capable,
+                    (tag, retry_capable),
+                    signal,
                 )
                 .await;
                 let _ = result_tx.send(soften(result, retry_capable, tag, &context));
@@ -5058,6 +5066,7 @@ async fn dispatch_request(
                 .iter()
                 .map(|group| (group.addr.as_str(), group.frame.clone(), group.expect));
             let pending = context.backends.enqueue_mixed(&context, requests).await;
+            let signal = slot.signal;
 
             tokio::spawn(async move {
                 let result = finish_multi_touch(
@@ -5072,6 +5081,7 @@ async fn dispatch_request(
                     groups,
                     pending,
                     tag,
+                    signal,
                 )
                 .await;
                 let _ = result_tx.send(soften(result, retry_capable, tag, &context));
@@ -5829,6 +5839,7 @@ async fn finish_multi_touch(
     groups: Vec<TouchGroup>,
     pending: Vec<PendingReply>,
     tag: Option<u32>,
+    signal: Option<OrderSignal>,
 ) -> DriverResult {
     let get = batch.get;
     let mut entries: Vec<Option<ProxyMultiEntry>> = vec![None; batch.keys.len()];
@@ -5871,7 +5882,7 @@ async fn finish_multi_touch(
         // #966): the keys a primary answered have expired their copies
         // there, so their other owners get theirs even when another leg's
         // outcome is unknown and the client is told `E` — as the SDKs do.
-        expire_batch_on_other_owners(context, &batch, &entries, &answered_by).await;
+        expire_batch_on_other_owners(context, &batch, &entries, &answered_by, signal).await;
     }
     if unknown {
         return Err(Fatal::OutcomeUnknown);
@@ -5961,6 +5972,7 @@ async fn expire_batch_on_other_owners(
     batch: &MultiTouchBatch<'_>,
     entries: &[Option<ProxyMultiEntry>],
     answered_by: &[Option<String>],
+    signal: Option<OrderSignal>,
 ) {
     let Some(ring) = current_ring(context) else {
         return;
@@ -5981,10 +5993,27 @@ async fn expire_batch_on_other_owners(
     let requests = frames
         .iter()
         .map(|(addr, frame)| (addr.as_str(), frame.clone()));
-    let results = context
-        .backends
-        .call_each(context, requests, Expect::MultiTouch)
-        .await;
+    // One share of the signal per leg: the last leg to enqueue fires it
+    // (issue #1847), as in `fan_out_to_replicas`.
+    let signal = signal.map(Arc::new);
+    let legs = requests
+        .map(|(addr, frame)| {
+            let signal = signal.clone();
+            Box::pin(async move {
+                let first = context
+                    .backends
+                    .enqueue(context, addr, frame.clone(), Expect::MultiTouch)
+                    .await;
+                drop(signal);
+                context
+                    .backends
+                    .finish_call(context, addr, frame, Expect::MultiTouch, first)
+                    .await
+            }) as Pin<Box<dyn Future<Output = io::Result<NodeReply>> + Send + '_>>
+        })
+        .collect::<Vec<_>>();
+    drop(signal);
+    let results = join_all(legs).await;
     for ((addr, _), result) in frames.iter().zip(results) {
         match result {
             Err(error) => log_replica_warning(format_args!(
@@ -6279,6 +6308,7 @@ async fn expire_on_other_owners(
     namespace: &[u8],
     key: &[u8],
     answered: &str,
+    signal: Option<OrderSignal>,
 ) {
     let Some(ring) = current_ring(context) else {
         return;
@@ -6292,7 +6322,7 @@ async fn expire_on_other_owners(
         return;
     }
     let plain = frame_touch(namespace, key, Some(0), false);
-    fan_out_to_replicas(context, &others, plain, Expect::Touch, "touch", None).await;
+    fan_out_to_replicas(context, &others, plain, Expect::Touch, "touch", signal).await;
 }
 
 /// The client's answer to a touch, from the primary's reply.
@@ -6332,8 +6362,8 @@ async fn finish_touch(
     key: &[u8],
     (ttl, get): (Option<u64>, bool),
     enqueued: EnqueuedWrite,
-    tag: Option<u32>,
-    retry_capable: bool,
+    (tag, retry_capable): (Option<u32>, bool),
+    signal: Option<OrderSignal>,
 ) -> DriverResult {
     let EnqueuedWrite { owners, pending } = enqueued;
     let mut replies = Vec::with_capacity(pending.len());
@@ -6359,12 +6389,30 @@ async fn finish_touch(
     match primary_reply {
         Ok(NodeReply::WrongNode) => {
             force_refresh(context).await;
-            refan_touch(context, namespace, key, ttl, get, tag, retry_capable).await
+            refan_touch(
+                context,
+                namespace,
+                key,
+                (ttl, get),
+                (tag, retry_capable),
+                signal,
+            )
+            .await
         }
         Err(error) if expires_at_once(ttl) && !request_not_sent(error) => {
             Err(Fatal::OutcomeUnknown)
         }
-        Err(_) => refan_touch(context, namespace, key, ttl, get, tag, retry_capable).await,
+        Err(_) => {
+            refan_touch(
+                context,
+                namespace,
+                key,
+                (ttl, get),
+                (tag, retry_capable),
+                signal,
+            )
+            .await
+        }
         Ok(reply) => {
             let answer = touch_answer(reply, tag);
             if expires_at_once(ttl) {
@@ -6375,7 +6423,7 @@ async fn finish_touch(
                     return Err(Fatal::Transient);
                 };
                 if let Some(primary) = owners.first() {
-                    expire_on_other_owners(context, namespace, key, primary).await;
+                    expire_on_other_owners(context, namespace, key, primary, signal).await;
                 }
                 return Ok(answer);
             }
@@ -6390,10 +6438,9 @@ async fn refan_touch(
     context: &ProxyContext,
     namespace: &[u8],
     key: &[u8],
-    ttl: Option<u64>,
-    get: bool,
-    tag: Option<u32>,
-    retry_capable: bool,
+    (ttl, get): (Option<u64>, bool),
+    (tag, retry_capable): (Option<u32>, bool),
+    signal: Option<OrderSignal>,
 ) -> DriverResult {
     let Some(ring) = current_ring(context) else {
         return Err(Fatal::Transient);
@@ -6420,7 +6467,7 @@ async fn refan_touch(
                 // `W` and `E` are refusals, not outcomes: nothing was
                 // expired, so a retry-capable client is answered `R`.
                 let answer = touch_answer(&reply, tag).ok_or(Fatal::Transient)?;
-                expire_on_other_owners(context, namespace, key, primary).await;
+                expire_on_other_owners(context, namespace, key, primary, signal).await;
                 Ok(answer)
             }
             Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
@@ -7668,6 +7715,15 @@ impl OrderTicket {
     }
 }
 
+/// Whether `request` is a touch that expires the keys it finds, whose
+/// replica legs are enqueued only after the primary's reply.
+fn expires_at_once_request(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Touch { ttl, .. } | Request::MultiTouch { ttl, .. } if expires_at_once(*ttl)
+    )
+}
+
 /// Registrations between sweeps of released entries, at least.
 const ORDER_SWEEP_MIN: usize = 1024;
 
@@ -7701,7 +7757,9 @@ impl ConnectionOrder {
             request,
             Request::Incr { .. } | Request::CasSet { .. } | Request::CasDelete { .. }
         );
-        if pending.waits.is_empty() && !primary_evaluated {
+        // An expiring touch (`t`/`y` with ttl 0) registers too: its replica
+        // legs go out only after the primary has answered (issue #1847).
+        if pending.waits.is_empty() && !primary_evaluated && !expires_at_once_request(request) {
             return OrderTicket {
                 waits: pending.waits,
                 signal: None,
@@ -12511,6 +12569,11 @@ mod tests {
                         if ttl == Some(0) && current.is_some() {
                             store.lock().unwrap().remove(&(namespace, key));
                         }
+                        // The reply, not the apply, is what waits (issue #1847).
+                        let pause = *delay.lock().unwrap();
+                        if !pause.is_zero() {
+                            sleep(pause).await;
+                        }
                         match current {
                             None => {
                                 stream
@@ -12606,6 +12669,11 @@ mod tests {
                             && close_after_touch_apply_once.swap(false, Ordering::SeqCst)
                         {
                             return Ok(());
+                        }
+
+                        let pause = *delay.lock().unwrap();
+                        if !pause.is_zero() {
+                            sleep(pause).await;
                         }
 
                         let mut header = format!("{} {count}", if get { "M" } else { "Y" });
@@ -17433,6 +17501,98 @@ mod tests {
         // Both copies are gone: the touch expired the key everywhere.
         stream.write_all(b"G 3\nkey").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+    }
+
+    /// The replica of `key` in a two-node cluster, and the cluster's proxy.
+    async fn two_nodes_with_replica_of(key: &str) -> (Vec<MockNode>, String, usize) {
+        let (nodes, proxy) = cluster(2).await;
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            2,
+        );
+        let primary_addr = ring.owners(b"", key.as_bytes())[0].clone();
+        let replica = if primary_addr == nodes[0].addr { 1 } else { 0 };
+        (nodes, proxy, replica)
+    }
+
+    async fn replica_settles_on(node: &MockNode, key: &[u8], want: Option<&[u8]>) -> bool {
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if node.entry(b"", key).as_deref() == want {
+                // Give a late deferred leg the chance to undo it.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                return node.entry(b"", key).as_deref() == want;
+            }
+        }
+        false
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_pipelined_behind_a_zero_ttl_touch_is_not_expired_on_the_replica() {
+        // Issue #1847: `t k 0` sends the replica its plain touch only once
+        // the primary has answered, and the `S` behind it went to the
+        // replica straight away, so the late touch expired the
+        // acknowledged value there.
+        let (nodes, proxy, replica) = two_nodes_with_replica_of("key").await;
+        *nodes[1 - replica].get_delay.lock().unwrap() = Duration::from_millis(150);
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"t 0 3 0\nkeyS 3 1\nkeyv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert!(
+            replica_settles_on(&nodes[replica], b"key", Some(b"v")).await,
+            "the replica must hold the acknowledged write, not the late expiry"
+        );
+        assert_eq!(nodes[1 - replica].entry(b"", b"key"), Some(b"v".to_vec()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_pipelined_behind_a_zero_ttl_batch_touch_is_not_expired_on_the_replica() {
+        // Issue #1847, `y` form; a batch wider than `ORDER_MULTI_KEYS_MAX`
+        // is registered for its namespace as a whole.
+        for wide in [false, true] {
+            let (nodes, proxy, replica) = two_nodes_with_replica_of("key").await;
+            *nodes[1 - replica].get_delay.lock().unwrap() = Duration::from_millis(150);
+            let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+            let mut keys = vec!["key".to_string()];
+            if wide {
+                keys.extend((0..ORDER_MULTI_KEYS_MAX + 1).map(|index| format!("w{index}")));
+            }
+            let lens: Vec<String> = keys.iter().map(|key| key.len().to_string()).collect();
+            let request = format!(
+                "y 0 {} {} 0\n{}S 3 1\nkeyv",
+                keys.len(),
+                lens.join(" "),
+                keys.concat()
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let reply = read_line(&mut stream, &mut buf).await.unwrap();
+            assert!(reply.starts_with("Y "), "wide={wide}: {reply}");
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+            assert!(
+                replica_settles_on(&nodes[replica], b"key", Some(b"v")).await,
+                "wide={wide}: the replica must hold the acknowledged write"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_ttl_touch_registers_in_the_connection_order_and_a_plain_one_does_not() {
+        let mut order = ConnectionOrder::new();
+        let expiring = order.admit(&touch_request(b"", b"k", Some(0), false));
+        assert!(expiring.waits.is_empty() && !expiring.defer);
+        let behind = order.admit(&order_request("get", "k"));
+        assert_eq!(behind.waits.len(), 1, "a same-key request waits");
+        assert!(behind.defer);
+        let other = order.admit(&order_request("get", "other"));
+        assert!(other.waits.is_empty(), "other keys do not");
+        drop(expiring);
+        let mut order = ConnectionOrder::new();
+        let _plain = order.admit(&touch_request(b"", b"k", Some(30), false));
+        assert!(order.admit(&order_request("get", "k")).waits.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]

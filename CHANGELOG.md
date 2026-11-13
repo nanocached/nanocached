@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: the replica legs of an expiring touch (`t ... 0`, `y ... 0`) are
+  sent only after the primary has answered, outside the connection's
+  pipelined order, so a write pipelined behind it on the same key reached the
+  replica first and the late touch expired the acknowledged value there. An
+  expiring touch now holds later same-key requests of its connection back
+  until its replica legs are enqueued, like the result of an `i`/`k`/`x`
+  (#1847).
+
 - Discovery: the "L served despite dissent" and "refusing L" WARNs shared one
   limiter of 1 line per 10 s, so a served WARN written just before the
   dissent became a strict majority swallowed the refusal line, and `L` then
