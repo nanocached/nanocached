@@ -14,6 +14,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: the `L` roster fetch accepted what the node's roster parser rejects:
+  an entry body not ending in `\n`, extra header or entry fields, and a
+  replication factor above the roster limit. A response whose lengths
+  disagreed with its body built the ring from shifted slices. It now applies
+  the same checks (#1856).
+
 - Discovery: the "L served despite dissent" and "refusing L" WARNs shared one
   limiter of 1 line per 10 s, so a served WARN written just before the
   dissent became a strict majority swallowed the refusal line, and `L` then
