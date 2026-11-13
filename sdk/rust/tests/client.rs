@@ -9433,6 +9433,61 @@ async fn via_proxy_bulk_ops_fail_over_to_another_proxy() {
     }
 }
 
+#[tokio::test]
+async fn via_proxy_failover_is_single_flight_under_concurrent_requests() {
+    // Issue #1846: with 40 gets in flight when the proxy dies, each used to
+    // re-fetch `Q`, dial the survivor and close the connection a sibling had
+    // just installed, so retries on the closed connection failed although a
+    // healthy proxy existed. Now one failover happens and all 40 succeed.
+    let proxy_a = MockNode::start().await;
+    let proxy_b = MockNode::start().await;
+    let discovery = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-a".to_string(), proxy_a.address())],
+    )
+    .await;
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", discovery.port)])
+            .via_proxy(true),
+    )
+    .await
+    .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+    let q_before = discovery.q_requests.load(Ordering::SeqCst);
+
+    proxy_a.stop();
+    discovery.set_proxies(vec![("proxy-b".to_string(), proxy_b.address())]);
+
+    let mut tasks = Vec::new();
+    for _ in 0..40 {
+        let client = client.clone();
+        tasks.push(tokio::spawn(async move { client.get("k").await }));
+    }
+    let mut errors = 0;
+    for task in tasks {
+        if task.await.unwrap().is_err() {
+            errors += 1;
+        }
+    }
+    assert_eq!(errors, 0, "every get must fail over to proxy B");
+    assert_eq!(
+        proxy_b.state.connections.load(Ordering::SeqCst),
+        1,
+        "one failover dial, not one per caller"
+    );
+    assert_eq!(
+        discovery.q_requests.load(Ordering::SeqCst) - q_before,
+        1,
+        "one roster fetch, not one per caller"
+    );
+
+    client.close().await;
+    discovery.stop();
+    proxy_b.stop();
+}
+
 /// Issue #1822: proxy mode counts `refresh_failures` only for a refresh that
 /// yielded no usable roster; a roster whose proxies all fail to dial is not
 /// a refresh failure.

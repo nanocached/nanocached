@@ -1713,7 +1713,7 @@ async fn read_one_response(
         b'B' => {
             // `B` (busy) is always untagged — unsolicited, sent before
             // auth (and so before tagging) even completes (echoed response tags).
-            read_half.read_u8().await?; // the trailing '\n'
+            expect_lf(read_half).await?;
             Ok((marker, None, None, None, None))
         }
         b'S' | b'D' | b'N' | b'W' | b'C' | b'R' | b'T' => {
@@ -1726,7 +1726,7 @@ async fn read_one_response(
                 let line = read_line(read_half).await?;
                 Ok((marker, None, None, Some(parse_tag(line.trim())?), None))
             } else {
-                read_half.read_u8().await?; // the trailing '\n'
+                expect_lf(read_half).await?;
                 Ok((marker, None, None, None, None))
             }
         }
@@ -1952,6 +1952,19 @@ pub(crate) async fn read_line<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -
     }
 }
 
+/// Reads the `\n` that ends an untagged no-body marker (`S`, `D`, `B`, ...).
+/// Anything else means the stream is desynchronised (`Sx` is not `S`), so it
+/// is a protocol error, which poisons the connection (#1848).
+async fn expect_lf<R: tokio::io::AsyncRead + Unpin>(stream: &mut R) -> Result<()> {
+    if stream.read_u8().await? == b'\n' {
+        Ok(())
+    } else {
+        Err(Error::Protocol(
+            "nanocached: expected a newline after the response marker".to_string(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2060,6 +2073,22 @@ mod tests {
 
     /// A bound large enough not to interfere, for tests unconcerned with it.
     const UNBOUNDED_MULTI_GET: usize = usize::MAX;
+
+    #[tokio::test]
+    async fn an_untagged_no_body_marker_must_end_with_a_newline() {
+        // Issue #1848: `Sx` used to be accepted as `S` because the byte after
+        // the marker was read and dropped without being compared with '\n'.
+        for marker in *b"BSDNWCRT" {
+            let result = read_one_from_bytes(&[marker, b'x'], false, UNBOUNDED_MULTI_GET).await;
+            assert!(
+                matches!(result, Err(Error::Protocol(_))),
+                "'{}x' must be a protocol error, got {result:?}",
+                marker as char
+            );
+            let ok = read_one_from_bytes(&[marker, b'\n'], false, UNBOUNDED_MULTI_GET).await;
+            assert!(ok.is_ok(), "'{}\\n' must parse, got {ok:?}", marker as char);
+        }
+    }
 
     #[tokio::test]
     async fn a_value_length_with_a_leading_plus_is_a_protocol_error_not_silently_accepted() {

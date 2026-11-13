@@ -1125,7 +1125,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		// carries the leading space. A get-and-touch's reply (issue #825)
 		// adds `I`'s optional TTL between them, told apart by field count
 		// for the connection's mode.
-		fields := strings.Fields(header)
+		fields := splitHeaderFields(header)
 		minFields := 1
 		if c.tagged {
 			minFields = 2
@@ -1173,7 +1173,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		if err != nil {
 			return 0, nil, 0, 0, nil, err
 		}
-		fields := strings.Fields(header)
+		fields := splitHeaderFields(header)
 		minFields, maxFields := 1, 2
 		if c.tagged {
 			minFields, maxFields = 2, 3
@@ -1225,7 +1225,7 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		if err != nil {
 			return 0, nil, 0, 0, nil, err
 		}
-		fields := strings.Fields(header)
+		fields := splitHeaderFields(header)
 		if len(fields) < 1 {
 			return 0, nil, 0, 0, nil, protocolError("invalid multi-get header in response")
 		}
@@ -1322,13 +1322,13 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 		// Busy is always untagged (echoed response tags) — it's an
 		// unsolicited response sent whether or not this connection
 		// negotiated tags.
-		if _, err := c.reader.ReadByte(); err != nil { // the trailing '\n'
+		if err := expectLF(c.reader); err != nil {
 			return 0, nil, 0, 0, nil, err
 		}
 		return marker, nil, 0, 0, nil, nil
 	case 'S', 'D', 'N', 'W', 'C', 'R', 'T':
 		if !c.tagged {
-			if _, err := c.reader.ReadByte(); err != nil { // the trailing '\n'
+			if err := expectLF(c.reader); err != nil {
 				return 0, nil, 0, 0, nil, err
 			}
 			return marker, nil, 0, 0, nil, nil
@@ -1390,7 +1390,7 @@ func (c *connection) readAckRoster(what string, tokens map[string]multiEntry) ([
 	if err != nil {
 		return nil, 0, err
 	}
-	fields := strings.Fields(header)
+	fields := splitHeaderFields(header)
 	if len(fields) < 1 {
 		return nil, 0, protocolError("invalid " + what + " header in response")
 	}
@@ -1500,6 +1500,42 @@ func parseTag(field string) (uint32, error) {
 		return 0, protocolError("invalid response tag")
 	}
 	return uint32(tag), nil
+}
+
+// expectLF reads the '\n' that ends an untagged no-body reply (`B\n`,
+// `S\n`, ...). Any other byte means the stream is desynchronised (a tagged
+// reply on an untagged connection, say), so it is a protocol error rather
+// than an accepted reply that leaves the byte to misalign the next one
+// (issue #1859), as in the TypeScript, Java and .NET SDKs.
+func expectLF(reader *bufio.Reader) error {
+	b, err := reader.ReadByte()
+	if err != nil {
+		return err
+	}
+	if b != '\n' {
+		return protocolError("unexpected byte after response marker (connection desynced)")
+	}
+	return nil
+}
+
+// splitHeaderFields splits a response header line (as readLine returns it:
+// the space after the marker byte still leading, the "\n" still trailing)
+// on single spaces, the way the Python and TypeScript SDKs do (issue
+// #1849). strings.Fields would also accept doubled spaces, tabs and a
+// trailing "\r" a hostile or buggy peer might send. It returns nil, which
+// every caller's field-count check rejects, for a header that does not
+// start with a space, lacks the "\n", or has an empty field.
+func splitHeaderFields(header string) []string {
+	if len(header) < 2 || header[0] != ' ' || header[len(header)-1] != '\n' {
+		return nil
+	}
+	fields := strings.Split(header[1:len(header)-1], " ")
+	for _, f := range fields {
+		if f == "" {
+			return nil
+		}
+	}
+	return fields
 }
 
 // readLine reads one '\n'-terminated line from reader, like

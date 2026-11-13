@@ -5688,20 +5688,21 @@ async fn read_published_roster<S: AsyncBufReadExt + Unpin>(
     read_roster(stream, b'N', b"B\n", "malformed L response").await
 }
 
-/// The roster layout the heartbeat ack and `L` share: `<tag> <count>
-/// <replication>\n` then `count` `<name-len> <addr-len>\n<name><addr>\n`
-/// entries; `withheld` alone (`A\n`, `B\n`) is `None`.
-async fn read_roster<S: AsyncBufReadExt + Unpin>(
+/// The header line `read_roster` and `fetch_roster_once` share: `<tag>
+/// <count> <replication>\n`, nothing more. `withheld` alone is `None`.
+/// `count` is bounded by `MAX_ROSTER_ENTRIES` and `replication` by
+/// `1..=MAX_ROSTER_ENTRIES`, with no extra fields, so the two parsers cannot
+/// drift apart on what they accept (issue #1850).
+async fn read_roster_header<S: AsyncBufReadExt + Unpin>(
     stream: &mut S,
     tag: u8,
     withheld: &[u8],
+    deadline: tokio::time::Instant,
+    line: &mut Vec<u8>,
     what: &'static str,
-) -> io::Result<Option<(Vec<String>, usize)>> {
+) -> io::Result<Option<(usize, usize)>> {
     let malformed = || io::Error::new(io::ErrorKind::InvalidData, what);
-
-    let deadline = outbound_line_deadline();
-    let mut line = Vec::new();
-    infra::read_line_bounded(stream, MAX_ROSTER_LINE_LEN, deadline, &mut line).await?;
+    infra::read_line_bounded(stream, MAX_ROSTER_LINE_LEN, deadline, line).await?;
     if line == withheld {
         return Ok(None);
     }
@@ -5727,34 +5728,68 @@ async fn read_roster<S: AsyncBufReadExt + Unpin>(
     if fields.next().is_some() {
         return Err(malformed());
     }
+    Ok(Some((count, replication)))
+}
+
+/// An entry's length line, `<len> <len>[ <len>]\n` (`N` lengths, each at
+/// most `max`, exactly `N` fields). `None` when it is anything else.
+fn parse_roster_entry_lengths<const N: usize>(line: &[u8], max: usize) -> Option<[usize; N]> {
+    let entry = std::str::from_utf8(line.strip_suffix(b"\n")?).ok()?;
+    let mut fields = entry.split(' ');
+    let mut lengths = [0usize; N];
+    for length in &mut lengths {
+        *length = fields
+            .next()?
+            .parse()
+            .ok()
+            .filter(|length| *length <= max)?;
+    }
+    fields.next().is_none().then_some(lengths)
+}
+
+/// An entry's `<fields>\n` body: `len` bytes plus the terminator. `None`
+/// when the byte after the fields is not `\n`, i.e. the lengths and the body
+/// disagree and every later entry would be read from a shifted offset.
+async fn read_roster_entry_body<S: AsyncBufReadExt + Unpin>(
+    stream: &mut S,
+    len: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut body = vec![0u8; len + 1];
+    stream.read_exact(&mut body).await?;
+    if body[len] != b'\n' {
+        return Ok(None);
+    }
+    body.truncate(len);
+    Ok(Some(body))
+}
+
+/// The roster layout the heartbeat ack and `L` share: `<tag> <count>
+/// <replication>\n` then `count` `<name-len> <addr-len>\n<name><addr>\n`
+/// entries; `withheld` alone (`A\n`, `B\n`) is `None`.
+async fn read_roster<S: AsyncBufReadExt + Unpin>(
+    stream: &mut S,
+    tag: u8,
+    withheld: &[u8],
+    what: &'static str,
+) -> io::Result<Option<(Vec<String>, usize)>> {
+    let malformed = || io::Error::new(io::ErrorKind::InvalidData, what);
+
+    let deadline = outbound_line_deadline();
+    let mut line = Vec::new();
+    let Some((count, replication)) =
+        read_roster_header(stream, tag, withheld, deadline, &mut line, what).await?
+    else {
+        return Ok(None);
+    };
 
     let mut names = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
         infra::read_line_bounded(stream, MAX_ROSTER_LINE_LEN, deadline, &mut line).await?;
-        let entry = line
-            .strip_suffix(b"\n")
-            .and_then(|rest| std::str::from_utf8(rest).ok())
+        let [name_len, addr_len] =
+            parse_roster_entry_lengths(&line, MAX_ROSTER_FIELD_LEN).ok_or_else(malformed)?;
+        let body = read_roster_entry_body(stream, name_len + addr_len)
+            .await?
             .ok_or_else(malformed)?;
-        let mut lengths = entry.split(' ');
-        let name_len: usize = lengths
-            .next()
-            .and_then(|raw| raw.parse().ok())
-            .filter(|len| *len <= MAX_ROSTER_FIELD_LEN)
-            .ok_or_else(malformed)?;
-        let addr_len: usize = lengths
-            .next()
-            .and_then(|raw| raw.parse().ok())
-            .filter(|len| *len <= MAX_ROSTER_FIELD_LEN)
-            .ok_or_else(malformed)?;
-        if lengths.next().is_some() {
-            return Err(malformed());
-        }
-        // `<name><addr>\n`
-        let mut body = vec![0u8; name_len + addr_len + 1];
-        stream.read_exact(&mut body).await?;
-        if body[name_len + addr_len] != b'\n' {
-            return Err(malformed());
-        }
         let name = std::str::from_utf8(&body[..name_len]).map_err(|_| malformed())?;
         names.push(name.to_string());
     }
@@ -8701,68 +8736,39 @@ async fn fetch_roster_once(
 
     let bad = || io::Error::new(io::ErrorKind::InvalidData, "bad T response");
 
+    // The header and the entry framing are `read_roster`'s (issue #1850): a
+    // discovery whose length fields disagree with its body must fail the
+    // fetch, not hand the leaver a ring built from shifted slices.
     let deadline = outbound_line_deadline();
     let mut line = Vec::new();
-    infra::read_line_bounded(&mut stream, MAX_ROSTER_LINE_LEN, deadline, &mut line).await?;
-    if line == b"B\n" {
+    let Some((count, replication)) = read_roster_header(
+        &mut stream,
+        b'N',
+        b"B\n",
+        deadline,
+        &mut line,
+        "bad T response",
+    )
+    .await?
+    else {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "discovery is in its startup grace",
         ));
-    }
-    let header = line
-        .strip_suffix(b"\n")
-        .map(|rest| String::from_utf8_lossy(rest).into_owned())
-        .ok_or_else(bad)?;
-    let mut parts = header.strip_prefix("N ").ok_or_else(bad)?.split(' ');
-    let count: usize = parts
-        .next()
-        .and_then(|part| part.parse().ok())
-        .ok_or_else(bad)?;
-    let replication: usize = parts
-        .next()
-        .and_then(|part| part.parse().ok())
-        .ok_or_else(bad)?;
-    if count > MAX_ROSTER_ENTRIES || replication == 0 {
-        return Err(bad());
-    }
+    };
 
-    let mut members = Vec::with_capacity(count);
+    let mut members = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
         infra::read_line_bounded(&mut stream, MAX_ROSTER_LINE_LEN, deadline, &mut line).await?;
-        let entry_header = line
-            .strip_suffix(b"\n")
-            .map(|rest| String::from_utf8_lossy(rest).into_owned())
+        let [name_length, addr_length, token_length] =
+            parse_roster_entry_lengths(&line, MAX_NAME_ADDR_OR_TOKEN_LENGTH).ok_or_else(bad)?;
+        let body = read_roster_entry_body(&mut stream, name_length + addr_length + token_length)
+            .await?
             .ok_or_else(bad)?;
-        let mut parts = entry_header.split(' ');
-        let name_length: usize = parts
-            .next()
-            .and_then(|part| part.parse().ok())
-            .ok_or_else(bad)?;
-        let addr_length: usize = parts
-            .next()
-            .and_then(|part| part.parse().ok())
-            .ok_or_else(bad)?;
-        let token_length: usize = parts
-            .next()
-            .and_then(|part| part.parse().ok())
-            .ok_or_else(bad)?;
-        if name_length > MAX_NAME_ADDR_OR_TOKEN_LENGTH
-            || addr_length > MAX_NAME_ADDR_OR_TOKEN_LENGTH
-            || token_length > MAX_NAME_ADDR_OR_TOKEN_LENGTH
-        {
-            return Err(bad());
-        }
-        // Body + trailing newline.
-        let mut body = vec![0u8; name_length + addr_length + token_length + 1];
-        stream.read_exact(&mut body).await?;
         members.push((
             String::from_utf8_lossy(&body[..name_length]).into_owned(),
             String::from_utf8_lossy(&body[name_length..name_length + addr_length]).into_owned(),
-            String::from_utf8_lossy(
-                &body[name_length + addr_length..name_length + addr_length + token_length],
-            )
-            .into_owned(),
+            String::from_utf8_lossy(&body[name_length + addr_length..]).into_owned(),
         ));
     }
 
@@ -31598,6 +31604,65 @@ mod tests {
         );
         let error = fetch_with_count(MAX_ROSTER_ENTRIES + 1).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_roster_once_rejects_what_read_roster_rejects() {
+        // Issue #1850: `T` was parsed more loosely than the heartbeat ack
+        // and `L`. A response whose length fields disagree with its body, an
+        // extra header field, or an out-of-range replication factor must fail
+        // the fetch rather than build a ring from shifted slices.
+        async fn fetch(response: &'static [u8]) -> io::Result<usize> {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let discovery_addr = listener.local_addr().unwrap().to_string();
+            let fake_discovery = tokio::spawn(async move {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 64];
+                let _ = connection.read(&mut request).await;
+                let _ = connection.write_all(response).await;
+                // Keep the socket open so a parser that over-reads waits
+                // instead of seeing EOF.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+            let node_context = test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            );
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                fetch_roster_once(&node_context, &discovery_addr),
+            )
+            .await
+            .expect("fetch_roster_once must not hang on this response");
+            fake_discovery.abort();
+            result.map(|(members, _)| members.len())
+        }
+
+        // What discovery sends is accepted.
+        assert_eq!(fetch(b"N 1 2\n1 1 1\nnat\n").await.unwrap(), 1);
+        assert_eq!(fetch(b"N 0 1\n").await.unwrap(), 0);
+
+        for (case, response) in [
+            ("body not terminated by newline", &b"N 1 2\n1 1 1\nnatX"[..]),
+            ("length fields short of the body", b"N 1 2\n1 1 1\nnatx\n"),
+            ("extra header field", b"N 1 2 3\n1 1 1\nnat\n"),
+            ("replication zero", b"N 1 0\n1 1 1\nnat\n"),
+            ("replication above the cap", b"N 1 70000\n1 1 1\nnat\n"),
+            ("extra entry field", b"N 1 2\n1 1 1 1\nnat\n"),
+            ("missing entry field", b"N 1 2\n1 1\nnat\n"),
+        ] {
+            let error = fetch_owned(case, response).await;
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{case}");
+        }
+
+        async fn fetch_owned(case: &str, response: &'static [u8]) -> io::Error {
+            match fetch(response).await {
+                Ok(_) => panic!("{case}: accepted"),
+                Err(error) => error,
+            }
+        }
     }
 
     #[test]
