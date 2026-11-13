@@ -468,8 +468,18 @@ connections incrementing one counter are not ordered against each other,
 through a proxy as in cluster-direct mode (see the accepted behaviour
 below).</p>
 
+<p>An expiring touch (<code>t</code> or <code>y</code> with a TTL of 0) is
+inside the order too. The proxy sends the key&rsquo;s replicas their touch only
+after the primary has answered, since a replica that expired its copy ahead of
+a failing primary would lose the value. A later request on the same key would
+otherwise reach a replica first and have its write expired by the late touch,
+so it waits until those replica frames are enqueued, as for an <code>i</code>
+(enqueued, not acknowledged). Touches with any other TTL send every owner its
+frame at once and register nothing.</p>
+
 <p>One case is wider than the key. A multi-key request (<code>m</code>,
-<code>o</code>, <code>y</code>) that has to wait and carries more than 64
+<code>o</code>, <code>y</code>) that has to wait, or an expiring
+<code>y</code>, and carries more than 64
 keys is not registered key by key, which would leave an entry per key on the
 connection until the next sweep, outside every in-flight budget (tens of
 megabytes for a 1&nbsp;MiB batch of short keys). It is registered for its
@@ -776,8 +786,9 @@ here.</p>
   connection was judged not worth it. A client that needs the order
   awaits the <code>G</code> reply first. The replica write of an
   <code>i</code>, <code>k</code> or <code>x</code> result is in the
-  order (a later request on the same key waits for it to be enqueued); a
-  re-sent replica write is not.</li>
+  order (a later request on the same key waits for it to be enqueued), as
+  are the replica legs of an expiring touch (<code>t</code> or <code>y</code>
+  with a TTL of 0); a re-sent replica write is not.</li>
   <li>A multi-key request (<code>m</code>, <code>o</code>, <code>y</code>)
   of more than 64 keys that the proxy has to defer, because it waits for an
   earlier <code>i</code>, <code>k</code> or <code>x</code> result or other

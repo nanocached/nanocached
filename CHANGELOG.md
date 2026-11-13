@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: the replica legs of an expiring touch (`t ... 0`, `y ... 0`) are
+  sent only after the primary has answered, outside the connection's
+  pipelined order, so a write pipelined behind it on the same key reached the
+  replica first and the late touch expired the acknowledged value there. An
+  expiring touch now holds later same-key requests of its connection back
+  until its replica legs are enqueued, like the result of an `i`/`k`/`x`
+  (#1847).
+
 - Proxy: the `L` roster fetch accepted what the node's roster parser rejects:
   an entry body not ending in `\n`, extra header or entry fields, and a
   replication factor above the roster limit. A response whose lengths
