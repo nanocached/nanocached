@@ -16,6 +16,7 @@ follow the `sdk/rust/vX.Y.Z` tags.
 
 ### Fixed
 
+- An untagged no-body reply marker (`S`, `D`, `N`, `W`, `C`, `R`, `T`, `B`) is now followed by a checked `\n`; a reply such as `Sx` was accepted as `S`, so a desynchronised stream went undetected. It is now an `Error::Protocol` that closes the connection, as in the Java and .NET SDKs. (#1848)
 - In proxy mode (`via_proxy`), the reconnect after losing the proxy counted a `stats().refresh_failures` whenever no proxy could be dialed, including when discovery returned a usable proxy roster and only the dials failed. It now counts only a refresh that yields no usable roster, as the Python, TypeScript and Java SDKs do. (#1822)
 - At the initial connect, a listed node that answered the handshake with something that is no reply to `A` (an HTTP server on its reused address) was stored in the reconnect cooldown with the dial's `Error::Protocol`, so for the first cooldown (1 s by default) an operation routed to it failed with `Protocol` instead of refreshing and rerouting. The cooldown now carries `Error::ConnectionLost`, as a redial gives it; `connect()` still returns `Error::Protocol` when no listed node is reachable. (#1821)
 - A multi-key operation still running when `close()` was called (`close()` does not wait for it) ran its forced node-list refresh after a failed leg: a discovery round trip (with slow discovery, seconds) and dials of new nodes on a closed client. A closed client no longer refreshes, as in the Python, TypeScript and Java SDKs. (#1814)
