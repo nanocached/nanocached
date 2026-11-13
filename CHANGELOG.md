@@ -22,6 +22,20 @@ framework adapters at one version, whether or not a component changed.
   until its replica legs are enqueued, like the result of an `i`/`k`/`x`
   (#1847).
 
+- Proxy: the `L` roster fetch accepted what the node's roster parser rejects:
+  an entry body not ending in `\n`, extra header or entry fields, and a
+  replication factor above the roster limit. A response whose lengths
+  disagreed with its body built the ring from shifted slices. It now applies
+  the same checks (#1856).
+
+- Node: the `T` roster fetch behind the decommission drain and the eviction
+  re-replication accepted what the heartbeat ack and `L` parsers reject: an
+  entry whose lengths disagreed with its body (no `\n` after the token), an
+  extra header or entry field, and a replication factor above the roster
+  limit. Such a response from a buggy or version-skewed discovery built the
+  ring and tokens from shifted slices. The three now share one header and
+  entry parser (#1850).
+
 - Discovery: the "L served despite dissent" and "refusing L" WARNs shared one
   limiter of 1 line per 10 s, so a served WARN written just before the
   dissent became a strict majority swallowed the refusal line, and `L` then

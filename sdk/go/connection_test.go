@@ -1,6 +1,7 @@
 package nanocached
 
 import (
+	"bufio"
 	"errors"
 	"math"
 	"net"
@@ -200,5 +201,51 @@ func TestParseTagRejectsLeadingPlus(t *testing.T) {
 	tag, err := parseTag("5")
 	if err != nil || tag != 5 {
 		t.Fatalf("parseTag(%q) = %d, %v, want 5, nil", "5", tag, err)
+	}
+}
+
+// TestResponseHeadersSplitOnSingleSpacesOnly is issue #1849: the V, I and M
+// header fields are split on single spaces like the Python and TypeScript
+// SDKs, so a doubled space, a tab, a trailing space or a trailing "\r" is a
+// protocol error instead of being tolerated the way strings.Fields did.
+func TestResponseHeadersSplitOnSingleSpacesOnly(t *testing.T) {
+	tests := []struct {
+		name   string
+		tagged bool
+		reply  string
+		wantOK bool
+	}{
+		{"V canonical", false, "V 5\nhello", true},
+		{"V doubled space", false, "V  5\nhello", false},
+		{"V tab", false, "V\t5\nhello", false},
+		{"V trailing space", false, "V 5 \nhello", false},
+		{"V trailing CR", false, "V 5\r\nhello", false},
+		{"V tagged canonical", true, "V 5 7\nhello", true},
+		{"V tagged doubled space", true, "V 5  7\nhello", false},
+		{"I canonical", false, "I 5\nhello", true},
+		{"I doubled space", false, "I  5\nhello", false},
+		{"I trailing CR", false, "I 5\r\nhello", false},
+		{"M canonical", false, "M 2 5 -\nhello", true},
+		{"M doubled space", false, "M 2 5  -\nhello", false},
+		{"M tab", false, "M 2 5\t-\nhello", false},
+		{"M trailing CR", false, "M 2 5 -\r\nhello", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer server.Close()
+			defer client.Close()
+			// Built by hand: newConnection would start a readLoop that
+			// consumes the reply before readOneResponse could.
+			conn := &connection{conn: client, reader: bufio.NewReader(client), tagged: tt.tagged}
+			go func() { _, _ = server.Write([]byte(tt.reply)) }()
+			_, _, _, _, _, err := conn.readOneResponse()
+			if tt.wantOK && err != nil {
+				t.Fatalf("readOneResponse(%q) = %v, want success", tt.reply, err)
+			}
+			if !tt.wantOK && !errors.Is(err, ErrProtocol) {
+				t.Fatalf("readOneResponse(%q) = %v, want ErrProtocol", tt.reply, err)
+			}
+		})
 	}
 }

@@ -1274,8 +1274,13 @@ async fn fetch_roster_from(
         .next()
         .and_then(|r| r.parse().ok())
         .ok_or_else(bad_header)?;
+    // Issue #1856: the node's `read_roster` rejects extra fields and a
+    // replication factor outside 1..=MAX_ROSTER_ENTRIES; so does this.
+    if parts.next().is_some() {
+        return Err(bad_header());
+    }
 
-    if count > MAX_ROSTER_ENTRIES || replication == 0 {
+    if count > MAX_ROSTER_ENTRIES || !(1..=MAX_ROSTER_ENTRIES).contains(&replication) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "L header out of bounds",
@@ -1306,12 +1311,20 @@ async fn fetch_roster_from(
             .next()
             .and_then(|p| p.parse().ok())
             .ok_or_else(bad_entry)?;
+        if parts.next().is_some() {
+            return Err(bad_entry());
+        }
         if name_length > MAX_NAME_OR_ADDR_LENGTH || addr_length > MAX_NAME_OR_ADDR_LENGTH {
             return Err(bad_entry());
         }
-        // +1: discovery writes a trailing '\n' after each entry body.
+        // +1: discovery writes a trailing '\n' after each entry body. If it
+        // is not there the lengths and the body disagree, and every later
+        // entry would be cut from a shifted offset (issue #1856).
         read_exact_into(&mut stream, &mut buf, name_length + addr_length + 1).await?;
         let entry = buf.split_to(name_length + addr_length + 1);
+        if entry[name_length + addr_length] != b'\n' {
+            return Err(bad_entry());
+        }
         let name = String::from_utf8_lossy(&entry[..name_length]).into_owned();
         let node_addr =
             String::from_utf8_lossy(&entry[name_length..name_length + addr_length]).into_owned();
@@ -19762,6 +19775,50 @@ mod tests {
 
         let ring = current_ring(&context).expect("the ring is still there");
         assert_eq!(ring.nodes.len(), 1, "an empty roster replaced the ring");
+    }
+
+    /// Issue #1856: the `L` fetch took what the node's `read_roster`
+    /// refuses: an entry body not ending in '\n', extra header or entry
+    /// fields, and a replication factor above the roster limit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_roster_refuses_what_the_node_parser_refuses() {
+        async fn fetch(response: &'static [u8]) -> io::Result<usize> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = BytesMut::new();
+                let _ = read_line(&mut stream, &mut buf).await;
+                let _ = stream.write_all(response).await;
+                let _ = stream.flush().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+            let result = timeout(
+                Duration::from_secs(5),
+                fetch_roster_from(&addr, &None, &None),
+            )
+            .await
+            .expect("must not hang on this response");
+            server.abort();
+            result.map(|ring| ring.nodes.len())
+        }
+
+        assert_eq!(fetch(b"N 1 2\n1 1\nab\n").await.unwrap(), 1);
+        for (case, response) in [
+            ("body not newline-terminated", &b"N 1 2\n1 1\nabX"[..]),
+            ("lengths short of the body", b"N 1 2\n1 1\nabx\n"),
+            ("extra header field", b"N 1 2 3\n1 1\nab\n"),
+            ("replication above the cap", b"N 1 70000\n1 1\nab\n"),
+            ("extra entry field", b"N 1 2\n1 1 1\nab\n"),
+        ] {
+            let result = fetch(response).await;
+            assert!(result.is_err(), "{case}: accepted");
+            assert_eq!(
+                result.unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "{case}"
+            );
+        }
     }
 
     /// Issue #1246: the `L` parser's entry bound is the fleet's 65,536,
