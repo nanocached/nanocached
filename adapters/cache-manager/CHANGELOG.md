@@ -18,6 +18,7 @@ changed. What 1.0.0 will promise is described on the
 
 ### Fixed
 
+- `set()`/`mset()` with a `ttl` of `Infinity`, or any value past the SDK's range, threw a `RangeError` from the SDK. It now writes with no expiry, as the Django backend does. (#1851)
 - The README said the value size limit is measured after compression when `compress` is on. The SDK checks the value before compressing it, so a value over the limit is rejected with `RangeError` even if it would compress to less; the README now says so. (#1603)
 
 ## [0.6.2] - 2026-11-03
