@@ -495,3 +495,26 @@ describe("nanocached-keyv, through cache-manager v6+'s createCache()", () => {
     }
   });
 });
+
+describe("a ttl beyond the wire's range means no expiry (issue #1851)", () => {
+  for (const [name, ttlMs] of [
+    ["Infinity", Infinity],
+    ["a finite value past the SDK's range", Number.MAX_VALUE],
+  ] as const) {
+    it(`set() with ${name} writes with no expiry`, async () => {
+      const node = await startMockNode();
+      try {
+        const store = await connectStore(node);
+        try {
+          await store.set("k", "v", ttlMs);
+          assert.equal(await store.get("k"), "v");
+          assert.equal(node.lastSetTtl(), 0);
+        } finally {
+          await store.disconnect();
+        }
+      } finally {
+        await node.close();
+      }
+    });
+  }
+});
