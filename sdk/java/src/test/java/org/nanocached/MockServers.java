@@ -1764,6 +1764,8 @@ final class MockServers {
                         body = Integer.parseInt(p[1]);
                         int count = Integer.parseInt(p[2]);
                         for (int i = 0; i < count; i++) body += Integer.parseInt(p[3 + i]);
+                    } else if (p[0].equals("i")) {
+                        body = Integer.parseInt(p[1]) + Integer.parseInt(p[2]);
                     }
                     in.readNBytes(body);
                     frames.incrementAndGet();
