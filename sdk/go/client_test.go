@@ -3592,6 +3592,28 @@ func TestDiscoveryNodeListExceedingTheAggregateCapIsRejected(t *testing.T) {
 	}
 }
 
+func TestDiscoveryNodeEntryWithAnEmptyNameOrAddressIsAProtocolError(t *testing.T) {
+	// Issue #1871: a zero-length name used to be accepted, and "" is the
+	// single-mode slot, so routing to that member dereferenced the nil
+	// c.single and panicked. The discovery server rejects empty fields
+	// (parse_string_fields → EmptyField), so Connect now refuses either.
+	node := startMockNode(t, nil)
+	for _, entry := range []discoveredNode{
+		{Name: "", Address: node.address()},
+		{Name: "n1", Address: ""},
+	} {
+		discovery := startMockDiscovery(t, []discoveredNode{entry}, 1)
+		client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}})
+		if err == nil {
+			client.Close()
+			t.Fatalf("entry %+v: Connect succeeded, want a protocol error", entry)
+		}
+		if !errors.Is(err, ErrProtocol) {
+			t.Fatalf("entry %+v: err = %v, want ErrProtocol", entry, err)
+		}
+	}
+}
+
 // ── クラスタと複製 ────────────────────────────────────────────────
 
 func startCluster(t *testing.T, replication int) (map[string]*mockNode, *mockDiscovery) {
