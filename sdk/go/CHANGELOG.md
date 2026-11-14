@@ -19,6 +19,7 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A discovery `N` entry (node or proxy roster) with a zero-length name or address is now `ErrProtocol`, as the discovery server's own parser treats it. An empty name was accepted and collided with the single-mode slot, so `Connect` succeeded and the first operation routed to that member (and every `ClearAll`) panicked on a nil connection, in SDK-started goroutines where the caller cannot recover. (#1871)
 - An untagged reply without a body (`B`, `S`, `D`, `N`, `W`, `C`, `R`, `T`) whose next byte is not `\n` is now a protocol error instead of being accepted, which left that byte to misalign the next reply, as in the TypeScript, Java and .NET SDKs. (#1859)
 - Response headers (`V`, `I`, `M`, `Y`, `O`) are now split on single spaces, like the Python and TypeScript SDKs. A doubled space, a tab, a trailing space or a trailing `\r` was accepted through `strings.Fields`; each is now `ErrProtocol`. (#1849)
 - A multi-key operation still running when `Close()` was called (`Close()` does not wait for it) ran its forced node-list refresh after a failed leg: a discovery round trip (with slow discovery, seconds) and dials of new nodes on a closed client. A closed client no longer refreshes, as in the Python, TypeScript and Java SDKs. (#1813)
