@@ -118,7 +118,9 @@ pub(crate) const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
 /// is. When the pinned bytes are the whole budget a holder that pins some
 /// itself takes the overdraft token and runs uncharged, one at a time
 /// (issue #1315, `charge_within_room`): the overshoot is one frame or one
-/// reply.
+/// reply. A receive buffer whose doubling the room cannot cover does the
+/// same (issue #1869, `charge_growth`): it grows uncharged under the token
+/// until its frame has been answered, so the overshoot is one frame then.
 #[derive(Clone)]
 pub(crate) struct InFlightBudget {
     permits: Arc<Semaphore>,
@@ -137,7 +139,7 @@ pub(crate) struct InFlightBudget {
     pinned: Arc<AtomicUsize>,
     /// The overdraft token (issue #1315): one permit, node-wide. A holder
     /// that pins bytes itself and finds nothing left to wait for takes it
-    /// and runs uncharged (`charge_within_room`).
+    /// and runs uncharged (`charge_within_room`, `charge_growth`).
     overdraft: Arc<Semaphore>,
 }
 
@@ -243,6 +245,50 @@ impl InFlightBudget {
         }
     }
 
+    /// Charges a receive buffer's growth: `cost` more bytes on top of the
+    /// `own` its buffer is already charged. A buffer cannot be grown by
+    /// part of a doubling, so unlike `charge_within_room` the cost is not
+    /// clamped to the room: it is charged whole when the room covers it,
+    /// waiting only for bytes whose holders are not waiting on the budget.
+    ///
+    /// Issue #1869: when the room does not cover it, the bytes it needs
+    /// are pinned, many of them by other connections' receive buffers, and
+    /// a receive buffer is only released once its frame has arrived and
+    /// been served. Connections that were each part-way through a large
+    /// frame, together holding most of the budget, each waited for a
+    /// doubling only the others could free, until the frame deadline
+    /// (`IDLE_TIMEOUT`) closed some of them. A buffer that is already
+    /// charged (`own > 0`) now waits for the overdraft token as well, or
+    /// for the bytes, whichever comes first, as frames and replies do
+    /// (issue #1315): the holder of the token grows uncharged
+    /// (`Charge::Overdraft`) and keeps it until that frame has been
+    /// answered, the others follow one at a time. A buffer charged nothing
+    /// (`own == 0`) holds nothing anyone waits for and keeps waiting for
+    /// the bytes. The caller bounds the wait by the frame deadline.
+    async fn charge_growth(&self, cost: usize, own: usize) -> Charge {
+        loop {
+            if own == 0 || self.room(own) >= cost {
+                return Charge::Budget(self.charge_exact(cost).await);
+            }
+            // Not a one-byte wake-up as in `charge_within_room`: the room
+            // may be short of the cost without being 0, and then a byte is
+            // free at once. The bytes themselves only come once enough
+            // pinned ones are released, which is also when the room has
+            // grown.
+            tokio::select! {
+                token = Arc::clone(&self.overdraft).acquire_owned() => {
+                    let token = token.expect("the overdraft token is never closed");
+                    if self.room(own) < cost {
+                        return Charge::Overdraft(token);
+                    }
+                    // The room grew while the token was awaited: charge
+                    // the growth instead, and leave the token to others.
+                }
+                more = self.charge_exact(cost) => return Charge::Budget(more),
+            }
+        }
+    }
+
     /// Reserves `cost` bytes (clamped to the budget), waiting for them.
     /// Every holder in the server charges in steps on top of what it
     /// already holds, so they go through `charge_exact` with their own
@@ -253,9 +299,9 @@ impl InFlightBudget {
     }
 
     /// `charge` without the clamp, for a holder that grows its charge in
-    /// steps and clamps the total itself (`handle_connection`'s receive
-    /// buffer) — clamping each step would let one holder ask for more
-    /// than exists, waiting for itself.
+    /// steps and clamps the total itself (`charge_growth`, for
+    /// `handle_connection`'s receive buffer) — clamping each step would let
+    /// one holder ask for more than exists, waiting for itself.
     async fn charge_exact(&self, cost: usize) -> tokio::sync::OwnedSemaphorePermit {
         let permits = u32::try_from(cost).unwrap_or(u32::MAX);
         Arc::clone(&self.permits)
@@ -527,12 +573,16 @@ const MULTI_SET_VALUE_BYTES_PER_KEY: usize = 32;
 /// (`InFlightBudget::room`), so it neither waits for its own buffer nor
 /// for bytes whose holders are waiting for it. Waits at most
 /// `WRITE_TIMEOUT`, like a reply, and fails the connection if the budget
-/// does not free in that time.
+/// does not free in that time. `receive_overdraft` is the overdraft token
+/// the frame's receive buffer grew under (issue #1869,
+/// `InFlightBudget::charge_growth`): the frame then runs under it,
+/// uncharged, rather than wait for itself, and keeps it for its reply.
 async fn charge_multi_key_frame(
     config: &ConnectionConfig,
     receive_charged: usize,
     keys: usize,
     values: bool,
+    receive_overdraft: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> io::Result<FrameCharge> {
     let per_key = MULTI_KEY_FRAME_BYTES_PER_KEY
         + if values {
@@ -545,9 +595,11 @@ async fn charge_multi_key_frame(
     let cost = keys.saturating_mul(per_key);
     let permit = timeout(
         WRITE_TIMEOUT,
-        config
-            .in_flight_bytes
-            .charge_within_room(cost, receive_charged, false),
+        config.in_flight_bytes.charge_within_room(
+            cost,
+            receive_charged,
+            receive_overdraft.is_some(),
+        ),
     )
     .await
     .map_err(|_| {
@@ -556,7 +608,7 @@ async fn charge_multi_key_frame(
             "in-flight byte budget exhausted while serving a request",
         )
     })?;
-    let mut overdraft = None;
+    let mut overdraft = receive_overdraft;
     let held = match permit {
         Some(Charge::Budget(permit)) => {
             let held = u32::try_from(permit.num_permits()).unwrap_or(u32::MAX);
@@ -3108,6 +3160,11 @@ async fn handle_connection(
     let mut receive_charge: Option<tokio::sync::OwnedSemaphorePermit> = None;
     let mut receive_charged = 0usize;
     let mut receive_tally = ReceiveTally::new(&config.in_flight_bytes);
+    // The overdraft token, while the buffer has grown uncharged under it
+    // for the frame still arriving at its front (issue #1869,
+    // `InFlightBudget::charge_growth`); that frame takes it over once it
+    // has arrived.
+    let mut receive_overdraft: Option<tokio::sync::OwnedSemaphorePermit> = None;
     // No secret configured means auth isn't required, so every connection
     // starts already authenticated.
     let mut authenticated = config.auth_secret.is_none();
@@ -3152,6 +3209,18 @@ async fn handle_connection(
         let buffered_before = received.len();
         let lead = received.first().copied();
         let mut parsed = parse_resumable(&mut received, tagged, &mut parse_progress, false);
+        // Issue #1869: a buffer only grows while its front frame is
+        // incomplete, so a frame parsed now is the one an overdraft growth
+        // was for. It keeps the token until it has been answered (dropped
+        // with this iteration), so that the frame, its charges and its
+        // reply are the one thing beyond the budget, as for a multi-key
+        // frame that took the token itself (`FrameCharge::overdraft`), and
+        // its charges run under it rather than wait for it.
+        let mut frame_overdraft = if matches!(parsed, Err(ParseError::Incomplete)) {
+            None
+        } else {
+            receive_overdraft.take()
+        };
         // A multi-key frame (`m`, `o`, `y`) is charged for its per-key
         // working memory before the parser builds its key vectors, not
         // after: a connection waiting for the budget would otherwise hold
@@ -3173,8 +3242,16 @@ async fn handle_connection(
                 )
                 .await);
             }
-            frame_charge =
-                Some(charge_multi_key_frame(&config, receive_charged, keys, values).await?);
+            frame_charge = Some(
+                charge_multi_key_frame(
+                    &config,
+                    receive_charged,
+                    keys,
+                    values,
+                    frame_overdraft.take(),
+                )
+                .await?,
+            );
             parsed = parse_resumable(&mut received, tagged, &mut parse_progress, true);
         }
 
@@ -3492,7 +3569,15 @@ async fn handle_connection(
                 }
 
                 let response = execute_command(&request_tx, Command::Get { key }).await?;
-                write_reply(&mut stream, &config, &response, tag, receive_charged, false).await?;
+                write_reply(
+                    &mut stream,
+                    &config,
+                    &response,
+                    tag,
+                    receive_charged,
+                    frame_overdraft.is_some(),
+                )
+                .await?;
 
                 continue;
             }
@@ -4435,7 +4520,15 @@ async fn handle_connection(
 
                 if get {
                     let reply = Response::Touched(value, remaining_ttl);
-                    write_reply(&mut stream, &config, &reply, tag, receive_charged, false).await?;
+                    write_reply(
+                        &mut stream,
+                        &config,
+                        &reply,
+                        tag,
+                        receive_charged,
+                        frame_overdraft.is_some(),
+                    )
+                    .await?;
                 } else {
                     write_response(&mut stream, &encode_response(&Response::Stored, tag)).await?;
                 }
@@ -4657,6 +4750,7 @@ async fn handle_connection(
             receive_tally.set(0);
             receive_charge = None;
             receive_charged = 0;
+            receive_overdraft = None;
         }
 
         // Bounded by time remaining until `deadline`, not by a fresh
@@ -4672,15 +4766,24 @@ async fn handle_connection(
         // rather than by the connection count. The first 64 KiB of every
         // connection are free; a connection that cannot get the growth
         // by its frame deadline is closed, like one that trickled.
+        //
+        // Issue #1869: a growth the room cannot cover may instead take the
+        // overdraft token (`InFlightBudget::charge_growth`), and the frame
+        // still arriving then grows uncharged until it is complete. What
+        // it grew by stays uncharged until the buffer is rebuilt below
+        // the threshold, or is charged by the next growth, which asks
+        // for everything beyond `receive_charged`.
         if received.capacity() - received.len() < READ_CHUNK_SIZE {
             let grown = (received.capacity() * 2).max(received.len() + READ_CHUNK_SIZE);
             let want = config
                 .in_flight_bytes
                 .clamp(grown.saturating_sub(REQUEST_BUFFER_SHRINK_THRESHOLD));
-            if want > receive_charged {
-                let more = timeout(
+            if want > receive_charged && receive_overdraft.is_none() {
+                let charge = timeout(
                     remaining,
-                    config.in_flight_bytes.charge_exact(want - receive_charged),
+                    config
+                        .in_flight_bytes
+                        .charge_growth(want - receive_charged, receive_charged),
                 )
                 .await
                 .map_err(|_| {
@@ -4689,15 +4792,20 @@ async fn handle_connection(
                         "in-flight byte budget exhausted while receiving a request",
                     )
                 })?;
-                receive_charged = want;
-                receive_tally.set(want);
-                receive_charge = Some(match receive_charge.take() {
-                    Some(mut held) => {
-                        held.merge(more);
-                        held
+                match charge {
+                    Charge::Budget(more) => {
+                        receive_charged = want;
+                        receive_tally.set(want);
+                        receive_charge = Some(match receive_charge.take() {
+                            Some(mut held) => {
+                                held.merge(more);
+                                held
+                            }
+                            None => more,
+                        });
                     }
-                    None => more,
-                });
+                    Charge::Overdraft(token) => receive_overdraft = Some(token),
+                }
             }
             received.reserve(grown - received.len());
         }
@@ -12738,6 +12846,76 @@ mod tests {
         assert_eq!(budget.available(), 16 * 1024);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_buffers_that_each_hold_part_of_the_budget_do_not_wait_for_each_other() {
+        // Issue #1869: five connections are each part-way through a
+        // 300,000-byte store. Each receive buffer is charged 192 KiB, so
+        // they pin all but 64 KiB of the 1 MiB budget, and none of their
+        // next doublings (256 KiB more each) fits. A buffer is only
+        // released once its frame has arrived and been served, so each
+        // waited for bytes only the others could free, until the frame
+        // deadline (`IDLE_TIMEOUT`) closed some of them. One at a time,
+        // each now grows under the overdraft token and is answered.
+        const SIZE: usize = 300_000;
+        const SENT: usize = 200_000;
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for _ in 0..5 {
+            let (mut client, server) = tcp_pair().await;
+            tasks.push(tokio::spawn(handle_connection(
+                ServerStream::Plain(server),
+                test_client_addr(),
+                request_tx.clone(),
+                connection_config_with_budget(&budget, IDLE_TIMEOUT),
+                shutdown_rx.clone(),
+            )));
+            let mut head = format!("S 1 {SIZE}\nk").into_bytes();
+            head.extend(std::iter::repeat_n(b'v', SENT));
+            client.write_all(&head).await.unwrap();
+            clients.push(client);
+            sleep(Duration::from_millis(300)).await;
+        }
+        assert!(
+            budget.room(0) < 256 * 1024,
+            "the premise: no buffer's next doubling fits what is left, room {}",
+            budget.room(0)
+        );
+
+        let mut readers = Vec::new();
+        for mut client in clients {
+            client.write_all(&vec![b'v'; SIZE - SENT]).await.unwrap();
+            readers.push(tokio::spawn(async move {
+                let mut reply = [0u8; 2];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply, b"S\n");
+                client
+            }));
+        }
+        let mut clients = Vec::new();
+        for reader in readers {
+            clients.push(
+                timeout(Duration::from_secs(5), reader)
+                    .await
+                    .expect("every store is answered, not at the idle timeout")
+                    .unwrap(),
+            );
+        }
+
+        drop(clients);
+        for task in tasks {
+            let _ = timeout(Duration::from_secs(5), task).await;
+        }
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+        assert_eq!(budget.overdraft.available_permits(), 1);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
     /// An `m` frame of `keys` one-byte keys in the root namespace.
     fn multi_get_frame(keys: usize) -> Vec<u8> {
         let mut frame = format!("m 0 {keys}").into_bytes();
@@ -13368,7 +13546,7 @@ mod tests {
         let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
         let config = connection_config_with_budget(&budget, IDLE_TIMEOUT);
         let mut charge = Some(
-            charge_multi_key_frame(&config, 0, 100, false)
+            charge_multi_key_frame(&config, 0, 100, false, None)
                 .await
                 .unwrap(),
         );
@@ -13705,7 +13883,7 @@ mod tests {
         let pinned_permit = budget.charge(MAX_REQUEST_SIZE).await;
         let config = connection_config_with_budget(&budget, IDLE_TIMEOUT);
 
-        let charge = charge_multi_key_frame(&config, 0, 1_000, false);
+        let charge = charge_multi_key_frame(&config, 0, 1_000, false, None);
         tokio::pin!(charge);
         assert!(
             timeout(Duration::from_millis(300), &mut charge)
@@ -13762,7 +13940,7 @@ mod tests {
             .unwrap();
         let frame = timeout(
             Duration::from_secs(2),
-            charge_multi_key_frame(&config, MAX_REQUEST_SIZE, 1_000, false),
+            charge_multi_key_frame(&config, MAX_REQUEST_SIZE, 1_000, false, None),
         )
         .await
         .expect("nor is a frame")
@@ -14096,7 +14274,7 @@ mod tests {
         let mut first = Some(
             timeout(
                 Duration::from_secs(2),
-                charge_multi_key_frame(&config, half, 1_000, false),
+                charge_multi_key_frame(&config, half, 1_000, false, None),
             )
             .await
             .expect("a frame whose holder pins bytes is not left waiting")
@@ -14105,7 +14283,7 @@ mod tests {
         assert_eq!(first.as_ref().unwrap().held, 0);
         assert!(holds_overdraft(&first));
 
-        let second = charge_multi_key_frame(&config, half, 1_000, false);
+        let second = charge_multi_key_frame(&config, half, 1_000, false, None);
         tokio::pin!(second);
         assert!(
             timeout(Duration::from_millis(300), &mut second)
@@ -14254,7 +14432,7 @@ mod tests {
         // The charge is the key count times the per-key figure, less
         // nothing; a connection already holding receive-buffer bytes asks
         // only for the rest of the budget when the frame costs more.
-        let small = charge_multi_key_frame(&config, 0, 100, false)
+        let small = charge_multi_key_frame(&config, 0, 100, false, None)
             .await
             .unwrap();
         assert_eq!(
@@ -14262,7 +14440,7 @@ mod tests {
             MAX_REQUEST_SIZE - 100 * MULTI_KEY_FRAME_BYTES_PER_KEY
         );
         drop(small);
-        let all_the_rest = charge_multi_key_frame(&config, 300_000, 1_000_000, false)
+        let all_the_rest = charge_multi_key_frame(&config, 300_000, 1_000_000, false, None)
             .await
             .unwrap();
         assert_eq!(budget.available(), 300_000);
@@ -14272,7 +14450,7 @@ mod tests {
         // WRITE_TIMEOUT with the budget error and holds nothing.
         let held = budget.charge(MAX_REQUEST_SIZE).await;
         let started = tokio::time::Instant::now();
-        let error = charge_multi_key_frame(&config, 0, 10, false)
+        let error = charge_multi_key_frame(&config, 0, 10, false, None)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);

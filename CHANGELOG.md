@@ -14,6 +14,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node: connections each part-way through a large frame, whose receive
+  buffers together held most of `--max-in-flight-bytes`, each waited for a
+  buffer doubling only the others could free, so none of them finished until
+  the idle timeout (60 s) closed some with "in-flight byte budget exhausted
+  while receiving a request". A doubling the budget cannot cover now takes
+  the node-wide overdraft slot that frames and replies already use, and grows
+  without a charge until its frame has been answered, one connection at a
+  time (#1869).
+
 - Proxy: a touch with a TTL other than 0 that had to wait behind an earlier
   request on its key kept the next request on that key (on the namespace for
   a `y` of more than 64 keys) waiting until every owner had answered the
