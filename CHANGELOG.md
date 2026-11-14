@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Discovery: when a ready member's `M` ack was lost or slow and the member
+  reported its handoff complete in the meantime, the retry of that `M` found
+  the join gone and sent the member an `X` as if the join had been
+  abandoned, so the member ended its forwarding window early, reverted its
+  ring and restored the handed-off copies while the joiner was already a
+  member; discovery also logged the successful join as abandoned. A retry now
+  stops without an `X` once the join it was for has completed (#1870).
+
 - Node: connections each part-way through a large frame, whose receive
   buffers together held most of `--max-in-flight-bytes`, each waited for a
   buffer doubling only the others could free, so none of them finished until

@@ -336,7 +336,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1261,6 +1261,14 @@ struct PendingJoin {
 struct LateHandoffs {
     fanout_limit: Arc<Semaphore>,
     sends: JoinSet<()>,
+    /// Issue #1870: set by `handle_complete` just before it clears the
+    /// slot and promotes the joiner, so a retried `M` send of this join
+    /// (`send_migrate_with_retry`) can tell "this join completed" apart
+    /// from "this join was abandoned or superseded" — both leave
+    /// `current_join` without this joiner and generation. Each
+    /// `PendingJoin` gets its own, so a re-join of the same name (a new
+    /// generation) never sees an earlier join's flag, nor it this one's.
+    promoted: Arc<AtomicBool>,
 }
 
 impl Default for LateHandoffs {
@@ -1268,7 +1276,46 @@ impl Default for LateHandoffs {
         Self {
             fanout_limit: Arc::new(Semaphore::new(MAX_FANOUT_CONCURRENCY)),
             sends: JoinSet::new(),
+            promoted: Arc::new(AtomicBool::new(false)),
         }
+    }
+}
+
+/// What `send_migrate_with_retry` finds when it checks, before every
+/// attempt, on the join its `M` is for (issue #1030, #1870).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinStatus {
+    /// Still the pending join: send (or retry) the `M`.
+    Current,
+    /// Completed: every ready member reported `C` and the joiner was
+    /// promoted. Stop without an `X` — the handoff it would cancel has
+    /// already finished.
+    Promoted,
+    /// Abandoned or superseded: stop, and cancel with `X` an `M` that
+    /// may have landed.
+    Ended,
+}
+
+/// The `send_migrate_with_retry` check for the join identified by
+/// `joining_name` and `generation`, whose `LateHandoffs::promoted` is
+/// `promoted` (issue #1870).
+fn join_status(
+    current_join: &CurrentJoin,
+    joining_name: &str,
+    generation: u64,
+    promoted: &AtomicBool,
+) -> JoinStatus {
+    let is_current = lock_current_join(current_join)
+        .as_ref()
+        .is_some_and(|pending| {
+            pending.joining_name == joining_name && pending.generation == generation
+        });
+    if is_current {
+        JoinStatus::Current
+    } else if promoted.load(Ordering::Acquire) {
+        JoinStatus::Promoted
+    } else {
+        JoinStatus::Ended
     }
 }
 
@@ -2537,7 +2584,16 @@ async fn try_begin_next_join(
     // again after each bootstrap promotion; the next candidate then
     // finds a `Joined` member and starts a real staged join, after which
     // `C`/abandon chain the rest as usual.
-    let (name, joining_addr, joining_token, joined, ready_tokens, generation, fanout_limit) = loop {
+    let (
+        name,
+        joining_addr,
+        joining_token,
+        joined,
+        ready_tokens,
+        generation,
+        fanout_limit,
+        promoted,
+    ) = loop {
         let mut join_guard = lock_current_join(current_join);
 
         if join_guard.is_some() {
@@ -2630,6 +2686,7 @@ async fn try_begin_next_join(
         let joined = Arc::new(joined);
         let late = LateHandoffs::default();
         let fanout_limit = Arc::clone(&late.fanout_limit);
+        let promoted = Arc::clone(&late.promoted);
 
         *join_guard = Some(PendingJoin {
             joining_name: name.clone(),
@@ -2650,6 +2707,7 @@ async fn try_begin_next_join(
             ready_tokens,
             generation,
             fanout_limit,
+            promoted,
         );
     };
 
@@ -2685,6 +2743,7 @@ async fn try_begin_next_join(
         let ready_token = ready_tokens.get(&ready_name).cloned().unwrap_or_default();
         let fanout_limit = Arc::clone(&fanout_limit);
         let current_join = Arc::clone(current_join);
+        let promoted = Arc::clone(&promoted);
 
         sends.spawn(async move {
             let _permit = fanout_limit
@@ -2704,13 +2763,7 @@ async fn try_begin_next_join(
                 replication,
                 generation,
                 OUTBOUND_IO_TIMEOUT,
-                || {
-                    lock_current_join(&current_join)
-                        .as_ref()
-                        .is_some_and(|pending| {
-                            pending.joining_name == joining_name && pending.generation == generation
-                        })
-                },
+                || join_status(&current_join, &joining_name, generation, &promoted),
             )
             .await;
 
@@ -2732,10 +2785,13 @@ async fn try_begin_next_join(
                      {MIGRATE_SEND_ATTEMPTS} attempts: {error}"
                 );
             }
-            Ok((_, Ok(entries))) => {
+            Ok((_, Ok(Some(entries)))) => {
                 let mut join_guard = lock_current_join(current_join);
                 credit_migrate_send_result(&mut join_guard, &name, generation, entries);
             }
+            // Issue #1870: the join completed before a retry went out —
+            // nothing failed.
+            Ok((_, Ok(None))) => {}
             Err(error) => eprintln!("WARN a task sending M panicked: {error}"),
         }
     }
@@ -2788,9 +2844,10 @@ fn credit_migrate_send_result(
 /// connect) since a failed write/read leaves the previous connection's
 /// state unknown. This only bounds the *send* — the handoff itself,
 /// reported back asynchronously via `C`, stays a separate, unretried
-/// concern (see `send_migrate`'s own docs). `still_current` says whether
-/// the join this `M` is for is still the pending one; checked before
-/// every attempt (issue #1030, see the loop).
+/// concern (see `send_migrate`'s own docs). `status` says whether the
+/// join this `M` is for is still the pending one; checked before every
+/// attempt (issue #1030, see the loop). Returns `Ok(None)` if the join
+/// completed before an attempt went out (issue #1870).
 #[allow(clippy::too_many_arguments)]
 async fn send_migrate_with_retry(
     token: &str,
@@ -2805,8 +2862,8 @@ async fn send_migrate_with_retry(
     replication: usize,
     generation: u64,
     io_timeout: Duration,
-    still_current: impl Fn() -> bool,
-) -> io::Result<usize> {
+    status: impl Fn() -> JoinStatus,
+) -> io::Result<Option<usize>> {
     let mut last_error = None;
 
     for attempt in 1..=MIGRATE_SEND_ATTEMPTS {
@@ -2818,7 +2875,18 @@ async fn send_migrate_with_retry(
         // occupied slot then rejects the new join's `M`. So the send stops
         // here, and if an earlier attempt may have landed (its ack lost in
         // transit), an `X` of this send's own follows it.
-        if !still_current() {
+        // Issue #1870: but a join that is no longer pending may also have
+        // *completed* — this node's `C` (and every other member's) came
+        // in while an attempt's ack was lost or still timing out, and the
+        // joiner was promoted. An `X` then would make the node abandon a
+        // finished handoff (end its forwarding window, revert its ring,
+        // restore the handed-off copies) under a joiner discovery lists
+        // as a member, so the send just stops.
+        let join_status = status();
+        if join_status == JoinStatus::Promoted {
+            return Ok(None);
+        }
+        if join_status == JoinStatus::Ended {
             if attempt > 1
                 && let Err(error) = send_cancel(
                     token,
@@ -2855,7 +2923,7 @@ async fn send_migrate_with_retry(
         )
         .await
         {
-            Ok(entries) => return Ok(entries),
+            Ok(entries) => return Ok(Some(entries)),
             Err(error) => {
                 eprintln!(
                     "WARN failed to send M to {ready_name} (attempt \
@@ -3640,6 +3708,7 @@ fn hand_off_from_late_member(
     let generation = pending.generation;
     let roster = Arc::clone(&pending.roster);
     let fanout_limit = Arc::clone(&pending.late.fanout_limit);
+    let promoted = Arc::clone(&pending.late.promoted);
     println!(
         "INFO join in progress: {joining_name} — sending M to {name}, admitted by P after the \
          join started"
@@ -3668,20 +3737,16 @@ fn hand_off_from_late_member(
             replication,
             generation,
             OUTBOUND_IO_TIMEOUT,
-            || {
-                lock_current_join(&current_join)
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        pending.joining_name == joining_name && pending.generation == generation
-                    })
-            },
+            || join_status(&current_join, &joining_name, generation, &promoted),
         )
         .await;
         match result {
-            Ok(entries) => {
+            Ok(Some(entries)) => {
                 let mut join_guard = lock_current_join(&current_join);
                 credit_migrate_send_result(&mut join_guard, &joining_name, generation, entries);
             }
+            // Issue #1870: the join completed before a retry went out.
+            Ok(None) => {}
             Err(error) => eprintln!(
                 "WARN permanently failed to send M to {name} (admitted by P mid-join) after \
                  {MIGRATE_SEND_ATTEMPTS} attempts: {error}"
@@ -3828,6 +3893,10 @@ async fn handle_complete(
         }
 
         let joining_name = pending.joining_name.clone();
+        // Issue #1870: marked before the slot clears, so a retried `M`
+        // send of this join that finds it gone knows it completed and
+        // sends no `X` (see `send_migrate_with_retry`).
+        pending.late.promoted.store(true, Ordering::Release);
         *join_guard = None;
         joining_name
     };
@@ -14918,11 +14987,14 @@ mod tests {
             2,
             9,
             OUTBOUND_IO_TIMEOUT,
-            || true,
+            || JoinStatus::Current,
         )
         .await;
 
-        assert!(result.is_ok(), "expected recovery on retry, got {result:?}");
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "expected recovery on retry, got {result:?}"
+        );
         node_task.await.unwrap();
     }
 
@@ -14959,7 +15031,7 @@ mod tests {
             2,
             9,
             OUTBOUND_IO_TIMEOUT,
-            || true,
+            || JoinStatus::Current,
         )
         .await;
 
@@ -15015,7 +15087,13 @@ mod tests {
             2,
             9,
             OUTBOUND_IO_TIMEOUT,
-            || checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0,
+            || {
+                if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    JoinStatus::Current
+                } else {
+                    JoinStatus::Ended
+                }
+            },
         )
         .await;
 
@@ -15031,6 +15109,112 @@ mod tests {
             frames[0].starts_with(b"X "),
             "the second frame must be an X (cancel), got {:?}",
             String::from_utf8_lossy(&frames[0])
+        );
+    }
+
+    /// Issue #1870: attempt 1's `M` lands but its ack never comes back;
+    /// meanwhile the ready member finishes its handoff and sends `C`, and
+    /// the joiner is promoted. The retry must neither resend `M` nor send
+    /// an `X` — that would make the member abandon a handoff that already
+    /// completed — and the send is not a failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_migrate_with_retry_sends_no_cancel_after_the_join_completed() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:1".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:2".to_string(),
+                NodeState::Joining,
+                "tk-node-b".to_string(),
+            ),
+        );
+        let late = LateHandoffs::default();
+        let promoted = Arc::clone(&late.promoted);
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-b".to_string(),
+            expected: [("node-a".to_string(), "tk-node-a".to_string())]
+                .into_iter()
+                .collect(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            generation: 9,
+            roster: Arc::new(Vec::new()),
+            late,
+        })));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let node_registry = Arc::clone(&registry);
+        let node_join = Arc::clone(&current_join);
+        let node_task = tokio::spawn(async move {
+            // node-a: reads the `M`, withholds the ack, and reports `C`.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = stream.read(&mut buffer).await.unwrap();
+            assert!(
+                handle_complete(
+                    &node_registry,
+                    &node_join,
+                    "node-a",
+                    "node-b",
+                    "tk-node-a",
+                    Some(9),
+                )
+                .await
+            );
+            // Hold the connection until the attempt times out, then
+            // record anything discovery sends after it.
+            let _ = stream.read(&mut buffer).await;
+            let mut frames = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                timeout(Duration::from_millis(500), listener.accept()).await
+            {
+                let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+                frames.push(buffer[..bytes_read].to_vec());
+                let _ = stream.write_all(b"A\n").await;
+            }
+            frames
+        });
+
+        let result = send_migrate_with_retry(
+            "tk-node-a",
+            "node-a",
+            &address,
+            &None,
+            &None,
+            "node-b",
+            "127.0.0.1:2",
+            "tk-node-b",
+            &[],
+            2,
+            9,
+            Duration::from_millis(200),
+            || join_status(&current_join, "node-b", 9, &promoted),
+        )
+        .await;
+
+        assert_eq!(lock(&registry)["node-b"].state, NodeState::Joined);
+        assert!(
+            matches!(result, Ok(None)),
+            "a completed join's send is not a failure, got {result:?}"
+        );
+        let frames = node_task.await.unwrap();
+        assert!(
+            frames.is_empty(),
+            "nothing may follow the promotion, got {:?}",
+            frames
+                .iter()
+                .map(|frame| String::from_utf8_lossy(frame).into_owned())
+                .collect::<Vec<_>>()
         );
     }
 
