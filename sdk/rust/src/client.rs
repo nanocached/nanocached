@@ -1186,6 +1186,11 @@ enum Target {
 struct Inner {
     state: Mutex<State>,
     redials: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Proxy mode: how many `reconnect_proxy` runs found no proxy to dial.
+    /// `with_cluster_retry` compares it across an attempt to tell an
+    /// attempt whose connection acquisition already failed over in vain
+    /// (issue #1864) from one that lost a connection it had.
+    proxy_failovers_failed: AtomicU64,
     /// Single-flight gate for `maybe_refresh`/`refresh_node_list`: without
     /// it, every concurrent caller that observes a stale (or forced)
     /// node list independently redials discovery, so a burst of
@@ -1893,6 +1898,7 @@ impl NanocachedClient {
                 last_refresh_end: None,
             }),
             redials: Mutex::new(HashMap::new()),
+            proxy_failovers_failed: AtomicU64::new(0),
             refresh_gate: Mutex::new(()),
             reconnect_cooldowns: Mutex::new(initial_cooldowns),
             reconnect_cooldown,
@@ -4673,8 +4679,12 @@ impl NanocachedClient {
     /// own same-address redial already failed, exactly like a genuine
     /// standalone node, with no way to fail over to a different proxy at
     /// all. `reconnect_proxy` is that failover: it re-fetches the roster
-    /// and swaps onto another, randomly chosen, reachable proxy before
-    /// this retries the operation once more. `WrongNode` is not
+    /// and swaps onto another, randomly chosen, reachable proxy. It runs
+    /// inside connection acquisition (`slot_connection`, issue #1845), so
+    /// this branch only retries the operation once more, which acquires a
+    /// connection and fails over there; it does not retry when a failover
+    /// already found no proxy during the first attempt (issue #1864).
+    /// `WrongNode` is not
     /// special-cased here — a well-behaved proxy never sends one (it owns
     /// every key), so one arriving anyway propagates rather than looping.
     /// A `ConnectionLostAfterSend` (issue #225) is deliberately excluded
@@ -4692,11 +4702,21 @@ impl NanocachedClient {
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
+        let failovers_failed = self.inner.proxy_failovers_failed.load(Ordering::SeqCst);
         let result = match operation().await {
             Ok(value) => Ok(value),
-            Err(Error::ConnectionLost(_)) if self.inner.via_proxy => {
-                self.reconnect_proxy().await;
-                operation().await
+            // Issue #1864: connection acquisition (`slot_connection`) is
+            // where proxy mode fails over (#1845), so the retry below reaches
+            // another proxy through it. If a failover already came up empty
+            // during this attempt there is no proxy to retry on: running it
+            // again would only re-fetch `Q` (and count another refresh
+            // failure) for the same answer.
+            Err(error @ Error::ConnectionLost(_)) if self.inner.via_proxy => {
+                if self.inner.proxy_failovers_failed.load(Ordering::SeqCst) == failovers_failed {
+                    operation().await
+                } else {
+                    Err(error)
+                }
             }
             Err(error @ (Error::WrongNode | Error::ConnectionLost(_))) => {
                 let clustered =
@@ -5882,10 +5902,9 @@ impl NanocachedClient {
     }
 
     /// Proxy mode reconnect-on-loss, second half (issue #122; see
-    /// `Options::via_proxy`'s doc comment). Called from `with_cluster_retry`
-    /// once the same-proxy redial already inside `apply_reconnecting`'s
-    /// own one-shot retry has failed — the proxy itself is down, not just
-    /// this one socket — so this re-fetches the proxy roster from the
+    /// `Options::via_proxy`'s doc comment). Called from `slot_connection`
+    /// once its same-proxy redial has failed (issue #1845) — the proxy
+    /// itself is down, not just this one socket — so this re-fetches the proxy roster from the
     /// configured discovery address(es) and, if a reachable one turns up,
     /// swaps `state.target` onto it exactly like `connect_via_proxy` built
     /// it in the first place.
@@ -5918,6 +5937,9 @@ impl NanocachedClient {
         }
         let (dialed, got_roster) = self.dial_a_fresh_proxy().await;
         let Some((address, stream, tagged)) = dialed else {
+            self.inner
+                .proxy_failovers_failed
+                .fetch_add(1, Ordering::SeqCst);
             // Issue #1822: a refresh failure is a refresh that yielded no
             // usable proxy roster, as in the other SDKs; a roster that came
             // back with every proxy dial failing is not counted.

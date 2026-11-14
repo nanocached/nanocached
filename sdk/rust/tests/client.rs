@@ -9535,7 +9535,10 @@ async fn via_proxy_reconnect_does_not_count_a_refresh_failure_when_the_roster_wa
 #[tokio::test]
 async fn via_proxy_reconnect_counts_a_refresh_failure_when_the_roster_is_empty() {
     let failures = proxy_reconnect_refresh_failures(vec![]).await;
-    assert!(failures >= 1, "an empty roster is a refresh failure");
+    // Issue #1864: exactly one. Connection acquisition fails over, and
+    // `with_cluster_retry` used to fail over again and then retry, whose
+    // acquisition failed over a third time: three `Q` for one `get`.
+    assert_eq!(failures, 1, "one get with no proxy left is one refresh");
 }
 
 #[tokio::test]
