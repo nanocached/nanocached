@@ -9128,6 +9128,49 @@ class EstablishedConnectionResetRetiresTheSocketTests(unittest.IsolatedAsyncioTe
             server.close()
             await server.wait_closed()
 
+    async def test_an_en_rejects_only_the_oldest_pipelined_request(self):
+        # Issue #1874: a node's `En` answers the oldest request still
+        # waiting; whatever was pipelined behind it is never answered.
+        # _poison() handed the rejection to every pending slot, so a touch
+        # behind it raised ServerTooOldError and an incr the node never ran
+        # failed as "may have been applied" (ConnectionLostError) and was
+        # not replayed. Only the oldest gets it now; the rest fail as a
+        # plain connection loss, not sent.
+        from nanocached._connection import Connection, _ServerRejectedError
+
+        async def answer_en_after_three_requests(reader, writer):
+            with contextlib.suppress(Exception):
+                received = b""
+                while received.count(b"\n") < 3:
+                    received += await reader.read(1024)
+                writer.write(b"En\n")
+                await writer.drain()
+            writer.close()
+
+        server = await asyncio.start_server(answer_en_after_three_requests, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            connection = Connection(reader, writer, on_close=lambda: None, tagged=False)
+            results = await asyncio.gather(
+                connection.get(b"y"),
+                connection.touch(b"t", 30, b"ns"),
+                connection.incr(b"i", 1, b"ns"),
+                return_exceptions=True,
+            )
+            oldest, touch, incr = results
+            self.assertIsInstance(oldest, ConnectionLostError)
+            self.assertIsInstance(oldest.__cause__, _ServerRejectedError)
+            for behind in (touch, incr):
+                self.assertIsInstance(behind, ConnectionError)
+                self.assertNotIsInstance(behind, ConnectionLostError)
+                self.assertNotIsInstance(behind, _ServerRejectedError)
+                self.assertNotIsInstance(behind.__cause__, _ServerRejectedError)
+            await connection.wait_closed()
+        finally:
+            server.close()
+            await server.wait_closed()
+
 
 class RedialAfterCloseTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_request_retried_after_close_fails_as_closed_instead_of_dialing(self):
