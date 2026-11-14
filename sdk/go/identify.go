@@ -509,7 +509,12 @@ func readListEntries(reader *bufio.Reader, count int) ([]discoveredNode, error) 
 		}
 		nameLength, err1 := parseStrictInt(lengths[0])
 		addrLength, err2 := parseStrictInt(lengths[1])
-		if err1 != nil || err2 != nil || nameLength < 0 || addrLength < 0 ||
+		// Issue #1871: a zero-length name or address is rejected too, as
+		// the discovery server's own parser does (parse_string_fields →
+		// EmptyField). An empty name collided with the single-mode slot
+		// "" (snapshotSlot), so routing to that member dereferenced the
+		// nil c.single and panicked, often in an SDK-started goroutine.
+		if err1 != nil || err2 != nil || nameLength <= 0 || addrLength <= 0 ||
 			nameLength > maxNodeFieldLength || addrLength > maxNodeFieldLength {
 			return nil, protocolErrorf("nanocached: invalid node entry lengths in discovery response")
 		}
