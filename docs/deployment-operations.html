@@ -116,7 +116,11 @@ buffers pin the whole budget, nothing is left to wait for: a connection
 that holds a buffer itself then takes a single node-wide overdraft slot
 and answers without a charge, one at a time, because its buffer is only
 released after the replies it has buffered and two such connections would
-otherwise wait for each other. That overshoots the budget by one frame or
+otherwise wait for each other. A receive buffer whose next doubling the
+room cannot cover does the same: it grows under that slot without a charge
+until its frame has arrived and been answered, since connections each
+part-way through a large frame would otherwise wait for each other's
+buffers. That overshoots the budget by one frame or
 reply, never more, and a connection with no buffer charged keeps waiting
 for the budget. A connection that cannot get its share in time is closed,
 like a stalled one.</p>
