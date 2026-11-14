@@ -73,7 +73,7 @@ public sealed class NanocachedNamespace
     public Task<string?> GetAsync(byte[] key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<string?>(cancellationToken)
-        : Cancellation.Abandonable(_client.GetAsync(_namespace, key), cancellationToken);
+        : Cancellation.Abandonable(_client.GetAsync(_namespace, _client.OwnReadKey(key, cancellationToken)), cancellationToken);
 
     public Task<byte[]?> GetBytesAsync(string key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
@@ -88,7 +88,7 @@ public sealed class NanocachedNamespace
     public Task<byte[]?> GetBytesAsync(byte[] key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<byte[]?>(cancellationToken)
-        : Cancellation.Abandonable(_client.GetBytesAsync(_namespace, key), cancellationToken);
+        : Cancellation.Abandonable(_client.GetBytesAsync(_namespace, _client.OwnReadKey(key, cancellationToken)), cancellationToken);
 
     /// <summary><paramref name="ttlSeconds"/> of 0 (the default) means no expiry.</summary>
     public Task SetAsync(string key, string value, long ttlSeconds = 0, CancellationToken cancellationToken = default) =>
@@ -247,7 +247,7 @@ public sealed class NanocachedNamespace
     public Task<(string Value, string Token)?> GetWithTokenAsync(byte[] key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<(string Value, string Token)?>(cancellationToken)
-        : Cancellation.Abandonable(_client.GetWithTokenAsync(_namespace, key), cancellationToken);
+        : Cancellation.Abandonable(_client.GetWithTokenAsync(_namespace, _client.OwnReadKey(key, cancellationToken)), cancellationToken);
 
     /// <summary>issue #141: as
     /// <see cref="NanocachedClient.GetBytesWithTokenAsync(string, CancellationToken)"/>,
@@ -260,7 +260,7 @@ public sealed class NanocachedNamespace
     public Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(byte[] key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<(byte[] Value, string Token)?>(cancellationToken)
-        : Cancellation.Abandonable(_client.GetBytesWithTokenAsync(_namespace, key), cancellationToken);
+        : Cancellation.Abandonable(_client.GetBytesWithTokenAsync(_namespace, _client.OwnReadKey(key, cancellationToken)), cancellationToken);
 
     /// <summary>issue #141 — <c>add</c>/<c>putIfAbsent</c>: as
     /// <see cref="NanocachedClient.PutIfAbsentAsync(string, string, long, CancellationToken)"/>,
