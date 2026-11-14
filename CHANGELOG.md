@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node: a decommission drain (SIGTERM) that interrupted a join handoff this
+  node was still sending left out every key the join had already sent: it
+  read them as dead copies, though aborting the join makes them live again,
+  so they went only to the abandoned joiner — lost at R=1, one copy short at
+  R≥2 — and were not counted as left behind. A re-replication starting while
+  a transfer was still running had the same gap. A join holds its marks until
+  discovery confirms it, whether or not its transfer has finished (#1868).
+
 - Proxy: a touch with a TTL other than 0 that had to wait behind an earlier
   request on its key kept the next request on that key (on the namespace for
   a `y` of more than 64 keys) waiting until every owner had answered the

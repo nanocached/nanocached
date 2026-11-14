@@ -9645,17 +9645,29 @@ async fn peek_entry_for_handoff(
 
 /// Issue #970: whether this node's dead copies may be left out of a
 /// handoff it sends. Marks are held — the copies they name may become
-/// live again — only while the join that made them is undecided (a
-/// completed slot discovery has not confirmed, issue #62); once confirmed
-/// they are released to the sweep, and a decommission drain or a
-/// re-replication pass that runs before the sweep got to them must not
-/// hand them on as if live. With no slot there are no held marks.
+/// live again — only while the join that made them is undecided (a slot
+/// discovery has not confirmed, issue #62); once confirmed they are
+/// released to the sweep, and a decommission drain or a re-replication
+/// pass that runs before the sweep got to them must not hand them on as
+/// if live. With no slot there are no held marks.
+///
+/// Issue #1868: a join still transferring (`completed_at` unset) holds
+/// its marks too. `run_migration` marks each displaced key as soon as
+/// the joiner acks it, and only the unwind of an aborted transfer
+/// (`unmark_migrated_many`) gives them back — but `run_decommission`'s
+/// wait stops as soon as it has set `abort_requested`, and
+/// `run_rereplication` can start with a transfer still running, so both
+/// used to read the keys already sent as absent and hand them only to a
+/// joiner whose join was about to be abandoned. At R=1 they were lost.
+/// `run_sweep` already treated a running transfer this way. Remnant
+/// slots (`take_slot_keeping_lingering`) are created confirmed and hold
+/// no marks.
 fn marks_released(active_migration: &Arc<Mutex<Option<ActiveMigration>>>) -> bool {
     !active_migration
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .as_ref()
-        .is_some_and(|active| active.completed_at.is_some() && !active.confirmed)
+        .is_some_and(|active| !active.confirmed)
 }
 
 async fn mark_migrated(request_tx: &mpsc::Sender<CacheRequest>, key: &Key) {
@@ -25670,6 +25682,103 @@ mod tests {
             node_context.gates.drain_left_behind.load(Ordering::SeqCst),
             live,
             "only the live entries bound for the dead entrant are left behind"
+        );
+
+        discovery_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// Issue #1868: a join this node is still transferring (its slot not
+    /// completed, not confirmed) holds the marks it has made so far — the
+    /// drain aborts it, and an aborted join makes those copies live again.
+    /// The drain used to treat them as released and read each key the
+    /// join had already sent as absent, so at R=1 it reached neither its
+    /// post-leave owner nor the `left_behind` count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn decommission_drain_hands_on_keys_marked_by_a_join_still_transferring() {
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let (_left, discovery_task) = spawn_mock_discovery(discovery_listener, peer_addr, None);
+        let node_context = drain_test_context(&discovery_addr, &request_tx);
+
+        // Every key the leaver owns at R=1 was already sent to the joiner
+        // and marked; the transfer itself has not finished.
+        let before = HashRing::new(vec!["leaver".into(), "peer".into()]);
+        let mut sent_to_joiner = Vec::new();
+        for index in 0..30u32 {
+            let name = format!("key-{index:03}");
+            let k = key(name.as_bytes());
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: k.clone(),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+            if before.is_owner(&k, "leaver", 1) {
+                send_command(&request_tx, Command::MarkMigrated { key: k }).await;
+                sent_to_joiner.push(name);
+            }
+        }
+        assert!(sent_to_joiner.len() > 4, "{sent_to_joiner:?}");
+        let mut slot = completed_slot_for(
+            "joiner",
+            "127.0.0.1:1",
+            Arc::new(HashRing::new(vec![
+                "leaver".into(),
+                "peer".into(),
+                "joiner".into(),
+            ])),
+            Duration::ZERO,
+            false,
+        );
+        slot.replication = 1;
+        slot.completed_at = None;
+        slot.acked_entries = None;
+        slot.marked_keys = sent_to_joiner
+            .iter()
+            .map(|name| key(name.as_bytes()))
+            .collect();
+        *node_context.active_migration.lock().unwrap() = Some(slot);
+
+        run_decommission(
+            node_context.clone(),
+            vec![discovery_addr],
+            Duration::from_secs(12),
+            None,
+        )
+        .await;
+
+        let delivered: HashSet<String> = frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|frame| {
+                let text = String::from_utf8_lossy(frame).into_owned();
+                sent_to_joiner
+                    .iter()
+                    .find(|name| text.contains(name.as_str()))
+                    .cloned()
+            })
+            .collect();
+        assert_eq!(
+            delivered.len(),
+            sent_to_joiner.len(),
+            "every key the aborted join had taken must reach its post-leave owner"
+        );
+        assert_eq!(
+            node_context.gates.drain_left_behind.load(Ordering::SeqCst),
+            0
         );
 
         discovery_task.abort();
