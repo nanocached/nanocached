@@ -4853,8 +4853,15 @@ async fn dispatch_request(
         } => {
             let enqueued = enqueue_touch(&context, &ring, &namespace, &key, ttl, get).await;
             // Only an expiring touch holds its slot's signal (issue #1847):
-            // its replica legs are enqueued by `finish_touch`.
-            let signal = slot.signal;
+            // its replica legs are enqueued by `finish_touch`. Any other
+            // touch has enqueued every frame by now, so its signal goes with
+            // the slot when this returns (issue #1865), not once every owner
+            // has answered.
+            let signal = if expires_at_once(ttl) {
+                slot.signal
+            } else {
+                None
+            };
             tokio::spawn(async move {
                 let result = finish_touch(
                     &context,
@@ -5079,7 +5086,13 @@ async fn dispatch_request(
                 .iter()
                 .map(|group| (group.addr.as_str(), group.frame.clone(), group.expect));
             let pending = context.backends.enqueue_mixed(&context, requests).await;
-            let signal = slot.signal;
+            // As for `t` (issues #1847, #1865): only an expiring batch
+            // enqueues frames after its primaries answer.
+            let signal = if expires_at_once(ttl) {
+                slot.signal
+            } else {
+                None
+            };
 
             tokio::spawn(async move {
                 let result = finish_multi_touch(
@@ -17589,6 +17602,32 @@ mod tests {
                 replica_settles_on(&nodes[replica], b"key", Some(b"v")).await,
                 "wide={wide}: the replica must hold the acknowledged write"
             );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_plain_touch_that_waited_releases_its_order_once_enqueued() {
+        // Issue #1865: a `t`/`y` with a TTL other than 0 that had to wait
+        // (here behind an `i` on the key) held its order signal until every
+        // owner had answered, so the `G` behind it reached the primary only
+        // after the slow replica's touch reply. It must go out as soon as the
+        // touch's frames are enqueued.
+        for request in ["t 0 3 30 2\nkey", "y 0 1 3 30 2\nkey"] {
+            let (nodes, proxy, replica) = two_nodes_with_replica_of("key").await;
+            let primary = 1 - replica;
+            let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+            *nodes[replica].get_delay.lock().unwrap() = Duration::from_millis(600);
+            let frames = format!("i 0 3 1 1\nkey{request}G 3 3\nkey");
+            stream.write_all(frames.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert_eq!(
+                nodes[primary].gets.load(Ordering::SeqCst),
+                1,
+                "{request:?}: the get must not wait for the replica's touch reply"
+            );
+            for _ in 0..3 {
+                read_line(&mut stream, &mut buf).await.unwrap();
+            }
         }
     }
 
