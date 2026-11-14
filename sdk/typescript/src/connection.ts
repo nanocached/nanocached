@@ -837,6 +837,24 @@ export class Connection {
         // destroy()'s 'close' event lands next tick. A direct destroy()
         // left that window open for another request to pick this
         // connection and write to an already-dead socket.
+        if (error instanceof ServerRejectedError) {
+          // Issue #1876: a bare `En` answers only the oldest request still
+          // waiting (docs/protocol.html); whatever was pipelined behind it
+          // is never answered, so it must not inherit the rejection (which
+          // `wasRejectedByServer()` would read as "the node does not know
+          // this command" and never retry). Reject the oldest with it now,
+          // as the Go SDK's `poisonRejecting` (#940) does, and let the
+          // 'close' handler fail the rest with a plain ConnectionLostError
+          // that keeps their redial/resend.
+          const oldest = this.pending.shift();
+          oldest?.reject(new ConnectionLostError(`nanocached: connection closed: ${error.message}`, { cause: error }));
+          this.poison(
+            new ConnectionLostError("nanocached: connection closed after the server rejected an earlier request", {
+              requestWasSent: false,
+            }),
+          );
+          return;
+        }
         this.poison(error as Error);
         return;
       }

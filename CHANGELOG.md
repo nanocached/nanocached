@@ -22,6 +22,23 @@ framework adapters at one version, whether or not a component changed.
   member; discovery also logged the successful join as abandoned. A retry now
   stops without an `X` once the join it was for has completed (#1870).
 
+- Node: connections each part-way through a large frame, whose receive
+  buffers together held most of `--max-in-flight-bytes`, each waited for a
+  buffer doubling only the others could free, so none of them finished until
+  the idle timeout (60 s) closed some with "in-flight byte budget exhausted
+  while receiving a request". A doubling the budget cannot cover now takes
+  the node-wide overdraft slot that frames and replies already use, and grows
+  without a charge until its frame has been answered, one connection at a
+  time (#1869).
+
+- Node: a decommission drain (SIGTERM) that interrupted a join handoff this
+  node was still sending left out every key the join had already sent: it
+  read them as dead copies, though aborting the join makes them live again,
+  so they went only to the abandoned joiner — lost at R=1, one copy short at
+  R≥2 — and were not counted as left behind. A re-replication starting while
+  a transfer was still running had the same gap. A join holds its marks until
+  discovery confirms it, whether or not its transfer has finished (#1868).
+
 - Proxy: a touch with a TTL other than 0 that had to wait behind an earlier
   request on its key kept the next request on that key (on the namespace for
   a `y` of more than 64 keys) waiting until every owner had answered the

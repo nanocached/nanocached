@@ -1144,7 +1144,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<string?> GetAsync(byte[] key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<string?>(cancellationToken)
-        : Cancellation.Abandonable(GetAsync(EmptyNamespace, key), cancellationToken);
+        : Cancellation.Abandonable(GetAsync(EmptyNamespace, OwnReadKey(key, cancellationToken)), cancellationToken);
 
     /// <summary>issue #105: as <see cref="GetAsync(string, CancellationToken)"/>, scoped to
     /// <paramref name="namespaceBytes"/> — the internal method
@@ -1174,7 +1174,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<byte[]?> GetBytesAsync(byte[] key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<byte[]?>(cancellationToken)
-        : Cancellation.Abandonable(GetBytesAsync(EmptyNamespace, key), cancellationToken);
+        : Cancellation.Abandonable(GetBytesAsync(EmptyNamespace, OwnReadKey(key, cancellationToken)), cancellationToken);
 
     /// <summary>issue #105: as <see cref="GetBytesAsync(string, CancellationToken)"/>, scoped
     /// to <paramref name="namespaceBytes"/>.</summary>
@@ -1190,6 +1190,18 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         byte[]? value = await GetRawBytesAsync(namespaceBytes, key).ConfigureAwait(false);
         return value is null || !_compress ? value : Compression.DecompressValue(value, _inflateBudget);
     }
+
+    /// <summary>Issue #1872: a read whose clean miss may be read-repaired
+    /// also writes — <see cref="TryReadRepairAsync"/> sends the key to the
+    /// primary — so an abandoned read must not keep reading a key array the
+    /// caller may reuse after the cancellation (it would "repair" whatever
+    /// key the buffer holds by then on its primary, with the replicas' copy
+    /// and a <see cref="ReadRepairTtlSeconds"/> TTL). The caller's
+    /// <c>byte[]</c> key is therefore owned (<see cref="Cancellation.Own"/>)
+    /// at call time when read repair can run; otherwise an abandoned read
+    /// only returns a value nobody awaits and the copy is skipped.</summary>
+    internal byte[] OwnReadKey(byte[] key, CancellationToken cancellationToken) =>
+        _readRepair && _ring is not null ? Cancellation.Own(key, cancellationToken) : key;
 
     /// <summary>The shared read path behind <see cref="GetBytesAsync(byte[], byte[])"/>
     /// and <see cref="GetWithTokenAsync(byte[], byte[])"/> (issue #141): the
@@ -1229,7 +1241,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<(string Value, string Token)?> GetWithTokenAsync(byte[] key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<(string Value, string Token)?>(cancellationToken)
-        : Cancellation.Abandonable(GetWithTokenAsync(EmptyNamespace, key), cancellationToken);
+        : Cancellation.Abandonable(GetWithTokenAsync(EmptyNamespace, OwnReadKey(key, cancellationToken)), cancellationToken);
 
     /// <summary>issue #141: as <see cref="GetWithTokenAsync(string, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
@@ -1260,7 +1272,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<(byte[] Value, string Token)?> GetBytesWithTokenAsync(byte[] key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<(byte[] Value, string Token)?>(cancellationToken)
-        : Cancellation.Abandonable(GetBytesWithTokenAsync(EmptyNamespace, key), cancellationToken);
+        : Cancellation.Abandonable(GetBytesWithTokenAsync(EmptyNamespace, OwnReadKey(key, cancellationToken)), cancellationToken);
 
     /// <summary>issue #141: as <see cref="GetBytesWithTokenAsync(string, CancellationToken)"/>,
     /// scoped to <paramref name="namespaceBytes"/> — the internal method
