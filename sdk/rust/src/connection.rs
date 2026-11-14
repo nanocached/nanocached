@@ -515,23 +515,16 @@ impl Connection {
         }
     }
 
-    /// Turns the node's `E` (an unknown command) into
+    /// Turns the node's `En` (an unknown command) into
     /// [`Error::ServerTooOld`] naming `command`, leaving every other error
     /// as it was. Only the touch methods call this, so every other
     /// command keeps surfacing the `Protocol` error it always did for an
-    /// `E`.
+    /// `En`. Any other `E` (the proxy's outcome-unknown, issue #939) is
+    /// already a connection loss after the send (see `read_one_response`).
     fn server_too_old(error: Error, command: &'static str) -> Error {
         match error {
             Error::Protocol(message) if message == SERVER_REJECTED_MESSAGE => {
                 Error::ServerTooOld { command }
-            }
-            // Any other `E` (issue #939): the proxy's "outcome unknown"
-            // (`E`, tagged `E <tag>`), not a node that predates the
-            // command. The frame was written and the connection is gone, so
-            // it is a loss after the send, which an expiring touch is not
-            // resent on.
-            Error::Protocol(message) if message.starts_with(SERVER_ERROR_REPLY_MESSAGE) => {
-                Error::ConnectionLostAfterSend(message)
             }
             other => other,
         }
@@ -1416,7 +1409,29 @@ async fn read_loop(
                 // the oldest pending request specifically, not the
                 // connection in general (see drain_pending).
                 shared.mark_closed(&shutdown_tx);
-                drain_pending(&shared, Some(error)).await;
+                // Issue #1873: a node's `En` refuses that oldest request
+                // alone (mirrors Go's `poisonRejecting`, issue #940).
+                // Everything pipelined behind it was never answered and
+                // merely shares the dead connection, so it gets the plain
+                // connection loss that keeps its redial and replay, not a
+                // clone of the rejection, which no retry path sends again.
+                if matches!(&error, Error::Protocol(message) if message == SERVER_REJECTED_MESSAGE)
+                {
+                    let oldest = shared.pending.lock().unwrap().pop_front();
+                    if let Some(slot) = oldest {
+                        let _ = slot.tx.send(Err(error));
+                    }
+                    drain_pending(
+                        &shared,
+                        Some(Error::ConnectionLost(
+                            "nanocached: the server closed the connection after rejecting a request"
+                                .to_string(),
+                        )),
+                    )
+                    .await;
+                } else {
+                    drain_pending(&shared, Some(error)).await;
+                }
                 return;
             }
         };
@@ -1840,18 +1855,26 @@ async fn read_one_response(
         }
         // issue #825: `En` — a node that does not know the command just
         // sent. It closes the connection right after; only the touch
-        // methods tell this apart from other garbage (see `server_too_old`).
+        // methods tell this apart from other garbage (see `server_too_old`),
+        // and only the oldest pending request receives it (issue #1873,
+        // see the read loop).
         // Any other `E` is not a node's `En`: the proxy answers a bare `E`
         // (tagged: `E <tag>`) when it could not tell whether a request was
-        // applied (issue #939). The rest of the line is read either way, so
-        // the two are told apart by the byte that follows the `E`.
+        // applied (issue #939). That is a connection lost after the frame
+        // was written (mirrors Go): idempotent requests replay it as any
+        // lost reply, an incr/CAS or expiring touch does not, and every
+        // request behind it gets the same loss. The rest of the line is
+        // read either way, so the two are told apart by the byte that
+        // follows the `E`.
         b'E' => {
             let line = read_line(read_half).await?;
-            Err(Error::Protocol(if line.starts_with('n') {
-                SERVER_REJECTED_MESSAGE.to_string()
+            if line.starts_with('n') {
+                Err(Error::Protocol(SERVER_REJECTED_MESSAGE.to_string()))
             } else {
-                format!("{SERVER_ERROR_REPLY_MESSAGE}: {line:?}")
-            }))
+                Err(Error::ConnectionLost(format!(
+                    "nanocached: the server answered E: the outcome of the request is unknown ({line:?})"
+                )))
+            }
         }
         other => Err(Error::Protocol(format!(
             "nanocached: unexpected response from server: {}",
@@ -1863,18 +1886,9 @@ async fn read_one_response(
 /// The `Protocol` message for a node's `En` — the same text the generic
 /// unknown-marker arm has always produced for that byte, so a node's `En`
 /// to any command other than touch keeps surfacing exactly what it did
-/// before. Only the touch methods tell it apart from the proxy's `E` (see
-/// [`SERVER_ERROR_REPLY_MESSAGE`]); every other command reports a non-`En`
-/// `E` as a `Protocol` error carrying that message, which no retry path
-/// sends again.
+/// before. The read loop gives it to the oldest pending request only
+/// (issue #1873) and the touch methods map it to `ServerTooOld`.
 const SERVER_REJECTED_MESSAGE: &str = "nanocached: unexpected response from server: E";
-
-/// The `Protocol` message for an `E` line that is not a node's `En` (the
-/// proxy's `E`, tagged `E <tag>`, for a request whose outcome it could not
-/// tell, issue #939); the line itself follows. It must not equal
-/// [`SERVER_REJECTED_MESSAGE`], which is how `En` is told apart.
-const SERVER_ERROR_REPLY_MESSAGE: &str =
-    "nanocached: unexpected response from server: E reply that is not En";
 
 /// Parses a response's echoed tag (echoed response tags): a `u32` in decimal,
 /// matching the wire width the client itself claims tags from.
