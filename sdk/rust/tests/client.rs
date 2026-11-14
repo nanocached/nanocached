@@ -195,6 +195,14 @@ struct NodeState {
     /// bare `E` (tagged `E <tag>`) for a touch whose outcome it could not
     /// tell.
     touch_error_reply: Mutex<Option<Vec<u8>>>,
+    /// Issue #1873: as `touch_error_reply`, for `i`: the raw bytes (the
+    /// proxy's `E 7\n`, say) to answer every `i` frame with, unapplied,
+    /// then close the connection.
+    incr_error_reply: Mutex<Option<Vec<u8>>>,
+    /// Issue #1873: how long `touch_error_reply`/`incr_error_reply` waits
+    /// before it is written, so a test can pipeline other requests behind
+    /// the frame it answers.
+    error_reply_delay_ms: AtomicUsize,
     /// Issue #934: holds every `t` and `y` frame this long before it is
     /// applied and answered — a slow primary, so a test can look at the
     /// replicas while the primary has not answered yet. Persistent.
@@ -591,6 +599,13 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     continue;
                 }
                 state.incrs.fetch_add(1, Ordering::SeqCst);
+                let error_reply = state.incr_error_reply.lock().unwrap().clone();
+                if let Some(reply) = error_reply {
+                    let delay = state.error_reply_delay_ms.load(Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
+                    let _ = stream.get_mut().write_all(&reply).await;
+                    return;
+                }
                 if take_one(&state.retryable_replies) {
                     let reply = format!("R{tag_suffix}\n");
                     if stream.get_mut().write_all(reply.as_bytes()).await.is_err() {
@@ -670,6 +685,8 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                 }
                 let error_reply = state.touch_error_reply.lock().unwrap().clone();
                 if let Some(reply) = error_reply {
+                    let delay = state.error_reply_delay_ms.load(Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
                     let _ = stream.get_mut().write_all(&reply).await;
                     return;
                 }
@@ -5208,6 +5225,77 @@ async fn en_to_a_touch_is_still_server_too_old() {
         client.close().await;
         node.stop();
     }
+}
+
+// ── an `E` fails only the request it answers (issue #1873) ──────────
+
+/// Starts a `get` of `key` on `client` while the node holds its error
+/// reply to an earlier frame, so the `get` is pipelined behind it.
+async fn get_pipelined_behind_error_reply(
+    client: &NanocachedClient,
+    key: &'static str,
+) -> tokio::task::JoinHandle<Result<Option<String>, Error>> {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let client = client.clone();
+    tokio::spawn(async move { client.get(key).await })
+}
+
+#[tokio::test]
+async fn en_to_a_touch_fails_only_the_touch_and_a_pipelined_get_is_retried() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("p", "v", 0).await.unwrap();
+    *node.state.touch_error_reply.lock().unwrap() = Some(b"En\n".to_vec());
+    node.state.error_reply_delay_ms.store(400, Ordering::SeqCst);
+
+    let touch = {
+        let client = client.clone();
+        tokio::spawn(async move { client.touch("k", Some(30)).await })
+    };
+    let get = get_pipelined_behind_error_reply(&client, "p").await;
+
+    let touch = touch.await.unwrap();
+    assert!(
+        matches!(touch, Err(Error::ServerTooOld { command: "t" })),
+        "touch: {touch:?}"
+    );
+    let get = get.await.unwrap();
+    assert_eq!(get.unwrap().as_deref(), Some("v"));
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn the_proxys_e_to_an_incr_is_a_connection_loss_and_a_pipelined_get_is_retried() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("p", "v", 0).await.unwrap();
+    client.set("n", "1", 0).await.unwrap();
+    *node.state.incr_error_reply.lock().unwrap() = Some(b"E 7\n".to_vec());
+    node.state.error_reply_delay_ms.store(400, Ordering::SeqCst);
+
+    let incr = {
+        let client = client.clone();
+        tokio::spawn(async move { client.incr("n", 1).await })
+    };
+    let get = get_pipelined_behind_error_reply(&client, "p").await;
+
+    let incr = incr.await.unwrap();
+    assert!(
+        matches!(incr, Err(Error::ConnectionLost(_))),
+        "incr: {incr:?}"
+    );
+    assert_eq!(
+        node.state.incrs.load(Ordering::SeqCst),
+        1,
+        "an incr whose outcome is unknown is not sent again"
+    );
+    let get = get.await.unwrap();
+    assert_eq!(get.unwrap().as_deref(), Some("v"));
+
+    client.close().await;
+    node.stop();
 }
 
 // ── a failed chunk of an expiring touch_many (issue #941) ───────────
