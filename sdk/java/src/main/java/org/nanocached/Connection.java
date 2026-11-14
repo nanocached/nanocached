@@ -1145,6 +1145,24 @@ final class Connection {
                 poison(new NanocachedException.ConnectionLost(
                         "nanocached: connection failed: " + error.getMessage(), error));
                 return;
+            } catch (NanocachedException.ServerRejected rejected) {
+                // Issue #1875: a node's `En` answers the oldest request
+                // still waiting, and whatever was pipelined behind it is
+                // never read (docs/protocol.html; the Go SDK's
+                // poisonRejecting, #940). Only that oldest request gets the
+                // rejection; the rest fail not-sent, so the redial path
+                // resends them (an INCR, a CAS, a ttl=0 touch, or a touch
+                // that must not be reported ServerTooOld for its own
+                // command). The proxy's bare `E` is a plain ConnectionLost,
+                // not this, and still fails everything as written.
+                Pending oldest;
+                synchronized (this) {
+                    oldest = pending.pollFirst();
+                }
+                poison(new NanocachedException.ConnectionLost(
+                        "nanocached: connection closed by the server", null, true));
+                if (oldest != null) oldest.future().completeExceptionally(rejected);
+                return;
             } catch (NanocachedException error) {
                 poison(error);
                 return;

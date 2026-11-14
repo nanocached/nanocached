@@ -1613,6 +1613,43 @@ class NanocachedClientTest {
         }
     }
 
+    @Test
+    void anEnRejectsOnlyTheOldestRequestAndAnIncrPipelinedBehindItIsRedialed() throws Exception {
+        // Issue #1875: a node's `En` answers the oldest request still
+        // waiting; whatever was sent behind it is never read, so an INCR
+        // pipelined behind a refused touchMany must be failed not-sent and
+        // redialed, not reported as an unknown outcome.
+        java.util.concurrent.CountDownLatch touchSent = new java.util.concurrent.CountDownLatch(1);
+        AtomicInteger incrFrames = new AtomicInteger();
+        try (ScriptedNode node = new ScriptedNode(header -> {
+            if (header.startsWith("y ")) {
+                touchSent.countDown();
+                return ""; // held until the incr is pipelined behind it
+            }
+            if (header.startsWith("i ")) {
+                // The first incr arrives behind the held `y`: refuse the `y`.
+                return incrFrames.getAndIncrement() == 0 ? "En\n" : "I 1\n6";
+            }
+            return null;
+        })) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                CompletableFuture<Throwable> touch = CompletableFuture.supplyAsync(() -> {
+                    try {
+                        client.touchMany(List.of("a", "b"), 30);
+                        return null;
+                    } catch (Throwable error) {
+                        return error;
+                    }
+                });
+                assertTrue(touchSent.await(5, java.util.concurrent.TimeUnit.SECONDS));
+                assertEquals(java.util.OptionalLong.of(6), client.incr("n", 1));
+                Throwable touchError = touch.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                assertTrue(touchError instanceof NanocachedException.ServerTooOld, String.valueOf(touchError));
+                assertEquals(2, incrFrames.get());
+            }
+        }
+    }
+
     // ── ttl 0: the replicas are touched after the primary answered (issue #934) ──
 
     /** Drops {@code node} from the discovery server's list, so the client's
