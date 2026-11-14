@@ -973,6 +973,24 @@ class Connection:
         while True:
             try:
                 marker, value, tag = await self._read_one_response()
+            except _ServerRejectedError as error:
+                # Issue #1874: a node's `En` answers the oldest request
+                # still waiting, and whatever was pipelined behind it is
+                # never answered (docs/protocol.html; the Go SDK's #940
+                # poisonRejecting). Only that oldest slot gets the
+                # rejection; the rest fail as a plain connection loss
+                # marked not sent, so a touch behind it is not reported
+                # ServerTooOldError, a touch_many leg is not marked
+                # rejected, and an incr/CAS the node never ran keeps its
+                # redial and replay. The proxy's bare `E` is not this
+                # error and still fails every slot below.
+                oldest = self._pending.popleft() if self._pending else None
+                for slot in self._pending:
+                    slot.sent = False
+                self._poison(ConnectionError("nanocached: connection closed by server"))
+                if oldest is not None and not oldest.future.cancelled():
+                    oldest.future.set_exception(self._error_for(oldest, error))
+                return
             except (ConnectionError, NanocachedError) as error:
                 self._poison(error)
                 return

@@ -3659,6 +3659,41 @@ public class NanocachedClientTests
         Assert.Equal(Bytes("from-replica"), got);
     }
 
+    // Issue #1872: with ReadRepair a read also writes — a clean miss on the
+    // primary is repaired from a replica — but a byte[] key was copied at
+    // call time only for writes. A read cancelled while the primary sat on
+    // its miss kept the caller's array; once the caller reused it for
+    // another key the abandoned read "repaired" that key on its primary,
+    // which was never asked, with the replicas' copy and a 60 s TTL.
+    [Fact]
+    public async Task AnAbandonedReadDoesNotRepairTheKeyTheCallersReusedBufferHolds()
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> ownersOne = OwnersOf("key-one");
+        IReadOnlyList<string> ownersTwo = OwnersOf("key-two");
+        string storedTwo = MockNode.KeyOf(Bytes("key-two"));
+        cluster.Nodes[ownersTwo[1]].Store[storedTwo] = Bytes("stale");
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadRepair = true,
+        });
+        cluster.Nodes[ownersOne[0]].DelayGets(300);
+
+        byte[] buffer = Bytes("key-one");
+        using var cts = new CancellationTokenSource();
+        Task<byte[]?> read = client.GetBytesAsync(buffer, cts.Token);
+        cts.CancelAfter(50);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => read);
+        Bytes("key-two").CopyTo(buffer, 0); // the caller reuses its buffer
+
+        // Well past the primary's 300 ms miss and the repair it triggers.
+        await Task.Delay(1000);
+        Assert.False(cluster.Nodes[ownersTwo[0]].Store.ContainsKey(storedTwo),
+            "the abandoned read repaired the key the reused buffer now holds");
+    }
+
     [Fact]
     public async Task ReadRepairProbesOnlyTheRemainingOwnersNotThePrimary()
     {

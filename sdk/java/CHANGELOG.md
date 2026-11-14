@@ -21,6 +21,14 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A node's `En` (a command it does not know, such as a `touchMany` sent to a
+  node that predates it) failed every request pipelined behind the refused
+  one as sent with an unknown outcome, so an `incr`, a `putIfAbsent` or a
+  ttl=0 touch from another thread on the same connection failed instead of
+  being resent, and a touch behind it was reported `ServerTooOld` for its own
+  command. Only the oldest request gets the rejection now; the rest fail
+  not-sent and are redialed, as in the Go and .NET SDKs (#1875).
+
 - A multi-key operation still running when `close()` was called (`close()`
   lets it finish) ran its forced node-list refresh after a failed leg: a
   discovery round trip and dials of new nodes on a closed client (with slow

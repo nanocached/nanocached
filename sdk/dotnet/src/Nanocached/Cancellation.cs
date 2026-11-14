@@ -30,8 +30,10 @@ internal static class Cancellation
     /// <summary>The caller's array, or a copy when
     /// <paramref name="cancellationToken"/> can be cancelled (a token that
     /// never is — <c>default</c> — costs nothing). Applied to the arguments
-    /// of operations that write or change a key's expiry; an abandoned read
-    /// that reads a changed buffer only returns a value nobody awaits.
+    /// of operations that write or change a key's expiry, and (issue #1872)
+    /// to the key of a read that may be read-repaired, since the repair
+    /// writes that key to its primary; any other abandoned read that reads a
+    /// changed buffer only returns a value nobody awaits.
     /// <c>null</c> is passed on so the argument check still reports
     /// it.</summary>
     internal static byte[] Own(byte[] array, CancellationToken cancellationToken) =>
