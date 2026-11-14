@@ -475,7 +475,9 @@ a failing primary would lose the value. A later request on the same key would
 otherwise reach a replica first and have its write expired by the late touch,
 so it waits until those replica frames are enqueued, as for an <code>i</code>
 (enqueued, not acknowledged). Touches with any other TTL send every owner its
-frame at once and register nothing.</p>
+frame at once. Like a <code>g</code> or <code>s</code>, such a touch is in the
+order only when it has to wait itself, and it releases the key once its frames
+are enqueued, not once the owners answer.</p>
 
 <p>One case is wider than the key. A multi-key request (<code>m</code>,
 <code>o</code>, <code>y</code>) that has to wait, or an expiring

@@ -14,6 +14,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: a touch with a TTL other than 0 that had to wait behind an earlier
+  request on its key kept the next request on that key (on the namespace for
+  a `y` of more than 64 keys) waiting until every owner had answered the
+  touch, instead of only until its frames were enqueued. Only an expiring
+  touch (TTL 0) holds the key past that point (#1865).
+
 - Proxy: the replica legs of an expiring touch (`t ... 0`, `y ... 0`) are
   sent only after the primary has answered, outside the connection's
   pipelined order, so a write pipelined behind it on the same key reached the
