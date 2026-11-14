@@ -5164,6 +5164,30 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
     );
   });
 
+  it("an En is not attributed to a touch pipelined behind the rejected y (issue #1876)", async () => {
+    await withClient(
+      async (client) => {
+        await client.set("k2", "v");
+        // Both written to the one connection before the node answers: the
+        // node answers `En` to the `y` and closes without reading the `t`.
+        // A single-node client does not redial a lost request (a cluster
+        // client's withWrongNodeRetry does), so the `t` surfaces as a
+        // never-sent ConnectionLostError — not as the node's rejection.
+        const [many, single] = await Promise.allSettled([client.touchMany(["k1"], 60), client.touch("k2", 60)]);
+        assert.equal(many.status, "rejected");
+        assert.ok(many.reason instanceof ServerTooOldError);
+        assert.equal(many.reason.command, "y");
+        assert.equal(single.status, "rejected");
+        assert.ok(!(single.reason instanceof ServerTooOldError), `touch blamed for the y's En: ${single.reason}`);
+        assert.ok(single.reason instanceof ConnectionLostError);
+        assert.equal(single.reason.requestWasSent, false);
+        // The node knows `t`: the next touch redials and succeeds.
+        assert.equal(await client.touch("k2", 60), true);
+      },
+      { withoutMultiTouch: true },
+    );
+  });
+
   it("a connection lost on a later chunk keeps the earlier chunks' hits for a get only", async () => {
     await withClient(async (client, node) => {
       const values: Record<string, string> = {};
