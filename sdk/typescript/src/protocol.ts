@@ -971,9 +971,10 @@ export function tryParseResponse(
     case MARKER_INCREMENTED: {
       const headerEnd = buf.indexOf(LF);
       if (headerEnd === -1) {
-        // Same backstop as MARKER_VALUE above, generously widened for the
-        // optional TTL field this response can also carry.
-        if (buf.length > MAX_VALUE_HEADER_LENGTH + 1 + String(MAX_TAG).length + (tagged ? 1 + String(MAX_TAG).length : 0)) {
+        // Same backstop as MARKER_VALUE above, widened for the optional TTL
+        // field this response can also carry. Issue #1887: that TTL is a
+        // u64 (up to 20 digits), not tag-sized — budget it as `V` does.
+        if (buf.length > MAX_VALUE_HEADER_LENGTH + 1 + MAX_U64_DIGITS + (tagged ? 1 + String(MAX_TAG).length : 0)) {
           throw new NanocachedError("nanocached: invalid value length in response (missing header terminator)");
         }
         return null;
