@@ -485,9 +485,14 @@ async def _read_entries(
             raise HandshakeProtocolError(
                 f"nanocached: invalid {kind} entry header in discovery response"
             ) from error
+        # Issue #1889: a zero-length name or address is rejected too, as
+        # the discovery server's own parser does (parse_string_fields →
+        # EmptyField). An empty name collided with the single/proxy-mode
+        # slot "" (_open_and_adopt), so in cluster mode every request to
+        # that member opened a socket that was never adopted nor closed.
         if (
-            name_length < 0
-            or addr_length < 0
+            name_length <= 0
+            or addr_length <= 0
             or name_length > _MAX_NODE_FIELD_LENGTH
             or addr_length > _MAX_NODE_FIELD_LENGTH
         ):
