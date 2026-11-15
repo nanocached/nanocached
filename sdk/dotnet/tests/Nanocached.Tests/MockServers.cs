@@ -345,6 +345,17 @@ public sealed class MockNode : IDisposable
     public void FailTouchAfterApplyOnce() => Interlocked.Increment(ref _failTouchAfterApplyReplies);
     private int _failTouchAfterApplyReplies;
 
+    /// <summary>Every <c>D</c>/<c>d</c> (delete) frame received, whatever
+    /// it was answered — lets a test assert which owners were sent one.</summary>
+    public int DeleteRequestCount => _deleteRequestCount;
+    private int _deleteRequestCount;
+
+    /// <summary>The <see cref="DelayTouches"/> counterpart for
+    /// <c>D</c>/<c>d</c>: hold every delete for <paramref name="millis"/>
+    /// after it was counted and before it is applied and answered.</summary>
+    public void DelayDeletes(int millis) => _deleteDelayMillis = millis;
+    private volatile int _deleteDelayMillis;
+
     /// <summary>issue #825: from now on answer every <c>t</c> like a node
     /// that predates it — <c>En</c>, then close the connection.</summary>
     public void RejectTouchLikeAnOldServer() => _rejectTouch = true;
@@ -662,6 +673,8 @@ public sealed class MockNode : IDisposable
                     case "D":
                     {
                         byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
+                        Interlocked.Increment(ref _deleteRequestCount);
+                        if (_deleteDelayMillis > 0) await Task.Delay(_deleteDelayMillis);
                         if (_silent)
                         {
                             break; // half-open: frame consumed, never answered
@@ -962,6 +975,8 @@ public sealed class MockNode : IDisposable
                     {
                         byte[] namespaceBytes = await Wire.ReadExactlyAsync(stream, int.Parse(parts[1]));
                         byte[] key = await Wire.ReadExactlyAsync(stream, int.Parse(parts[2]));
+                        Interlocked.Increment(ref _deleteRequestCount);
+                        if (_deleteDelayMillis > 0) await Task.Delay(_deleteDelayMillis);
                         Interlocked.Increment(ref _namespacedRequestCount);
                         if (_silent)
                         {

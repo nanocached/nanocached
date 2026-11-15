@@ -10,7 +10,8 @@ namespace Nanocached.Tests;
 /// primary could still fail or answer <c>W</c>: the reroute then reached
 /// the surviving replica (now the primary), which answered <c>N</c> for a
 /// key that existed, and the value was gone. A positive or removed TTL
-/// keeps the concurrent fan-out.
+/// keeps the concurrent fan-out. A delete follows the same order, for the
+/// same reason: its reroute would answer <c>false</c> for a key that existed.
 /// </summary>
 [Collection(DialSettings.CollectionName)]
 public class ExpiringTouchOrderTests
@@ -189,6 +190,62 @@ public class ExpiringTouchOrderTests
         Assert.False(call.IsCompleted, "the primary had not answered yet");
         await WaitForAsync(() => primary.TouchFrames.Count == 1, "the primary's touch frame");
         await call;
+    }
+
+    // ── delete ───────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task ADeletePrimaryThatAnswersWrongNodeOnceIsRetriedWithTheReplicaDeletedOnce()
+    {
+        using var cluster = new Cluster();
+        await cluster.ConnectAsync();
+        const string key = "shared-key";
+        await cluster.Client.SetAsync(key, "v");
+        var (_, primary) = cluster.Primary(key);
+        var (_, replica) = cluster.Replica(key);
+        primary.AnswerWrongNodeOnce();
+
+        Assert.True(await cluster.Client.DeleteAsync(key));
+        Assert.Equal(2, primary.DeleteRequestCount);
+        Assert.Equal(1, replica.DeleteRequestCount);
+    }
+
+    [Fact]
+    public async Task ADeadPrimaryDroppedFromTheRosterReroutesADeleteToTheValue()
+    {
+        using var cluster = new Cluster();
+        await cluster.ConnectAsync();
+        const string key = "shared-key";
+        await cluster.Client.SetAsync(key, "v");
+        var (primaryName, primary) = cluster.Primary(key);
+        var (_, replica) = cluster.Replica(key);
+        primary.Dispose();
+        await Task.Delay(100);
+        cluster.Discovery.SetNodes(
+            cluster.Nodes.Where(p => p.Key != primaryName).Select(p => (p.Key, p.Value.Address)).ToList());
+
+        Assert.True(await cluster.Client.DeleteAsync(key));
+        Assert.Equal(1, replica.DeleteRequestCount);
+    }
+
+    [Fact]
+    public async Task ADeleteSendsTheReplicaItsFrameOnlyAfterThePrimaryAnswered()
+    {
+        using var cluster = new Cluster();
+        await cluster.ConnectAsync();
+        const string key = "shared-key";
+        await cluster.Client.SetAsync(key, "v");
+        var (_, primary) = cluster.Primary(key);
+        var (_, replica) = cluster.Replica(key);
+        primary.DelayDeletes(400);
+
+        Task<bool> call = cluster.Client.DeleteAsync(key);
+        await WaitForAsync(() => primary.DeleteRequestCount == 1, "the primary's delete");
+        await Task.Delay(100);
+        Assert.Equal(0, replica.DeleteRequestCount); // the primary has not answered yet
+        await call;
+
+        Assert.Equal(1, replica.DeleteRequestCount);
     }
 
     // ── batch ────────────────────────────────────────────────────────
