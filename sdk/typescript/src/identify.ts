@@ -575,7 +575,10 @@ async function authenticate(
 ): Promise<Authenticated> {
   const socket = await connectSocket(options);
 
-  const secret = options.authSecret !== undefined ? Buffer.from(options.authSecret, "utf8") : NO_SECRET_PLACEHOLDER;
+  // An empty secret is no secret, as in the Rust, Go, Java and .NET SDKs:
+  // sent as is it would be `A 0`, which every server answers `En`.
+  const authSecret = options.authSecret === "" ? undefined : options.authSecret;
+  const secret = authSecret !== undefined ? Buffer.from(authSecret, "utf8") : NO_SECRET_PLACEHOLDER;
   // Retryable-error status (issue #125): the capability token order on
   // the wire is fixed as `[T] [R]` — `R` never rides without `T`, since
   // the probe only ever asks for it alongside tags (see
@@ -608,7 +611,7 @@ async function authenticate(
 
   if (!identity.accepted) {
     socket.destroy();
-    if (options.authSecret === undefined) {
+    if (authSecret === undefined) {
       throw new AuthenticationError(
         `nanocached: ${options.host}:${options.port} requires authentication, but no authSecret was provided`,
       );

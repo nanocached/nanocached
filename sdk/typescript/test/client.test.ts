@@ -7656,6 +7656,20 @@ describe("NanocachedClient retryable-error status (issue #125)", () => {
     }
   });
 
+  it("sends the one-byte placeholder for an empty authSecret, not the malformed A 0", async () => {
+    const node = await startMockNode({ supportTags: true });
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }], authSecret: "" });
+      try {
+        assert.equal(node.lastAuthHeader(), "A 1 T R");
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("falls back to A <len> T against a server that understands tags but predates R", async () => {
     // The middle stage of the three-stage probe (A <len> T R -> A <len> T
     // -> A <len>): a server that predates R treats the fuller extended
