@@ -177,6 +177,7 @@ class NanocachedCacheTest {
     // bytes".
 
     @Test
+    @SuppressWarnings("unchecked") // a Class<HashMap<String, String>> needs a cast
     void threeArgReplaceSucceedsWhenTheOldValueIsEqualButNotIdenticallySerialized() {
         MutableConfiguration<String, HashMap<String, String>> config = new MutableConfiguration<>();
         config.setTypes(String.class, (Class<HashMap<String, String>>) (Class<?>) HashMap.class);
@@ -202,6 +203,7 @@ class NanocachedCacheTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked") // a Class<HashMap<String, String>> needs a cast
     void twoArgRemoveSucceedsWhenTheOldValueIsEqualButNotIdenticallySerialized() {
         MutableConfiguration<String, HashMap<String, String>> config = new MutableConfiguration<>();
         config.setTypes(String.class, (Class<HashMap<String, String>>) (Class<?>) HashMap.class);
@@ -1446,6 +1448,7 @@ class NanocachedCacheTest {
     // ── configuration / lifecycle ────────────────────────────────────
 
     @Test
+    @SuppressWarnings("unchecked") // JSR-107's getConfiguration takes a raw class literal
     void getConfigurationReturnsTheCompleteConfiguration() {
         javax.cache.configuration.CompleteConfiguration<String, String> configuration =
                 cache.getConfiguration(javax.cache.configuration.CompleteConfiguration.class);

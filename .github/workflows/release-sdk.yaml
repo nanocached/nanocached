@@ -117,7 +117,7 @@ jobs:
 
       - name: Publish to Maven Central
         working-directory: sdk/java
-        run: gradle publishToMavenCentral --no-daemon
+        run: ./gradlew publishToMavenCentral --no-daemon
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
@@ -398,7 +398,7 @@ jobs:
       # coordinates at this version.
       - name: Publish to Maven Central
         working-directory: adapters/${{ steps.tag.outputs.name }}
-        run: gradle publishToMavenCentral --no-daemon
+        run: ./gradlew publishToMavenCentral --no-daemon
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}

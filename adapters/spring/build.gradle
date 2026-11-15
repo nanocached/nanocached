@@ -1,6 +1,7 @@
 plugins {
     id 'java-library'
     id 'com.vanniktech.maven.publish' version '0.37.0'
+    id 'com.diffplug.spotless' version '8.11.0'
 }
 
 group = 'org.nanocached'
@@ -40,6 +41,27 @@ java {
     }
 }
 
+// `./gradlew spotlessApply` rewrites sources; `spotlessCheck` (part of
+// `check`) fails on drift. AOSP style is google-java-format with 4-space
+// indentation. google-java-format 2.x needs a JDK 21+ Gradle JVM.
+spotless {
+    java {
+        googleJavaFormat('2.0.0').aosp()
+    }
+    groovyGradle {
+        // Eclipse's defaults indent with tabs; .editorconfig says 4 spaces.
+        greclipse('4.41').configProperties('''
+            org.eclipse.jdt.core.formatter.tabulation.char=space
+            org.eclipse.jdt.core.formatter.tabulation.size=4
+        ''')
+    }
+}
+
+// Any javac warning fails the build, in main and test sources alike.
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs += ['-Xlint:all', '-Werror']
+}
+
 repositories {
     mavenCentral()
 }
@@ -75,6 +97,6 @@ test {
     useJUnitPlatform()
     testLogging {
         events 'failed'
-        exceptionFormat 'full'
+        exceptionFormat = 'full'
     }
 }

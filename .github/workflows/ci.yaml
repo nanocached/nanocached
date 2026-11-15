@@ -141,9 +141,9 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
-      - name: Run tests
+      - name: Check (format, lint, tests)
         working-directory: sdk/java
-        run: gradle test
+        run: ./gradlew check
 
   spring-adapter:
     runs-on: ubuntu-latest
@@ -162,9 +162,9 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
-      - name: Run tests
+      - name: Check (format, lint, tests)
         working-directory: adapters/spring
-        run: gradle test
+        run: ./gradlew check
 
   spring-boot-starter:
     runs-on: ubuntu-latest
@@ -183,9 +183,9 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
-      - name: Run tests
+      - name: Check (format, lint, tests)
         working-directory: adapters/spring-boot-starter
-        run: gradle test
+        run: ./gradlew check
 
   jcache-adapter:
     runs-on: ubuntu-latest
@@ -204,9 +204,9 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
-      - name: Run tests
+      - name: Check (format, lint, tests)
         working-directory: adapters/jcache
-        run: gradle test
+        run: ./gradlew check
 
   dotnet-adapter:
     runs-on: ubuntu-latest
