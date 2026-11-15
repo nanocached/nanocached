@@ -653,9 +653,10 @@ rather than bloated.
 
 Decompression is bounded three ways: one value may expand to at most
 64 MiB, one `getMany`/`getManyBytes` response to at most 256 MiB across
-the batch, and one client to at most 256 MiB of DEFLATE output in
-flight at a time across every concurrent read. Each decompression of a
-compressed value reserves the 64 MiB per-value cap from that last
+the batch, and one client to at most four values' worth (4 × (64 MiB +
+1 byte)) of DEFLATE output in flight at a time across every concurrent
+read. Each decompression of a compressed value reserves the per-value cap
+(plus the one byte used to detect an over-cap value) from that last
 budget while it runs (its output size is not known in advance), so at
 most four run at once per client and further ones wait; the budget is
 released as soon as the value is returned — what a caller then holds is

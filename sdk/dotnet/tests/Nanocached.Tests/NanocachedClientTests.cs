@@ -994,6 +994,34 @@ public class NanocachedClientTests
         }
     }
 
+    // Issue #1895: a watchdog that fires before the deadline (the runtime
+    // timer clock can run ahead of TickCount64 on Windows) must re-arm for
+    // the remaining time, not return and leave the request hanging.
+    [Fact]
+    public async Task AnEarlyWatchdogFireStillTimesTheRequestOut()
+    {
+        TimeSpan defaultTimeout = Connection.RequestTimeout;
+        Connection.RequestTimeout = TimeSpan.FromMilliseconds(500);
+        try
+        {
+            var stream = new FailingReadStream(); // never answers
+            var connection = new Connection(stream);
+
+            Task<byte[]?> pending = connection.GetAsync(Bytes("k"));
+            connection.FireWatchdogEarlyForTest();
+            Assert.False(pending.IsCompleted);
+
+            Task finished = await Task.WhenAny(pending, Task.Delay(TimeSpan.FromSeconds(5)));
+            Assert.Same(pending, finished);
+            ConnectionLostException lost = await Assert.ThrowsAsync<ConnectionLostException>(() => pending);
+            Assert.True(lost.TimedOut);
+        }
+        finally
+        {
+            Connection.RequestTimeout = defaultTimeout;
+        }
+    }
+
     [Fact]
     public async Task CloseFiresOnClosedExactlyOnceUnderConcurrency()
     {

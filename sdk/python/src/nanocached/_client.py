@@ -1533,7 +1533,8 @@ class NanocachedClient:
     # get and set").
     # Both str and bytes keys are accepted, matching every other method
     # on this client — the returned dict is keyed by whichever original
-    # object the caller passed, indexed by position rather than by
+    # object the caller passed (a bytearray or memoryview by a bytes copy
+    # of it, issue #1888), indexed by position rather than by
     # encoded bytes, so a batch may freely mix the two. A key given more
     # than once (the same str twice, or "a" and b"a", which encode
     # identically) is read once and the result is keyed under every
@@ -1553,9 +1554,19 @@ class NanocachedClient:
         originals: list[tuple[str | bytes, ...]] = []
         key_bytes_list: list[bytes] = []
         seen: dict[bytes, int] = {}
-        for original in keys:
-            key_bytes = _to_bytes(original)
+        for key in keys:
+            key_bytes = _to_bytes(key)
             _check_key(key_bytes, namespace)
+            # Issue #1888: _to_bytes accepts a bytearray or memoryview
+            # key, as every single-key call does, but neither a bytearray
+            # nor a writable memoryview can be a dict key, and keying by
+            # the caller's object failed only after the round trip —
+            # after touch_many/get_many_and_touch had already applied the
+            # TTL. Such a key is spelled by its immutable bytes copy
+            # instead; that copy compares and hashes equal to a read-only
+            # memoryview of the same bytes, so a lookup by one still finds
+            # the value.
+            original: str | bytes = key if isinstance(key, (str, bytes)) else key_bytes
             idx = seen.get(key_bytes)
             if idx is not None:
                 if original not in originals[idx]:
@@ -2209,7 +2220,8 @@ class NanocachedClient:
         """Batched touch (issue #871): replaces the TTL of every existing
         key in ``keys`` in place, one round trip per involved node instead
         of one per key. ``keys`` must be non-empty. Returns a dict keyed by
-        the original key objects: ``True`` for a key that existed,
+        the original key objects (a bytearray or memoryview key by a bytes
+        copy of it): ``True`` for a key that existed,
         ``False`` for a missing or expired one, which a touch never
         creates. ``ttl_seconds`` is one TTL for the whole batch and means
         what it means for touch(): no default, ``None`` removes the TTL,
