@@ -1533,7 +1533,8 @@ class NanocachedClient:
     # get and set").
     # Both str and bytes keys are accepted, matching every other method
     # on this client — the returned dict is keyed by whichever original
-    # object the caller passed, indexed by position rather than by
+    # object the caller passed (a bytearray or memoryview by a bytes copy
+    # of it, issue #1888), indexed by position rather than by
     # encoded bytes, so a batch may freely mix the two. A key given more
     # than once (the same str twice, or "a" and b"a", which encode
     # identically) is read once and the result is keyed under every
@@ -1553,9 +1554,19 @@ class NanocachedClient:
         originals: list[tuple[str | bytes, ...]] = []
         key_bytes_list: list[bytes] = []
         seen: dict[bytes, int] = {}
-        for original in keys:
-            key_bytes = _to_bytes(original)
+        for key in keys:
+            key_bytes = _to_bytes(key)
             _check_key(key_bytes, namespace)
+            # Issue #1888: _to_bytes accepts a bytearray or memoryview
+            # key, as every single-key call does, but neither a bytearray
+            # nor a writable memoryview can be a dict key, and keying by
+            # the caller's object failed only after the round trip —
+            # after touch_many/get_many_and_touch had already applied the
+            # TTL. Such a key is spelled by its immutable bytes copy
+            # instead; that copy compares and hashes equal to a read-only
+            # memoryview of the same bytes, so a lookup by one still finds
+            # the value.
+            original: str | bytes = key if isinstance(key, (str, bytes)) else key_bytes
             idx = seen.get(key_bytes)
             if idx is not None:
                 if original not in originals[idx]:
@@ -2209,7 +2220,8 @@ class NanocachedClient:
         """Batched touch (issue #871): replaces the TTL of every existing
         key in ``keys`` in place, one round trip per involved node instead
         of one per key. ``keys`` must be non-empty. Returns a dict keyed by
-        the original key objects: ``True`` for a key that existed,
+        the original key objects (a bytearray or memoryview key by a bytes
+        copy of it): ``True`` for a key that existed,
         ``False`` for a missing or expired one, which a touch never
         creates. ``ttl_seconds`` is one TTL for the whole batch and means
         what it means for touch(): no default, ``None`` removes the TTL,
@@ -4005,8 +4017,11 @@ class NanocachedClient:
 
     def _start_keepalive(self) -> None:
         # Always on, with an internal interval (issue #27): half the
-        # server's 60s idle timeout, so it never severs a healthy client.
-        # Module-level only so tests can shorten it.
+        # server's 60s idle timeout. Each tick pings every connection idle
+        # for at least half an interval (issue #1894), so a healthy
+        # connection goes at most 1.5 intervals (45s) without traffic —
+        # 15s short of the server's cutoff, far more than this loop's
+        # sleep() drift. Module-level only so tests can shorten it.
         interval = _KEEPALIVE_INTERVAL
 
         async def ping(connection: Connection) -> None:
@@ -4056,7 +4071,13 @@ class NanocachedClient:
                             continue  # dead connections stay lazy, redialed on use
                         if connection in pings:
                             continue  # its last ping is still waiting on a hung node
-                        if connection.idle_seconds() < interval:
+                        # Issue #1894: skip only a connection used within
+                        # the last half interval. Skipping every one idle
+                        # for less than a full interval left a connection
+                        # used just after a tick unpinged until almost two
+                        # intervals — the server's 60s idle limit — so the
+                        # sleep() drift alone let the server close it.
+                        if connection.idle_seconds() < interval / 2:
                             continue  # real traffic already reset the server's timer
                         pings[connection] = asyncio.ensure_future(ping(connection))
             finally:

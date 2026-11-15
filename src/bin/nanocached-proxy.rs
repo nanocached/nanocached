@@ -2969,14 +2969,10 @@ async fn run_backend(
             // until the next frame — up to a whole keep-alive interval —
             // was written into the dead connection and answered with a
             // plain error: for an INCR/CAS one the client could not
-            // retry, although the frame never reached a node. `biased`
-            // so a reservation that is already queued is always taken
-            // first, and the idle read is a readiness poll that consumes
-            // nothing unless it completes.
-            let next = tokio::select! {
-                biased;
-                slot = pending_rx.recv() => slot,
-                idle = watch_idle_backend(&mut read_half, &mut buf) => {
+            // retry, although the frame never reached a node.
+            let next = match next_reply_slot(&mut read_half, &mut buf, &mut pending_rx).await {
+                Ok(next) => next,
+                Err(idle) => {
                     // Nothing was pending, so no client request is on
                     // this connection: the writer's next reservation
                     // fails before it writes (`not_sent`, redialled).
@@ -3209,22 +3205,49 @@ async fn run_backend(
     }
 }
 
-/// Waits, while no reply is pending on a shared backend connection, for
-/// the node to close it (EOF) or to fail it; resolves to what happened,
-/// for the log line. Data arriving with nothing pending is a desynced
-/// stream (the node never speaks unsolicited once authenticated), so it
-/// counts as a failure too rather than being parsed against a later
-/// reply. Cancel-safe: `read` consumes bytes only when it completes, so
-/// a reservation winning the `select!` leaves the stream untouched.
-async fn watch_idle_backend<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut BytesMut) -> String {
+/// The reader's next reserved reply slot (`None` once the writer is gone
+/// and the queue is drained), watching the socket while no reply is
+/// pending for the node to close it (EOF) or to fail it; `Err` is what
+/// happened, for the log line. Data arriving with nothing pending is a
+/// desynced stream (the node never speaks unsolicited once
+/// authenticated), so it counts as a failure too rather than being parsed
+/// against a later reply. `biased` so a reservation that is already
+/// queued is always taken first, and the idle read is a readiness poll
+/// that consumes nothing unless it completes: a reservation winning the
+/// `select!` leaves the stream untouched.
+///
+/// Issue #1892: the queue was empty when `select!` polled it, but the
+/// writer runs on another thread and can reserve a request, write it and
+/// be answered before this one polls the read — it only has to be
+/// preempted for a node round trip in between. The read then returns the
+/// start of that request's reply, which used to be taken for unsolicited
+/// data: the connection was poisoned and the request failed as written
+/// (an `E` for an INCR/CAS). So once data has arrived the queue is checked
+/// again. The writer reserves before it writes, so any request the data
+/// can answer is queued by now, and its reply is read on from the bytes
+/// already in `buf`; only data with still nothing reserved is a desync
+/// (and bytes that are not that reply fail its tag check).
+async fn next_reply_slot<S: AsyncRead + Unpin, T>(
+    stream: &mut S,
+    buf: &mut BytesMut,
+    pending: &mut mpsc::Receiver<T>,
+) -> Result<Option<T>, String> {
     let mut chunk = [0u8; 64];
-    match stream.read(&mut chunk).await {
-        Ok(0) => "closed by the node while idle".to_string(),
+    let read = tokio::select! {
+        biased;
+        slot = pending.recv() => return Ok(slot),
+        read = stream.read(&mut chunk) => read,
+    };
+    match read {
+        Ok(0) => Err("closed by the node while idle".to_string()),
         Ok(n) => {
             buf.extend_from_slice(&chunk[..n]);
-            "sent data with no request pending".to_string()
+            pending
+                .try_recv()
+                .map(Some)
+                .map_err(|_| "sent data with no request pending".to_string())
         }
-        Err(error) => format!("failed while idle ({error})"),
+        Err(error) => Err(format!("failed while idle ({error})")),
     }
 }
 
@@ -7386,6 +7409,18 @@ impl ClientReply {
             charge: None,
         }
     }
+
+    /// Issue #1891: the `E` for the client's own protocol error (a request
+    /// before authentication, a second `A`, a malformed or oversized
+    /// frame). Resolved as an ordinary reply, not `Err`: the writer counts
+    /// every `Err` in `upstream_failures_total`, and no backend failed
+    /// here. The reader closes the connection right after queueing it, so
+    /// the writer still sends nothing behind this `E`.
+    fn protocol_error() -> Self {
+        let (response_tx, response_rx) = oneshot::channel();
+        let _ = response_tx.send(Ok(b"E\n".to_vec()));
+        Self::uncharged(response_rx)
+    }
 }
 
 /// The per-connection, per-source-IP and proxy-wide reservations of one
@@ -8151,9 +8186,7 @@ async fn handle_client(
                         // violation — answer `E` and close (the node's
                         // stance on any protocol error) rather than let it
                         // re-negotiate tagging on a live connection.
-                        let (response_tx, response_rx) = oneshot::channel();
-                        let _ = response_tx.send(Err(Fatal::Transient));
-                        let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
+                        let _ = fifo_tx.send(ClientReply::protocol_error()).await;
                         break 'connection Ok(());
                     }
                     let accepted = match &context.secret {
@@ -8191,9 +8224,7 @@ async fn handle_client(
                 }
                 Ok(ParseOutcome::Ready(request, tag)) => {
                     if !authenticated {
-                        let (response_tx, response_rx) = oneshot::channel();
-                        let _ = response_tx.send(Err(Fatal::Transient));
-                        let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
+                        let _ = fifo_tx.send(ClientReply::protocol_error()).await;
                         break 'connection Ok(());
                     }
                     // The writer is gone (it answered `E`, or a write
@@ -8317,9 +8348,7 @@ async fn handle_client(
                     // charged now, while no per-key memory exists, and the
                     // parse that follows hands the request this charge.
                     if !authenticated {
-                        let (response_tx, response_rx) = oneshot::channel();
-                        let _ = response_tx.send(Err(Fatal::Transient));
-                        let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
+                        let _ = fifo_tx.send(ClientReply::protocol_error()).await;
                         break 'connection Ok(());
                     }
                     if fifo_tx.is_closed() {
@@ -8400,9 +8429,7 @@ async fn handle_client(
                     // below the loop); before that, a peer does not get to
                     // hold its connection for that long.
                     drain_rejected = authenticated;
-                    let (response_tx, response_rx) = oneshot::channel();
-                    let _ = response_tx.send(Err(Fatal::Transient));
-                    let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
+                    let _ = fifo_tx.send(ClientReply::protocol_error()).await;
                     break 'connection Ok(());
                 }
             }
@@ -13728,6 +13755,58 @@ mod tests {
         assert_eq!(n, 0, "the proxy must close the connection after the E");
     }
 
+    /// Issue #1891: the `E` for the client's own protocol error (a request
+    /// before `A`, a malformed frame, a second `A`) was counted in
+    /// `upstream_failures_total`, so anyone who could reach the port raised
+    /// the proxy's upstream error rate without a request or a backend
+    /// involved. Only a backend failure counts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_protocol_errors_are_not_counted_as_upstream_failures() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap().to_string();
+        let discovery = start_mock_discovery(vec![("node-dead".to_string(), dead_addr)], 1).await;
+        let (proxy, _drain, context) = start_proxy_full(
+            &discovery,
+            Some("s3cret"),
+            test_limits(64),
+            None,
+            Arc::new(SharedBackends::new()),
+        )
+        .await;
+        drop(listener);
+        let failures = || {
+            context
+                .upstream_failures_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        for (sent, replies) in [
+            (&b"G 3\nkey"[..], &["E"][..]),
+            (&b"hello world\n"[..], &["E"][..]),
+            (&b"A 6\ns3cretA 6\ns3cret"[..], &["On", "E"][..]),
+        ] {
+            let mut stream = TcpStream::connect(&proxy).await.unwrap();
+            stream.write_all(sent).await.unwrap();
+            let mut buf = BytesMut::new();
+            for reply in replies {
+                assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), *reply);
+            }
+            // The proxy closes after the `E`, and only after its writer
+            // has finished: the counter is settled by then.
+            assert_eq!(stream.read_buf(&mut buf).await.unwrap(), 0);
+        }
+        assert_eq!(failures(), 0, "protocol errors are not upstream failures");
+
+        // A request the (dead) backend fails still counts.
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        stream.write_all(b"A 6\ns3cretG 4\nname").await.unwrap();
+        let mut buf = BytesMut::new();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+        assert_eq!(stream.read_buf(&mut buf).await.unwrap(), 0);
+        assert_eq!(failures(), 1);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn round_trips_and_isolates_namespaces_through_the_proxy() {
         let (nodes, proxy) = cluster(2).await;
@@ -15314,6 +15393,79 @@ mod tests {
             node.auth_count.load(Ordering::SeqCst),
             2,
             "exactly one redial, made by the request"
+        );
+    }
+
+    // Issue #1892: a shared backend connection's read half on which the
+    // race lands. The reader has just found its pending queue empty, and
+    // inside its idle read — after that check, before the read returns —
+    // the writer reserves a request (`reserve`) and the node's reply to it
+    // starts to arrive. Later reads hand out the rest, then EOF.
+    struct RacingBackendRead {
+        pending: mpsc::Sender<u32>,
+        reserve: Option<u32>,
+        chunks: std::collections::VecDeque<&'static [u8]>,
+    }
+
+    impl tokio::io::AsyncRead for RacingBackendRead {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if let Some(tag) = self.reserve.take() {
+                self.pending.try_send(tag).unwrap();
+            }
+            if let Some(chunk) = self.chunks.pop_front() {
+                buf.put_slice(chunk);
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reply_that_arrives_as_the_idle_reader_finds_nothing_pending_is_read_as_the_reply() {
+        // Issue #1892: the request is reserved after the reader saw its
+        // queue empty and before its idle read, which returns the start of
+        // that request's reply. That used to be taken for unsolicited data
+        // and poisoned the connection under a request already written (an
+        // `E` for an INCR/CAS). The data is that request's: its slot is
+        // returned and its reply read on from the bytes already buffered.
+        let (pending_tx, mut pending_rx) = mpsc::channel(MAX_BACKEND_IN_FLIGHT);
+        let mut stream = RacingBackendRead {
+            pending: pending_tx,
+            reserve: Some(7),
+            chunks: [&b"V 5 7\nhel"[..], &b"lo"[..]].into(),
+        };
+        let mut buf = BytesMut::new();
+
+        assert_eq!(
+            next_reply_slot(&mut stream, &mut buf, &mut pending_rx).await,
+            Ok(Some(7)),
+            "the data answers the request reserved meanwhile"
+        );
+        let reply = read_reply_and_shrink(&mut stream, &mut buf, 7, Expect::Value)
+            .await
+            .expect("the buffered bytes are the start of its reply");
+        assert_eq!(reply, NodeReply::Value(Bytes::from_static(b"hello")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn data_from_the_node_with_no_request_pending_still_poisons_the_connection() {
+        // Issue #1892: checking the queue again once data arrives must not
+        // let genuinely unsolicited bytes through. With nothing reserved
+        // they are a desynced stream, not parsed against a later reply.
+        let (pending_tx, mut pending_rx) = mpsc::channel::<u32>(MAX_BACKEND_IN_FLIGHT);
+        let mut stream = RacingBackendRead {
+            pending: pending_tx,
+            reserve: None,
+            chunks: [&b"V 5 7\nhello"[..]].into(),
+        };
+        let mut buf = BytesMut::new();
+
+        assert_eq!(
+            next_reply_slot(&mut stream, &mut buf, &mut pending_rx).await,
+            Err("sent data with no request pending".to_string())
         );
     }
 

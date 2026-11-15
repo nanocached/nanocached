@@ -5547,8 +5547,11 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     // ── keep-alive ────────────────────────────────────────────────
 
     // Always on, with an internal interval (issue #27): half the
-    // server's 60s idle timeout, so it never severs a healthy client.
-    // Internal and mutable only so tests can shorten it.
+    // server's 60s idle timeout. Each tick pings every connection idle
+    // for at least half an interval (issue #1894), so a healthy
+    // connection goes at most 1.5 intervals (45s) without traffic — 15s
+    // short of the server's cutoff. Internal and mutable only so tests
+    // can shorten it.
     internal static TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(30);
 
     // Fire-and-forget replica writes: bounds how many replica writes a single client
@@ -5624,7 +5627,13 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 // pending request per timeout window rather than one per tick.
                 foreach (Connection connection in connections)
                 {
-                    if (connection.IsClosed || connection.Idle < every) continue;
+                    // Issue #1894: skip only a connection used within the
+                    // last half interval. Skipping every one idle for less
+                    // than a full interval left a connection used just
+                    // after a tick unpinged until almost two intervals —
+                    // the server's 60s idle limit — so any tick drift let
+                    // the server close it.
+                    if (connection.IsClosed || connection.Idle < every / 2) continue;
                     if (!pingsInFlight.TryAdd(connection, 0)) continue;
                     _ = Task.Run(async () =>
                     {

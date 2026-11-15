@@ -6830,8 +6830,11 @@ public final class NanocachedClient implements AutoCloseable {
 
     private void startKeepAlive() {
         // Always on, with an internal interval (issue #27): half the
-        // server's 60s idle timeout, so it never severs a healthy
-        // client. Package-visible only so tests can shorten it.
+        // server's 60s idle timeout. Each tick pings every connection idle
+        // for at least half an interval (issue #1894), so a healthy
+        // connection goes at most 1.5 intervals (45s) without traffic —
+        // 15s short of the server's cutoff. Package-visible only so tests
+        // can shorten it.
         Duration interval = Duration.ofMillis(keepAliveIntervalMillis);
 
         // A small pool, not a single thread: the tick below only decides
@@ -6861,7 +6864,12 @@ public final class NanocachedClient implements AutoCloseable {
             }
             for (Connection connection : connections) {
                 if (connection.isClosed()) continue; // dead ones stay lazy
-                if (connection.idleNanos() < interval.toNanos()) continue;
+                // Issue #1894: skip only a connection used within the last
+                // half interval. Skipping every one idle for less than a
+                // full interval left a connection used just after a tick
+                // unpinged until almost two intervals — the server's 60s
+                // idle limit — so any tick drift let the server close it.
+                if (connection.idleNanos() < interval.toNanos() / 2) continue;
                 if (!pingsInFlight.add(connection)) continue;
                 try {
                     keepAlive.execute(() -> {

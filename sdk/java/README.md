@@ -503,8 +503,10 @@ writes run on.
 ## Reconnect and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps
-its connections warm automatically, pinging any connection that real
-traffic has left idle for 30 seconds — so an idle timeout never severs a
+its connections warm automatically: every 30 seconds it pings any
+connection that real traffic has left idle for 15 seconds or more, so a
+healthy connection never goes much past 45 seconds without traffic and an
+idle timeout never severs a
 healthy client, and a request that does find its connection dead (a node
 restart, a network blip) redials and retries once transparently — but
 **only when the dead connection had genuinely never sent the request**
@@ -651,9 +653,10 @@ rather than bloated.
 
 Decompression is bounded three ways: one value may expand to at most
 64 MiB, one `getMany`/`getManyBytes` response to at most 256 MiB across
-the batch, and one client to at most 256 MiB of DEFLATE output in
-flight at a time across every concurrent read. Each decompression of a
-compressed value reserves the 64 MiB per-value cap from that last
+the batch, and one client to at most four values' worth (4 × (64 MiB +
+1 byte)) of DEFLATE output in flight at a time across every concurrent
+read. Each decompression of a compressed value reserves the per-value cap
+(plus the one byte used to detect an over-cap value) from that last
 budget while it runs (its output size is not known in advance), so at
 most four run at once per client and further ones wait; the budget is
 released as soon as the value is returned — what a caller then holds is

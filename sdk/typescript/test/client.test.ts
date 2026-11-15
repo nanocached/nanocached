@@ -1481,6 +1481,35 @@ describe("NanocachedClient keep-alive", () => {
     }
   });
 
+  it("pings a connection idle for more than half an interval at the next tick (issue #1894)", async () => {
+    // A tick skipped every connection idle for less than a full interval,
+    // so one used just after a tick went almost two intervals — the
+    // server's 60s idle limit — before its ping.
+    const node = await startMockNode();
+    try {
+      const intervalMs = 300;
+      KEEPALIVE_TUNING.intervalMs = intervalMs;
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: node.port }],
+      });
+      try {
+        await waitFor(() => node.getCount() >= 1, "the first keep-alive ping to arrive");
+        // Used just after that tick, so the next one finds it idle for
+        // more than half an interval but less than a full one.
+        await client.set("k", "v");
+        const deadline = Date.now() + 1.5 * intervalMs;
+        while (node.getCount() < 2) {
+          assert.ok(Date.now() < deadline, "no keep-alive ping at the next tick");
+          await delay(5);
+        }
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("stops pinging once the client is closed", async () => {
     const node = await startMockNode();
     try {

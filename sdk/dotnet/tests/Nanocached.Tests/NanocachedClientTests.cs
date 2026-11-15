@@ -884,6 +884,37 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task KeepAlivePingsAConnectionIdleForMoreThanHalfTheInterval()
+    {
+        // Issue #1894: a tick skipped every connection idle for less than a
+        // full interval, so one used just after a tick went almost two
+        // intervals — the server's 60s idle limit — before its ping.
+        TimeSpan defaultInterval = NanocachedClient.KeepAliveInterval;
+        TimeSpan interval = TimeSpan.FromMilliseconds(300);
+        NanocachedClient.KeepAliveInterval = interval;
+        try
+        {
+            using var node = new MockNode();
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+            await WaitForAsync(() => node.GetCount >= 1, "the first keep-alive ping");
+            // Used just after that tick, so the next one finds it idle for
+            // more than half an interval but less than a full one.
+            await client.SetAsync("k", "v");
+            DateTime deadline = DateTime.UtcNow + interval * 1.5;
+            while (node.GetCount < 2)
+            {
+                Assert.True(DateTime.UtcNow < deadline, "no keep-alive ping at the next tick");
+                await Task.Delay(5);
+            }
+        }
+        finally
+        {
+            NanocachedClient.KeepAliveInterval = defaultInterval;
+        }
+    }
+
+    [Fact]
     public async Task ARequestToAHalfOpenServerFailsWithinTheTimeoutInsteadOfHanging()
     {
         // Regression (issue #42): a server that completes the A handshake
@@ -956,6 +987,34 @@ public class NanocachedClientTests
                 stop.Cancel();
                 await ticker;
             }
+        }
+        finally
+        {
+            Connection.RequestTimeout = defaultTimeout;
+        }
+    }
+
+    // Issue #1895: a watchdog that fires before the deadline (the runtime
+    // timer clock can run ahead of TickCount64 on Windows) must re-arm for
+    // the remaining time, not return and leave the request hanging.
+    [Fact]
+    public async Task AnEarlyWatchdogFireStillTimesTheRequestOut()
+    {
+        TimeSpan defaultTimeout = Connection.RequestTimeout;
+        Connection.RequestTimeout = TimeSpan.FromMilliseconds(500);
+        try
+        {
+            var stream = new FailingReadStream(); // never answers
+            var connection = new Connection(stream);
+
+            Task<byte[]?> pending = connection.GetAsync(Bytes("k"));
+            connection.FireWatchdogEarlyForTest();
+            Assert.False(pending.IsCompleted);
+
+            Task finished = await Task.WhenAny(pending, Task.Delay(TimeSpan.FromSeconds(5)));
+            Assert.Same(pending, finished);
+            ConnectionLostException lost = await Assert.ThrowsAsync<ConnectionLostException>(() => pending);
+            Assert.True(lost.TimedOut);
         }
         finally
         {

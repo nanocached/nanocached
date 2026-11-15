@@ -2916,6 +2916,40 @@ async fn keep_alive_pings_an_idle_connection() {
 }
 
 #[tokio::test]
+async fn keep_alive_pings_a_connection_idle_for_more_than_half_the_interval() {
+    // Issue #1894: a tick skipped every connection idle for less than a
+    // full interval, so one used just after a tick went almost two
+    // intervals — the server's 60s idle limit — before its ping.
+    let interval = Duration::from_millis(300);
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port).keep_alive_interval(interval))
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while node.state.gets.load(Ordering::SeqCst) < 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no first keep-alive ping"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Used just after that tick, so the next one finds it idle for more
+    // than half an interval but less than a full one.
+    client.set("k", "v", 0).await.unwrap();
+    let deadline = tokio::time::Instant::now() + interval * 3 / 2;
+    while node.state.gets.load(Ordering::SeqCst) < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no keep-alive ping at the next tick"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
 async fn dropping_every_client_handle_without_close_stops_the_keep_alive_task() {
     // Regression for issue #325: the keep-alive task used to hold a
     // strong `Arc<Inner>`, so dropping every `NanocachedClient` handle

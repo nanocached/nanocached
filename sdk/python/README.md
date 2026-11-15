@@ -314,7 +314,9 @@ hit past that budget is answered as a miss, so a batch of many large
 keys can come back with fewer keys than exist (read such a key again on
 its own rather than taking it for evicted). Keys may be `str` or
 `bytes`, freely mixed within one call — the result dict is keyed by
-whichever original object was passed in, not by its encoded bytes. A
+whichever original object was passed in, not by its encoded bytes (a
+`bytearray` or `memoryview` key, which a dict cannot always hold, by a
+`bytes` copy of it). A
 key repeated in a `get_many` (the same key twice, or `"a"` and `b"a"`,
 which encode identically) is read once, as in the other SDKs, and the
 result holds it under every spelling passed in (both `"a"` and `b"a"`
@@ -539,8 +541,10 @@ limit.
 ## Reconnect and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps
-its connections warm automatically, pinging any connection that real
-traffic has left idle for 30 seconds — so an idle timeout never severs a
+its connections warm automatically: every 30 seconds it pings any
+connection that real traffic has left idle for 15 seconds or more, so a
+healthy connection never goes much past 45 seconds without traffic and an
+idle timeout never severs a
 healthy client. A request that finds its connection already closed (a node
 restart, a network blip) redials it before sending. In cluster mode a
 request whose connection is lost is also retried once, after a node-list
