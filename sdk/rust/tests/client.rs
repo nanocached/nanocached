@@ -8050,6 +8050,28 @@ async fn connect_with_suspect_threshold(
     client
 }
 
+// Hedged reads: the cap on legs left running by reads that already
+// returned. Like the suspect threshold above it is read once per connect
+// from a process-wide static, so a test sets it just around the connect.
+// Issue #1908: two tests set it to different values, and without a lock
+// held from the store until the client has captured it, one test's client
+// was built with the other's cap.
+async fn connect_with_hedge_loser_cap(
+    port: u16,
+    hedge_after: Duration,
+    cap: usize,
+) -> NanocachedClient {
+    static HEDGE_LOSER_CAP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = HEDGE_LOSER_CAP_LOCK.lock().await;
+    let default = nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.load(Ordering::SeqCst);
+    nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.store(cap, Ordering::SeqCst);
+    let client = NanocachedClient::connect(options(port).read_hedge_after(hedge_after))
+        .await
+        .unwrap();
+    nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.store(default, Ordering::SeqCst);
+    client
+}
+
 #[tokio::test]
 async fn a_silent_primary_is_tried_last_once_it_has_enough_late_legs() {
     let (nodes, discovery) = start_cluster(2).await;
@@ -8251,16 +8273,9 @@ async fn hedge_losers_fall_back_to_synchronous_past_the_cap() {
     // returned, so the replica leg is drained synchronously instead of
     // detached.
     {
-        let default_cap = nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.load(Ordering::SeqCst);
-        nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.store(0, Ordering::SeqCst);
-
         let (nodes, discovery) = start_cluster(2).await;
-        let client = NanocachedClient::connect(
-            options(discovery.port).read_hedge_after(Duration::from_millis(20)),
-        )
-        .await
-        .unwrap();
-        nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.store(default_cap, Ordering::SeqCst);
+        let client =
+            connect_with_hedge_loser_cap(discovery.port, Duration::from_millis(20), 0).await;
 
         client.set("k", "v", 0).await.unwrap();
         let owners = owners_of("k");
@@ -8302,14 +8317,7 @@ async fn legs_of_reads_still_in_flight_do_not_count_against_the_hedge_cap() {
     // primary legs alone met the cap and all three waited for the slow
     // primary.
     let (nodes, discovery) = start_cluster(2).await;
-    let default_cap = nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.load(Ordering::SeqCst);
-    nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.store(3, Ordering::SeqCst);
-    let client = NanocachedClient::connect(
-        options(discovery.port).read_hedge_after(Duration::from_millis(50)),
-    )
-    .await
-    .unwrap();
-    nanocached::MAX_INFLIGHT_HEDGE_LOSER_LEGS.store(default_cap, Ordering::SeqCst);
+    let client = connect_with_hedge_loser_cap(discovery.port, Duration::from_millis(50), 3).await;
 
     client.set("k", "v", 0).await.unwrap();
     let owners = owners_of("k");
