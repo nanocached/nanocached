@@ -1272,6 +1272,12 @@ func (c *Client) setBytesNS(namespace []byte, key string, value []byte, ttlSecon
 }
 
 // Delete removes the key, reporting whether it existed before this call.
+//
+// In a cluster the other owners are sent the delete only after the primary
+// has answered, as for Touch with ttlSeconds == 0 (issue #934): a primary
+// that could not be reached or answered `W` is rerouted with no replica
+// deleted yet, so the reroute does not report false from a copy this call
+// already removed.
 func (c *Client) Delete(key string) (existed bool, err error) {
 	return c.deleteNS(nil, key)
 }
@@ -1288,7 +1294,7 @@ func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error
 	}
 	keyBytes := []byte(key)
 	err = c.withClusterRetry(func() error {
-		return c.write(namespace, keyBytes, func(conn *connection, primary bool) error {
+		return c.writeWith(namespace, keyBytes, func(conn *connection, primary bool) error {
 			e, opErr := conn.deleteNS(namespace, keyBytes)
 			// Only the primary's answer decides (client-side replication) — and only the
 			// primary leg may touch `existed`: the replica legs run on
@@ -1298,7 +1304,7 @@ func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error
 				existed = e
 			}
 			return opErr
-		})
+		}, c.applyReconnecting, true)
 	})
 	return existed, err
 }
@@ -3185,9 +3191,9 @@ func (c *Client) writeValue(namespace, key, callerValue []byte, op func(conn *co
 // idempotent op) or applyExpiring (resend only a request that was never
 // sent, for a touch that expires the entry — issue #901). The replica legs
 // always keep applyReconnecting: a replica's outcome never decides the
-// result, and replaying a touch there is harmless.
+// result, and replaying a delete or a touch there is harmless.
 //
-// replicasAfterPrimary (a touch with ttlSeconds == 0, issue #934) sends the
+// replicasAfterPrimary (a delete, or a touch with ttlSeconds == 0, issue #934) sends the
 // replica legs only once the primary has answered, the way Incr's result
 // fan-out does, instead of concurrently with it. The plain `t ... 0` expires
 // the entry on whoever receives it, so a replica touched before the primary

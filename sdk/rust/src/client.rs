@@ -2442,6 +2442,12 @@ impl NanocachedClient {
     }
 
     /// Returns whether the key existed before this call.
+    ///
+    /// In a cluster the other owners are sent the delete only after the
+    /// primary has answered, as for `touch` with `Some(0)` (issue #934):
+    /// a primary that could not be reached or answered `W` is rerouted
+    /// with no replica deleted yet, so the reroute's answer is not a
+    /// `false` from a replica this call had already emptied.
     pub async fn delete(&self, key: impl AsRef<[u8]>) -> Result<bool> {
         self.delete_in(DEFAULT_NAMESPACE, key).await
     }
@@ -5112,6 +5118,10 @@ impl NanocachedClient {
                 ttl_seconds: Some(0)
             }
         );
+        // A delete is resent like a `set` (a lost reply may then answer
+        // `false`, the accepted #1714 case) but shares the expiring
+        // touch's primary-first fan-out below.
+        let replicas_after_primary = !replay_primary || matches!(body, WriteBody::Delete);
         let owners = {
             let state = self.inner.state.lock().await;
             if let Target::Single { .. } = state.target {
@@ -5131,22 +5141,27 @@ impl NanocachedClient {
             ));
         };
 
-        // A touch that expires its entry (`Some(0)`, issue #934) fans out
+        // A delete or a touch that expires its entry (issue #934) fans out
         // to the other owners only once the primary has answered. The
-        // replicas used to be sent the plain touch concurrently with the
-        // primary, so a primary that could not be reached or answered `W`
-        // from a stale ring left a replica that had already expired its
-        // copy: the reroute then reached that replica as the new primary
-        // and found nothing (a miss, with the value consumed by the first
-        // frame and never returned). Primary first means a failed or
-        // misrouted primary leg is rerouted with no replica touched yet
-        // (`with_cluster_retry` runs this again over the refreshed ring),
-        // as `incr_once` does for its replicas. The deferred replica legs
-        // run outside the order the pipelined connections otherwise give a
-        // key's operations, the same class as the retry paths. A positive
-        // or removed TTL keeps the concurrent fan-out below.
-        if !replay_primary {
-            let result = self.apply_reconnecting_no_replay(Some(primary), &op).await;
+        // replicas used to be sent theirs concurrently with the primary,
+        // so a primary that could not be reached or answered `W` from a
+        // stale ring left a replica that had already deleted or expired
+        // its copy: the reroute then reached that replica as the new
+        // primary and found nothing (a `false` from `delete`, a miss with
+        // the value consumed and never returned from `get_and_touch`).
+        // Primary first means a failed or misrouted primary leg is
+        // rerouted with no replica written yet (`with_cluster_retry` runs
+        // this again over the refreshed ring), as `incr_once` does for its
+        // replicas. The deferred replica legs run outside the order the
+        // pipelined connections otherwise give a key's operations, the
+        // same class as the retry paths. A `set` and a positive or removed
+        // TTL keep the concurrent fan-out below.
+        if replicas_after_primary {
+            let result = if replay_primary {
+                self.apply_reconnecting(Some(primary), &op).await
+            } else {
+                self.apply_reconnecting_no_replay(Some(primary), &op).await
+            };
             if result.is_ok() {
                 // The ring in force now, not the one the primary was
                 // picked from: every owner but the one that answered.
@@ -5163,8 +5178,9 @@ impl NanocachedClient {
         }
 
         // Fan out to the replicas concurrently with the primary write —
-        // `set`/`delete` are idempotent, so replaying the same op on a
-        // replica regardless of how the primary leg turns out is safe.
+        // `set` and a non-expiring touch are idempotent, so replaying the
+        // same op on a replica regardless of how the primary leg turns out
+        // is safe.
         // `replicate_writes` is shared with `incr_once` (issue #129),
         // which instead awaits it only *after* its own primary leg has
         // already succeeded — see that method's own doc comment for why

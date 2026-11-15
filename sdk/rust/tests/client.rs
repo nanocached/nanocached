@@ -186,6 +186,8 @@ struct NodeState {
     /// As `hang_after_touch`, but only for a `y` frame in the `G` form, so a
     /// test can pick the primary's frame over a replica's plain one.
     hang_after_get_multi_touch: AtomicUsize,
+    /// Every `D`/`d` frame this node has received, applied or not.
+    deletes_received: AtomicUsize,
     /// Issue #825: behave like a node that predates `t` — answer `En` and
     /// close the connection.
     reject_touch: std::sync::atomic::AtomicBool,
@@ -570,6 +572,7 @@ async fn serve_node(socket: TcpStream, state: Arc<NodeState>) {
                     }
                     continue;
                 }
+                state.deletes_received.fetch_add(1, Ordering::SeqCst);
                 let reply = if take_wrong_node(&state) {
                     format!("W{tag_suffix}\n")
                 } else if state
@@ -3695,6 +3698,104 @@ async fn a_zero_ttl_touch_in_a_cluster_is_not_resent_once_the_request_was_sent()
         "expected ConnectionLost, got {result:?}"
     );
     assert_eq!(touch_frames(primary).len(), 1, "the touch was sent once");
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+// A delete reaches the other owners only after the primary answered (as
+// an expiring touch, issue #934): a primary that answered `W` or was
+// unreachable is rerouted with no replica deleted yet, so the reroute does
+// not answer `false` from a copy this call already removed.
+
+#[tokio::test]
+async fn a_delete_rerouted_after_a_wrong_node_answer_reports_that_the_key_existed() {
+    let key = "shared-key";
+    let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let owners = owners_of(key);
+    let primary = node_named(&nodes, &owners[0]);
+    let replica = node_named(&nodes, &owners[1]);
+
+    primary.state.wrong_node_replies.store(1, Ordering::SeqCst);
+    assert!(client.delete(key).await.unwrap(), "the seeded key existed");
+    assert_eq!(
+        replica.state.deletes_received.load(Ordering::SeqCst),
+        1,
+        "one replica delete, after the primary's definitive answer"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_delete_reroutes_a_dead_primary_with_no_replica_deleted() {
+    let key = "shared-key";
+    let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let owners = owners_of(key);
+    let primary = node_named(&nodes, &owners[0]);
+    let replica = node_named(&nodes, &owners[1]);
+
+    // The primary goes away and the roster still lists it: the call fails,
+    // and the replica's copy was left alone.
+    primary.stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let result = client.delete(key).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "{result:?}"
+    );
+    assert_eq!(replica.state.deletes_received.load(Ordering::SeqCst), 0);
+    assert!(stored(replica, key), "the copy is still there");
+
+    // Once the roster drops the primary the reroute reaches the replica as
+    // the new primary, which still has the key. The next forced refresh
+    // waits out the minimum interval (issue #1580).
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    shrink_roster_to(&discovery, &nodes, &owners[1]);
+    assert!(client.delete(key).await.unwrap(), "the key existed");
+    assert!(!stored(replica, key));
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_delete_in_a_cluster_reports_the_primarys_answer_and_then_deletes_the_replica() {
+    let key = "shared-key";
+    let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let owners = owners_of(key);
+    let replica = node_named(&nodes, &owners[1]);
+
+    assert!(client.delete(key).await.unwrap(), "the seeded key existed");
+    assert_eq!(replica.state.deletes_received.load(Ordering::SeqCst), 1);
+    assert!(
+        !replica
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .contains_key(&store_key(b"", key.as_bytes())),
+        "the replica's copy is gone"
+    );
 
     client.close().await;
     discovery.stop();
