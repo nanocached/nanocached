@@ -1049,6 +1049,25 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             await impostor.close()
 
+    async def test_a_discovered_entry_with_an_empty_name_or_address_is_a_protocol_error(self):
+        # Issue #1889: a zero-length name used to be accepted, and "" is
+        # the single/proxy-mode slot, so every request to that member
+        # leaked a socket. The discovery server rejects empty fields
+        # (parse_string_fields → EmptyField), so connect() now refuses either.
+        node = await MockNode().start()
+        try:
+            for entry in [("", node.address), (NAMES[0], "")]:
+                with self.subTest(entry=entry):
+                    discovery = await MockDiscovery([entry]).start()
+                    try:
+                        with self.assertRaisesRegex(NanocachedError, "invalid node entry lengths"):
+                            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                            await client.close()
+                    finally:
+                        await discovery.close()
+        finally:
+            await node.close()
+
     async def test_a_refresh_finishing_after_close_installs_no_connections(self):
         # Regression for issue #10.
         node = await MockNode().start()
