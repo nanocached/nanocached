@@ -790,7 +790,7 @@ here.</p>
   <code>i</code>, <code>k</code> or <code>x</code> result is in the
   order (a later request on the same key waits for it to be enqueued), as
   are the replica legs of an expiring touch (<code>t</code> or <code>y</code>
-  with a TTL of 0); a re-sent replica write is not.</li>
+  with a TTL of 0) and of a delete; a re-sent replica write is not.</li>
   <li>A multi-key request (<code>m</code>, <code>o</code>, <code>y</code>)
   of more than 64 keys that the proxy has to defer, because it waits for an
   earlier <code>i</code>, <code>k</code> or <code>x</code> result or other

@@ -31,7 +31,10 @@
 //!   and swallowed, the SDKs' own stance; `t` (issue #824) goes the same
 //!   way, with the value of a `G` touch coming from the primary alone and
 //!   a lost connection re-sent rather than failed, since a touch is
-//!   idempotent); a `W` from a node means the
+//!   idempotent). A delete, like an expiring touch, reaches the other
+//!   owners only once the primary has answered, so a primary that fails or
+//!   answers `W` is retried with no copy deleted yet. A `W` from a node
+//!   means the
 //!   proxy's roster is stale — refresh once and retry, never forwarded
 //!   to the client. `c`/`F` (#106) fan out to every member; any failure
 //!   forces one refresh-and-retry before the operation fails. To a
@@ -74,10 +77,11 @@
 //!   the reader goes on with requests on other keys, other connections have
 //!   their own `ConnectionOrder`, and a request with nothing to wait for
 //!   takes the inline path unchanged. An expiring touch (`t`/`y` with TTL
-//!   0) registers its keys the same way (issue #1847): its replica legs are
-//!   sent only after the primary has answered, so a later write on the key
-//!   would otherwise reach the replica first and be expired by the late
-//!   touch; the registration is released once those legs are enqueued. The
+//!   0) registers its keys the same way (issue #1847), and so does a
+//!   delete: its replica legs are sent only after the primary has
+//!   answered, so a later write on the key would otherwise reach the
+//!   replica first and be expired or deleted by the late leg; the
+//!   registration is released once those legs are enqueued. The
 //!   exception is an `i`/`k`/`x`
 //!   behind other `i`/`k`/`x` that were themselves dispatched inline: its
 //!   primary frame is enqueued inline too, so a run of increments of one
@@ -4845,8 +4849,8 @@ async fn dispatch_request(
                     &key,
                     write,
                     enqueued,
-                    tag,
-                    retry_capable,
+                    (tag, retry_capable),
+                    None,
                 )
                 .await;
                 let _ = result_tx.send(soften(result, retry_capable, tag, &context));
@@ -4854,6 +4858,10 @@ async fn dispatch_request(
         }
         Request::Delete { namespace, key } => {
             let enqueued = enqueue_write(&context, &ring, &namespace, &key, None).await;
+            // Like an expiring touch's, a delete's replica legs are enqueued
+            // by `finish_write`, once the primary has answered, so it holds
+            // its slot's signal until then.
+            let signal = slot.signal;
             tokio::spawn(async move {
                 let result = finish_write(
                     &context,
@@ -4861,8 +4869,8 @@ async fn dispatch_request(
                     &key,
                     None,
                     enqueued,
-                    tag,
-                    retry_capable,
+                    (tag, retry_capable),
+                    signal,
                 )
                 .await;
                 let _ = result_tx.send(soften(result, retry_capable, tag, &context));
@@ -6159,9 +6167,15 @@ async fn retry_multi_touch(
     unknown
 }
 
-/// Enqueues a write/delete on every owner concurrently (issue #177: one
-/// owner slow to dial must not delay the others); returns the pending
-/// replies in owner order, primary first.
+/// Enqueues a write on every owner concurrently (issue #177: one owner
+/// slow to dial must not delay the others); returns the pending replies in
+/// owner order, primary first. A delete goes to the primary alone, like an
+/// expiring touch (`enqueue_touch`), and `finish_write` sends the other
+/// owners theirs once the primary has answered: sent together, a replica
+/// deleted its copy while the primary leg was still failing (unreachable,
+/// or `W` from a stale ring), and the re-fan over the refreshed ring asked
+/// that replica, now the primary, for a key it no longer held — `N` for a
+/// key that existed.
 async fn enqueue_write(
     context: &ProxyContext,
     ring: &RingView,
@@ -6171,7 +6185,12 @@ async fn enqueue_write(
 ) -> EnqueuedWrite {
     let owners = ring.owners(namespace, key);
     let (frame, expect) = write_frame(namespace, key, write);
-    let requests = owners.iter().map(|addr| (addr.as_str(), frame.clone()));
+    let legs = if write.is_some() {
+        &owners[..]
+    } else {
+        &owners[..owners.len().min(1)]
+    };
+    let requests = legs.iter().map(|addr| (addr.as_str(), frame.clone()));
     let pending = context
         .backends
         .enqueue_each(context, requests, expect)
@@ -6198,19 +6217,34 @@ fn write_frame(
     }
 }
 
+/// The client's answer to a write or delete, from the primary's reply.
+fn write_answer(reply: &NodeReply, tag: Option<u32>) -> Option<Vec<u8>> {
+    match reply {
+        NodeReply::Stored => Some(respond("S", tag)),
+        NodeReply::Deleted => Some(respond("D", tag)),
+        NodeReply::NotFound => Some(respond("N", tag)),
+        _ => None,
+    }
+}
+
 /// A write/delete's completion: the primary's ack answers the client,
 /// replica failures are logged and swallowed (the SDKs' replica-leg
 /// stance) — but awaited before answering, so a client that reads its
 /// own write through a replica isn't racing the leg. A primary `W`
 /// forces one refresh-and-refan.
+///
+/// A delete's other owners were not enqueued with the primary (see
+/// `enqueue_write`): `delete_on_other_owners` sends them theirs here, once
+/// the primary has answered, and only then releases `signal`. A primary
+/// that failed or answered `W` is re-fanned with no copy deleted yet.
 async fn finish_write(
     context: &ProxyContext,
     namespace: &[u8],
     key: &[u8],
     write: Option<(Bytes, Option<u64>)>,
     enqueued: EnqueuedWrite,
-    tag: Option<u32>,
-    retry_capable: bool,
+    (tag, retry_capable): (Option<u32>, bool),
+    signal: Option<OrderSignal>,
 ) -> DriverResult {
     let EnqueuedWrite { owners, pending } = enqueued;
     let write_ref = write.as_ref().map(|(value, ttl)| (value, *ttl));
@@ -6237,34 +6271,58 @@ async fn finish_write(
     }
 
     match primary_reply {
-        Ok(NodeReply::Stored) => Ok(respond("S", tag)),
-        Ok(NodeReply::Deleted) => Ok(respond("D", tag)),
-        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
         Ok(NodeReply::WrongNode) => {
             // Stale roster: refresh, then re-fan on the new owner set.
             force_refresh(context).await;
-            refan_write(context, namespace, key, write_ref, tag, retry_capable).await
+            refan_write(
+                context,
+                namespace,
+                key,
+                write_ref,
+                (tag, retry_capable),
+                signal,
+            )
+            .await
         }
         // A transport failure on the ordered attempt: the shared
         // connection may simply have been idle-closed by the node
         // (issue #110 — long-lived shared connections make that the
         // common case). Re-fan once via `call`, whose transparent
         // redial recovers it; a second failure is real.
-        Err(_) => refan_write(context, namespace, key, write_ref, tag, retry_capable).await,
-        Ok(_) => Err(Fatal::Transient),
+        Err(_) => {
+            refan_write(
+                context,
+                namespace,
+                key,
+                write_ref,
+                (tag, retry_capable),
+                signal,
+            )
+            .await
+        }
+        Ok(reply) => {
+            let answer = write_answer(reply, tag).ok_or(Fatal::Transient)?;
+            if write.is_none()
+                && let Some(primary) = owners.first()
+            {
+                delete_on_other_owners(context, namespace, key, primary, signal).await;
+            }
+            Ok(answer)
+        }
     }
 }
 
 /// One whole write fan-out over the *current* ring via `call` (redials
 /// dead shared connections) — `finish_write`'s retry path for both a
-/// primary `W` and a transport failure.
+/// primary `W` and a transport failure. A delete reaches the other owners
+/// only once the primary has answered (see `finish_write`).
 async fn refan_write(
     context: &ProxyContext,
     namespace: &[u8],
     key: &[u8],
     write: Option<(&Bytes, Option<u64>)>,
-    tag: Option<u32>,
-    retry_capable: bool,
+    (tag, retry_capable): (Option<u32>, bool),
+    signal: Option<OrderSignal>,
 ) -> DriverResult {
     let Some(ring) = current_ring(context) else {
         return Err(Fatal::Transient);
@@ -6274,13 +6332,54 @@ async fn refan_write(
     let Some((primary, replicas)) = owners.split_first() else {
         return Ok(transient_reply(retry_capable, tag));
     };
-    fan_out_to_replicas(context, replicas, frame.clone(), expect, "write", None).await;
-    match context.backends.call(context, primary, frame, expect).await {
-        Ok(NodeReply::Stored) => Ok(respond("S", tag)),
-        Ok(NodeReply::Deleted) => Ok(respond("D", tag)),
-        Ok(NodeReply::NotFound) => Ok(respond("N", tag)),
-        _ => Err(Fatal::Transient),
+    if write.is_some() {
+        fan_out_to_replicas(context, replicas, frame.clone(), expect, "write", None).await;
     }
+    match context.backends.call(context, primary, frame, expect).await {
+        Ok(reply) => {
+            let answer = write_answer(&reply, tag).ok_or(Fatal::Transient)?;
+            if write.is_none() {
+                delete_on_other_owners(context, namespace, key, primary, signal).await;
+            }
+            Ok(answer)
+        }
+        Err(_) => Err(Fatal::Transient),
+    }
+}
+
+/// The deferred replica legs of a delete (see `finish_write`): the plain
+/// `D`/`d` to every owner of `key` on the current ring other than
+/// `answered`, as `expire_on_other_owners` does for an expiring touch.
+async fn delete_on_other_owners(
+    context: &ProxyContext,
+    namespace: &[u8],
+    key: &[u8],
+    answered: &str,
+    signal: Option<OrderSignal>,
+) {
+    let others = other_owners(context, namespace, key, answered);
+    if others.is_empty() {
+        return;
+    }
+    let frame = frame_delete(namespace, key);
+    fan_out_to_replicas(context, &others, frame, Expect::Deleted, "delete", signal).await;
+}
+
+/// Every owner of `key` on the current ring other than `answered`, the
+/// node whose definitive reply the client is about to get.
+fn other_owners(
+    context: &ProxyContext,
+    namespace: &[u8],
+    key: &[u8],
+    answered: &str,
+) -> Vec<String> {
+    let Some(ring) = current_ring(context) else {
+        return Vec::new();
+    };
+    ring.owners(namespace, key)
+        .into_iter()
+        .filter(|addr| addr != answered)
+        .collect()
 }
 
 /// The frames of a touch for its owners, primary first, and what each
@@ -6359,14 +6458,7 @@ async fn expire_on_other_owners(
     answered: &str,
     signal: Option<OrderSignal>,
 ) {
-    let Some(ring) = current_ring(context) else {
-        return;
-    };
-    let others: Vec<String> = ring
-        .owners(namespace, key)
-        .into_iter()
-        .filter(|addr| addr != answered)
-        .collect();
+    let others = other_owners(context, namespace, key, answered);
     if others.is_empty() {
         return;
     }
@@ -7776,13 +7868,14 @@ impl OrderTicket {
     }
 }
 
-/// Whether `request` is a touch that expires the keys it finds, whose
-/// replica legs are enqueued only after the primary's reply.
-fn expires_at_once_request(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::Touch { ttl, .. } | Request::MultiTouch { ttl, .. } if expires_at_once(*ttl)
-    )
+/// Whether `request`'s replica legs are enqueued only after the primary's
+/// reply: a touch that expires the keys it finds, or a delete.
+fn replicas_after_primary(request: &Request) -> bool {
+    match request {
+        Request::Touch { ttl, .. } | Request::MultiTouch { ttl, .. } => expires_at_once(*ttl),
+        Request::Delete { .. } => true,
+        _ => false,
+    }
 }
 
 /// Registrations between sweeps of released entries, at least.
@@ -7818,9 +7911,10 @@ impl ConnectionOrder {
             request,
             Request::Incr { .. } | Request::CasSet { .. } | Request::CasDelete { .. }
         );
-        // An expiring touch (`t`/`y` with ttl 0) registers too: its replica
-        // legs go out only after the primary has answered (issue #1847).
-        if pending.waits.is_empty() && !primary_evaluated && !expires_at_once_request(request) {
+        // An expiring touch (`t`/`y` with ttl 0) and a delete register too:
+        // their replica legs go out only after the primary has answered
+        // (issue #1847).
+        if pending.waits.is_empty() && !primary_evaluated && !replicas_after_primary(request) {
             return OrderTicket {
                 waits: pending.waits,
                 signal: None,
@@ -11840,6 +11934,9 @@ mod tests {
         /// `a_cas_results_fan_out_never_replays_the_operation_on_a_replica`).
         cas_sets: Arc<AtomicUsize>,
         cas_deletes: Arc<AtomicUsize>,
+        /// How many `D`/`d` frames this node received, including one it
+        /// answered `W` — shows when a replica got its leg, and how often.
+        deletes: Arc<AtomicUsize>,
         /// The TTL field (if any) of every `S`/`s` this node received, in
         /// arrival order — shows which TTL a fanned-out result carried.
         set_ttls: Arc<StdMutex<Vec<Option<u64>>>>,
@@ -11893,6 +11990,7 @@ mod tests {
                 incrs: Arc::new(AtomicUsize::new(0)),
                 cas_sets: Arc::new(AtomicUsize::new(0)),
                 cas_deletes: Arc::new(AtomicUsize::new(0)),
+                deletes: Arc::new(AtomicUsize::new(0)),
                 set_ttls: Arc::new(StdMutex::new(Vec::new())),
                 incr_reply_ttl: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 keepalives: Arc::new(AtomicUsize::new(0)),
@@ -11923,6 +12021,7 @@ mod tests {
             let incrs = Arc::clone(&node.incrs);
             let cas_sets = Arc::clone(&node.cas_sets);
             let cas_deletes = Arc::clone(&node.cas_deletes);
+            let deletes = Arc::clone(&node.deletes);
             let set_ttls = Arc::clone(&node.set_ttls);
             let incr_reply_ttl = Arc::clone(&node.incr_reply_ttl);
             let keepalives = Arc::clone(&node.keepalives);
@@ -11965,6 +12064,7 @@ mod tests {
                             incrs: Arc::clone(&incrs),
                             cas_sets: Arc::clone(&cas_sets),
                             cas_deletes: Arc::clone(&cas_deletes),
+                            deletes: Arc::clone(&deletes),
                             set_ttls: Arc::clone(&set_ttls),
                             incr_reply_ttl: Arc::clone(&incr_reply_ttl),
                             keepalives: Arc::clone(&keepalives),
@@ -11993,6 +12093,10 @@ mod tests {
 
         fn cas_deletes(&self) -> usize {
             self.cas_deletes.load(Ordering::SeqCst)
+        }
+
+        fn deletes(&self) -> usize {
+            self.deletes.load(Ordering::SeqCst)
         }
 
         fn set_ttls(&self) -> Vec<Option<u64>> {
@@ -12048,6 +12152,7 @@ mod tests {
         incrs: Arc<AtomicUsize>,
         cas_sets: Arc<AtomicUsize>,
         cas_deletes: Arc<AtomicUsize>,
+        deletes: Arc<AtomicUsize>,
         set_ttls: Arc<StdMutex<Vec<Option<u64>>>>,
         incr_reply_ttl: Arc<std::sync::atomic::AtomicU64>,
         keepalives: Arc<AtomicUsize>,
@@ -12114,6 +12219,7 @@ mod tests {
             incrs,
             cas_sets,
             cas_deletes,
+            deletes,
             set_ttls,
             incr_reply_ttl,
             keepalives,
@@ -12761,6 +12867,7 @@ mod tests {
                             read_exact_into(&mut stream, &mut buf, key_length).await?;
                             (Vec::new(), buf.split_to(key_length).to_vec())
                         };
+                        deletes.fetch_add(1, Ordering::SeqCst);
                         if wrong_once.swap(false, Ordering::SeqCst) {
                             stream
                                 .write_all(format!("W {}\n", tag(&fields)).as_bytes())
@@ -12770,6 +12877,11 @@ mod tests {
                         let existed = store.lock().unwrap().remove(&(namespace, key)).is_some();
                         if close_after_delete_apply_once.swap(false, Ordering::SeqCst) {
                             return Ok(());
+                        }
+                        // The reply, not the apply, is what waits, as for `t`.
+                        let pause = *delay.lock().unwrap();
+                        if !pause.is_zero() {
+                            sleep(pause).await;
                         }
                         let marker = if existed { "D" } else { "N" };
                         stream
@@ -17342,6 +17454,38 @@ mod tests {
         assert_eq!(&buf.split_to(2)[..], b"vv");
     }
 
+    /// A tagged `D` and `d` (tag 2) of `key`, each with its namespace.
+    const DELETE_FORMS: [(&[u8], &[u8]); 2] = [(b"", b"D 3 2\nkey"), (b"ns", b"d 2 3 2\nnskey")];
+
+    /// `primary_and_replica` for a key in `namespace`: `key`'s primary and
+    /// replica in a two-node `cluster` (the primary is the same at any
+    /// replication factor).
+    fn primary_and_replica_in<'a>(
+        nodes: &'a [MockNode],
+        namespace: &[u8],
+        key: &[u8],
+    ) -> (&'a MockNode, &'a MockNode) {
+        let ring = RingView::new(
+            vec![
+                ("node-a".to_string(), nodes[0].addr.clone()),
+                ("node-b".to_string(), nodes[1].addr.clone()),
+            ],
+            2,
+        );
+        if ring.owners(namespace, key)[0] == nodes[0].addr {
+            (&nodes[0], &nodes[1])
+        } else {
+            (&nodes[1], &nodes[0])
+        }
+    }
+
+    fn store_on(node: &MockNode, namespace: &[u8], key: &[u8]) {
+        node.store
+            .lock()
+            .unwrap()
+            .insert((namespace.to_vec(), key.to_vec()), b"v".to_vec());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_delete_whose_reply_was_lost_is_re_sent_and_answers_what_the_retry_found() {
         // A delete is idempotent, so the proxy sends it again when the
@@ -17361,6 +17505,161 @@ mod tests {
         stream.write_all(b"D 1\nk").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
         assert!(nodes[0].entry(b"", b"k").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_rerouted_to_its_replica_after_a_w_finds_the_key() {
+        // The primary answers `W`, and the refreshed roster lists only the
+        // replica, which the re-fan asks as the new primary. Sent together
+        // with the primary leg, the replica's delete had already removed its
+        // copy, and the client was told `N` for a key that existed although
+        // no reply was lost.
+        for (namespace, request) in DELETE_FORMS {
+            let form = String::from_utf8_lossy(request);
+            let nodes = vec![MockNode::start().await, MockNode::start().await];
+            let names = ["node-a", "node-b"];
+            let roster: Vec<(String, String)> = names
+                .iter()
+                .zip(&nodes)
+                .map(|(name, node)| (name.to_string(), node.addr.clone()))
+                .collect();
+            let discovery = start_mock_discovery_handle(roster.clone(), 2).await;
+            let proxy = start_proxy(&discovery.addr, None, 64).await;
+            let (primary, replica) = primary_and_replica_in(&nodes, namespace, b"key");
+            for node in &nodes {
+                store_on(node, namespace, b"key");
+            }
+            let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+
+            *discovery.roster.lock().unwrap() = roster
+                .into_iter()
+                .filter(|(_, addr)| *addr == replica.addr)
+                .collect();
+            primary.wrong_node_once.store(true, Ordering::SeqCst);
+            stream.write_all(request).await.unwrap();
+            assert_eq!(
+                read_line(&mut stream, &mut buf).await.unwrap(),
+                "D 2",
+                "{form}"
+            );
+            assert_eq!(primary.deletes(), 1, "{form}: only the `W`");
+            assert_eq!(
+                replica.deletes(),
+                1,
+                "{form}: the replica is asked once, as the new primary"
+            );
+            assert!(replica.entry(namespace, b"key").is_none(), "{form}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_reaches_no_replica_before_its_primary_answered() {
+        let (nodes, proxy, replica) = two_nodes_with_replica_of("key").await;
+        let primary = &nodes[1 - replica];
+        for node in &nodes {
+            store_on(node, b"", b"key");
+        }
+        *primary.get_delay.lock().unwrap() = Duration::from_millis(300);
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"D 3\nkey").await.unwrap();
+        // The primary has applied the delete and is holding its reply.
+        for _ in 0..100 {
+            if primary.deletes() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(primary.deletes(), 1);
+        assert_eq!(
+            nodes[replica].deletes(),
+            0,
+            "the replica must not be sent the delete before the primary answered"
+        );
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "D");
+        assert_eq!(nodes[replica].deletes(), 1);
+        assert!(nodes[replica].entry(b"", b"key").is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_does_not_reach_a_replica_while_its_primary_is_unreachable() {
+        // As for a `ttl=0` touch (issue #934): sent together with the primary
+        // leg, the replica deleted its copy while the primary could not be
+        // reached, and the re-fan over a refreshed ring that made it the
+        // primary would have answered `N` for a key that existed.
+        for namespaced in [false, true] {
+            let (live, proxy, key) = live_replica_dead_primary_cluster().await;
+            store_on(&live, b"", key.as_bytes());
+            let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+            let request = if namespaced {
+                format!("d 0 {} 1\n{key}", key.len())
+            } else {
+                format!("D {} 1\n{key}", key.len())
+            };
+            stream.write_all(request.as_bytes()).await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 1");
+            assert_eq!(
+                live.deletes(),
+                0,
+                "namespaced={namespaced}: the replica must not be sent the delete while the primary leg fails"
+            );
+            assert_eq!(live.entry(b"", key.as_bytes()), Some(b"v".to_vec()));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_reaches_the_replica_once_after_the_primary_answered() {
+        // The primary's stale `W` costs one refresh-and-re-fan; the replica
+        // is sent its delete exactly once, after the primary answered, and
+        // the client is told the key existed.
+        for (namespace, request) in DELETE_FORMS {
+            let form = String::from_utf8_lossy(request);
+            let (nodes, proxy) = cluster(2).await;
+            let (primary, replica) = primary_and_replica_in(&nodes, namespace, b"key");
+            for node in &nodes {
+                store_on(node, namespace, b"key");
+            }
+            let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+
+            primary.wrong_node_once.store(true, Ordering::SeqCst);
+            stream.write_all(request).await.unwrap();
+            assert_eq!(
+                read_line(&mut stream, &mut buf).await.unwrap(),
+                "D 2",
+                "{form}"
+            );
+            assert_eq!(primary.deletes(), 2, "{form}: the `W`, then the re-fan");
+            assert_eq!(
+                replica.deletes(),
+                1,
+                "{form}: one delete, sent after the primary answered"
+            );
+            assert!(
+                nodes
+                    .iter()
+                    .all(|node| node.entry(namespace, b"key").is_none()),
+                "{form}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_write_pipelined_behind_a_delete_is_not_deleted_on_the_replica() {
+        // The delete's replica leg goes out once the primary has answered,
+        // so the `S` behind it waits for that leg (as behind a `ttl=0`
+        // touch, issue #1847) instead of reaching the replica first and
+        // being deleted there by the late leg.
+        let (nodes, proxy, replica) = two_nodes_with_replica_of("key").await;
+        *nodes[1 - replica].get_delay.lock().unwrap() = Duration::from_millis(150);
+        let (mut stream, mut buf) = connect_and_auth(&proxy).await;
+        stream.write_all(b"D 3\nkeyS 3 1\nkeyv").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S");
+        assert!(
+            replica_settles_on(&nodes[replica], b"key", Some(b"v")).await,
+            "the replica must hold the acknowledged write, not the late delete"
+        );
+        assert_eq!(nodes[1 - replica].entry(b"", b"key"), Some(b"v".to_vec()));
     }
 
     #[tokio::test(flavor = "current_thread")]
