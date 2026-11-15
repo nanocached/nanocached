@@ -7756,6 +7756,17 @@ class RetryableErrorTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
+    async def test_an_empty_auth_secret_sends_the_placeholder_not_the_malformed_a_0(self):
+        node = await MockNode(support_tags=True).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)], auth_secret="")
+            try:
+                self.assertEqual(node.last_auth_header, b"A 1 T R")
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
     async def test_falls_back_from_retryable_to_tagged_against_a_server_that_predates_r(self):
         # A server that understands `T` but not the further-extended `T
         # R` closes on the retryable probe only — the client must redial

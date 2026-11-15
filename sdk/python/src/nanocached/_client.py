@@ -825,7 +825,9 @@ class NanocachedClient:
 
         client = cls()
         client._addresses = list(addresses)
-        client._auth_secret = auth_secret.encode("utf-8") if auth_secret is not None else None
+        # An empty secret is no secret, as in the Rust, Go, Java and .NET
+        # SDKs: sent as is it would be `A 0`, which every server answers `En`.
+        client._auth_secret = auth_secret.encode("utf-8") if auth_secret else None
         client._ssl_context = _build_ssl_context(tls, ca)
         client._compress = compress
         client._compression_threshold = compression_threshold
