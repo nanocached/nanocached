@@ -43,6 +43,10 @@
     "build": "pnpm run build:sdk && tsc",
     "pretypecheck": "pnpm run build:sdk",
     "typecheck": "tsc --noEmit",
+    "prelint": "pnpm run build:sdk",
+    "lint": "oxlint --report-unused-disable-directives --deny-warnings",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check",
     "pretest": "pnpm run build:sdk",
     "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
     "prepublishOnly": "npm run test && npm run build"
@@ -59,6 +63,9 @@
     "cache-manager": "^7.2.0",
     "keyv": "^6.1.0",
     "keyv5": "npm:keyv@^5.6.0",
+    "oxfmt": "0.78.0",
+    "oxlint": "1.93.0",
+    "oxlint-tsgolint": "7.0.2007",
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.8.0",
     "typescript": "^7.0.2"

@@ -40,11 +40,17 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "lint": "oxlint --report-unused-disable-directives --deny-warnings",
+    "format": "oxfmt",
+    "format:check": "oxfmt --check",
     "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
     "prepublishOnly": "npm run test && npm run build"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
+    "oxfmt": "0.78.0",
+    "oxlint": "1.93.0",
+    "oxlint-tsgolint": "7.0.2007",
     "typescript": "^7.0.2"
   }
 }

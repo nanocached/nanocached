@@ -138,14 +138,6 @@ function namespaceParts(namespace: Uint8Array): void {
   }
 }
 
-/** `keyHash(key, namespace)` into `partsHi`/`partsLo` — FNV-1a fed the
- * `be32(len(ns))`, namespace and key bytes one after the other, which is
- * the same stream `keyHash` concatenates (see its doc comment). */
-function keyHashParts(key: Uint8Array, namespace: Uint8Array): void {
-  namespaceParts(namespace);
-  for (let i = 0; i < key.length; i++) feedPart(key[i]);
-}
-
 /** `fmix64` of the value `hi:lo` (each taken mod 2^32), into
  * `partsHi`/`partsLo`. */
 function scoreParts(hiIn: number, loIn: number): void {

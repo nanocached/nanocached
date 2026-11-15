@@ -67,7 +67,9 @@ export const MAX_REQUEST_BYTES = 1024 * 1024 - MAX_REQUEST_HEADER_LENGTH;
  */
 export function utf8Bytes(text: string): Buffer {
   if (!text.isWellFormed()) {
-    throw new RangeError("nanocached: a string with a lone surrogate has no UTF-8 encoding; use a Uint8Array or a well-formed string");
+    throw new RangeError(
+      "nanocached: a string with a lone surrogate has no UTF-8 encoding; use a Uint8Array or a well-formed string",
+    );
   }
   return Buffer.from(text, "utf8");
 }
@@ -98,7 +100,9 @@ export function checkKey(key: Uint8Array, namespace: Uint8Array = EMPTY_NAMESPAC
     throw new RangeError("nanocached: key must not be empty");
   }
   if (namespace.length + key.length > MAX_REQUEST_BYTES) {
-    throw new RangeError(`nanocached: namespace and key together exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${namespace.length + key.length} bytes`);
+    throw new RangeError(
+      `nanocached: namespace and key together exceed MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${namespace.length + key.length} bytes`,
+    );
   }
 }
 
@@ -120,7 +124,12 @@ export const COMPRESSION_MARKER_BYTES = 1;
 // that compresses well slip past the cap; Python's client.py has the
 // same two-layer check for the same reason). `allowance` is extra bytes
 // permitted on top of the cap: the encoders pass COMPRESSION_MARKER_BYTES.
-export function checkKeyAndValue(key: Uint8Array, value: Uint8Array, namespace: Uint8Array = EMPTY_NAMESPACE, allowance = 0): void {
+export function checkKeyAndValue(
+  key: Uint8Array,
+  value: Uint8Array,
+  namespace: Uint8Array = EMPTY_NAMESPACE,
+  allowance = 0,
+): void {
   checkKey(key, namespace);
   if (namespace.length + key.length + value.length > MAX_REQUEST_BYTES + allowance) {
     // See MAX_REQUEST_BYTES/checkKey above: same server-side rejection, same
@@ -144,7 +153,13 @@ export function encodeGet(key: Uint8Array, tag?: number, namespace: Uint8Array =
 // TTL field entirely — exactly what an absent/undefined TTL meant before
 // this field existed; the server has no separate "explicit no-op TTL"
 // concept, so any other encoding would be a distinct thing.
-export function encodeSet(key: Uint8Array, value: Uint8Array, ttlSeconds = 0, tag?: number, namespace: Uint8Array = EMPTY_NAMESPACE): Buffer {
+export function encodeSet(
+  key: Uint8Array,
+  value: Uint8Array,
+  ttlSeconds = 0,
+  tag?: number,
+  namespace: Uint8Array = EMPTY_NAMESPACE,
+): Buffer {
   if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 0) {
     // A non-integer/negative/too-large TTL (3.5, -1, NaN, Infinity, 1e21)
     // would serialize to a frame the server rejects with no reply, closing
@@ -196,7 +211,9 @@ export function encodeIncr(key: Uint8Array, delta: number, tag?: number, namespa
   // actually mean, so reject it here, synchronously, before anything is
   // written.
   if (!Number.isSafeInteger(delta)) {
-    throw new RangeError(`nanocached: delta must be a safe integer (got ${delta}) — see README's incr/decr section for the precision caveat`);
+    throw new RangeError(
+      `nanocached: delta must be a safe integer (got ${delta}) — see README's incr/decr section for the precision caveat`,
+    );
   }
   return Buffer.concat([toAscii(`i ${namespace.length} ${key.length} ${delta}${tagField(tag)}\n`), namespace, key]);
 }
@@ -285,7 +302,10 @@ function validateDigest(digest: string): void {
  * 32-character lowercase hex string (three-argument
  * `replace(key, old, new)`). `x`'s own `<cond>` (two-argument
  * `remove(key, old)`) only ever uses `digest` — see `encodeCasDelete`. */
-export type CasCondition = { readonly kind: "absent" } | { readonly kind: "present" } | { readonly kind: "digest"; readonly digest: string };
+export type CasCondition =
+  | { readonly kind: "absent" }
+  | { readonly kind: "present" }
+  | { readonly kind: "digest"; readonly digest: string };
 
 function condToken(cond: CasCondition): string {
   switch (cond.kind) {
@@ -310,7 +330,14 @@ function condToken(cond: CasCondition): string {
 // exactly what it means for `S` (omitted/0 = no expiry); unlike `i`, the
 // new value is supplied whole by the caller, so there's no old TTL to
 // preserve.
-export function encodeCas(key: Uint8Array, value: Uint8Array, cond: CasCondition, ttlSeconds = 0, tag?: number, namespace: Uint8Array = EMPTY_NAMESPACE): Buffer {
+export function encodeCas(
+  key: Uint8Array,
+  value: Uint8Array,
+  cond: CasCondition,
+  ttlSeconds = 0,
+  tag?: number,
+  namespace: Uint8Array = EMPTY_NAMESPACE,
+): Buffer {
   if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds < 0) {
     // Same rationale as encodeSet's own check: a bad/too-large TTL would
     // serialize into a frame the server rejects with no reply, closing the
@@ -356,7 +383,9 @@ export function encodeClear(namespace: Uint8Array = EMPTY_NAMESPACE, tag?: numbe
   // rejection as an oversized key/value (see checkKey above), so this
   // guards for it too before anything is written.
   if (namespace.length > MAX_REQUEST_BYTES) {
-    throw new RangeError(`nanocached: namespace exceeds MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${namespace.length} bytes`);
+    throw new RangeError(
+      `nanocached: namespace exceeds MAX_REQUEST_BYTES (${MAX_REQUEST_BYTES} bytes), got ${namespace.length} bytes`,
+    );
   }
   return Buffer.concat([toAscii(`c ${namespace.length}${tagField(tag)}\n`), namespace]);
 }
@@ -546,7 +575,10 @@ export function encodeMultiTouch(
  * every other key's. `"hit"`/`"miss"` are `M`-only (a `O` reply has
  * nothing to echo back); `"stored"` is `O`-only; `"wrongNode"` is
  * shared by both. */
-export type MultiEntry = { readonly kind: "hit"; readonly value: Buffer } | { readonly kind: "miss" } | { readonly kind: "wrongNode" };
+export type MultiEntry =
+  | { readonly kind: "hit"; readonly value: Buffer }
+  | { readonly kind: "miss" }
+  | { readonly kind: "wrongNode" };
 export type MultiAckEntry = { readonly kind: "stored" } | { readonly kind: "wrongNode" };
 /** One key's answer in a batched touch's `Y` roster (issue #871): `touched`
  * (`S`), `missing` (`N`, no live entry — a touch never creates one) or
@@ -623,8 +655,7 @@ const MAX_TAGGED_FIXED_FRAME_LENGTH = 2 + String(MAX_TAG).length + 1;
 // chunks is never mistaken for a desynced one. Exported so Connection
 // can bound total per-frame accumulation as a backstop covering every
 // response kind, not just the header search above.
-export const MAX_RESPONSE_FRAME_LENGTH =
-  MAX_VALUE_HEADER_LENGTH + 1 + String(MAX_TAG).length + MAX_VALUE_LENGTH;
+export const MAX_RESPONSE_FRAME_LENGTH = MAX_VALUE_HEADER_LENGTH + 1 + String(MAX_TAG).length + MAX_VALUE_LENGTH;
 
 const MARKER_STORED = 0x53; // 'S'
 const MARKER_DELETED = 0x44; // 'D'
@@ -821,7 +852,8 @@ function parseMultiHeader(buf: Buffer, tagged: boolean): MultiHeader | null {
  * tryParseResponse itself to reject the next time it's actually
  * invoked. */
 export function peekMultiFrameLength(buf: Buffer, tagged: boolean): number | undefined {
-  if (buf.length === 0 || (buf[0] !== MARKER_MULTI && buf[0] !== MARKER_MULTI_ACK && buf[0] !== MARKER_MULTI_TOUCH)) return undefined;
+  if (buf.length === 0 || (buf[0] !== MARKER_MULTI && buf[0] !== MARKER_MULTI_ACK && buf[0] !== MARKER_MULTI_TOUCH))
+    return undefined;
 
   let header: MultiHeader | null;
   try {

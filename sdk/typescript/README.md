@@ -821,6 +821,18 @@ family (e.g. an invalid `ttlSeconds` throws a builtin `RangeError`):
 those indicate a bug in the calling code, not a nanocached failure, a
 convention shared across the SDKs.
 
+## Build
+
+```sh
+pnpm install
+pnpm format         # oxfmt, in place (Markdown is left alone)
+pnpm format:check   # what CI runs; fails on any unformatted file
+pnpm lint           # oxlint, including type-aware rules (oxlint-tsgolint)
+pnpm typecheck      # tsc --noEmit, strict
+pnpm test           # node --test against in-process mock servers
+pnpm build
+```
+
 ## License
 
 MIT

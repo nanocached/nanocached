@@ -209,9 +209,14 @@ Django cache backend, [JCache](../jcache), [Keyv](../keyv) for
 
 ## Building
 
-```
+```sh
 cd adapters/cache-manager
-pnpm install && pnpm typecheck && pnpm test
+pnpm install
+pnpm format         # oxfmt, in place (Markdown is left alone)
+pnpm format:check   # what CI runs; fails on any unformatted file
+pnpm lint           # oxlint, including type-aware rules (oxlint-tsgolint)
+pnpm typecheck      # tsc --noEmit, strict
+pnpm test
 ```
 
 This package depends on the sibling `sdk/typescript` via
@@ -223,7 +228,7 @@ which always creates a real symlink to that directory (unlike plain
 (`dist/`) is gitignored and produced by a separate build step, an install
 that ran before that step packed an incomplete dependency missing
 `dist/` entirely, permanently, until the next `pnpm install`). With the
-symlink, `pretypecheck`/`pretest` scripts here run `sdk/typescript`'s own
+symlink, `pretypecheck`/`prelint`/`pretest` scripts here run `sdk/typescript`'s own
 `build` first (`pnpm --dir ../../sdk/typescript run build`) so
 `dist/` exists before `tsc`/`node --test` resolve `nanocached` through it
 — no manual build step, no checked-in SDK artifact needed for a fresh

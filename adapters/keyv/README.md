@@ -312,9 +312,14 @@ ecosystems get their own idiomatic adapters (Spring `CacheManager`,
 
 ## Building
 
-```
+```sh
 cd adapters/keyv
-pnpm install && pnpm typecheck && pnpm test
+pnpm install
+pnpm format         # oxfmt, in place (Markdown is left alone)
+pnpm format:check   # what CI runs; fails on any unformatted file
+pnpm lint           # oxlint, including type-aware rules (oxlint-tsgolint)
+pnpm typecheck      # tsc --noEmit, strict
+pnpm test
 ```
 
 The tests run the adapter through keyv 6 directly (`keyv`, the dev
@@ -324,6 +329,6 @@ also what `cache-manager` and NestJS use).
 This package depends on the sibling `sdk/typescript` via
 `"nanocached": "link:../../sdk/typescript"` — see the sibling
 `cache-manager` adapter's README for why `link:` (not `file:`) and the
-`build:sdk`/`pretypecheck`/`pretest` scripts exist.
+`build:sdk`/`pretypecheck`/`prelint`/`pretest` scripts exist.
 
 MIT license.

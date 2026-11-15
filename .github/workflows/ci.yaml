@@ -62,6 +62,14 @@ jobs:
         working-directory: sdk/typescript
         run: pnpm install --frozen-lockfile
 
+      - name: Check formatting
+        working-directory: sdk/typescript
+        run: pnpm format:check
+
+      - name: Lint
+        working-directory: sdk/typescript
+        run: pnpm lint
+
       - name: Typecheck
         working-directory: sdk/typescript
         run: pnpm typecheck
@@ -307,7 +315,16 @@ jobs:
 
       - name: Install dependencies
         working-directory: adapters/cache-manager
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Check formatting
+        working-directory: adapters/cache-manager
+        run: pnpm format:check
+
+      # prelint builds the sibling SDK first: type-aware rules need its .d.ts.
+      - name: Lint
+        working-directory: adapters/cache-manager
+        run: pnpm lint
 
       - name: Typecheck
         working-directory: adapters/cache-manager
@@ -350,7 +367,16 @@ jobs:
 
       - name: Install dependencies
         working-directory: adapters/keyv
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Check formatting
+        working-directory: adapters/keyv
+        run: pnpm format:check
+
+      # prelint builds the sibling SDK first: type-aware rules need its .d.ts.
+      - name: Lint
+        working-directory: adapters/keyv
+        run: pnpm lint
 
       - name: Typecheck
         working-directory: adapters/keyv

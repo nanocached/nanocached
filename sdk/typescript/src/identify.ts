@@ -163,7 +163,7 @@ function readFrame<T>(
         parsed = parser.parse(buffer);
       } catch (error) {
         cleanup();
-        reject(error as Error);
+        reject(error);
         return;
       }
 
@@ -249,7 +249,7 @@ function tryParseIdentity(buf: Buffer): AuthIdentity | null {
   const status = buf[0];
   const type = buf[1];
 
-  const accepted = status === 0x4f /* 'O' */;
+  const accepted = status === 0x4f; /* 'O' */
   if (!accepted && status !== 0x45 /* 'E' */) {
     throw new HandshakeError("nanocached: unexpected response to A");
   }
@@ -289,7 +289,9 @@ export class AuthenticationError extends NanocachedError {
  * should try another address, or retry shortly. */
 export class DiscoveryBusyError extends NanocachedError {
   constructor() {
-    super("nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's");
+    super(
+      "nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's",
+    );
     this.name = "DiscoveryBusyError";
   }
 }
@@ -430,7 +432,9 @@ function readNodeListHeader(buf: Buffer): ListHeader<{ nodes: DiscoveredNode[]; 
   }
 
   if (buf[0] !== 0x4e /* 'N' */) {
-    throw new NanocachedError(`nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`);
+    throw new NanocachedError(
+      `nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`,
+    );
   }
 
   // `N <count> <r>\n` (client-side replication) — the replication factor rides along.
@@ -477,7 +481,9 @@ function readProxyListHeader(buf: Buffer): ListHeader<DiscoveredNode[]> | null {
   }
 
   if (buf[0] !== 0x4e /* 'N' */) {
-    throw new NanocachedError(`nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`);
+    throw new NanocachedError(
+      `nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`,
+    );
   }
 
   const count = parseStrictInteger(buf.subarray(2, headerEnd).toString("ascii"));
@@ -678,7 +684,11 @@ export async function connectAndListProxies(options: IdentifyOptions): Promise<P
   }
 }
 
-async function listProxiesOnce(options: IdentifyOptions, requestTags: boolean, requestRetryable: boolean): Promise<ProxyListResult> {
+async function listProxiesOnce(
+  options: IdentifyOptions,
+  requestTags: boolean,
+  requestRetryable: boolean,
+): Promise<ProxyListResult> {
   const deadlineMs = options.connectDeadlineMs ?? CONNECT_DEADLINE_MS;
   const startedAt = Date.now();
   const identified = await authenticate(options, requestTags, requestRetryable, deadlineMs, startedAt);
