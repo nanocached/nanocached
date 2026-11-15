@@ -5172,6 +5172,29 @@ async fn connect_client_stream(
     .await
 }
 
+/// `connect_client_stream` for `register_with_discovery`'s long-lived
+/// connection, with TCP keepalive on (issue #1893). A `J` waits for its
+/// promotion with no timeout (see there), so a discovery host that vanished
+/// without a FIN or RST (power loss, a black-holed route) would otherwise
+/// hold that wait until shutdown; the kernel now fails the read after about
+/// 25 s of silence instead (`infra::TCP_KEEPALIVE_IDLE`). Set on the TCP
+/// socket under TLS too: the option belongs to the socket, which the TLS
+/// layer only wraps.
+async fn connect_discovery_stream(
+    addr: &str,
+    tls_connector: Option<&TlsConnector>,
+) -> io::Result<ClientStream> {
+    let stream = connect_client_stream(addr, tls_connector).await?;
+    let socket = match &stream {
+        infra::MaybeTls::Plain(socket) => socket,
+        infra::MaybeTls::Tls(tls) => tls.get_ref().0,
+    };
+    if let Err(error) = infra::enable_tcp_keepalive(socket) {
+        eprintln!("WARN enabling TCP keepalive for discovery server at {addr} failed: {error}");
+    }
+    Ok(stream)
+}
+
 /// This registration task's relationship to one discovery replica
 /// (discovery HA). The primary is the only one ever sent `J` — the staged node join
 /// join, with its data handoff — and flips the shared `promoted` flag
@@ -5379,7 +5402,7 @@ async fn register_with_discovery(
         // unreachable take ~30s to exit.
         let connected = tokio::select! {
             _ = shutdown_rx.changed() => return,
-            result = connect_client_stream(&discovery_addr, tls_connector.as_ref()) => result,
+            result = connect_discovery_stream(&discovery_addr, tls_connector.as_ref()) => result,
         };
 
         match connected {
@@ -5469,12 +5492,28 @@ async fn register_with_discovery(
                     // For `J`, staged node join: this connection is held open by
                     // discovery (no idle timeout applies) until this node
                     // is promoted, which may take an unbounded amount of
-                    // time if another join is already in progress. For
-                    // `P`, the same `R\n` comes back immediately.
+                    // time if another join is already in progress — so no
+                    // timeout here, only the keepalive
+                    // `connect_discovery_stream` set. For `P`, `R\n` (or
+                    // `G\n`) comes back immediately or the connection is
+                    // dropped. Issue #1893: so that reply is bounded like
+                    // the heartbeat ack below; a discovery host that
+                    // vanished right after the `P` held this task until
+                    // shutdown, never redialing this replica (nor, for the
+                    // primary, adopting its rosters). Expiry fails the
+                    // registration and redials like any other failure.
                     let mut promoted = [0u8; 2];
                     let read_promoted = tokio::select! {
                         _ = shutdown_rx.changed() => return,
-                        result = stream.read_exact(&mut promoted) => result,
+                        result = async {
+                            if sending_join {
+                                stream.read_exact(&mut promoted).await
+                            } else {
+                                timeout(OUTBOUND_IO_TIMEOUT, stream.read_exact(&mut promoted))
+                                    .await
+                                    .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+                            }
+                        } => result,
                     };
 
                     // Discovery evicted this node earlier and the cluster
@@ -34790,6 +34829,83 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_heartbeats_redials_when_the_announce_is_never_answered() {
+        // Issue #1893: the reply to a `P` announce was read with no
+        // timeout, so a discovery host that vanished without a FIN or RST
+        // right after the `P` held the registration until shutdown: no
+        // redial, no heartbeat, no roster. It must give up within
+        // `OUTBOUND_IO_TIMEOUT` and redial instead.
+        //
+        // Real time, not `start_paused`, for the reason given in
+        // `send_heartbeats_redials_when_the_ack_never_arrives`.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+
+        let (announced_tx, announced_rx) = oneshot::channel::<Vec<u8>>();
+        let (redialed_tx, redialed_rx) = oneshot::channel::<()>();
+        let fake_discovery = tokio::spawn(async move {
+            let mut buffer = [0u8; 128];
+            // The first join: promoted, one heartbeat, then the connection
+            // goes away without an ack, so the node re-registers with a
+            // `P` on the next one.
+            let (mut first, _) = listener.accept().await.unwrap();
+            let _ = first.read(&mut buffer).await;
+            first.write_all(b"R\n").await.unwrap();
+            let _ = first.read(&mut buffer).await;
+            drop(first);
+
+            // The announce: read, and then never answered nor closed —
+            // only a timeout, not a read error, should end this leg.
+            let (mut second, _) = listener.accept().await.unwrap();
+            let n = second.read(&mut buffer).await.unwrap();
+            let _ = announced_tx.send(buffer[..n].to_vec());
+
+            // A third connection means the announce gave up and
+            // `register_with_discovery` redialed.
+            let _ = listener.accept().await;
+            let _ = redialed_tx.send(());
+            drop(second);
+        });
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            ),
+            mpsc::channel::<RereplicationTask>(4).1,
+            shutdown_rx,
+            mpsc::channel(1).0,
+        ));
+
+        let announced = timeout(Duration::from_secs(5), announced_rx).await;
+        let redialed = timeout(OUTBOUND_IO_TIMEOUT + Duration::from_secs(5), redialed_rx).await;
+
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        fake_discovery.abort();
+
+        assert_eq!(
+            String::from_utf8_lossy(&announced.unwrap().unwrap()),
+            "P 9 8356 12 G\ntest-nodetk-test-node"
+        );
+        assert!(
+            matches!(redialed, Ok(Ok(()))),
+            "expected the unanswered announce to time out and trigger a redial within \
+             OUTBOUND_IO_TIMEOUT"
+        );
+    }
+
     /// Installs rustls's default crypto provider if nothing else has yet;
     /// safe to call from multiple tests since a second, redundant install is
     /// just ignored rather than treated as an error.
@@ -35065,6 +35181,62 @@ mod tests {
         fake_discovery.abort();
 
         assert_join_then_heartbeats(&received.lock().unwrap(), 8356);
+    }
+
+    /// Issue #1893: the registration's connection to discovery carries TCP
+    /// keepalive, so a `J` waiting for its promotion on a host that
+    /// vanished without a FIN or RST ends instead of waiting until
+    /// shutdown. A vanished peer cannot be simulated in-process, so this
+    /// checks the dialed socket's options — under TLS too, where they must
+    /// be on the socket the TLS stream wraps.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_discovery_stream_enables_tcp_keepalive_with_and_without_tls() {
+        let (acceptor, connector) = self_signed_tls();
+        for (acceptor, connector) in [(None, None), (Some(acceptor), Some(connector))] {
+            let tls = connector.is_some();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let discovery_addr = listener.local_addr().unwrap().to_string();
+            let fake_discovery = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                if let Some(acceptor) = acceptor {
+                    acceptor.accept(stream).await.unwrap();
+                }
+            });
+
+            let stream = connect_discovery_stream(&discovery_addr, connector.as_ref())
+                .await
+                .unwrap();
+            fake_discovery.await.unwrap();
+
+            let socket = match &stream {
+                infra::MaybeTls::Plain(socket) => {
+                    assert!(!tls);
+                    socket
+                }
+                infra::MaybeTls::Tls(stream) => {
+                    assert!(tls);
+                    stream.get_ref().0
+                }
+            };
+            let socket = socket2::SockRef::from(socket);
+            assert!(socket.keepalive().unwrap(), "tls={tls}");
+            assert_eq!(
+                socket.tcp_keepalive_time().unwrap(),
+                infra::TCP_KEEPALIVE_IDLE,
+                "tls={tls}"
+            );
+            assert_eq!(
+                socket.tcp_keepalive_interval().unwrap(),
+                infra::TCP_KEEPALIVE_INTERVAL,
+                "tls={tls}"
+            );
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            assert_eq!(
+                socket.tcp_keepalive_retries().unwrap(),
+                infra::TCP_KEEPALIVE_RETRIES,
+                "tls={tls}"
+            );
+        }
     }
 
     /// The wire bytes of the frame `queued_set_frame` chose.
