@@ -40,12 +40,10 @@ final class NanocachedCacheEntryEvent<K, V> extends CacheEntryEvent<K, V> {
         return value;
     }
 
+    /** JSR-107 1.1: {@code null} when there was no previous value or it is
+     * not available ({@link #isOldValueAvailable()} tells the two apart). */
     @Override
     public V getOldValue() {
-        if (!oldValueAvailable) {
-            throw new UnsupportedOperationException(
-                    "nanocached-jcache: old value not available for this event");
-        }
         return oldValue;
     }
 

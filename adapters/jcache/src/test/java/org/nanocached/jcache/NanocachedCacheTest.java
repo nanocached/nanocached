@@ -1350,6 +1350,25 @@ class NanocachedCacheTest {
         assertEquals(List.of("CREATED:a:1", "UPDATED:a:2:old=1", "REMOVED:a:old=2"), events);
     }
 
+    // JSR-107 1.1: a removed event's getValue() is the removed value, and
+    // getOldValue() is null, not an exception, when there is no old value
+    // (a create, the two-argument replace). Reading it unguarded used to
+    // throw out of the put/replace after the write had landed.
+    @Test
+    void eventValuesFollowJsr107WithoutCheckingOldValueAvailability() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        UnguardedListener<String, String> listener = new UnguardedListener<>(events);
+        cache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(listener), null, true, true));
+
+        cache.put("a", "1"); // created: no old value
+        assertTrue(cache.replace("a", "2")); // updated: old value unavailable
+        cache.remove("a"); // removed
+
+        assertEquals(List.of("CREATED:a:1:null", "UPDATED:a:2:null", "REMOVED:a:2:2"), events);
+        assertNull(cache.get("a"));
+    }
+
     @Test
     void aFilterSuppressesNonMatchingEvents() {
         List<String> events = new CopyOnWriteArrayList<>();
@@ -1687,6 +1706,42 @@ class NanocachedCacheTest {
                 String oldValue = event.isOldValueAvailable() ? String.valueOf(event.getOldValue()) : "?";
                 events.add("REMOVED:" + event.getKey() + ":old=" + oldValue);
             }
+        }
+    }
+
+    /** Reads getValue() and getOldValue() on every event without asking
+     * isOldValueAvailable() first, as a JSR-107 1.1 listener may. */
+    private static final class UnguardedListener<K, V>
+            implements CacheEntryCreatedListener<K, V>,
+                    CacheEntryUpdatedListener<K, V>,
+                    CacheEntryRemovedListener<K, V>,
+                    java.io.Serializable {
+
+        private final transient List<String> events;
+
+        UnguardedListener(List<String> events) {
+            this.events = events;
+        }
+
+        private void record(String type, Iterable<CacheEntryEvent<? extends K, ? extends V>> iterable) {
+            for (CacheEntryEvent<? extends K, ? extends V> event : iterable) {
+                events.add(type + ":" + event.getKey() + ":" + event.getValue() + ":" + event.getOldValue());
+            }
+        }
+
+        @Override
+        public void onCreated(Iterable<CacheEntryEvent<? extends K, ? extends V>> iterable) {
+            record("CREATED", iterable);
+        }
+
+        @Override
+        public void onUpdated(Iterable<CacheEntryEvent<? extends K, ? extends V>> iterable) {
+            record("UPDATED", iterable);
+        }
+
+        @Override
+        public void onRemoved(Iterable<CacheEntryEvent<? extends K, ? extends V>> iterable) {
+            record("REMOVED", iterable);
         }
     }
 

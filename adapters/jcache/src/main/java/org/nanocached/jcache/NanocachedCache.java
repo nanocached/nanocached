@@ -1121,8 +1121,11 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         fire(EventType.UPDATED, key, value, null, false);
     }
 
+    /** JSR-107 1.1: a removed event's {@code getValue()} is the removed
+     * value, the same as {@code getOldValue()} (1.0 listeners read it
+     * there). */
     private void fireRemoved(K key, V oldValue) {
-        fire(EventType.REMOVED, key, null, oldValue, true);
+        fire(EventType.REMOVED, key, oldValue, oldValue, true);
     }
 
     private void fireRemovedWithoutOldValue(K key) {
