@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Discovery: a join that finished because the last member it still waited
+  for was replaced (a restart under a new name at the same address) was
+  not marked completed, unlike one finished by a `C`. An `M` send of that
+  join still retrying then took it for abandoned and sent `X` to a member
+  that had already completed its handoff, which made that member revert
+  its ring and restore the copies it had handed to a node now listed as
+  joined (the #1870 failure, by the other way a join ends).
+
 - Node: a discovery replica whose host vanished without closing the
   connection (power loss, a black-holed route) right after the node
   re-registered with it held that registration until shutdown: the node
