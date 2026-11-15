@@ -1403,7 +1403,27 @@ struct ConnectionConfig {
 /// required; a value that is not valid UTF-8 is a startup error
 /// (`infra::read_env_secret`).
 fn read_auth_secret() -> Result<Option<Bytes>, String> {
-    infra::read_env_secret(AUTH_SECRET_ENV_VAR).map(|secret| secret.map(Bytes::from))
+    infra::read_env_secret(AUTH_SECRET_ENV_VAR)
+        .map(|secret| secret.map(Bytes::from))
+        .and_then(check_auth_secret)
+}
+
+/// Issue #1890: refuses a secret whose `A` frame (header sized for the
+/// longest form, `A <len> T R`) cannot fit `MAX_REQUEST_SIZE`: no client
+/// could ever present it, so every one would be locked out. Mirrors
+/// `nanocached-node`'s own `auth_frame_fits` check at startup.
+fn check_auth_secret(secret: Option<Bytes>) -> Result<Option<Bytes>, String> {
+    if let Some(secret) = &secret
+        && format!("A {} T R\n", secret.len()).len() + secret.len() > MAX_REQUEST_SIZE
+    {
+        return Err(format!(
+            "{AUTH_SECRET_ENV_VAR} is {} bytes; an auth frame must fit in {MAX_REQUEST_SIZE} \
+             bytes, so the secret can be at most ~{} bytes",
+            secret.len(),
+            MAX_REQUEST_SIZE - 16
+        ));
+    }
+    Ok(secret)
 }
 
 /// One source's token bucket in the announce limiter: `tokens` new
@@ -5603,7 +5623,35 @@ async fn handle_connection(
     let mut handled_a_command = false;
 
     loop {
+        let buffered_before = received.len();
         let parsed = parse(&mut received);
+
+        // Issue #1890: `MAX_REQUEST_SIZE` bounds one frame, so it is
+        // measured on the frame `parse` just took off the front of
+        // `received` — never on `received.len()` after a read, which also
+        // holds whatever the client pipelined behind it (a connection whose
+        // every frame was within the limit used to be closed when they
+        // arrived together). A frame over the limit is answered `Ed\n`, as
+        // `docs/protocol.html` lists, then the rest is drained before the
+        // close, as for any other rejected request.
+        let front_frame_too_large = match parsed {
+            Ok(_) => buffered_before - received.len() > MAX_REQUEST_SIZE,
+            // Every complete frame already buffered has been parsed by the
+            // time one comes back `Incomplete`, so everything in `received`
+            // belongs to its unfinished front frame. This is also what keeps
+            // the buffer bounded: it never holds more than `MAX_REQUEST_SIZE`
+            // of one frame plus what the one read after that added.
+            Err(ParseError::Incomplete) => received.len() > MAX_REQUEST_SIZE,
+            Err(_) => false,
+        };
+        if front_frame_too_large {
+            let _ = write_response(&mut stream, b"Ed\n").await;
+            drain_rejected_request(&mut stream).await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request is too large",
+            ));
+        }
 
         // Only a fully parsed command extends the deadline — an
         // `Incomplete` result (more bytes needed) leaves it untouched, so
@@ -6532,13 +6580,6 @@ async fn handle_connection(
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "connection closed before request was complete",
-            ));
-        }
-
-        if received.len() > MAX_REQUEST_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "request is too large",
             ));
         }
     }
@@ -13914,6 +13955,95 @@ mod tests {
         drop(client);
         let error = connection_task.await.unwrap().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Issue #1890: `handle_connection` on a fresh connection for the
+    /// size-limit tests below.
+    fn spawn_size_limit_connection(
+        server: TcpStream,
+        secret: Option<&[u8]>,
+    ) -> (watch::Sender<bool>, tokio::task::JoinHandle<io::Result<()>>) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::new(RegistryState::default()),
+            Arc::new(Mutex::new(None)),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: secret.map(Bytes::copy_from_slice),
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        (shutdown_tx, task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_answers_pipelined_frames_whose_sum_exceeds_the_size_limit() {
+        // Issue #1890: every frame is within `MAX_REQUEST_SIZE`, only
+        // their sum is not; the limit is per frame, so all are answered.
+        // A large `A` frame sent in two writes grows the read buffer, so
+        // its tail and the frames pipelined behind it arrive in one read.
+        let secret = vec![b's'; 4000];
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, connection_task) = spawn_size_limit_connection(server, Some(&secret));
+        let mut large = b"A 4000\n".to_vec();
+        large.extend_from_slice(&secret);
+        client.write_all(&large[..3900]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let small = b"A 4000\n";
+        let count = 200;
+        let mut rest = large[3900..].to_vec();
+        for _ in 0..count {
+            rest.extend_from_slice(small);
+            rest.extend_from_slice(&secret);
+        }
+        client.write_all(&rest).await.unwrap();
+        let mut response = vec![0u8; (count + 1) * 3];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, b"Od\n".repeat(count + 1));
+        drop(client);
+        connection_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_answers_ed_to_a_frame_over_the_size_limit() {
+        // Issue #1890: used to be closed with no reply at all.
+        for secret in [None, Some(&b"correct-secret"[..])] {
+            let (mut client, server) = tcp_pair().await;
+            let (_shutdown_tx, connection_task) = spawn_size_limit_connection(server, secret);
+            let mut frame = format!("A {}\n", MAX_REQUEST_SIZE + 904).into_bytes();
+            frame.resize(frame.len() + MAX_REQUEST_SIZE + 904, b'x');
+            client.write_all(&frame).await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"Ed\n", "secret {:?}", secret.is_some());
+            drop(client);
+            let error = connection_task.await.unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn check_auth_secret_refuses_a_secret_whose_auth_frame_cannot_fit() {
+        // Issue #1890: no client could present such a secret.
+        assert_eq!(check_auth_secret(None), Ok(None));
+        let longest = (1..MAX_REQUEST_SIZE)
+            .rev()
+            .find(|len| check_auth_secret(Some(Bytes::from(vec![b's'; *len]))).is_ok())
+            .unwrap();
+        assert!(longest > 3000);
+        let mut frame = format!("A {longest} T R\n").into_bytes();
+        frame.resize(frame.len() + longest, b's');
+        assert_eq!(frame.len(), MAX_REQUEST_SIZE);
+        assert!(check_auth_secret(Some(Bytes::from(vec![b's'; longest + 1]))).is_err());
+        assert!(check_auth_secret(Some(Bytes::from(vec![b's'; MAX_REQUEST_SIZE]))).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

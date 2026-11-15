@@ -11,6 +11,8 @@ changed. What 1.0.0 will promise is described on the
 
 ### Fixed
 
+- A TTL of `ChronoUnit.FOREVER.getDuration()` (set through the builder's `defaultTtl` / `ttl` or the Boot starter's `nanocached.cache.default-ttl` / `ttl.<name>`) overflowed while being rounded up to whole seconds and was sent as a 1-second TTL. The rounding now saturates at `Long.MAX_VALUE` seconds. (#1886)
+
 - The README said the value size limit is measured after serialization and optional compression. The SDK checks the serialized value before compressing it, so a value over the limit is rejected even if it would compress to less; the README now says so. (#1603)
 
 ## [0.6.2] - 2026-11-03

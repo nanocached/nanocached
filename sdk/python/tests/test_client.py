@@ -1049,6 +1049,25 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             await impostor.close()
 
+    async def test_a_discovered_entry_with_an_empty_name_or_address_is_a_protocol_error(self):
+        # Issue #1889: a zero-length name used to be accepted, and "" is
+        # the single/proxy-mode slot, so every request to that member
+        # leaked a socket. The discovery server rejects empty fields
+        # (parse_string_fields → EmptyField), so connect() now refuses either.
+        node = await MockNode().start()
+        try:
+            for entry in [("", node.address), (NAMES[0], "")]:
+                with self.subTest(entry=entry):
+                    discovery = await MockDiscovery([entry]).start()
+                    try:
+                        with self.assertRaisesRegex(NanocachedError, "invalid node entry lengths"):
+                            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                            await client.close()
+                    finally:
+                        await discovery.close()
+        finally:
+            await node.close()
+
     async def test_a_refresh_finishing_after_close_installs_no_connections(self):
         # Regression for issue #10.
         node = await MockNode().start()
@@ -2884,6 +2903,35 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await client.touch_many(["a", b"a", "a"], 30), {"a": True, b"a": True})
             self.assertEqual(await client.get_many_and_touch(["a", b"a"], 30), {"a": "1", b"a": "1"})
             self.assertEqual([frame[1] for frame in self.node.multi_touch_frames], [[b"a"], [b"a"]])
+        finally:
+            await client.close()
+
+    async def test_bytearray_and_memoryview_keys_are_answered_under_a_bytes_copy(self):
+        # Issue #1888: neither a bytearray nor a writable memoryview can
+        # be a dict key, and keying the result by them raised after the
+        # node had already applied the TTL. They are answered under a
+        # bytes copy instead, which a read-only memoryview also finds.
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "1", "b": "2"}, ttl_seconds=10)
+            touched = await client.touch_many(
+                [bytearray(b"a"), memoryview(bytearray(b"b")), bytearray(b"missing"), b"a"], 100
+            )
+            self.assertEqual(touched, {b"a": True, b"b": True, b"missing": False})
+            self.assertTrue(all(type(key) is bytes for key in touched))
+            self.assertEqual(self.node.entry_ttl[(b"", b"a")], 100)
+            self.assertEqual(self.node.entry_ttl[(b"", b"b")], 100)
+            self.assertEqual(
+                await client.get_many_and_touch([bytearray(b"a"), memoryview(bytearray(b"b"))], 50),
+                {b"a": "1", b"b": "2"},
+            )
+            self.assertEqual(self.node.entry_ttl[(b"", b"a")], 50)
+            users = client.namespace("users")
+            await users.set("a", "u")
+            self.assertEqual(await users.touch_many([bytearray(b"a")], 70), {b"a": True})
+            self.assertEqual(self.node.entry_ttl[(b"users", b"a")], 70)
+            # A read-only memoryview of the same bytes finds the copy.
+            self.assertTrue(touched[memoryview(b"b")])
         finally:
             await client.close()
 
@@ -8139,6 +8187,24 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await client.get_many(["a"] * 20_000), {"a": "va"})
             self.assertEqual(len(self.node.multi_get_frame_sizes), 1)
             self.assertLess(self.node.multi_get_frame_sizes[0], 64)
+        finally:
+            await client.close()
+
+    async def test_get_many_bytes_answers_bytearray_and_memoryview_keys_under_a_bytes_copy(self):
+        # Issue #1888: a bytearray or writable memoryview key cannot be a
+        # dict key; keying the result by it raised once the reply was in.
+        client = await self.connect()
+        try:
+            await client.set("a", "va")
+            await client.set("b", "vb")
+            result = await client.get_many_bytes(
+                [bytearray(b"a"), memoryview(bytearray(b"b")), bytearray(b"missing"), "a"]
+            )
+            self.assertEqual(result, {b"a": b"va", b"b": b"vb", "a": b"va"})
+            self.assertTrue(all(type(key) in (str, bytes) for key in result))
+            self.assertEqual(await client.get_many([bytearray(b"a")]), {b"a": "va"})
+            # A read-only memoryview of the same bytes finds the copy.
+            self.assertEqual(result[memoryview(b"b")], b"vb")
         finally:
             await client.close()
 
