@@ -45,85 +45,74 @@ import org.nanocached.NanocachedClient;
 import org.nanocached.NanocachedException;
 
 /**
- * One JCache {@link Cache}, backed by one nanocached namespace (issue
- * #118) — the cache name <em>is</em> the namespace, {@link #clear()} is
- * the namespace's {@code CLEAR}, and get/put/remove are the SDK's
- * namespaced get/set/delete.
+ * One JCache {@link Cache}, backed by one nanocached namespace (issue #118) — the cache name
+ * <em>is</em> the namespace, {@link #clear()} is the namespace's {@code CLEAR}, and get/put/remove
+ * are the SDK's namespaced get/set/delete.
  *
  * <p><b>Honest subset — what this cannot do:</b>
  *
  * <ul>
- *   <li>{@link #iterator()} always throws {@link
- *       UnsupportedOperationException}: the wire protocol has no key
- *       enumeration, so this cache cannot be listed;
- *   <li>{@link #invoke}/{@link #invokeAll} (entry processors) always
- *       throw {@link UnsupportedOperationException} — out of scope for
- *       this adapter;
- *   <li>read-through ({@code CacheLoader}) and write-through ({@code
- *       CacheWriter}) are rejected at {@link NanocachedCacheManager#createCache};
- *   <li>{@code getExpiryForUpdate()} returning {@code null} is supposed
- *       to mean "leave the current TTL unchanged", but the wire has no
- *       way to read a key's remaining TTL outside of {@code INCR}'s own
- *       response — a {@code null} update policy is treated as "no
- *       expiry" (eternal) instead, which is not faithful to the spec;
- *   <li>{@link CacheEntryListener}s only ever see mutations <em>this
- *       cache instance itself</em> performed — never another
- *       client/JVM's changes to the same namespace, and never {@code
- *       EXPIRED} events (server-side TTL expiry isn't observable).
- *       {@link #put}'s update branch and {@link #getAndPut}/{@link
- *       #getAndReplace}/{@link #getAndRemove}/3-argument {@link
- *       #replace(Object, Object, Object)}/{@link #remove(Object, Object)}
- *       fire {@code Updated}/{@code Removed} events with an accurate old
- *       value; the 2-argument {@link #replace(Object, Object)} fires
- *       {@code Updated} with the old value unavailable (a single
- *       CAS round trip, not a read-then-write); {@link #removeAll()}
- *       fires no per-entry events at all — enumerating what a bulk
- *       {@code CLEAR} actually removed would need a client-side key
- *       registry this adapter does not keep, so it behaves exactly like
- *       {@link #clear()}. {@link #put}, {@link #putAll} and the
- *       single-argument {@link #remove(Object)} and {@link
- *       #replace(Object, Object)} decode the previous value only when a
- *       listener is registered, and fire without an old value if it can no
- *       longer be deserialized rather than fail a write that has landed.
+ *   <li>{@link #iterator()} always throws {@link UnsupportedOperationException}: the wire protocol
+ *       has no key enumeration, so this cache cannot be listed;
+ *   <li>{@link #invoke}/{@link #invokeAll} (entry processors) always throw {@link
+ *       UnsupportedOperationException} — out of scope for this adapter;
+ *   <li>read-through ({@code CacheLoader}) and write-through ({@code CacheWriter}) are rejected at
+ *       {@link NanocachedCacheManager#createCache};
+ *   <li>{@code getExpiryForUpdate()} returning {@code null} is supposed to mean "leave the current
+ *       TTL unchanged", but the wire has no way to read a key's remaining TTL outside of {@code
+ *       INCR}'s own response — a {@code null} update policy is treated as "no expiry" (eternal)
+ *       instead, which is not faithful to the spec;
+ *   <li>{@link CacheEntryListener}s only ever see mutations <em>this cache instance itself</em>
+ *       performed — never another client/JVM's changes to the same namespace, and never {@code
+ *       EXPIRED} events (server-side TTL expiry isn't observable). {@link #put}'s update branch and
+ *       {@link #getAndPut}/{@link #getAndReplace}/{@link #getAndRemove}/3-argument {@link
+ *       #replace(Object, Object, Object)}/{@link #remove(Object, Object)} fire {@code
+ *       Updated}/{@code Removed} events with an accurate old value; the 2-argument {@link
+ *       #replace(Object, Object)} fires {@code Updated} with the old value unavailable (a single
+ *       CAS round trip, not a read-then-write); {@link #removeAll()} fires no per-entry events at
+ *       all — enumerating what a bulk {@code CLEAR} actually removed would need a client-side key
+ *       registry this adapter does not keep, so it behaves exactly like {@link #clear()}. {@link
+ *       #put}, {@link #putAll} and the single-argument {@link #remove(Object)} and {@link
+ *       #replace(Object, Object)} decode the previous value only when a listener is registered, and
+ *       fire without an old value if it can no longer be deserialized rather than fail a write that
+ *       has landed.
  * </ul>
  *
- * <p><b>{@code getAndPut}/{@code getAndReplace}/{@code getAndRemove}/
- * {@code replace(K,V,V)}/{@code remove(K,V)} are genuinely atomic</b>,
- * unlike the caveats {@code nanocached-spring} had to carry before
- * issue #141 shipped compare-and-set: each is a bounded compare-and-set
- * retry loop (read the current value and the digest it was read with,
- * attempt the conditioned write, retry on a concurrent change) — see
- * {@link #casRetryDeadlineMillis}. The two-value-argument pair compares the
- * read value against the caller's {@code oldValue} with {@code
- * equals()} (issue #186) — not a digest of {@code oldValue}'s own
- * re-serialized form, which would reject a value that is {@code
- * equals()}-equal but not canonically serialized (a {@code HashMap}
- * built in a different insertion order, a type with transient state,
- * ...).
+ * <p><b>{@code getAndPut}/{@code getAndReplace}/{@code getAndRemove}/ {@code replace(K,V,V)}/{@code
+ * remove(K,V)} are genuinely atomic</b>, unlike the caveats {@code nanocached-spring} had to carry
+ * before issue #141 shipped compare-and-set: each is a bounded compare-and-set retry loop (read the
+ * current value and the digest it was read with, attempt the conditioned write, retry on a
+ * concurrent change) — see {@link #casRetryDeadlineMillis}. The two-value-argument pair compares
+ * the read value against the caller's {@code oldValue} with {@code equals()} (issue #186) — not a
+ * digest of {@code oldValue}'s own re-serialized form, which would reject a value that is {@code
+ * equals()}-equal but not canonically serialized (a {@code HashMap} built in a different insertion
+ * order, a type with transient state, ...).
  */
 final class NanocachedCache<K, V> implements Cache<K, V> {
 
-    /** Bound on how long the {@code getAnd*}/{@code replace(K,V,V)}/
-     * {@code remove(K,V)} compare-and-set loops keep retrying when the
-     * value keeps changing between the read and the conditioned write —
-     * see the class doc. A loop that is still losing the race when this
-     * much time has passed fails with {@link CacheException} rather than
-     * falling back to an unconditional write or delete: four writers on
-     * one key exhausted a fixed budget of ten attempts in ordinary use,
-     * and the fallback then returned the same "previous value" to more
-     * than one caller and let a {@code getAndRemove} hand out a value it
-     * had not removed. JSR-107 specifies these operations as atomic, so
-     * the only honest outcomes are the atomic one and a loud failure.
-     * Package-private and mutable only so a test can shorten it. */
+    /**
+     * Bound on how long the {@code getAnd*}/{@code replace(K,V,V)}/ {@code remove(K,V)}
+     * compare-and-set loops keep retrying when the value keeps changing between the read and the
+     * conditioned write — see the class doc. A loop that is still losing the race when this much
+     * time has passed fails with {@link CacheException} rather than falling back to an
+     * unconditional write or delete: four writers on one key exhausted a fixed budget of ten
+     * attempts in ordinary use, and the fallback then returned the same "previous value" to more
+     * than one caller and let a {@code getAndRemove} hand out a value it had not removed. JSR-107
+     * specifies these operations as atomic, so the only honest outcomes are the atomic one and a
+     * loud failure. Package-private and mutable only so a test can shorten it.
+     */
     static volatile long casRetryDeadlineMillis = 5_000;
 
-    /** Longest pause between two attempts of a CAS loop; the pause starts
-     * at tens of microseconds and doubles, so a brief collision retries
-     * at once and a sustained one stops spinning. */
+    /**
+     * Longest pause between two attempts of a CAS loop; the pause starts at tens of microseconds
+     * and doubles, so a brief collision retries at once and a sustained one stops spinning.
+     */
     private static final long CAS_BACKOFF_MAX_NANOS = 2_000_000;
 
-    /** One run of a compare-and-set loop: counts attempts, pauses between
-     * them, and enforces {@link #casRetryDeadlineMillis}. */
+    /**
+     * One run of a compare-and-set loop: counts attempts, pauses between them, and enforces {@link
+     * #casRetryDeadlineMillis}.
+     */
     private static final class CasLoop {
         private final String operation;
         private final Object key;
@@ -140,63 +129,75 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             attempts++;
             long elapsedNanos = System.nanoTime() - started;
             if (elapsedNanos > TimeUnit.MILLISECONDS.toNanos(casRetryDeadlineMillis)) {
-                throw new CacheException("nanocached-jcache: " + operation + " on key " + key + " gave up after "
-                        + attempts + " attempts over " + TimeUnit.NANOSECONDS.toMillis(elapsedNanos)
-                        + " ms: the stored value kept changing between the read and the compare-and-set");
+                throw new CacheException(
+                        "nanocached-jcache: "
+                                + operation
+                                + " on key "
+                                + key
+                                + " gave up after "
+                                + attempts
+                                + " attempts over "
+                                + TimeUnit.NANOSECONDS.toMillis(elapsedNanos)
+                                + " ms: the stored value kept changing between the read and the compare-and-set");
             }
             long pause = Math.min(CAS_BACKOFF_MAX_NANOS, 20_000L << Math.min(attempts, 20));
             java.util.concurrent.locks.LockSupport.parkNanos(pause);
         }
     }
 
-    /** Bound on {@link #getAll}/{@link #putAll} retrying the remainder of
-     * a batch that is still wrong-node after the SDK's own {@code
-     * getManyBytes}/{@code setManyBytes} built-in one bounded
-     * refresh-and-retry (issue #415) — the same role {@link
-     * #casRetryDeadlineMillis} plays for the CAS loops above: a ring that keeps
-     * moving under one batch for this long is pathological, so this stays
-     * small and a batch still unresolved after it propagates instead of
-     * retrying forever. */
+    /**
+     * Bound on {@link #getAll}/{@link #putAll} retrying the remainder of a batch that is still
+     * wrong-node after the SDK's own {@code getManyBytes}/{@code setManyBytes} built-in one bounded
+     * refresh-and-retry (issue #415) — the same role {@link #casRetryDeadlineMillis} plays for the
+     * CAS loops above: a ring that keeps moving under one batch for this long is pathological, so
+     * this stays small and a batch still unresolved after it propagates instead of retrying
+     * forever.
+     */
     private static final int MAX_BULK_WRONG_NODE_RETRIES = 3;
 
-    /** Bound on {@link #removeAll(Set)}'s client-side concurrent fan-out
-     * (issue #415): the wire protocol has no bulk-delete primitive — only
-     * single-key {@code delete}/{@code deleteIfMatches} on {@link
-     * NanocachedClient.Namespace} — so this dispatches one {@link
-     * #remove(Object)} per key concurrently rather than sequentially, the
-     * same pattern {@code nanocached-django}'s {@code delete_many} (issue
-     * #233) and {@code nanocached-cache-manager}'s {@code mdel} use.
-     * Sized to the same order of magnitude as the SDK's own per-frame
-     * batch bound ({@code NanocachedClient.MAX_BATCH_KEYS}, 400 — private
-     * to that package, so not reusable directly) rather than launching one
-     * thread per key for an arbitrarily large key set: a fixed pool this
-     * size caps in-flight delete RPCs at once, queuing the rest, however
-     * large the key set. */
+    /**
+     * Bound on {@link #removeAll(Set)}'s client-side concurrent fan-out (issue #415): the wire
+     * protocol has no bulk-delete primitive — only single-key {@code delete}/{@code
+     * deleteIfMatches} on {@link NanocachedClient.Namespace} — so this dispatches one {@link
+     * #remove(Object)} per key concurrently rather than sequentially, the same pattern {@code
+     * nanocached-django}'s {@code delete_many} (issue #233) and {@code nanocached-cache-manager}'s
+     * {@code mdel} use. Sized to the same order of magnitude as the SDK's own per-frame batch bound
+     * ({@code NanocachedClient.MAX_BATCH_KEYS}, 400 — private to that package, so not reusable
+     * directly) rather than launching one thread per key for an arbitrarily large key set: a fixed
+     * pool this size caps in-flight delete RPCs at once, queuing the rest, however large the key
+     * set.
+     */
     private static final int MAX_CONCURRENT_REMOVES = 256;
 
-    /** How long an idle {@link #REMOVE_ALL_EXECUTOR} thread lingers before
-     * exiting. Short on purpose: the pool is static, so without a timeout
-     * one large removeAll would leave up to {@link #MAX_CONCURRENT_REMOVES}
-     * idle threads (each referencing this class's loader) alive for the
-     * rest of the JVM — through every webapp redeploy. */
+    /**
+     * How long an idle {@link #REMOVE_ALL_EXECUTOR} thread lingers before exiting. Short on
+     * purpose: the pool is static, so without a timeout one large removeAll would leave up to
+     * {@link #MAX_CONCURRENT_REMOVES} idle threads (each referencing this class's loader) alive for
+     * the rest of the JVM — through every webapp redeploy.
+     */
     private static final long REMOVE_ALL_IDLE_SECONDS = 2;
 
-    /** Shared, JVM-wide fan-out pool for {@link #removeAll(Set)} — daemon
-     * threads so it never blocks JVM shutdown, lazily grown (a fixed-size
-     * pool only starts a thread when a task needs one) so it costs nothing
-     * until first used, and with core-thread timeout so it drains back to
-     * zero threads once removeAll traffic stops. Package-private for the
-     * tests. */
+    /**
+     * Shared, JVM-wide fan-out pool for {@link #removeAll(Set)} — daemon threads so it never blocks
+     * JVM shutdown, lazily grown (a fixed-size pool only starts a thread when a task needs one) so
+     * it costs nothing until first used, and with core-thread timeout so it drains back to zero
+     * threads once removeAll traffic stops. Package-private for the tests.
+     */
     static final ThreadPoolExecutor REMOVE_ALL_EXECUTOR = newRemoveAllExecutor();
 
     private static ThreadPoolExecutor newRemoveAllExecutor() {
-        ThreadPoolExecutor executor = new ThreadPoolExecutor(
-                MAX_CONCURRENT_REMOVES, MAX_CONCURRENT_REMOVES, REMOVE_ALL_IDLE_SECONDS, TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(), runnable -> {
-                    Thread thread = new Thread(runnable, "nanocached-jcache-removeAll");
-                    thread.setDaemon(true);
-                    return thread;
-                });
+        ThreadPoolExecutor executor =
+                new ThreadPoolExecutor(
+                        MAX_CONCURRENT_REMOVES,
+                        MAX_CONCURRENT_REMOVES,
+                        REMOVE_ALL_IDLE_SECONDS,
+                        TimeUnit.SECONDS,
+                        new LinkedBlockingQueue<>(),
+                        runnable -> {
+                            Thread thread = new Thread(runnable, "nanocached-jcache-removeAll");
+                            thread.setDaemon(true);
+                            return thread;
+                        });
         executor.allowCoreThreadTimeOut(true);
         return executor;
     }
@@ -206,14 +207,18 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     private final NanocachedCacheManager manager;
     private final String name;
     private final Wire namespace;
-    /** Resolves cached values' classes — the loader the manager was
-     * created with (a {@code CachingProvider.getCacheManager(uri,
-     * classLoader, props)} argument), as JSR-107 asks, or, when none was
-     * given, the reading thread's context class loader. */
+
+    /**
+     * Resolves cached values' classes — the loader the manager was created with (a {@code
+     * CachingProvider.getCacheManager(uri, classLoader, props)} argument), as JSR-107 asks, or,
+     * when none was given, the reading thread's context class loader.
+     */
     private final ClassLoader classLoader;
+
     private final CompleteConfiguration<K, V> configuration;
     private final ExpiryPolicy expiryPolicy;
-    private final CopyOnWriteArrayList<RegisteredListener<K, V>> listeners = new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<RegisteredListener<K, V>> listeners =
+            new CopyOnWriteArrayList<>();
     private final NanocachedCacheStatistics statistics = new NanocachedCacheStatistics();
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private volatile ObjectName statisticsObjectName;
@@ -254,9 +259,10 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         // longer be overwritten with the value this get observed, and the
         // value does not travel back to the node.
         Duration accessExpiry = expiryPolicy.getExpiryForAccess();
-        Optional<byte[]> raw = accessExpiry == null
-                ? namespace.getBytes(keyBytes)
-                : namespace.getAndTouchBytes(keyBytes, touchTtlSeconds(accessExpiry));
+        Optional<byte[]> raw =
+                accessExpiry == null
+                        ? namespace.getBytes(keyBytes)
+                        : namespace.getAndTouchBytes(keyBytes, touchTtlSeconds(accessExpiry));
         if (raw.isEmpty()) {
             statistics.recordMiss();
             return null;
@@ -266,19 +272,20 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     }
 
     /**
-     * One batched wire round trip per owner for every key (issue #152, completed in #160): the SDK's
-     * positional {@code getManyBytes(byte[][])} carries {@link KeyCodec#toKeyBytes}'s output verbatim,
-     * so {@code byte[]} keys and JDK-serialized fallback keys batch exactly like {@code String} ones —
-     * there is no longer a "bulk-safe" subset that has to fall back to per-key {@link #get}.
+     * One batched wire round trip per owner for every key (issue #152, completed in #160): the
+     * SDK's positional {@code getManyBytes(byte[][])} carries {@link KeyCodec#toKeyBytes}'s output
+     * verbatim, so {@code byte[]} keys and JDK-serialized fallback keys batch exactly like {@code
+     * String} ones — there is no longer a "bulk-safe" subset that has to fall back to per-key
+     * {@link #get}.
      *
      * <p>An access-based {@link ExpiryPolicy} makes the read refresh the TTL in the same wire step
-     * (issue #871): {@code getManyAndTouchBytes} reads every key and replaces its TTL on the node, one
-     * batched round trip per owner. Like a single {@link #get} (issue #826), the values do not travel
-     * back to the node, and a write landing at the same time is never overwritten. {@code
-     * getExpiryForAccess()} is a single fixed, cache-wide policy — every hit resolves to the exact same
-     * outcome — so one TTL covers the whole batch: a positive duration sets it, an eternal one removes
-     * it, and {@link Duration#ZERO} expires the hits as they are read. A key that is missing is a miss
-     * and is not created.
+     * (issue #871): {@code getManyAndTouchBytes} reads every key and replaces its TTL on the node,
+     * one batched round trip per owner. Like a single {@link #get} (issue #826), the values do not
+     * travel back to the node, and a write landing at the same time is never overwritten. {@code
+     * getExpiryForAccess()} is a single fixed, cache-wide policy — every hit resolves to the exact
+     * same outcome — so one TTL covers the whole batch: a positive duration sets it, an eternal one
+     * removes it, and {@link Duration#ZERO} expires the hits as they are read. A key that is
+     * missing is a miss and is not created.
      */
     @Override
     public Map<K, V> getAll(Set<? extends K> keys) {
@@ -299,8 +306,11 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             raw = getManyBytesResolvingWrongNode(namespace::getManyBytes, wireKeys, false);
         } else {
             long touchTtl = touchTtlSeconds(accessExpiry);
-            raw = getManyBytesResolvingWrongNode(
-                    pending -> namespace.getManyAndTouchBytes(pending, touchTtl), wireKeys, touchTtl == 0L);
+            raw =
+                    getManyBytesResolvingWrongNode(
+                            pending -> namespace.getManyAndTouchBytes(pending, touchTtl),
+                            wireKeys,
+                            touchTtl == 0L);
         }
 
         for (int i = 0; i < ordered.size(); i++) {
@@ -316,61 +326,48 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     }
 
     /**
-     * {@link NanocachedClient.Namespace#getManyBytes(byte[][])}, but a
-     * ring change mid-batch (issue #415) no longer discards the keys that
-     * DID resolve: {@link NanocachedException.PartialWrongNodeRaw}
-     * carries every value that resolved plus the positions that didn't,
-     * so this retries only that remainder — bounded by {@link
-     * #MAX_BULK_WRONG_NODE_RETRIES} — splicing each round's newly
-     * resolved values back into their original positions. Single-key
-     * {@link #get} gets "one ring change doesn't lose data" for free from
-     * the SDK's own transparent {@code withWrongNodeRetry}; the bulk
-     * primitive has already spent its one built-in refresh-and-retry by
-     * the time it throws, so this does the equivalent at the adapter
-     * layer instead of just letting the exception propagate and throwing
-     * away an otherwise-successful batch.
+     * {@link NanocachedClient.Namespace#getManyBytes(byte[][])}, but a ring change mid-batch (issue
+     * #415) no longer discards the keys that DID resolve: {@link
+     * NanocachedException.PartialWrongNodeRaw} carries every value that resolved plus the positions
+     * that didn't, so this retries only that remainder — bounded by {@link
+     * #MAX_BULK_WRONG_NODE_RETRIES} — splicing each round's newly resolved values back into their
+     * original positions. Single-key {@link #get} gets "one ring change doesn't lose data" for free
+     * from the SDK's own transparent {@code withWrongNodeRetry}; the bulk primitive has already
+     * spent its one built-in refresh-and-retry by the time it throws, so this does the equivalent
+     * at the adapter layer instead of just letting the exception propagate and throwing away an
+     * otherwise-successful batch.
      *
-     * <p>Issue #439: {@link NanocachedException.PartialConnectionLostRaw}
-     * gets the same "don't discard the already-resolved data" treatment,
-     * but not the same bounded, repeat-until-resolved loop as the
-     * wrong-node case — a stale ring view is something retrying can be
-     * expected to fix on a subsequent attempt, but by the time this method
-     * sees a {@code PartialConnectionLostRaw} the SDK has already tried
-     * the failing chunk twice (its own original attempt plus one internal
-     * reconnect-and-retry, see {@code applyReconnecting} in {@code
-     * NanocachedClient}) and failed both times, so there is no reason to
-     * expect a third or fourth attempt to behave differently. This method
-     * therefore makes exactly one direct follow-up call for the remainder
-     * named by {@code unresolvedIndices} — not another trip through the
-     * {@code for} loop's wrong-node budget — and either merges its result
-     * and returns, or reports the second failure as the {@link
-     * CacheException} every operation declares, so a genuine failure is
-     * never silently reported as a set of misses. The follow-up is one
-     * more round of the same loop (gated by {@code connectionRetried},
-     * not by {@link #MAX_BULK_WRONG_NODE_RETRIES}), so what it throws is
-     * handled like any round's outcome: a remainder that meets a ring
-     * change goes on through the wrong-node branch with its resolved
-     * values kept, instead of escaping as the SDK's raw partial
+     * <p>Issue #439: {@link NanocachedException.PartialConnectionLostRaw} gets the same "don't
+     * discard the already-resolved data" treatment, but not the same bounded, repeat-until-resolved
+     * loop as the wrong-node case — a stale ring view is something retrying can be expected to fix
+     * on a subsequent attempt, but by the time this method sees a {@code PartialConnectionLostRaw}
+     * the SDK has already tried the failing chunk twice (its own original attempt plus one internal
+     * reconnect-and-retry, see {@code applyReconnecting} in {@code NanocachedClient}) and failed
+     * both times, so there is no reason to expect a third or fourth attempt to behave differently.
+     * This method therefore makes exactly one direct follow-up call for the remainder named by
+     * {@code unresolvedIndices} — not another trip through the {@code for} loop's wrong-node budget
+     * — and either merges its result and returns, or reports the second failure as the {@link
+     * CacheException} every operation declares, so a genuine failure is never silently reported as
+     * a set of misses. The follow-up is one more round of the same loop (gated by {@code
+     * connectionRetried}, not by {@link #MAX_BULK_WRONG_NODE_RETRIES}), so what it throws is
+     * handled like any round's outcome: a remainder that meets a ring change goes on through the
+     * wrong-node branch with its resolved values kept, instead of escaping as the SDK's raw partial
      * exception with those values discarded.
      *
-     * <p>A whole-batch {@link NanocachedException.WrongNode} (no
-     * per-key outcome attached) is retried like {@link #putAll}'s, under
-     * the same budget.
+     * <p>A whole-batch {@link NanocachedException.WrongNode} (no per-key outcome attached) is
+     * retried like {@link #putAll}'s, under the same budget.
      *
-     * <p>{@code fetch} is the batched read itself — a plain {@code
-     * getManyBytes}, or (issue #871) {@code getManyAndTouchBytes} under an
-     * access-based policy; both throw the same partial outcomes, and a
-     * touch is idempotent, so retrying the remainder is as safe as for a
-     * plain read — with one exception, {@code expiring}: a batched touch
-     * with a zero TTL (an access expiry of {@code Duration.ZERO}) expires
-     * every key it finds, and the SDK's {@code PartialConnectionLostRaw}
-     * for it lists as unresolved the keys of a frame that was sent and whose
-     * connection was then lost, keys the node may well have expired
-     * already. Fetching them again would ask for values the first frame
-     * consumed and report them as misses, so an expiring batch makes no
-     * follow-up on a connection failure: the failure propagates with the
-     * values resolved so far on it. The wrong-node remainder is still
-     * retried — a {@code W} key was not applied anywhere.
+     * <p>{@code fetch} is the batched read itself — a plain {@code getManyBytes}, or (issue #871)
+     * {@code getManyAndTouchBytes} under an access-based policy; both throw the same partial
+     * outcomes, and a touch is idempotent, so retrying the remainder is as safe as for a plain read
+     * — with one exception, {@code expiring}: a batched touch with a zero TTL (an access expiry of
+     * {@code Duration.ZERO}) expires every key it finds, and the SDK's {@code
+     * PartialConnectionLostRaw} for it lists as unresolved the keys of a frame that was sent and
+     * whose connection was then lost, keys the node may well have expired already. Fetching them
+     * again would ask for values the first frame consumed and report them as misses, so an expiring
+     * batch makes no follow-up on a connection failure: the failure propagates with the values
+     * resolved so far on it. The wrong-node remainder is still retried — a {@code W} key was not
+     * applied anywhere.
      */
     private byte[][] getManyBytesResolvingWrongNode(
             UnaryOperator<byte[][]> fetch, byte[][] wireKeys, boolean expiring) {
@@ -414,8 +411,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         }
     }
 
-    /** The keys of a batch still unresolved after one round, with the
-     * positions they came from. */
+    /** The keys of a batch still unresolved after one round, with the positions they came from. */
     private record Remainder(int[] positions, byte[][] pending) {
         static Remainder of(int[] positions, byte[][] pending, int[] unresolved) {
             int[] nextPositions = new int[unresolved.length];
@@ -443,12 +439,12 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         return namespace.getBytes(KeyCodec.toKeyBytes(key)).isPresent();
     }
 
-    /** {@code getExpiryForAccess()} is evaluated on every {@code get} —
-     * unlike the .NET adapter's per-call sliding expiration, JCache's
-     * {@link ExpiryPolicy} is fixed per cache, so there is no per-entry
-     * envelope to maintain: a non-null access policy just means touching
-     * the entry to that fixed duration, which is all {@link #get} passes
-     * to {@code getAndTouch} (issue #826). */
+    /**
+     * {@code getExpiryForAccess()} is evaluated on every {@code get} — unlike the .NET adapter's
+     * per-call sliding expiration, JCache's {@link ExpiryPolicy} is fixed per cache, so there is no
+     * per-entry envelope to maintain: a non-null access policy just means touching the entry to
+     * that fixed duration, which is all {@link #get} passes to {@code getAndTouch} (issue #826).
+     */
     private static long touchTtlSeconds(Duration accessExpiry) {
         OptionalLong ttl = wireTtlSeconds(accessExpiry);
         if (ttl.isEmpty()) {
@@ -472,7 +468,9 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
 
         Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
         Duration expiry =
-                existing.isPresent() ? expiryPolicy.getExpiryForUpdate() : expiryPolicy.getExpiryForCreation();
+                existing.isPresent()
+                        ? expiryPolicy.getExpiryForUpdate()
+                        : expiryPolicy.getExpiryForCreation();
         OptionalLong ttl = wireTtlSeconds(expiry);
         if (ttl.isEmpty()) {
             // Issue #278: an update resolving to Duration.ZERO deletes the
@@ -611,7 +609,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 loop.lostTheRace();
                 continue;
             }
-            if (namespace.replace(keyBytes, existing.get().token(), newValueBytes, ttl.getAsLong())) {
+            if (namespace.replace(
+                    keyBytes, existing.get().token(), newValueBytes, ttl.getAsLong())) {
                 statistics.recordHit();
                 statistics.recordPut();
                 fireUpdated(key, newValue, currentValue);
@@ -719,7 +718,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             n++;
         }
 
-        byte[][] existing = getManyBytesResolvingWrongNode(namespace::getManyBytes, wireKeys, false);
+        byte[][] existing =
+                getManyBytesResolvingWrongNode(namespace::getManyBytes, wireKeys, false);
 
         // Resolved TTL → the positions that share it. Insertion order is
         // kept so the groups' writes (and their listener events) follow
@@ -727,8 +727,11 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         Map<Long, List<Integer>> byTtl = new LinkedHashMap<>();
         for (int i = 0; i < n; i++) {
             boolean present = existing[i] != null;
-            OptionalLong ttl = wireTtlSeconds(
-                    present ? expiryPolicy.getExpiryForUpdate() : expiryPolicy.getExpiryForCreation());
+            OptionalLong ttl =
+                    wireTtlSeconds(
+                            present
+                                    ? expiryPolicy.getExpiryForUpdate()
+                                    : expiryPolicy.getExpiryForCreation());
             if (ttl.isEmpty()) {
                 // Issue #278: same as put()'s equivalent branch above —
                 // an update resolving to Duration.ZERO deletes the entry
@@ -764,39 +767,30 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     }
 
     /**
-     * {@link NanocachedClient.Namespace#setManyBytes(byte[][], byte[][],
-     * long)}, but a ring change mid-batch (issue #415) no longer aborts
-     * the whole group and discards its listener events with it:
-     * {@code setManyBytes} has nothing per-key to retry a remainder from
-     * on a partial failure — see {@link
-     * NanocachedException.PartialWrongNode}'s own doc, "there's no
-     * partial payload worth attaching" — so, bounded by {@link
-     * #MAX_BULK_WRONG_NODE_RETRIES}, this retries the *whole* group
-     * instead. That's safe: {@code setManyBytes}' per-key writes are
-     * idempotent, so re-sending a key that already landed on a previous
-     * attempt (the ring simply hadn't caught up yet) is a harmless
-     * duplicate write of the exact same value/TTL this call was already
-     * going to make.
+     * {@link NanocachedClient.Namespace#setManyBytes(byte[][], byte[][], long)}, but a ring change
+     * mid-batch (issue #415) no longer aborts the whole group and discards its listener events with
+     * it: {@code setManyBytes} has nothing per-key to retry a remainder from on a partial failure —
+     * see {@link NanocachedException.PartialWrongNode}'s own doc, "there's no partial payload worth
+     * attaching" — so, bounded by {@link #MAX_BULK_WRONG_NODE_RETRIES}, this retries the *whole*
+     * group instead. That's safe: {@code setManyBytes}' per-key writes are idempotent, so
+     * re-sending a key that already landed on a previous attempt (the ring simply hadn't caught up
+     * yet) is a harmless duplicate write of the exact same value/TTL this call was already going to
+     * make.
      *
-     * <p>Issue #439: {@link NanocachedException.PartialConnectionLostSetRaw}
-     * gets a narrower retry than the wrong-node branch above, not the
-     * "resend the whole group" treatment — a connection failure mid-batch
-     * only reaches here after the SDK has already retried the failing
-     * chunk once internally (original attempt plus one reconnect-and-retry,
-     * see {@code applyReconnecting} in {@code NanocachedClient}), so a
-     * further bounded loop isn't expected to help. Unlike the get side,
-     * {@code succeededIndices} names what's already DONE rather than
-     * what's outstanding (a successful {@code setManyBytes} has no
-     * positional array of its own to splice an answer into — see the
-     * exception's own doc), so this builds the complement — the positions
-     * NOT yet confirmed stored — and makes exactly one follow-up
-     * {@code setManyBytes} call for just that remainder (safe to retry
-     * for the same idempotency reason as the whole-group resend above),
-     * reporting a genuine second failure as the {@link CacheException}
-     * every operation declares. The follow-up is one more round of the
-     * same loop (gated by {@code connectionRetried}), so a remainder
-     * that meets a ring change is resent through the wrong-node branch
-     * instead of escaping as the SDK's raw exception.
+     * <p>Issue #439: {@link NanocachedException.PartialConnectionLostSetRaw} gets a narrower retry
+     * than the wrong-node branch above, not the "resend the whole group" treatment — a connection
+     * failure mid-batch only reaches here after the SDK has already retried the failing chunk once
+     * internally (original attempt plus one reconnect-and-retry, see {@code applyReconnecting} in
+     * {@code NanocachedClient}), so a further bounded loop isn't expected to help. Unlike the get
+     * side, {@code succeededIndices} names what's already DONE rather than what's outstanding (a
+     * successful {@code setManyBytes} has no positional array of its own to splice an answer into —
+     * see the exception's own doc), so this builds the complement — the positions NOT yet confirmed
+     * stored — and makes exactly one follow-up {@code setManyBytes} call for just that remainder
+     * (safe to retry for the same idempotency reason as the whole-group resend above), reporting a
+     * genuine second failure as the {@link CacheException} every operation declares. The follow-up
+     * is one more round of the same loop (gated by {@code connectionRetried}), so a remainder that
+     * meets a ring change is resent through the wrong-node branch instead of escaping as the SDK's
+     * raw exception.
      */
     private void setManyBytesResolvingWrongNode(byte[][] keys, byte[][] values, long ttlSeconds) {
         boolean connectionRetried = false;
@@ -926,19 +920,16 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     }
 
     /**
-     * Fans every key's {@link #remove(Object)} out concurrently on {@link
-     * #REMOVE_ALL_EXECUTOR} (issue #415) rather than issuing one delete
-     * RPC after another: there is no bulk-delete primitive on the wire
-     * ({@link NanocachedClient.Namespace} only has single-key {@code
-     * delete}/{@code deleteIfMatches}), so this is the client-side
-     * analogue of {@link #getAll}/{@link #putAll}'s own wire-level
-     * batching — see {@link #MAX_CONCURRENT_REMOVES} for the concurrency
-     * bound. {@link CompletableFuture#allOf} waits for every leg to
-     * finish, success or failure, before this reports anything — the same
-     * "wait for all, then raise" convention {@code nanocached-django}'s
-     * {@code delete_many} (issue #233/#332) and {@code
-     * nanocached-cache-manager}'s {@code mdel} follow — so a failing key
-     * never leaves sibling deletes still in flight when this returns.
+     * Fans every key's {@link #remove(Object)} out concurrently on {@link #REMOVE_ALL_EXECUTOR}
+     * (issue #415) rather than issuing one delete RPC after another: there is no bulk-delete
+     * primitive on the wire ({@link NanocachedClient.Namespace} only has single-key {@code
+     * delete}/{@code deleteIfMatches}), so this is the client-side analogue of {@link
+     * #getAll}/{@link #putAll}'s own wire-level batching — see {@link #MAX_CONCURRENT_REMOVES} for
+     * the concurrency bound. {@link CompletableFuture#allOf} waits for every leg to finish, success
+     * or failure, before this reports anything — the same "wait for all, then raise" convention
+     * {@code nanocached-django}'s {@code delete_many} (issue #233/#332) and {@code
+     * nanocached-cache-manager}'s {@code mdel} follow — so a failing key never leaves sibling
+     * deletes still in flight when this returns.
      */
     @Override
     public void removeAll(Set<? extends K> keys) {
@@ -965,11 +956,11 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         }
     }
 
-    /** Maps to the namespace's bulk {@code CLEAR}, same as {@link
-     * #clear()} — see the class doc's "honest subset" list for why this
-     * cannot fire per-entry {@code Removed} events the way the spec
-     * expects (no client-side key registry to enumerate what was
-     * removed). */
+    /**
+     * Maps to the namespace's bulk {@code CLEAR}, same as {@link #clear()} — see the class doc's
+     * "honest subset" list for why this cannot fire per-entry {@code Removed} events the way the
+     * spec expects (no client-side key registry to enumerate what was removed).
+     */
     @Override
     public void removeAll() {
         requireNotClosed();
@@ -994,17 +985,22 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     @Override
     public <T> T invoke(K key, EntryProcessor<K, V, T> entryProcessor, Object... arguments)
             throws EntryProcessorException {
-        throw new UnsupportedOperationException("nanocached-jcache: entry processors are not supported");
+        throw new UnsupportedOperationException(
+                "nanocached-jcache: entry processors are not supported");
     }
 
     @Override
     public <T> Map<K, EntryProcessorResult<T>> invokeAll(
             Set<? extends K> keys, EntryProcessor<K, V, T> entryProcessor, Object... arguments) {
-        throw new UnsupportedOperationException("nanocached-jcache: entry processors are not supported");
+        throw new UnsupportedOperationException(
+                "nanocached-jcache: entry processors are not supported");
     }
 
     @Override
-    public void loadAll(Set<? extends K> keys, boolean replaceExistingValues, CompletionListener completionListener) {
+    public void loadAll(
+            Set<? extends K> keys,
+            boolean replaceExistingValues,
+            CompletionListener completionListener) {
         requireNotClosed();
         // No CacheLoader is ever configured (rejected at createCache), so
         // per spec this completes immediately with nothing to do.
@@ -1021,7 +1017,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         if (clazz.isInstance(configuration)) {
             return (C) configuration;
         }
-        throw new IllegalArgumentException("nanocached-jcache: configuration cannot be represented as " + clazz);
+        throw new IllegalArgumentException(
+                "nanocached-jcache: configuration cannot be represented as " + clazz);
     }
 
     @Override
@@ -1042,10 +1039,11 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         }
     }
 
-    /** Called by {@link NanocachedCacheManager} when it (not this cache
-     * directly) is the one tearing this cache down — already removed
-     * from the manager's map by the caller, so this must not re-enter
-     * {@link NanocachedCacheManager#unregister}. */
+    /**
+     * Called by {@link NanocachedCacheManager} when it (not this cache directly) is the one tearing
+     * this cache down — already removed from the manager's map by the caller, so this must not
+     * re-enter {@link NanocachedCacheManager#unregister}.
+     */
     void markClosed() {
         if (closed.compareAndSet(false, true)) {
             unregisterStatisticsMBean();
@@ -1074,14 +1072,14 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         addListener(Objects.requireNonNull(config, "cacheEntryListenerConfiguration"));
     }
 
-    /** Registers {@code config}, from {@link #registerCacheEntryListener}
-     * and from the cache's own configuration alike.
+    /**
+     * Registers {@code config}, from {@link #registerCacheEntryListener} and from the cache's own
+     * configuration alike.
      *
-     * @throws IllegalArgumentException if an equal configuration is already
-     *     registered, as JSR-107 requires: the second registration would
-     *     deliver every event twice, and {@link
-     *     #deregisterCacheEntryListener} (which matches by {@code equals})
-     *     would remove both */
+     * @throws IllegalArgumentException if an equal configuration is already registered, as JSR-107
+     *     requires: the second registration would deliver every event twice, and {@link
+     *     #deregisterCacheEntryListener} (which matches by {@code equals}) would remove both
+     */
     private void addListener(CacheEntryListenerConfiguration<K, V> config) {
         // One registration at a time, so two threads registering equal
         // configurations cannot both pass the check.
@@ -1121,9 +1119,10 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         fire(EventType.UPDATED, key, value, null, false);
     }
 
-    /** JSR-107 1.1: a removed event's {@code getValue()} is the removed
-     * value, the same as {@code getOldValue()} (1.0 listeners read it
-     * there). */
+    /**
+     * JSR-107 1.1: a removed event's {@code getValue()} is the removed value, the same as {@code
+     * getOldValue()} (1.0 listeners read it there).
+     */
     private void fireRemoved(K key, V oldValue) {
         fire(EventType.REMOVED, key, oldValue, oldValue, true);
     }
@@ -1132,14 +1131,14 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         fire(EventType.REMOVED, key, null, null, false);
     }
 
-    /** {@link #fireUpdated} for a write that did not read the old value
-     * for its own sake ({@code put}, {@code putAll}): the previous bytes
-     * are decoded only when a listener is registered, and bytes that can
-     * no longer be deserialized (a changed {@code serialVersionUID}, a
-     * class removed by a redeploy, a serial-filter rejection, a stored
-     * class whose static initializer fails — a {@link LinkageError}, which
-     * {@link ValueCodec} does not wrap) fire the event without an old
-     * value instead of failing a write that has already landed. */
+    /**
+     * {@link #fireUpdated} for a write that did not read the old value for its own sake ({@code
+     * put}, {@code putAll}): the previous bytes are decoded only when a listener is registered, and
+     * bytes that can no longer be deserialized (a changed {@code serialVersionUID}, a class removed
+     * by a redeploy, a serial-filter rejection, a stored class whose static initializer fails — a
+     * {@link LinkageError}, which {@link ValueCodec} does not wrap) fire the event without an old
+     * value instead of failing a write that has already landed.
+     */
     private void fireUpdatedFromBytes(K key, V value, byte[] oldBytes) {
         if (listeners.isEmpty()) {
             return;
@@ -1172,8 +1171,13 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     }
 
     private void logUndecodableOldValue(K key, Throwable e) {
-        System.err.println("nanocached-jcache: previous value of " + key + " in " + name
-                + " cannot be deserialized; firing the event without an old value: " + e);
+        System.err.println(
+                "nanocached-jcache: previous value of "
+                        + key
+                        + " in "
+                        + name
+                        + " cannot be deserialized; firing the event without an old value: "
+                        + e);
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
@@ -1182,7 +1186,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             return;
         }
         NanocachedCacheEntryEvent<K, V> event =
-                new NanocachedCacheEntryEvent<>(this, type, key, value, oldValue, oldValueAvailable);
+                new NanocachedCacheEntryEvent<>(
+                        this, type, key, value, oldValue, oldValueAvailable);
         List<CacheEntryEvent<? extends K, ? extends V>> events = List.of(event);
         for (RegisteredListener<K, V> registered : listeners) {
             if (registered.filter() != null && !registered.filter().evaluate(event)) {
@@ -1191,17 +1196,20 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             try {
                 switch (type) {
                     case CREATED -> {
-                        if (registered.listener() instanceof CacheEntryCreatedListener<?, ?> listener) {
+                        if (registered.listener()
+                                instanceof CacheEntryCreatedListener<?, ?> listener) {
                             ((CacheEntryCreatedListener) listener).onCreated((Iterable) events);
                         }
                     }
                     case UPDATED -> {
-                        if (registered.listener() instanceof CacheEntryUpdatedListener<?, ?> listener) {
+                        if (registered.listener()
+                                instanceof CacheEntryUpdatedListener<?, ?> listener) {
                             ((CacheEntryUpdatedListener) listener).onUpdated((Iterable) events);
                         }
                     }
                     case REMOVED -> {
-                        if (registered.listener() instanceof CacheEntryRemovedListener<?, ?> listener) {
+                        if (registered.listener()
+                                instanceof CacheEntryRemovedListener<?, ?> listener) {
                             ((CacheEntryRemovedListener) listener).onRemoved((Iterable) events);
                         }
                     }
@@ -1234,8 +1242,12 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             return;
         }
         try {
-            ObjectName objectName = new ObjectName("javax.cache:type=CacheStatistics,CacheManager="
-                    + ObjectName.quote(manager.getURI().toString()) + ",Cache=" + ObjectName.quote(name));
+            ObjectName objectName =
+                    new ObjectName(
+                            "javax.cache:type=CacheStatistics,CacheManager="
+                                    + ObjectName.quote(manager.getURI().toString())
+                                    + ",Cache="
+                                    + ObjectName.quote(name));
             ManagementFactory.getPlatformMBeanServer().registerMBean(statistics, objectName);
             statisticsObjectName = objectName;
         } catch (JMException e) {
@@ -1258,13 +1270,13 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
 
     // ── shared helpers ──────────────────────────────────────────────
 
-    /** Converts a JSR-107 {@link Duration} to this wire's {@code
-     * ttlSeconds} convention (0 = no expiry), rounding a positive
-     * sub-second duration up to 1s (same rule {@code nanocached-spring}'s
-     * {@code toTtlSeconds} uses) — or {@link OptionalLong#empty()} for
-     * {@link Duration#ZERO}, whose JSR-107 meaning is "don't retain this
-     * entry at all", which the caller must implement as "don't write /
-     * delete instead", never as a wire TTL. */
+    /**
+     * Converts a JSR-107 {@link Duration} to this wire's {@code ttlSeconds} convention (0 = no
+     * expiry), rounding a positive sub-second duration up to 1s (same rule {@code
+     * nanocached-spring}'s {@code toTtlSeconds} uses) — or {@link OptionalLong#empty()} for {@link
+     * Duration#ZERO}, whose JSR-107 meaning is "don't retain this entry at all", which the caller
+     * must implement as "don't write / delete instead", never as a wire TTL.
+     */
     private static OptionalLong wireTtlSeconds(Duration duration) {
         if (duration == null || duration.isEternal()) {
             return OptionalLong.of(NO_EXPIRY);
@@ -1291,8 +1303,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         }
     }
 
-    /** {@link ValueCodec#deserialize(byte[], ClassLoader)} with this
-     * cache's class loader. */
+    /** {@link ValueCodec#deserialize(byte[], ClassLoader)} with this cache's class loader. */
     private V decode(byte[] bytes) {
         return ValueCodec.deserialize(bytes, classLoader);
     }
@@ -1303,17 +1314,13 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             CacheEntryEventFilter<? super K, ? super V> filter) {}
 
     /**
-     * The SDK namespace behind this cache, with every failure reported
-     * the way {@link javax.cache.Cache}'s contract asks: as a {@link
-     * CacheException} that carries the SDK's own exception as its cause.
-     * Without this a stopped node surfaced as the SDK's {@code
-     * ConnectionLost} and an over-size value as {@code
-     * IllegalArgumentException}, neither of which a JCache caller can
-     * be expected to catch. The two bulk calls let the SDK's partial
-     * and wrong-node outcomes through unwrapped: {@link
-     * #getManyBytesResolvingWrongNode} and {@link
-     * #setManyBytesResolvingWrongNode} act on them and wrap what they
-     * cannot resolve themselves.
+     * The SDK namespace behind this cache, with every failure reported the way {@link
+     * javax.cache.Cache}'s contract asks: as a {@link CacheException} that carries the SDK's own
+     * exception as its cause. Without this a stopped node surfaced as the SDK's {@code
+     * ConnectionLost} and an over-size value as {@code IllegalArgumentException}, neither of which
+     * a JCache caller can be expected to catch. The two bulk calls let the SDK's partial and
+     * wrong-node outcomes through unwrapped: {@link #getManyBytesResolvingWrongNode} and {@link
+     * #setManyBytesResolvingWrongNode} act on them and wrap what they cannot resolve themselves.
      */
     private static final class Wire {
         private final NanocachedClient.Namespace namespace;
@@ -1327,15 +1334,18 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         }
 
         private static RuntimeException wrapped(RuntimeException error) {
-            boolean backend = error instanceof NanocachedException || error instanceof IllegalArgumentException;
+            boolean backend =
+                    error instanceof NanocachedException
+                            || error instanceof IllegalArgumentException;
             return backend ? failure(error) : error;
         }
 
         private static RuntimeException wrappedUnlessBulkOutcome(RuntimeException error) {
-            boolean bulkOutcome = error instanceof NanocachedException.PartialWrongNodeRaw
-                    || error instanceof NanocachedException.PartialConnectionLostRaw
-                    || error instanceof NanocachedException.PartialConnectionLostSetRaw
-                    || error instanceof NanocachedException.WrongNode;
+            boolean bulkOutcome =
+                    error instanceof NanocachedException.PartialWrongNodeRaw
+                            || error instanceof NanocachedException.PartialConnectionLostRaw
+                            || error instanceof NanocachedException.PartialConnectionLostSetRaw
+                            || error instanceof NanocachedException.WrongNode;
             return bulkOutcome ? error : wrapped(error);
         }
 

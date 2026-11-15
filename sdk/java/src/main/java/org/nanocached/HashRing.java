@@ -9,59 +9,53 @@ import java.util.PriorityQueue;
 import java.util.Set;
 
 /**
- * Rendezvous (highest-random-weight) hashing over a fixed node list (the client-side
- * replication design). This is deliberately a
- * byte-for-byte port of the same computation every other nanocached
- * participant uses (the Rust node, the Go, TypeScript, Python, Rust, and
- * .NET SDKs) — not just "a" rendezvous hash, but <em>this specific</em>
- * one: if this SDK's ranking disagreed with a node's own copy, the two
- * would disagree about which nodes hold a key. Cross-language test
- * vectors pin the pipeline.
+ * Rendezvous (highest-random-weight) hashing over a fixed node list (the client-side replication
+ * design). This is deliberately a byte-for-byte port of the same computation every other nanocached
+ * participant uses (the Rust node, the Go, TypeScript, Python, Rust, and .NET SDKs) — not just "a"
+ * rendezvous hash, but <em>this specific</em> one: if this SDK's ranking disagreed with a node's
+ * own copy, the two would disagree about which nodes hold a key. Cross-language test vectors pin
+ * the pipeline.
  *
- * <p>For each (node, key) pair, {@code score = fmix64(fnv1a(name) ^
- * key_hash)}; a key's owners are the {@code replicas} highest-scoring
- * nodes in descending <em>unsigned</em> score order (ties — effectively
- * impossible at 64 bits — break toward the lexicographically smaller
- * name), and its primary is the top one.
+ * <p>For each (node, key) pair, {@code score = fmix64(fnv1a(name) ^ key_hash)}; a key's owners are
+ * the {@code replicas} highest-scoring nodes in descending <em>unsigned</em> score order (ties —
+ * effectively impossible at 64 bits — break toward the lexicographically smaller name), and its
+ * primary is the top one.
  *
  * <p>Built from node <em>names</em>, not addresses (node identity decoupled from address).
  *
- * <p>Namespaces (issue #105) enter the key side of the score, and the
- * canonical hash input is consensus-critical across the server, the six
- * SDKs and {@code verify-staged-join} (see {@code src/hash_ring.rs}'s
- * module docs for the full rationale):
+ * <p>Namespaces (issue #105) enter the key side of the score, and the canonical hash input is
+ * consensus-critical across the server, the six SDKs and {@code verify-staged-join} (see {@code
+ * src/hash_ring.rs}'s module docs for the full rationale):
  *
  * <ul>
- * <li>default (empty) namespace: {@code fnv1a(key)} — byte-identical to
- * the pre-namespace form, so every existing key keeps its placement
- * across a rolling upgrade (no cluster-wide hit-rate cliff, and
- * mixed-version clients agree on placement);
- * <li>non-empty namespace: {@code fnv1a(be32(len(ns)) || ns || key)} — the
- * namespace length as a 4-byte big-endian integer, then the namespace
- * bytes, then the key bytes, hashed as one stream. Length-prefixed so
- * {@code ("ab", "c")} and {@code ("a", "bc")} never share an input;
- * including the namespace at all is what keeps the placement balanced —
- * hashing the key alone would pile every namespace's common singleton
- * keys (e.g. {@code config}) onto the same nodes.
+ *   <li>default (empty) namespace: {@code fnv1a(key)} — byte-identical to the pre-namespace form,
+ *       so every existing key keeps its placement across a rolling upgrade (no cluster-wide
+ *       hit-rate cliff, and mixed-version clients agree on placement);
+ *   <li>non-empty namespace: {@code fnv1a(be32(len(ns)) || ns || key)} — the namespace length as a
+ *       4-byte big-endian integer, then the namespace bytes, then the key bytes, hashed as one
+ *       stream. Length-prefixed so {@code ("ab", "c")} and {@code ("a", "bc")} never share an
+ *       input; including the namespace at all is what keeps the placement balanced — hashing the
+ *       key alone would pile every namespace's common singleton keys (e.g. {@code config}) onto the
+ *       same nodes.
  * </ul>
  */
 final class HashRing {
-    /** The default namespace — every un-namespaced key routes as if
-     * namespaced by this, and {@link #keyHash} treats it identically to
-     * "no namespace at all" (the legacy {@code fnv1a(key)} form). */
+    /**
+     * The default namespace — every un-namespaced key routes as if namespaced by this, and {@link
+     * #keyHash} treats it identically to "no namespace at all" (the legacy {@code fnv1a(key)}
+     * form).
+     */
     private static final byte[] EMPTY_NAMESPACE = new byte[0];
 
     private final List<String> nodes;
     private final long[] nodeHashes;
 
     /**
-     * Issue #461 (mirrors src/hash_ring.rs's {@code HashRing::new} dedupe,
-     * issue #328, and the Python/Go SDK fixes for the same, issues #360
-     * and #389): deduplicates {@code nodes}, keeping the first occurrence
-     * so construction order is otherwise unaffected. A repeated name
-     * would otherwise score independently for each of its slots in
-     * {@link #owners}'s bounded top-{@code replicas} insertion, occupying
-     * more than one place in the returned set and inflating its
+     * Issue #461 (mirrors src/hash_ring.rs's {@code HashRing::new} dedupe, issue #328, and the
+     * Python/Go SDK fixes for the same, issues #360 and #389): deduplicates {@code nodes}, keeping
+     * the first occurrence so construction order is otherwise unaffected. A repeated name would
+     * otherwise score independently for each of its slots in {@link #owners}'s bounded top-{@code
+     * replicas} insertion, occupying more than one place in the returned set and inflating its
      * effective share of the ring.
      */
     public HashRing(List<String> nodes) {
@@ -84,10 +78,11 @@ final class HashRing {
         return fnv1aContinue(0xcbf29ce484222325L, data);
     }
 
-    /** Feeds {@code data} into an in-progress FNV-1a state, so a
-     * multi-part input hashes exactly as its concatenation would, with no
-     * allocation — used to fold the namespace length, namespace bytes,
-     * and key bytes into one stream in {@link #keyHash}. */
+    /**
+     * Feeds {@code data} into an in-progress FNV-1a state, so a multi-part input hashes exactly as
+     * its concatenation would, with no allocation — used to fold the namespace length, namespace
+     * bytes, and key bytes into one stream in {@link #keyHash}.
+     */
     private static long fnv1aContinue(long hash, byte[] data) {
         for (byte b : data) {
             hash ^= (b & 0xffL);
@@ -108,7 +103,7 @@ final class HashRing {
         // that could ever occur.
         int length = namespace.length;
         byte[] namespaceLength = {
-                (byte) (length >>> 24), (byte) (length >>> 16), (byte) (length >>> 8), (byte) length
+            (byte) (length >>> 24), (byte) (length >>> 16), (byte) (length >>> 8), (byte) length
         };
 
         long hash = fnv1aContinue(0xcbf29ce484222325L, namespaceLength);
@@ -127,27 +122,26 @@ final class HashRing {
     }
 
     /**
-     * The key's owners: the {@code replicas} highest-scoring nodes,
-     * primary first. Returns fewer when the cluster is smaller.
+     * The key's owners: the {@code replicas} highest-scoring nodes, primary first. Returns fewer
+     * when the cluster is smaller.
      *
-     * <p>Top-{@code replicas} selection via a bounded max-heap of the
-     * {@code replicas} best candidates seen so far (O(n log replicas))
-     * instead of sorting every node (O(n log n)) — replicas is typically a
-     * small constant (2-5) while a cluster can have many nodes, so this
-     * avoids paying for a full ranking this call only ever uses the front
-     * of. Produces the identical ordering a full sort would (same
-     * comparator, {@code ORDER}), just without sorting the nodes this
-     * call discards.
+     * <p>Top-{@code replicas} selection via a bounded max-heap of the {@code replicas} best
+     * candidates seen so far (O(n log replicas)) instead of sorting every node (O(n log n)) —
+     * replicas is typically a small constant (2-5) while a cluster can have many nodes, so this
+     * avoids paying for a full ranking this call only ever uses the front of. Produces the
+     * identical ordering a full sort would (same comparator, {@code ORDER}), just without sorting
+     * the nodes this call discards.
      */
     public List<String> owners(byte[] key, int replicas) {
         return owners(EMPTY_NAMESPACE, key, replicas);
     }
 
-    /** As {@link #owners(byte[], int)}, but scoped to {@code namespace}
-     * (issue #105): the same key name in two namespaces routes
-     * independently, since it enters the key-side hash (see the class
-     * doc). An empty namespace is exactly {@link #owners(byte[], int)} —
-     * the same legacy hash, so un-namespaced keys never move. */
+    /**
+     * As {@link #owners(byte[], int)}, but scoped to {@code namespace} (issue #105): the same key
+     * name in two namespaces routes independently, since it enters the key-side hash (see the class
+     * doc). An empty namespace is exactly {@link #owners(byte[], int)} — the same legacy hash, so
+     * un-namespaced keys never move.
+     */
     public List<String> owners(byte[] namespace, byte[] key, int replicas) {
         long keyHash = keyHash(namespace, key);
         int limit = Math.min(replicas, nodes.size());
@@ -180,19 +174,18 @@ final class HashRing {
 
     // Descending by UNSIGNED score; ties toward the lexicographically
     // smaller name — a total order every implementation agrees on.
-    private static final Comparator<Scored> ORDER = (a, b) -> {
-        int byScore = Long.compareUnsigned(b.score(), a.score());
-        return byScore != 0 ? byScore : compareNames(a.node(), b.node());
-    };
+    private static final Comparator<Scored> ORDER =
+            (a, b) -> {
+                int byScore = Long.compareUnsigned(b.score(), a.score());
+                return byScore != 0 ? byScore : compareNames(a.node(), b.node());
+            };
 
     /**
-     * Orders node names by their UTF-8 bytes, unsigned — the server's
-     * {@code str::cmp} in {@code src/hash_ring.rs}. {@link
-     * String#compareTo} orders by UTF-16 code units instead, which differs
-     * for a supplementary-plane character against one in U+E000..U+FFFF (a
-     * surrogate, 0xD800..0xDFFF, sorts below those in UTF-16 but its
-     * four-byte UTF-8 form sorts above their three-byte one). Reached only
-     * on a score tie, so the allocation does not matter.
+     * Orders node names by their UTF-8 bytes, unsigned — the server's {@code str::cmp} in {@code
+     * src/hash_ring.rs}. {@link String#compareTo} orders by UTF-16 code units instead, which
+     * differs for a supplementary-plane character against one in U+E000..U+FFFF (a surrogate,
+     * 0xD800..0xDFFF, sorts below those in UTF-16 but its four-byte UTF-8 form sorts above their
+     * three-byte one). Reached only on a score tie, so the allocation does not matter.
      */
     static int compareNames(String a, String b) {
         return java.util.Arrays.compareUnsigned(

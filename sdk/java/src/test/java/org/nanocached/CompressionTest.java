@@ -21,7 +21,7 @@ class CompressionTest {
     // produced, not merely that it round-trips its own output.
     private static final byte[] CROSS_LANGUAGE_PLAINTEXT =
             ("{\"user\":\"alice\",\"role\":\"admin\",\"tags\":[\"a\",\"b\",\"c\"],\"note\":\"the quick "
-                    + "brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog\"}")
+                            + "brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog\"}")
                     .getBytes(java.nio.charset.StandardCharsets.UTF_8);
     private static final String CROSS_LANGUAGE_DEFLATE_HEX =
             "958acb0d833010055b59bd3315d00ae2609bc531b1bdc41f9280d23b7609393ce98d662ed4cc0923"
@@ -81,13 +81,15 @@ class CompressionTest {
 
     @Test
     void unrecognizedMarkerByteThrows() {
-        assertThrows(NanocachedException.DecompressionFailed.class,
+        assertThrows(
+                NanocachedException.DecompressionFailed.class,
                 () -> Compression.decompressValue(new byte[] {0x02, 1, 2, 3}));
     }
 
     @Test
     void emptyValueWithCompressEnabledThrows() {
-        assertThrows(NanocachedException.DecompressionFailed.class,
+        assertThrows(
+                NanocachedException.DecompressionFailed.class,
                 () -> Compression.decompressValue(new byte[0]));
     }
 
@@ -101,7 +103,8 @@ class CompressionTest {
         assertEquals(0x01, stored[0]);
         assertTrue(stored.length < 1024 * 1024); // small on the wire
         NanocachedException.DecompressionFailed error =
-                assertThrows(NanocachedException.DecompressionFailed.class,
+                assertThrows(
+                        NanocachedException.DecompressionFailed.class,
                         () -> Compression.decompressValue(stored));
         assertTrue(error.getMessage().contains("decompression bomb"));
     }
@@ -116,8 +119,13 @@ class CompressionTest {
 
     @Test
     void corruptDeflateMarkedValueThrows() {
-        assertThrows(NanocachedException.DecompressionFailed.class,
-                () -> Compression.decompressValue(new byte[] {0x01, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF}));
+        assertThrows(
+                NanocachedException.DecompressionFailed.class,
+                () ->
+                        Compression.decompressValue(
+                                new byte[] {
+                                    0x01, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF
+                                }));
     }
 
     @Test
@@ -125,11 +133,16 @@ class CompressionTest {
         // Issue #1896: the default budget was 256 MiB, 4 bytes short of four
         // 64 MiB + 1 reservations, so the fourth acquire blocked until
         // another decompression released (here: forever, on one thread).
-        Compression.InflateBudget budget = new Compression.InflateBudget(Compression.maxInflightDecompressedBytes);
-        assertTimeoutPreemptively(java.time.Duration.ofSeconds(10), () -> {
-            for (int i = 0; i < 4; i++) {
-                assertEquals(Compression.INFLATE_RESERVATION, budget.acquire(Compression.INFLATE_RESERVATION));
-            }
-        });
+        Compression.InflateBudget budget =
+                new Compression.InflateBudget(Compression.maxInflightDecompressedBytes);
+        assertTimeoutPreemptively(
+                java.time.Duration.ofSeconds(10),
+                () -> {
+                    for (int i = 0; i < 4; i++) {
+                        assertEquals(
+                                Compression.INFLATE_RESERVATION,
+                                budget.acquire(Compression.INFLATE_RESERVATION));
+                    }
+                });
     }
 }

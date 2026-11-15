@@ -68,9 +68,13 @@ class HashRingTest {
     @Test
     void matchesCrossLanguageNamespacedVectors() {
         HashRing ring = new HashRing(NODES);
-        assertEquals(List.of("node-a", "node-c", "node-b"), ring.owners(bytes("users"), bytes("alpha"), 3));
-        assertEquals(List.of("node-b", "node-c", "node-a"), ring.owners(bytes("users"), bytes(""), 3));
-        assertEquals(List.of("node-b", "node-a", "node-c"),
+        assertEquals(
+                List.of("node-a", "node-c", "node-b"),
+                ring.owners(bytes("users"), bytes("alpha"), 3));
+        assertEquals(
+                List.of("node-b", "node-c", "node-a"), ring.owners(bytes("users"), bytes(""), 3));
+        assertEquals(
+                List.of("node-b", "node-a", "node-c"),
                 ring.owners(new byte[] {(byte) 0xff, 0x00}, bytes("beta"), 3));
     }
 
@@ -90,11 +94,9 @@ class HashRingTest {
         // un-namespaced concatenation.
         HashRing ring = new HashRing(NODES);
         assertNotEquals(
-                ring.owners(bytes("ab"), bytes("c"), 3),
-                ring.owners(bytes("a"), bytes("bc"), 3));
+                ring.owners(bytes("ab"), bytes("c"), 3), ring.owners(bytes("a"), bytes("bc"), 3));
         assertNotEquals(
-                ring.owners(bytes("ab"), bytes("c"), 3),
-                ring.owners(bytes(""), bytes("abc"), 3));
+                ring.owners(bytes("ab"), bytes("c"), 3), ring.owners(bytes(""), bytes("abc"), 3));
     }
 
     @Test
@@ -128,9 +130,8 @@ class HashRingTest {
         HashRing after = new HashRing(List.of("node-a", "node-b", "node-c", "node-d"));
         for (int i = 0; i < 500; i++) {
             byte[] key = bytes("key-" + i);
-            List<String> newOrder = after.owners(key, 4).stream()
-                    .filter(node -> !node.equals("node-d"))
-                    .toList();
+            List<String> newOrder =
+                    after.owners(key, 4).stream().filter(node -> !node.equals("node-d")).toList();
             assertEquals(before.owners(key, 3), newOrder, "reordered for key-" + i);
         }
     }
@@ -143,13 +144,15 @@ class HashRingTest {
     // (descending unsigned score; ties toward the lexicographically
     // smaller name). Mirrors the Go SDK's
     // TestOwnersMatchesANaiveFullSortReference.
-    private static List<String> naiveOwners(HashRing ring, List<String> nodes, byte[] key, int replicas) {
+    private static List<String> naiveOwners(
+            HashRing ring, List<String> nodes, byte[] key, int replicas) {
         long keyHash = HashRing.fnv1a(key);
         record Scored(long score, String node) {}
-        Comparator<Scored> order = (a, b) -> {
-            int byScore = Long.compareUnsigned(b.score(), a.score());
-            return byScore != 0 ? byScore : a.node().compareTo(b.node());
-        };
+        Comparator<Scored> order =
+                (a, b) -> {
+                    int byScore = Long.compareUnsigned(b.score(), a.score());
+                    return byScore != 0 ? byScore : a.node().compareTo(b.node());
+                };
         List<Scored> ranked = new ArrayList<>();
         for (String node : nodes) {
             ranked.add(new Scored(HashRing.fmix64(HashRing.fnv1a(bytes(node)) ^ keyHash), node));
@@ -172,18 +175,24 @@ class HashRingTest {
         // keeping this test free of any flakiness tied to a seeded
         // default source (mirrors the Go SDK's reference test).
         long[] state = {0xC0FFEEL};
-        java.util.function.LongSupplier next = () -> {
-            state[0] += 0x9E3779B97F4A7C15L;
-            long z = state[0];
-            z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
-            z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
-            return z ^ (z >>> 31);
-        };
+        java.util.function.LongSupplier next =
+                () -> {
+                    state[0] += 0x9E3779B97F4A7C15L;
+                    long z = state[0];
+                    z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
+                    z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
+                    return z ^ (z >>> 31);
+                };
 
-        for (int replicas : new int[] {0, 1, nodes.size() / 2, nodes.size(), nodes.size() + 1, nodes.size() + 10}) {
+        for (int replicas :
+                new int[] {
+                    0, 1, nodes.size() / 2, nodes.size(), nodes.size() + 1, nodes.size() + 10
+                }) {
             for (int i = 0; i < 200; i++) {
                 byte[] key = bytes("fuzz-key-" + next.getAsLong());
-                assertEquals(naiveOwners(ring, nodes, key, replicas), ring.owners(key, replicas),
+                assertEquals(
+                        naiveOwners(ring, nodes, key, replicas),
+                        ring.owners(key, replicas),
                         "replicas=" + replicas + " key=" + new String(key, StandardCharsets.UTF_8));
             }
         }
@@ -203,7 +212,9 @@ class HashRingTest {
 
         for (int replicas = 0; replicas <= 5; replicas++) {
             List<String> owners = ring.owners(key, replicas);
-            assertEquals(owners.size(), new java.util.HashSet<>(owners).size(),
+            assertEquals(
+                    owners.size(),
+                    new java.util.HashSet<>(owners).size(),
                     "replicas=" + replicas + " owners=" + owners);
         }
 
@@ -226,7 +237,8 @@ class HashRingTest {
         }
         double fair = (double) total / NODES.size();
         for (Map.Entry<String, Integer> entry : counts.entrySet()) {
-            assertTrue(Math.abs(entry.getValue() - fair) / fair < 0.15,
+            assertTrue(
+                    Math.abs(entry.getValue() - fair) / fair < 0.15,
                     entry.getKey() + " got " + entry.getValue() + "/" + total);
         }
     }

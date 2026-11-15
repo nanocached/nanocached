@@ -11,21 +11,18 @@ import java.io.Serializable;
 import javax.cache.CacheException;
 
 /**
- * Cache values to wire bytes — plain JDK serialization, the same default
- * {@code nanocached-spring}'s {@code JdkCacheValueSerializer} uses,
- * reimplemented independently here (see this module's README policy
- * note). Unlike Spring's cache abstraction, JCache never stores {@code
- * null} (see {@link javax.cache.Cache#put}'s contract), so there is no
- * null-marker concern here.
+ * Cache values to wire bytes — plain JDK serialization, the same default {@code
+ * nanocached-spring}'s {@code JdkCacheValueSerializer} uses, reimplemented independently here (see
+ * this module's README policy note). Unlike Spring's cache abstraction, JCache never stores {@code
+ * null} (see {@link javax.cache.Cache#put}'s contract), so there is no null-marker concern here.
  *
- * <p><b>Trust boundary.</b> {@link #deserialize} runs {@link ObjectInputStream#readObject()}
- * over whatever bytes are read back from the namespace — see this module's README
- * "Trust boundary / deserialization" section for what that means for anyone who can write to
- * that namespace. To bound what this class is willing to reconstruct, every {@code
- * ObjectInputStream} it creates has the JVM-wide serial filter applied, if one is configured
- * ({@code -Djdk.serialFilter}, or {@link ObjectInputFilter.Config#setSerialFilter}) — set
- * explicitly here because {@code ObjectInputStream} does not always pick up the process-wide
- * filter on its own.
+ * <p><b>Trust boundary.</b> {@link #deserialize} runs {@link ObjectInputStream#readObject()} over
+ * whatever bytes are read back from the namespace — see this module's README "Trust boundary /
+ * deserialization" section for what that means for anyone who can write to that namespace. To bound
+ * what this class is willing to reconstruct, every {@code ObjectInputStream} it creates has the
+ * JVM-wide serial filter applied, if one is configured ({@code -Djdk.serialFilter}, or {@link
+ * ObjectInputFilter.Config#setSerialFilter}) — set explicitly here because {@code
+ * ObjectInputStream} does not always pick up the process-wide filter on its own.
  */
 final class ValueCodec {
 
@@ -47,23 +44,22 @@ final class ValueCodec {
         return bytes.toByteArray();
     }
 
-    /** Resolves classes with the calling thread's context class loader —
-     * see {@link #deserialize(byte[], ClassLoader)}. */
+    /**
+     * Resolves classes with the calling thread's context class loader — see {@link
+     * #deserialize(byte[], ClassLoader)}.
+     */
     static <V> V deserialize(byte[] bytes) {
         return deserialize(bytes, null);
     }
 
     /**
-     * Resolves the value's classes with {@code classLoader} — the loader
-     * the {@code CacheManager} was created with, which JSR-107 says is the
-     * one for loading the cache's underlying classes — or, when it is
-     * {@code null}, the calling thread's context class loader, falling
-     * back to this class's own. A plain {@code ObjectInputStream} uses
-     * the loader that defined this adapter, which cannot see application
-     * classes in a child loader (a web application, a devtools restart):
-     * every cache hit then failed with {@code ClassNotFoundException}.
-     * A failure to read the value back is a {@link CacheException}, as
-     * the {@code Cache} contract asks.
+     * Resolves the value's classes with {@code classLoader} — the loader the {@code CacheManager}
+     * was created with, which JSR-107 says is the one for loading the cache's underlying classes —
+     * or, when it is {@code null}, the calling thread's context class loader, falling back to this
+     * class's own. A plain {@code ObjectInputStream} uses the loader that defined this adapter,
+     * which cannot see application classes in a child loader (a web application, a devtools
+     * restart): every cache hit then failed with {@code ClassNotFoundException}. A failure to read
+     * the value back is a {@link CacheException}, as the {@code Cache} contract asks.
      */
     @SuppressWarnings("unchecked")
     static <V> V deserialize(byte[] bytes, ClassLoader classLoader) {
@@ -74,7 +70,8 @@ final class ValueCodec {
         if (loader == null) {
             loader = ValueCodec.class.getClassLoader();
         }
-        try (ObjectInputStream in = new LoaderObjectInputStream(new ByteArrayInputStream(bytes), loader)) {
+        try (ObjectInputStream in =
+                new LoaderObjectInputStream(new ByteArrayInputStream(bytes), loader)) {
             ObjectInputFilter filter = ObjectInputFilter.Config.getSerialFilter();
             if (filter != null) {
                 in.setObjectInputFilter(filter);
@@ -94,7 +91,8 @@ final class ValueCodec {
         }
 
         @Override
-        protected Class<?> resolveClass(ObjectStreamClass desc) throws IOException, ClassNotFoundException {
+        protected Class<?> resolveClass(ObjectStreamClass desc)
+                throws IOException, ClassNotFoundException {
             try {
                 return Class.forName(desc.getName(), false, loader);
             } catch (ClassNotFoundException notInLoader) {

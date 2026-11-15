@@ -12,16 +12,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * A minimal in-process nanocached node speaking just the slice of the
- * wire protocol the Spring adapter's client traffic produces: the
- * {@code A ... T} handshake, the namespaced {@code g}/{@code s}/{@code
- * d}/{@code c} commands, their legacy default-namespace forms (the
- * SDK's keep-alive probe), the compare-and-set {@code k} (issue #141)
- * {@link NanocachedCache#putIfAbsent} relies on, and {@code F}. A
- * trimmed re-implementation of the SDK's own test double (that one is
- * package-private to the SDK), not a real store: no TTL expiry, no LRU —
- * the adapter tests only assert what reaches the wire and what comes
- * back.
+ * A minimal in-process nanocached node speaking just the slice of the wire protocol the Spring
+ * adapter's client traffic produces: the {@code A ... T} handshake, the namespaced {@code g}/{@code
+ * s}/{@code d}/{@code c} commands, their legacy default-namespace forms (the SDK's keep-alive
+ * probe), the compare-and-set {@code k} (issue #141) {@link NanocachedCache#putIfAbsent} relies on,
+ * and {@code F}. A trimmed re-implementation of the SDK's own test double (that one is
+ * package-private to the SDK), not a real store: no TTL expiry, no LRU — the adapter tests only
+ * assert what reaches the wire and what comes back.
  */
 final class MockNode implements AutoCloseable {
 
@@ -29,26 +26,29 @@ final class MockNode implements AutoCloseable {
 
     private final ServerSocket server;
     private final Thread acceptLoop;
+
     /** namespace (UTF-8-ish, raw bytes wrapped) → key → entry. */
     final Map<ByteBuffer, Map<ByteBuffer, Entry>> stores = new ConcurrentHashMap<>();
+
     final AtomicInteger clearCount = new AtomicInteger();
     final AtomicInteger flushCount = new AtomicInteger();
     final AtomicInteger casSetCount = new AtomicInteger();
 
     MockNode() throws IOException {
         server = new ServerSocket(0, 16, java.net.InetAddress.getLoopbackAddress());
-        acceptLoop = new Thread(() -> {
-            while (true) {
-                try {
-                    Socket socket = server.accept();
-                    Thread serve = new Thread(() -> serve(socket));
-                    serve.setDaemon(true);
-                    serve.start();
-                } catch (IOException stop) {
-                    return;
-                }
-            }
-        });
+        acceptLoop =
+                new Thread(() -> {
+                    while (true) {
+                        try {
+                            Socket socket = server.accept();
+                            Thread serve = new Thread(() -> serve(socket));
+                            serve.setDaemon(true);
+                            serve.start();
+                        } catch (IOException stop) {
+                            return;
+                        }
+                    }
+                });
         acceptLoop.setDaemon(true);
         acceptLoop.start();
     }
@@ -128,22 +128,31 @@ final class MockNode implements AutoCloseable {
         }
     }
 
-    private void get(InputStream in, OutputStream out, String namespace, int keyLength,
-            String tagSuffix) throws IOException {
+    private void get(
+            InputStream in, OutputStream out, String namespace, int keyLength, String tagSuffix)
+            throws IOException {
         byte[] key = in.readNBytes(keyLength);
         Entry entry = entry(namespace, key);
         if (entry == null) {
             reply(out, "N" + tagSuffix + "\n");
             return;
         }
-        out.write(("V " + entry.value().length + tagSuffix + "\n")
-                .getBytes(StandardCharsets.US_ASCII));
+        out.write(
+                ("V " + entry.value().length + tagSuffix + "\n")
+                        .getBytes(StandardCharsets.US_ASCII));
         out.write(entry.value());
         out.flush();
     }
 
-    private void set(InputStream in, OutputStream out, String namespace, String[] parts,
-            int firstLengthIndex, boolean tagged, String tagSuffix) throws IOException {
+    private void set(
+            InputStream in,
+            OutputStream out,
+            String namespace,
+            String[] parts,
+            int firstLengthIndex,
+            boolean tagged,
+            String tagSuffix)
+            throws IOException {
         int keyLength = Integer.parseInt(parts[firstLengthIndex]);
         int valueLength = Integer.parseInt(parts[firstLengthIndex + 1]);
         // Remaining numeric fields: [ttl] in untagged mode, [ttl] tag in
@@ -156,21 +165,23 @@ final class MockNode implements AutoCloseable {
         reply(out, "S" + tagSuffix + "\n");
     }
 
-    private void delete(InputStream in, OutputStream out, String namespace, int keyLength,
-            String tagSuffix) throws IOException {
+    private void delete(
+            InputStream in, OutputStream out, String namespace, int keyLength, String tagSuffix)
+            throws IOException {
         byte[] key = in.readNBytes(keyLength);
         boolean existed = store(namespace).remove(ByteBuffer.wrap(key)) != null;
         reply(out, (existed ? "D" : "N") + tagSuffix + "\n");
     }
 
-    /** {@code k <ns-len> <key-len> <val-len> <cond> [ttl] [tag]},
-     * docs/protocol.html "k / x" — only {@code <cond> == "A"} (add if
-     * absent) is implemented, the only condition {@link
-     * NanocachedCache#putIfAbsent} ever sends. The store's per-namespace
-     * map is the lock: check-then-put is synchronized on it so two
-     * connections racing on the same key really do serialize the way the
-     * real server's CAS does, not just "usually" thanks to test timing. */
-    private void casSet(InputStream in, OutputStream out, String[] parts, boolean tagged, String tagSuffix)
+    /**
+     * {@code k <ns-len> <key-len> <val-len> <cond> [ttl] [tag]}, docs/protocol.html "k / x" — only
+     * {@code <cond> == "A"} (add if absent) is implemented, the only condition {@link
+     * NanocachedCache#putIfAbsent} ever sends. The store's per-namespace map is the lock:
+     * check-then-put is synchronized on it so two connections racing on the same key really do
+     * serialize the way the real server's CAS does, not just "usually" thanks to test timing.
+     */
+    private void casSet(
+            InputStream in, OutputStream out, String[] parts, boolean tagged, String tagSuffix)
             throws IOException {
         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
         int keyLength = Integer.parseInt(parts[2]);

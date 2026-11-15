@@ -5,9 +5,8 @@ import javax.cache.event.CacheEntryEvent;
 import javax.cache.event.EventType;
 
 /**
- * A locally-fired {@link CacheEntryEvent} (issue #118) — see {@link
- * NanocachedCache}'s "local-only listeners" doc section for what "locally
- * fired" means and why.
+ * A locally-fired {@link CacheEntryEvent} (issue #118) — see {@link NanocachedCache}'s "local-only
+ * listeners" doc section for what "locally fired" means and why.
  */
 final class NanocachedCacheEntryEvent<K, V> extends CacheEntryEvent<K, V> {
 
@@ -40,8 +39,10 @@ final class NanocachedCacheEntryEvent<K, V> extends CacheEntryEvent<K, V> {
         return value;
     }
 
-    /** JSR-107 1.1: {@code null} when there was no previous value or it is
-     * not available ({@link #isOldValueAvailable()} tells the two apart). */
+    /**
+     * JSR-107 1.1: {@code null} when there was no previous value or it is not available ({@link
+     * #isOldValueAvailable()} tells the two apart).
+     */
     @Override
     public V getOldValue() {
         return oldValue;

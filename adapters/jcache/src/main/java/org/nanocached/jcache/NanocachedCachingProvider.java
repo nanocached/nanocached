@@ -12,25 +12,22 @@ import javax.cache.spi.CachingProvider;
 import org.nanocached.NanocachedClient;
 
 /**
- * JSR-107 entry point (issue #118): discovered by {@link
- * javax.cache.Caching#getCachingProvider()} via {@code
- * META-INF/services/javax.cache.spi.CachingProvider} — the standard JCache
- * discovery mechanism, nothing bespoke.
+ * JSR-107 entry point (issue #118): discovered by {@link javax.cache.Caching#getCachingProvider()}
+ * via {@code META-INF/services/javax.cache.spi.CachingProvider} — the standard JCache discovery
+ * mechanism, nothing bespoke.
  *
- * <p>Unlike {@code nanocached-spring} (which borrows an application-owned
- * {@link NanocachedClient}), this provider <em>creates and owns</em> the
- * client for each {@link CacheManager} it hands out, since JSR-107's
- * {@code CacheManager} is expected to manage its own resources. Connection
- * settings come from the {@link Properties} passed to {@link
- * #getCacheManager(URI, ClassLoader, Properties)} — see {@link
- * NanocachedCacheManager} for the recognized {@code nanocached.*} keys.
- * The {@link URI} is used only as part of a manager's identity (JSR-107's
- * "same URI + ClassLoader returns the same manager" contract); it is
- * never parsed as a pointer to an external config resource.
+ * <p>Unlike {@code nanocached-spring} (which borrows an application-owned {@link
+ * NanocachedClient}), this provider <em>creates and owns</em> the client for each {@link
+ * CacheManager} it hands out, since JSR-107's {@code CacheManager} is expected to manage its own
+ * resources. Connection settings come from the {@link Properties} passed to {@link
+ * #getCacheManager(URI, ClassLoader, Properties)} — see {@link NanocachedCacheManager} for the
+ * recognized {@code nanocached.*} keys. The {@link URI} is used only as part of a manager's
+ * identity (JSR-107's "same URI + ClassLoader returns the same manager" contract); it is never
+ * parsed as a pointer to an external config resource.
  *
- * <p>Policy note: framework adapters like this module are
- * ecosystem-specific and live <em>outside</em> the six-language SDK
- * parity policy (issue #25) — parity applies to the SDK core only.
+ * <p>Policy note: framework adapters like this module are ecosystem-specific and live
+ * <em>outside</em> the six-language SDK parity policy (issue #25) — parity applies to the SDK core
+ * only.
  */
 public final class NanocachedCachingProvider implements CachingProvider {
 
@@ -42,7 +39,8 @@ public final class NanocachedCachingProvider implements CachingProvider {
     @Override
     public CacheManager getCacheManager(URI uri, ClassLoader classLoader, Properties properties) {
         URI resolvedUri = uri != null ? uri : getDefaultURI();
-        ClassLoader resolvedClassLoader = classLoader != null ? classLoader : getDefaultClassLoader();
+        ClassLoader resolvedClassLoader =
+                classLoader != null ? classLoader : getDefaultClassLoader();
         ManagerKey key = new ManagerKey(resolvedUri, resolvedClassLoader);
 
         // Before the lookup, not inside connect(): a repeat call for a URI
@@ -69,14 +67,16 @@ public final class NanocachedCachingProvider implements CachingProvider {
                 new NanocachedCacheManager(this, resolvedUri, resolvedClassLoader, client);
 
         NanocachedCacheManager[] winner = new NanocachedCacheManager[1];
-        managers.compute(key, (unused, current) -> {
-            if (current != null && !current.isClosed()) {
-                winner[0] = current;
-                return current;
-            }
-            winner[0] = created;
-            return created;
-        });
+        managers.compute(
+                key,
+                (unused, current) -> {
+                    if (current != null && !current.isClosed()) {
+                        winner[0] = current;
+                        return current;
+                    }
+                    winner[0] = created;
+                    return created;
+                });
 
         if (winner[0] != created) {
             // Lost the race to another thread's connect for the same
@@ -92,21 +92,32 @@ public final class NanocachedCachingProvider implements CachingProvider {
     }
 
     /** Every {@code nanocached.*} property this provider reads. */
-    private static final java.util.Set<String> KNOWN_PROPERTIES = java.util.Set.of(
-            "nanocached.addresses", "nanocached.secret", "nanocached.tls", "nanocached.ca",
-            "nanocached.compress", "nanocached.compression-threshold",
-            "nanocached.fire-and-forget-replicas", "nanocached.read-repair",
-            "nanocached.reconnect-cooldown-millis", "nanocached.read-hedge-after-millis");
+    private static final java.util.Set<String> KNOWN_PROPERTIES =
+            java.util.Set.of(
+                    "nanocached.addresses",
+                    "nanocached.secret",
+                    "nanocached.tls",
+                    "nanocached.ca",
+                    "nanocached.compress",
+                    "nanocached.compression-threshold",
+                    "nanocached.fire-and-forget-replicas",
+                    "nanocached.read-repair",
+                    "nanocached.reconnect-cooldown-millis",
+                    "nanocached.read-hedge-after-millis");
 
-    /** A mistyped key (say {@code nanocached.tsl}) must not be ignored
-     * quietly: it would leave TLS off and send the secret in the clear.
-     * Properties outside the {@code nanocached.} prefix belong to the caller
-     * and are left alone. */
+    /**
+     * A mistyped key (say {@code nanocached.tsl}) must not be ignored quietly: it would leave TLS
+     * off and send the secret in the clear. Properties outside the {@code nanocached.} prefix
+     * belong to the caller and are left alone.
+     */
     private static void rejectUnknownProperties(Properties properties) {
         for (String name : properties.stringPropertyNames()) {
             if (name.startsWith("nanocached.") && !KNOWN_PROPERTIES.contains(name)) {
-                throw new CacheException("nanocached-jcache: unknown property \"" + name
-                        + "\"; the keys this provider reads are " + new java.util.TreeSet<>(KNOWN_PROPERTIES));
+                throw new CacheException(
+                        "nanocached-jcache: unknown property \""
+                                + name
+                                + "\"; the keys this provider reads are "
+                                + new java.util.TreeSet<>(KNOWN_PROPERTIES));
             }
         }
     }
@@ -121,7 +132,8 @@ public final class NanocachedCachingProvider implements CachingProvider {
                             + " properties)");
         }
 
-        NanocachedClient.Options options = new NanocachedClient.Options().addresses(parseAddresses(addresses));
+        NanocachedClient.Options options =
+                new NanocachedClient.Options().addresses(parseAddresses(addresses));
 
         // Every property is parsed and applied under its own name: a
         // value the SDK or the parser rejects is a CacheException that
@@ -145,12 +157,16 @@ public final class NanocachedCachingProvider implements CachingProvider {
         }
         Long compressionThreshold = longProperty(properties, "nanocached.compression-threshold");
         if (compressionThreshold != null) {
-            apply("nanocached.compression-threshold",
+            apply(
+                    "nanocached.compression-threshold",
                     () -> options.compressionThreshold(Math.toIntExact(compressionThreshold)));
         }
-        Boolean fireAndForgetReplicas = booleanProperty(properties, "nanocached.fire-and-forget-replicas");
+        Boolean fireAndForgetReplicas =
+                booleanProperty(properties, "nanocached.fire-and-forget-replicas");
         if (fireAndForgetReplicas != null) {
-            apply("nanocached.fire-and-forget-replicas", () -> options.fireAndForgetReplicas(fireAndForgetReplicas));
+            apply(
+                    "nanocached.fire-and-forget-replicas",
+                    () -> options.fireAndForgetReplicas(fireAndForgetReplicas));
         }
         Boolean readRepair = booleanProperty(properties, "nanocached.read-repair");
         if (readRepair != null) {
@@ -158,23 +174,27 @@ public final class NanocachedCachingProvider implements CachingProvider {
         }
         // Durations are given in whole milliseconds here — a plain
         // Properties value has no ISO-8601 binder like Boot's does.
-        Long reconnectCooldownMillis = longProperty(properties, "nanocached.reconnect-cooldown-millis");
+        Long reconnectCooldownMillis =
+                longProperty(properties, "nanocached.reconnect-cooldown-millis");
         if (reconnectCooldownMillis != null) {
             // Zero means "no cooldown", as the Spring Boot starter reads
             // it; the SDK's own Duration.ZERO means "use the default", so
             // zero must route through disableReconnectCooldown() to take
             // effect.
-            apply("nanocached.reconnect-cooldown-millis", () -> {
-                if (reconnectCooldownMillis == 0) {
-                    options.disableReconnectCooldown();
-                } else {
-                    options.reconnectCooldown(Duration.ofMillis(reconnectCooldownMillis));
-                }
-            });
+            apply(
+                    "nanocached.reconnect-cooldown-millis",
+                    () -> {
+                        if (reconnectCooldownMillis == 0) {
+                            options.disableReconnectCooldown();
+                        } else {
+                            options.reconnectCooldown(Duration.ofMillis(reconnectCooldownMillis));
+                        }
+                    });
         }
         Long readHedgeAfterMillis = longProperty(properties, "nanocached.read-hedge-after-millis");
         if (readHedgeAfterMillis != null) {
-            apply("nanocached.read-hedge-after-millis",
+            apply(
+                    "nanocached.read-hedge-after-millis",
                     () -> options.readHedgeAfter(Duration.ofMillis(readHedgeAfterMillis)));
         }
 
@@ -185,9 +205,10 @@ public final class NanocachedCachingProvider implements CachingProvider {
         }
     }
 
-    /** Only {@code true} and {@code false} are accepted: {@code
-     * Boolean.parseBoolean} reads anything else as {@code false}, so
-     * {@code nanocached.tls=yes} silently connected in plaintext. */
+    /**
+     * Only {@code true} and {@code false} are accepted: {@code Boolean.parseBoolean} reads anything
+     * else as {@code false}, so {@code nanocached.tls=yes} silently connected in plaintext.
+     */
     private static Boolean booleanProperty(Properties properties, String name) {
         String value = properties.getProperty(name);
         if (value == null) {
@@ -213,7 +234,12 @@ public final class NanocachedCachingProvider implements CachingProvider {
             return Long.parseLong(value.trim());
         } catch (NumberFormatException e) {
             throw new CacheException(
-                    "nanocached-jcache: \"" + name + "\" must be a whole number, got \"" + value + "\"", e);
+                    "nanocached-jcache: \""
+                            + name
+                            + "\" must be a whole number, got \""
+                            + value
+                            + "\"",
+                    e);
         }
     }
 
@@ -232,7 +258,8 @@ public final class NanocachedCachingProvider implements CachingProvider {
                     .map(NanocachedCachingProvider::parseAddress)
                     .toList();
         } catch (IllegalArgumentException e) {
-            throw new CacheException("nanocached-jcache: \"nanocached.addresses\": " + e.getMessage(), e);
+            throw new CacheException(
+                    "nanocached-jcache: \"nanocached.addresses\": " + e.getMessage(), e);
         }
     }
 
@@ -311,19 +338,19 @@ public final class NanocachedCachingProvider implements CachingProvider {
                 });
     }
 
-    /** Called by {@link NanocachedCacheManager#close()} so a manager
-     * closed directly (rather than via this provider) still drops out of
-     * the identity map instead of being handed out again as if live.
+    /**
+     * Called by {@link NanocachedCacheManager#close()} so a manager closed directly (rather than
+     * via this provider) still drops out of the identity map instead of being handed out again as
+     * if live.
      *
-     * <p>Removal is identity-checked ({@code managers.remove(key,
-     * manager)}, not {@code managers.remove(key)}): the caller's {@code
-     * close()} sets its {@code closed} flag and runs its own cleanup
-     * (closing the client, closing every cache) before this call reaches
-     * the registry. In that window another thread may already have
-     * dialed and installed a new manager under the same key (permitted,
-     * since the old one already reports {@code isClosed() == true}). A
-     * key-only removal here would evict that new, live manager instead
-     * of the stale one this call actually means to remove. */
+     * <p>Removal is identity-checked ({@code managers.remove(key, manager)}, not {@code
+     * managers.remove(key)}): the caller's {@code close()} sets its {@code closed} flag and runs
+     * its own cleanup (closing the client, closing every cache) before this call reaches the
+     * registry. In that window another thread may already have dialed and installed a new manager
+     * under the same key (permitted, since the old one already reports {@code isClosed() == true}).
+     * A key-only removal here would evict that new, live manager instead of the stale one this call
+     * actually means to remove.
+     */
     void forget(URI uri, ClassLoader classLoader, NanocachedCacheManager manager) {
         managers.remove(new ManagerKey(uri, classLoader), manager);
     }

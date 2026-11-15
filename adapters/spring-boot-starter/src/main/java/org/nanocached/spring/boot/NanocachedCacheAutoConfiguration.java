@@ -15,44 +15,38 @@ import org.springframework.boot.context.properties.source.ConfigurationPropertyS
 import org.springframework.boot.context.properties.source.IterableConfigurationPropertySource;
 import org.springframework.cache.CacheManager;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.core.env.ConfigurableEnvironment;
 import org.springframework.core.env.Environment;
 import org.springframework.core.io.ResourceLoader;
-import org.springframework.context.annotation.Conditional;
 
 /**
- * Registers a {@link NanocachedClient} and a {@link NanocachedCacheManager}
- * from {@code nanocached.*} properties (issue #119), so a Boot app needs
- * only the dependency plus {@code @EnableCaching} and {@code
- * nanocached.addresses} — no manual {@code @Bean} methods, unlike
+ * Registers a {@link NanocachedClient} and a {@link NanocachedCacheManager} from {@code
+ * nanocached.*} properties (issue #119), so a Boot app needs only the dependency plus
+ * {@code @EnableCaching} and {@code nanocached.addresses} — no manual {@code @Bean} methods, unlike
  * {@code nanocached-spring} on its own (see that module's README).
  *
- * <p>Inert until {@code nanocached.addresses} is set — in either the
- * comma-string or the YAML-list form, see {@link
- * OnNanocachedAddressesCondition} (issue #388): adding this starter's
- * dependency alone changes nothing, matching Boot's own
- * opt-in-by-configuration convention. Each bean also backs off
- * individually ({@link ConditionalOnMissingBean}) so an app can supply
- * its own client or manager and keep the other.
+ * <p>Inert until {@code nanocached.addresses} is set — in either the comma-string or the YAML-list
+ * form, see {@link OnNanocachedAddressesCondition} (issue #388): adding this starter's dependency
+ * alone changes nothing, matching Boot's own opt-in-by-configuration convention. Each bean also
+ * backs off individually ({@link ConditionalOnMissingBean}) so an app can supply its own client or
+ * manager and keep the other.
  *
- * <p>Ordered before Boot's own {@code CacheAutoConfiguration} (named by
- * string via {@code beforeName}, not a class literal: the class lives in
- * Boot's {@code spring-boot-cache} module, which an app without {@code
- * spring-boot-starter-cache} does not have, and this starter must still load
- * there) so this configuration's {@code CacheManager} exists by the time Boot's
- * runs — otherwise {@code @ConditionalOnMissingBean(CacheManager.class)}
- * would race the other way and Boot's default manager would win instead
- * (the same ordering {@code nanocached-spring}'s manual two-bean setup gets
- * for free from being declared directly in the app's own configuration).
+ * <p>Ordered before Boot's own {@code CacheAutoConfiguration} (named by string via {@code
+ * beforeName}, not a class literal: the class lives in Boot's {@code spring-boot-cache} module,
+ * which an app without {@code spring-boot-starter-cache} does not have, and this starter must still
+ * load there) so this configuration's {@code CacheManager} exists by the time Boot's runs —
+ * otherwise {@code @ConditionalOnMissingBean(CacheManager.class)} would race the other way and
+ * Boot's default manager would win instead (the same ordering {@code nanocached-spring}'s manual
+ * two-bean setup gets for free from being declared directly in the app's own configuration).
  *
- * <p>{@code nanocached.reconnect-cooldown: 0s} (or any zero duration)
- * disables the reconnect cooldown outright ({@code
- * Options.disableReconnectCooldown()}) rather than mapping to the SDK's
- * own default cooldown, which is what a bare {@code
- * Options.reconnectCooldown(Duration.ZERO)} call means — see {@link
- * NanocachedProperties#getReconnectCooldown()}.
+ * <p>{@code nanocached.reconnect-cooldown: 0s} (or any zero duration) disables the reconnect
+ * cooldown outright ({@code Options.disableReconnectCooldown()}) rather than mapping to the SDK's
+ * own default cooldown, which is what a bare {@code Options.reconnectCooldown(Duration.ZERO)} call
+ * means — see {@link NanocachedProperties#getReconnectCooldown()}.
  */
-@AutoConfiguration(beforeName = "org.springframework.boot.cache.autoconfigure.CacheAutoConfiguration")
+@AutoConfiguration(
+        beforeName = "org.springframework.boot.cache.autoconfigure.CacheAutoConfiguration")
 @EnableConfigurationProperties(NanocachedProperties.class)
 @ConditionalOnClass({NanocachedClient.class, CacheManager.class})
 @Conditional(OnNanocachedAddressesCondition.class)
@@ -129,20 +123,18 @@ public class NanocachedCacheAutoConfiguration {
         return builder.build();
     }
 
-    private static final ConfigurationPropertyName TTL_PREFIX = ConfigurationPropertyName.of("nanocached.cache.ttl");
+    private static final ConfigurationPropertyName TTL_PREFIX =
+            ConfigurationPropertyName.of("nanocached.cache.ttl");
 
     /**
-     * Fails startup for a {@code nanocached.cache.ttl.*} property that can
-     * never bind (issue #1680). {@code ttl} is a {@code Map<String,
-     * Duration>}, and for a value type outside {@code java.lang} Boot's
-     * binder takes exactly one name element after {@code ttl} as the key and
-     * reads the value at that name; a cache name containing a dot, written
-     * without brackets, is several elements, so {@code
-     * nanocached.cache.ttl.users.by.id=40s} binds nothing and the cache
-     * silently used the default TTL (no expiry unless configured). Any
-     * property under {@code ttl} with more than one element after it is
-     * unbound by construction, so rejecting it needs no guess about what the
-     * author meant; the bracketed form {@code
+     * Fails startup for a {@code nanocached.cache.ttl.*} property that can never bind (issue
+     * #1680). {@code ttl} is a {@code Map<String, Duration>}, and for a value type outside {@code
+     * java.lang} Boot's binder takes exactly one name element after {@code ttl} as the key and
+     * reads the value at that name; a cache name containing a dot, written without brackets, is
+     * several elements, so {@code nanocached.cache.ttl.users.by.id=40s} binds nothing and the cache
+     * silently used the default TTL (no expiry unless configured). Any property under {@code ttl}
+     * with more than one element after it is unbound by construction, so rejecting it needs no
+     * guess about what the author meant; the bracketed form {@code
      * nanocached.cache.ttl.[users.by.id]} is a single element and passes.
      */
     static void rejectUnbindablePerCacheTtlKeys(Environment environment) {
@@ -166,14 +158,18 @@ public class NanocachedCacheAutoConfiguration {
         }
         throw new IllegalStateException(
                 "nanocached.cache.ttl.<name>: these properties bind to no cache name, so their TTL would be"
-                        + " ignored: " + String.join(", ", unbindable) + ". A cache name that contains a dot must"
+                        + " ignored: "
+                        + String.join(", ", unbindable)
+                        + ". A cache name that contains a dot must"
                         + " be written in brackets, e.g. nanocached.cache.ttl.[users.by.id]=40s (an environment"
                         + " variable cannot spell such a name; use application.properties or YAML).");
     }
 
-    /** Same {@code "host:port"} split used by the manual setup in
-     * nanocached-spring's own README/tests — IPv6 literals aren't
-     * supported by that convention any more than they are there. */
+    /**
+     * Same {@code "host:port"} split used by the manual setup in nanocached-spring's own
+     * README/tests — IPv6 literals aren't supported by that convention any more than they are
+     * there.
+     */
     private static List<NanocachedClient.Address> parseAddresses(List<String> addresses) {
         return addresses.stream()
                 .map(String::trim)

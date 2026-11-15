@@ -12,13 +12,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * A minimal in-process nanocached node speaking just the slice of the
- * wire protocol the starter's client traffic produces: the {@code A ...}
- * handshake and the namespaced {@code g}/{@code s}/{@code d}/{@code c}
- * commands. A trimmed re-implementation of {@code
- * nanocached-spring}'s own test double (package-private to that module,
- * see the shared adapters spec) built without response tags — this
- * module's tests never configure anything that would request them.
+ * A minimal in-process nanocached node speaking just the slice of the wire protocol the starter's
+ * client traffic produces: the {@code A ...} handshake and the namespaced {@code g}/{@code
+ * s}/{@code d}/{@code c} commands. A trimmed re-implementation of {@code nanocached-spring}'s own
+ * test double (package-private to that module, see the shared adapters spec) built without response
+ * tags — this module's tests never configure anything that would request them.
  */
 final class MockNode implements AutoCloseable {
 
@@ -26,24 +24,27 @@ final class MockNode implements AutoCloseable {
 
     private final ServerSocket server;
     private final Thread acceptLoop;
+
     /** namespace (UTF-8-ish, raw bytes wrapped) → key → entry. */
     final Map<ByteBuffer, Map<ByteBuffer, Entry>> stores = new ConcurrentHashMap<>();
+
     final AtomicInteger clearCount = new AtomicInteger();
 
     MockNode() throws IOException {
         server = new ServerSocket(0, 16, java.net.InetAddress.getLoopbackAddress());
-        acceptLoop = new Thread(() -> {
-            while (true) {
-                try {
-                    Socket socket = server.accept();
-                    Thread serve = new Thread(() -> serve(socket));
-                    serve.setDaemon(true);
-                    serve.start();
-                } catch (IOException stop) {
-                    return;
-                }
-            }
-        });
+        acceptLoop =
+                new Thread(() -> {
+                    while (true) {
+                        try {
+                            Socket socket = server.accept();
+                            Thread serve = new Thread(() -> serve(socket));
+                            serve.setDaemon(true);
+                            serve.start();
+                        } catch (IOException stop) {
+                            return;
+                        }
+                    }
+                });
         acceptLoop.setDaemon(true);
         acceptLoop.start();
     }

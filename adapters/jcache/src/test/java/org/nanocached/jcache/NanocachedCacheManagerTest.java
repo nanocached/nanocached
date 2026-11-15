@@ -66,16 +66,22 @@ class NanocachedCacheManagerTest {
 
     @Test
     void creatingTheSameCacheNameTwiceFails() {
-        manager.createCache("users", new MutableConfiguration<String, User>().setTypes(String.class, User.class));
+        manager.createCache(
+                "users",
+                new MutableConfiguration<String, User>().setTypes(String.class, User.class));
 
         assertThrows(
                 CacheException.class,
-                () -> manager.createCache(
-                        "users", new MutableConfiguration<String, User>().setTypes(String.class, User.class)));
+                () ->
+                        manager.createCache(
+                                "users",
+                                new MutableConfiguration<String, User>()
+                                        .setTypes(String.class, User.class)));
     }
 
     @Test
-    void creatingADuplicateCacheNameWithStatisticsEnabledStillReportsTheDuplicateNameError() throws Exception {
+    void creatingADuplicateCacheNameWithStatisticsEnabledStillReportsTheDuplicateNameError()
+            throws Exception {
         // Issue #331: the losing createCache used to construct its
         // NanocachedCache — which registered a statistics MBean under the
         // same ObjectName the winner already claimed — before the
@@ -92,15 +98,23 @@ class NanocachedCacheManagerTest {
         second.setTypes(String.class, User.class);
         second.setStatisticsEnabled(true);
 
-        CacheException ex = assertThrows(CacheException.class, () -> manager.createCache("dup-stats", second));
-        assertTrue(ex.getMessage().contains("already exists"), "unexpected message: " + ex.getMessage());
+        CacheException ex =
+                assertThrows(CacheException.class, () -> manager.createCache("dup-stats", second));
+        assertTrue(
+                ex.getMessage().contains("already exists"),
+                "unexpected message: " + ex.getMessage());
 
         // The winner's own MBean must still be registered exactly once, and
         // the winner's cache must remain fully usable.
         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        ObjectName objectName = new ObjectName("javax.cache:type=CacheStatistics,CacheManager="
-                + ObjectName.quote(manager.getURI().toString()) + ",Cache=" + ObjectName.quote("dup-stats"));
-        assertTrue(mbs.isRegistered(objectName), "the winner's statistics MBean must be registered");
+        ObjectName objectName =
+                new ObjectName(
+                        "javax.cache:type=CacheStatistics,CacheManager="
+                                + ObjectName.quote(manager.getURI().toString())
+                                + ",Cache="
+                                + ObjectName.quote("dup-stats"));
+        assertTrue(
+                mbs.isRegistered(objectName), "the winner's statistics MBean must be registered");
 
         winner.put("a", new User("a", 1));
         assertEquals(new User("a", 1), winner.get("a"));
@@ -108,9 +122,13 @@ class NanocachedCacheManagerTest {
 
     @Test
     void typedGetCacheRejectsAMismatchedValueType() {
-        manager.createCache("users", new MutableConfiguration<String, User>().setTypes(String.class, User.class));
+        manager.createCache(
+                "users",
+                new MutableConfiguration<String, User>().setTypes(String.class, User.class));
 
-        assertThrows(ClassCastException.class, () -> manager.getCache("users", String.class, String.class));
+        assertThrows(
+                ClassCastException.class,
+                () -> manager.getCache("users", String.class, String.class));
     }
 
     @Test
@@ -136,7 +154,9 @@ class NanocachedCacheManagerTest {
 
         cache.close();
 
-        assertNull(manager.getCache("sessions"), "a closed cache must no longer be returned by the manager");
+        assertNull(
+                manager.getCache("sessions"),
+                "a closed cache must no longer be returned by the manager");
         assertEquals(0, node.clearCount.get(), "closing a handle directly must not clear its data");
     }
 
@@ -151,9 +171,13 @@ class NanocachedCacheManagerTest {
 
         manager.destroyCache("c");
 
-        assertEquals(1, node.clearCount.get(), "destroyCache must clear a cache whose handle was closed first");
+        assertEquals(
+                1,
+                node.clearCount.get(),
+                "destroyCache must clear a cache whose handle was closed first");
         javax.cache.Cache<String, String> recreated = manager.createCache("c", config);
-        assertNull(recreated.get("k"), "a re-created cache must not see the destroyed cache's data");
+        assertNull(
+                recreated.get("k"), "a re-created cache must not see the destroyed cache's data");
     }
 
     @Test
@@ -180,8 +204,12 @@ class NanocachedCacheManagerTest {
 
         ((NanocachedCacheManager) manager).unregister("race", cacheA);
 
-        assertTrue((Object) manager.getCache("race") == b, "the live cache B must still be registered under \"race\"");
-        assertFalse(((NanocachedCache<?, ?>) b).isClosed(), "B must not have been closed by A's late unregister");
+        assertTrue(
+                (Object) manager.getCache("race") == b,
+                "the live cache B must still be registered under \"race\"");
+        assertFalse(
+                ((NanocachedCache<?, ?>) b).isClosed(),
+                "B must not have been closed by A's late unregister");
     }
 
     @Test
@@ -218,7 +246,8 @@ class NanocachedCacheManagerTest {
         }
 
         @Override
-        public java.util.Map<String, String> loadAll(Iterable<? extends String> keys) throws CacheLoaderException {
+        public java.util.Map<String, String> loadAll(Iterable<? extends String> keys)
+                throws CacheLoaderException {
             return java.util.Map.of();
         }
     }

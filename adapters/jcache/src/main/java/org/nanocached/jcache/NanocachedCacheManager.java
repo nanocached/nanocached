@@ -16,13 +16,11 @@ import org.nanocached.NanocachedClient;
 import org.nanocached.NanocachedException;
 
 /**
- * One JSR-107 {@link CacheManager}, owning one {@link NanocachedClient}
- * (issue #118) — created and closed by this manager, unlike {@code
- * nanocached-spring}'s manager, which borrows an application-owned
- * client. Each named cache is created explicitly via {@link
- * #createCache}: unlike the Spring adapter's "any name works on first
- * use", JSR-107 requires {@link #getCache} to answer {@code null} for a
- * name that was never created (or has since been destroyed).
+ * One JSR-107 {@link CacheManager}, owning one {@link NanocachedClient} (issue #118) — created and
+ * closed by this manager, unlike {@code nanocached-spring}'s manager, which borrows an
+ * application-owned client. Each named cache is created explicitly via {@link #createCache}: unlike
+ * the Spring adapter's "any name works on first use", JSR-107 requires {@link #getCache} to answer
+ * {@code null} for a name that was never created (or has since been destroyed).
  */
 public final class NanocachedCacheManager implements CacheManager {
 
@@ -30,11 +28,15 @@ public final class NanocachedCacheManager implements CacheManager {
     private final URI uri;
     private final ClassLoader classLoader;
     private final NanocachedClient client;
-    private final ConcurrentHashMap<String, NanocachedCache<?, ?>> caches = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, NanocachedCache<?, ?>> caches =
+            new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     NanocachedCacheManager(
-            NanocachedCachingProvider provider, URI uri, ClassLoader classLoader, NanocachedClient client) {
+            NanocachedCachingProvider provider,
+            URI uri,
+            ClassLoader classLoader,
+            NanocachedClient client) {
         this.provider = provider;
         this.uri = uri;
         this.classLoader = classLoader;
@@ -75,7 +77,8 @@ public final class NanocachedCacheManager implements CacheManager {
         CompleteConfiguration<K, V> complete = completeConfigurationOf(configuration);
         validateSupported(complete);
 
-        NanocachedCache<K, V> cache = new NanocachedCache<>(this, cacheName, client.namespace(cacheName), complete);
+        NanocachedCache<K, V> cache =
+                new NanocachedCache<>(this, cacheName, client.namespace(cacheName), complete);
 
         NanocachedCache<?, ?> raced = caches.putIfAbsent(cacheName, cache);
         if (raced != null) {
@@ -94,13 +97,15 @@ public final class NanocachedCacheManager implements CacheManager {
         return cache;
     }
 
-    /** JSR-107 accepts a plain {@link Configuration} (just key/value
-     * types) as well as a {@link CompleteConfiguration}; a plain one is
-     * completed with {@link MutableConfiguration}'s own defaults
-     * (eternal expiry, statistics/management off, no listeners) —
-     * mirroring what {@code MutableConfiguration} itself defaults to. */
+    /**
+     * JSR-107 accepts a plain {@link Configuration} (just key/value types) as well as a {@link
+     * CompleteConfiguration}; a plain one is completed with {@link MutableConfiguration}'s own
+     * defaults (eternal expiry, statistics/management off, no listeners) — mirroring what {@code
+     * MutableConfiguration} itself defaults to.
+     */
     @SuppressWarnings("unchecked")
-    private static <K, V> CompleteConfiguration<K, V> completeConfigurationOf(Configuration<K, V> configuration) {
+    private static <K, V> CompleteConfiguration<K, V> completeConfigurationOf(
+            Configuration<K, V> configuration) {
         if (configuration instanceof CompleteConfiguration<K, V> complete) {
             return complete;
         }
@@ -109,9 +114,10 @@ public final class NanocachedCacheManager implements CacheManager {
                 .setStoreByValue(configuration.isStoreByValue());
     }
 
-    /** Rejects configuration this adapter cannot honor, rather than
-     * silently ignoring it — the "honest subset" this module documents
-     * throughout. */
+    /**
+     * Rejects configuration this adapter cannot honor, rather than silently ignoring it — the
+     * "honest subset" this module documents throughout.
+     */
     private static void validateSupported(CompleteConfiguration<?, ?> configuration) {
         if (!configuration.isStoreByValue()) {
             throw new UnsupportedOperationException(
@@ -130,18 +136,26 @@ public final class NanocachedCacheManager implements CacheManager {
 
     @Override
     @SuppressWarnings("unchecked")
-    public <K, V> javax.cache.Cache<K, V> getCache(String cacheName, Class<K> keyType, Class<V> valueType) {
+    public <K, V> javax.cache.Cache<K, V> getCache(
+            String cacheName, Class<K> keyType, Class<V> valueType) {
         requireNotClosed();
         NanocachedCache<?, ?> cache = caches.get(cacheName);
         if (cache == null) {
             return null;
         }
         Configuration<?, ?> configuration = cache.getConfiguration(Configuration.class);
-        if (!configuration.getKeyType().equals(keyType) || !configuration.getValueType().equals(valueType)) {
+        if (!configuration.getKeyType().equals(keyType)
+                || !configuration.getValueType().equals(valueType)) {
             throw new ClassCastException(
-                    "nanocached-jcache: cache \"" + cacheName + "\" was created with key type "
-                            + configuration.getKeyType().getName() + " and value type "
-                            + configuration.getValueType().getName() + ", not " + keyType.getName() + "/"
+                    "nanocached-jcache: cache \""
+                            + cacheName
+                            + "\" was created with key type "
+                            + configuration.getKeyType().getName()
+                            + " and value type "
+                            + configuration.getValueType().getName()
+                            + ", not "
+                            + keyType.getName()
+                            + "/"
                             + valueType.getName());
         }
         return (javax.cache.Cache<K, V>) cache;
@@ -183,20 +197,19 @@ public final class NanocachedCacheManager implements CacheManager {
         }
     }
 
-    /** Called by {@link NanocachedCache#close()} when a cache is closed
-     * directly rather than via {@link #destroyCache} — deregisters it
-     * without touching its data (closing a {@code Cache} handle must not
-     * delete what it holds; only {@link #destroyCache} does that).
+    /**
+     * Called by {@link NanocachedCache#close()} when a cache is closed directly rather than via
+     * {@link #destroyCache} — deregisters it without touching its data (closing a {@code Cache}
+     * handle must not delete what it holds; only {@link #destroyCache} does that).
      *
-     * <p>Removal is identity-checked ({@code caches.remove(name, cache)},
-     * not {@code caches.remove(name)}): {@code close()} flips its {@code
-     * closed} flag and performs its own cleanup (deregistering the
-     * statistics MBean) before this call reaches the registry, leaving a
-     * window in which another thread may already have created a new
-     * cache under the same name (permitted, since the old one already
-     * reports {@code isClosed() == true}). A key-only removal here would
-     * evict that new, live cache instead of the stale one this call
-     * actually means to remove. */
+     * <p>Removal is identity-checked ({@code caches.remove(name, cache)}, not {@code
+     * caches.remove(name)}): {@code close()} flips its {@code closed} flag and performs its own
+     * cleanup (deregistering the statistics MBean) before this call reaches the registry, leaving a
+     * window in which another thread may already have created a new cache under the same name
+     * (permitted, since the old one already reports {@code isClosed() == true}). A key-only removal
+     * here would evict that new, live cache instead of the stale one this call actually means to
+     * remove.
+     */
     void unregister(String cacheName, NanocachedCache<?, ?> cache) {
         caches.remove(cacheName, cache);
     }
@@ -243,7 +256,8 @@ public final class NanocachedCacheManager implements CacheManager {
         if (clazz.isInstance(client)) {
             return clazz.cast(client);
         }
-        throw new IllegalArgumentException("nanocached-jcache: cannot unwrap CacheManager as " + clazz);
+        throw new IllegalArgumentException(
+                "nanocached-jcache: cannot unwrap CacheManager as " + clazz);
     }
 
     private void requireNotClosed() {

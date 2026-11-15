@@ -21,9 +21,9 @@ import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 
 /**
- * In-process stand-ins for nanocached-node and nanocached-discovery,
- * speaking just enough of the wire protocol for client tests to run over
- * real TCP without the Rust binaries. Mirrors the TypeScript/Python mocks.
+ * In-process stand-ins for nanocached-node and nanocached-discovery, speaking just enough of the
+ * wire protocol for client tests to run over real TCP without the Rust binaries. Mirrors the
+ * TypeScript/Python mocks.
  */
 final class MockServers {
 
@@ -31,209 +31,293 @@ final class MockServers {
 
     static final class MockNode implements AutoCloseable {
         final Map<String, byte[]> store = new ConcurrentHashMap<>();
-        /** Namespaces (issue #105): one store per non-empty namespace,
-         * keyed by the namespace's {@link #keyOf} string form — the
-         * default (empty) namespace keeps using {@link #store} above, so
-         * every pre-existing test that inspects {@code store} directly is
-         * unaffected. Isolation between namespaces (and between a
-         * namespace and the default keyspace) falls out of these simply
-         * being different maps. */
+
+        /**
+         * Namespaces (issue #105): one store per non-empty namespace, keyed by the namespace's
+         * {@link #keyOf} string form — the default (empty) namespace keeps using {@link #store}
+         * above, so every pre-existing test that inspects {@code store} directly is unaffected.
+         * Isolation between namespaces (and between a namespace and the default keyspace) falls out
+         * of these simply being different maps.
+         */
         final Map<String, Map<String, byte[]>> namespacedStores = new ConcurrentHashMap<>();
-        /** Per-key TTL (whole seconds; absent = no expiry), default
-         * namespace — populated by `S`/`s` and read back by `i` (issue
-         * #129) so a mock node can answer INCR's own optional
-         * {@code <ttl-seconds>} trailing field truthfully. Nothing else
-         * (get/delete/clear included) needs a key's TTL, so this is the
-         * only place it's tracked. */
+
+        /**
+         * Per-key TTL (whole seconds; absent = no expiry), default namespace — populated by `S`/`s`
+         * and read back by `i` (issue #129) so a mock node can answer INCR's own optional {@code
+         * <ttl-seconds>} trailing field truthfully. Nothing else (get/delete/clear included) needs
+         * a key's TTL, so this is the only place it's tracked.
+         */
         final Map<String, Long> ttls = new ConcurrentHashMap<>();
-        /** As {@link #ttls}, one map per non-empty namespace — mirrors
-         * {@link #namespacedStores}. */
+
+        /**
+         * As {@link #ttls}, one map per non-empty namespace — mirrors {@link #namespacedStores}.
+         */
         final Map<String, Map<String, Long>> namespacedTtls = new ConcurrentHashMap<>();
+
         final AtomicInteger connectionCount = new AtomicInteger();
         final AtomicInteger getCount = new AtomicInteger();
-        /** Counts every `i` (INCR, issue #129) frame received — lets a
-         * test prove a replica never receives one (only the primary owner
-         * ever should; a replica gets the result forwarded as an ordinary
-         * `set` instead). */
+
+        /**
+         * Counts every `i` (INCR, issue #129) frame received — lets a test prove a replica never
+         * receives one (only the primary owner ever should; a replica gets the result forwarded as
+         * an ordinary `set` instead).
+         */
         final AtomicInteger incrCount = new AtomicInteger();
-        /** Counts every `k` (compare-and-set store, issue #141) frame
-         * received — lets a test prove a replica never receives one (only
-         * the primary owner ever should; a replica gets the result
-         * forwarded as an ordinary `set` instead). */
+
+        /**
+         * Counts every `k` (compare-and-set store, issue #141) frame received — lets a test prove a
+         * replica never receives one (only the primary owner ever should; a replica gets the result
+         * forwarded as an ordinary `set` instead).
+         */
         final AtomicInteger casSetCount = new AtomicInteger();
-        /** As {@link #casSetCount}, for `x` (compare-and-set delete, issue
-         * #141) frames. */
+
+        /** As {@link #casSetCount}, for `x` (compare-and-set delete, issue #141) frames. */
         final AtomicInteger casDeleteCount = new AtomicInteger();
+
         /** Counts every `m` (multi-get, issue #151) frame received. */
         final AtomicInteger multiGetCount = new AtomicInteger();
+
         /** Counts every `o` (multi-set, issue #151) frame received. */
         final AtomicInteger multiSetCount = new AtomicInteger();
-        /** The total number of key/value pairs carried by every `o` frame
-         * received — lets a test prove a batched set sent each key to a
-         * node exactly once, where a frame count alone cannot. */
+
+        /**
+         * The total number of key/value pairs carried by every `o` frame received — lets a test
+         * prove a batched set sent each key to a node exactly once, where a frame count alone
+         * cannot.
+         */
         final AtomicInteger multiSetKeyCount = new AtomicInteger();
-        /** When set, every `o` frame is read in full and then the
-         * connection is closed without a reply — a replica (or primary)
-         * that is down for every attempt, including the client's own
-         * in-leg redial, unlike the one-shot {@link
-         * #closeAfterNextMultiSet}. */
+
+        /**
+         * When set, every `o` frame is read in full and then the connection is closed without a
+         * reply — a replica (or primary) that is down for every attempt, including the client's own
+         * in-leg redial, unlike the one-shot {@link #closeAfterNextMultiSet}.
+         */
         private volatile boolean failAllMultiSets = false;
-        /** Every `m` frame's body byte count (namespace + every key's
-         * bytes, header line excluded) in receipt order (issue #222) —
-         * lets a test prove request chunking really did keep each
-         * sub-frame under the server's MAX_REQUEST_SIZE rather than just
-         * counting how many sub-frames arrived. */
+
+        /**
+         * Every `m` frame's body byte count (namespace + every key's bytes, header line excluded)
+         * in receipt order (issue #222) — lets a test prove request chunking really did keep each
+         * sub-frame under the server's MAX_REQUEST_SIZE rather than just counting how many
+         * sub-frames arrived.
+         */
         final List<Integer> multiGetFrameBodyBytes = new CopyOnWriteArrayList<>();
-        /** As {@link #multiGetFrameBodyBytes}, for `o` (issue #222):
-         * namespace + every key's and value's bytes. */
+
+        /**
+         * As {@link #multiGetFrameBodyBytes}, for `o` (issue #222): namespace + every key's and
+         * value's bytes.
+         */
         final List<Integer> multiSetFrameBodyBytes = new CopyOnWriteArrayList<>();
-        /** Counts every `g`/`s`/`d` frame received — never incremented by
-         * `G`/`S`/`D`. Lets a test prove the empty (default) namespace
-         * really does send the legacy frame, not `g 0 ...`/etc (issue
-         * #105's SDK rule). */
+
+        /**
+         * Counts every `g`/`s`/`d` frame received — never incremented by `G`/`S`/`D`. Lets a test
+         * prove the empty (default) namespace really does send the legacy frame, not `g 0 ...`/etc
+         * (issue #105's SDK rule).
+         */
         final AtomicInteger namespacedCommandCount = new AtomicInteger();
-        /** Counts every `c` (clear one namespace) frame received (issue
-         * #106) — lets a test prove a clear/clearAll fanned out reaches
-         * every node. */
+
+        /**
+         * Counts every `c` (clear one namespace) frame received (issue #106) — lets a test prove a
+         * clear/clearAll fanned out reaches every node.
+         */
         final AtomicInteger clearCount = new AtomicInteger();
-        /** Counts every `F` (flush everything) frame received (issue
-         * #106). */
+
+        /** Counts every `F` (flush everything) frame received (issue #106). */
         final AtomicInteger clearAllCount = new AtomicInteger();
+
         private final AtomicInteger wrongNodeReplies = new AtomicInteger();
-        /** echoed response tags: queued one-off replies that echo the WRONG tag (the
-         * request's tag + 1) — the desync a pre-tag stream
-         * misalignment would produce. Only takes effect on a tagged
-         * connection. */
+
+        /**
+         * echoed response tags: queued one-off replies that echo the WRONG tag (the request's tag +
+         * 1) — the desync a pre-tag stream misalignment would produce. Only takes effect on a
+         * tagged connection.
+         */
         private final AtomicInteger wrongTagReplies = new AtomicInteger();
-        /** echoed response tags: swallows the next G entirely (no reply) — the
-         * off-by-one stream desync where every later response answers
-         * the previous request. */
+
+        /**
+         * echoed response tags: swallows the next G entirely (no reply) — the off-by-one stream
+         * desync where every later response answers the previous request.
+         */
         private final AtomicInteger swallowedGets = new AtomicInteger();
+
         private final AtomicInteger malformedValueReplies = new AtomicInteger();
-        /** Queues a one-off G reply whose `V` length field is the given
-         * literal text instead of the real value length — issue #462
-         * regression coverage for the wire's digits-only integer grammar
-         * (e.g. a leading '+', which Integer.parseInt alone would accept). */
+
+        /**
+         * Queues a one-off G reply whose `V` length field is the given literal text instead of the
+         * real value length — issue #462 regression coverage for the wire's digits-only integer
+         * grammar (e.g. a leading '+', which Integer.parseInt alone would accept).
+         */
         private final java.util.concurrent.atomic.AtomicReference<String> customValueLengthField =
                 new java.util.concurrent.atomic.AtomicReference<>();
+
         private final AtomicInteger storedToGetReplies = new AtomicInteger();
-        /** Queues a one-off G reply whose `V` header never terminates with
-         * '\n' — regression coverage for the unbounded readLine() growth
-         * fix (issue: audit finding, MAX_HEADER_LINE_LENGTH). */
+
+        /**
+         * Queues a one-off G reply whose `V` header never terminates with '\n' — regression
+         * coverage for the unbounded readLine() growth fix (issue: audit finding,
+         * MAX_HEADER_LINE_LENGTH).
+         */
         private final AtomicInteger runawayHeaderReplies = new AtomicInteger();
-        /** Queues a one-off untagged fixed-shape (`N`) reply whose second
-         * byte is something other than '\n' — regression coverage for the
-         * unverified-trailing-byte fix (issue: audit finding, "connection
-         * desynced" on a bad trailer). */
+
+        /**
+         * Queues a one-off untagged fixed-shape (`N`) reply whose second byte is something other
+         * than '\n' — regression coverage for the unverified-trailing-byte fix (issue: audit
+         * finding, "connection desynced" on a bad trailer).
+         */
         private final AtomicInteger badTrailerReplies = new AtomicInteger();
-        /** Every `A` header line this node received verbatim (issue
-         * #125) — e.g. {@code "A 1 T R"} — across every dial attempt
-         * including any fallback redials, so a test can assert the exact
-         * probe form the client sent. */
+
+        /**
+         * Every `A` header line this node received verbatim (issue #125) — e.g. {@code "A 1 T R"} —
+         * across every dial attempt including any fallback redials, so a test can assert the exact
+         * probe form the client sent.
+         */
         final List<String> authHeaders = new CopyOnWriteArrayList<>();
-        /** Countdown of data requests (`G`/`S`/`D`/`g`/`s`/`d`/`c`/`F`) to
-         * answer with a transient `R` instead of their real reply (issue
-         * #125), tagged correctly on a tagged connection. */
+
+        /**
+         * Countdown of data requests (`G`/`S`/`D`/`g`/`s`/`d`/`c`/`F`) to answer with a transient
+         * `R` instead of their real reply (issue #125), tagged correctly on a tagged connection.
+         */
         private final AtomicInteger retryableReplies = new AtomicInteger();
+
         private volatile long setDelayMillis = 0;
         private volatile long getDelayMillis = 0;
         private volatile boolean failSets = false;
-        /** issue #225: one-off flags that make the next `i`/`k` frame
-         * apply normally (mutating the store, exactly like a real answer
-         * would) but close the connection instead of ever writing a
-         * reply — regression coverage for "the primary applied the op,
-         * only the ack was lost": the client must throw connection-lost
-         * rather than resend the request, and the effect must have
-         * landed exactly once. */
+
+        /**
+         * issue #225: one-off flags that make the next `i`/`k` frame apply normally (mutating the
+         * store, exactly like a real answer would) but close the connection instead of ever writing
+         * a reply — regression coverage for "the primary applied the op, only the ack was lost":
+         * the client must throw connection-lost rather than resend the request, and the effect must
+         * have landed exactly once.
+         */
         private final AtomicInteger dropReplyAfterIncr = new AtomicInteger();
+
         private final AtomicInteger dropReplyAfterCasSet = new AtomicInteger();
-        /** issue #825: every `t` (touch) header line received verbatim,
-         * e.g. {@code "t 0 3 30 G"}, in receipt order — lets a test assert
-         * the exact frame (ttl field, `G`, tag) and which node got which
-         * form. */
+
+        /**
+         * issue #825: every `t` (touch) header line received verbatim, e.g. {@code "t 0 3 30 G"},
+         * in receipt order — lets a test assert the exact frame (ttl field, `G`, tag) and which
+         * node got which form.
+         */
         final List<String> touchFrames = new CopyOnWriteArrayList<>();
-        /** Issue #934: {@link System#nanoTime()} at which each `t` / `y`
-         * frame (either kind, in receipt order) arrived — lets a test prove
-         * that a replica was sent its touch only after the primary had
-         * answered, together with {@link #touchReplyDelayMillis}. */
+
+        /**
+         * Issue #934: {@link System#nanoTime()} at which each `t` / `y` frame (either kind, in
+         * receipt order) arrived — lets a test prove that a replica was sent its touch only after
+         * the primary had answered, together with {@link #touchReplyDelayMillis}.
+         */
         final List<Long> touchReceiptNanos = new CopyOnWriteArrayList<>();
-        /** Issue #934: how long a `t` / `y` reply is held back after the
-         * frame has been applied; 0 is no delay. */
+
+        /**
+         * Issue #934: how long a `t` / `y` reply is held back after the frame has been applied; 0
+         * is no delay.
+         */
         private volatile long touchReplyDelayMillis = 0;
-        /** As {@link #dropReplyAfterIncr}, for `t`: a touch is idempotent, so
-         * the client resends it where it must not resend an INCR. */
+
+        /**
+         * As {@link #dropReplyAfterIncr}, for `t`: a touch is idempotent, so the client resends it
+         * where it must not resend an INCR.
+         */
         private final AtomicInteger dropReplyAfterTouch = new AtomicInteger();
+
         /** Every `D` / `d` frame received, answered or not (a `W` included). */
         final AtomicInteger deleteFrames = new AtomicInteger();
-        /** issue #825: behave like a node that predates `t` — an unknown
-         * command is answered `En` and the connection closed. */
+
+        /**
+         * issue #825: behave like a node that predates `t` — an unknown command is answered `En`
+         * and the connection closed.
+         */
         private volatile boolean rejectTouch = false;
-        /** One `y` (batched touch, issue #871) frame as this node saw it:
-         * {@code ttl} is {@code null} when the field was omitted (remove the
-         * TTL). One entry per frame, in receipt order — what proves a
-         * frame's grouping, which the per-key {@link #touchFrames} cannot. */
+
+        /**
+         * One `y` (batched touch, issue #871) frame as this node saw it: {@code ttl} is {@code
+         * null} when the field was omitted (remove the TTL). One entry per frame, in receipt order
+         * — what proves a frame's grouping, which the per-key {@link #touchFrames} cannot.
+         */
         record MultiTouchFrame(String namespace, List<String> keys, Long ttl, boolean get) {}
 
         final List<MultiTouchFrame> multiTouchFrames = new CopyOnWriteArrayList<>();
-        /** Behave like a node that knows `t` but predates `y` — `En`, then
-         * close ({@link #rejectTouch} implies it). */
+
+        /**
+         * Behave like a node that knows `t` but predates `y` — `En`, then close ({@link
+         * #rejectTouch} implies it).
+         */
         private volatile boolean rejectMultiTouch = false;
-        /** Answers this many more `y` frames normally, then closes the
-         * connection instead of replying to every one after that, so the
-         * client's own redial-and-resend fails too; -1 is disarmed — a
-         * connection loss on chunk N>1 of a chunked batch touch (the node
-         * itself stays up, unlike {@link #closeAfterMultiGet}). */
+
+        /**
+         * Answers this many more `y` frames normally, then closes the connection instead of
+         * replying to every one after that, so the client's own redial-and-resend fails too; -1 is
+         * disarmed — a connection loss on chunk N>1 of a chunked batch touch (the node itself stays
+         * up, unlike {@link #closeAfterMultiGet}).
+         */
         private final AtomicInteger multiTouchFailAfter = new AtomicInteger(-1);
-        /** The next `y` reply reports exactly this many roster entries
-         * whatever the request's key count (issue #181's desync, for `y`);
-         * -1 is disarmed. */
+
+        /**
+         * The next `y` reply reports exactly this many roster entries whatever the request's key
+         * count (issue #181's desync, for `y`); -1 is disarmed.
+         */
         private final AtomicInteger multiTouchBadCount = new AtomicInteger(-1);
-        /** One-off connection resets queued for the next `c`/`F` frame(s)
-         * (issue #106), mirroring {@link #wrongNodeReplies}/{@link
-         * #takeWrongNode()} rather than {@link #failSets}'s permanent
-         * switch — a test needs to arm exactly N failures (e.g. 2, to
-         * outlast a single fan-out pass's own applyReconnecting redial)
-         * and then let a later attempt succeed. */
+
+        /**
+         * One-off connection resets queued for the next `c`/`F` frame(s) (issue #106), mirroring
+         * {@link #wrongNodeReplies}/{@link #takeWrongNode()} rather than {@link #failSets}'s
+         * permanent switch — a test needs to arm exactly N failures (e.g. 2, to outlast a single
+         * fan-out pass's own applyReconnecting redial) and then let a later attempt succeed.
+         */
         private final AtomicInteger clearFailures = new AtomicInteger();
-        /** issue #411: one-off counters that answer the next `m`/`o` frame
-         * normally, then tear the whole node down (listener + every open
-         * connection, exactly like {@link #close()}) immediately after —
-         * for regression coverage of a chunked multi-get/multi-set batch
-         * whose first sub-frame succeeds but whose next one hits a
-         * connection failure that the client's own built-in
-         * reconnect-and-retry can't recover from either, since the
-         * listener itself is gone by the time it redials. */
+
+        /**
+         * issue #411: one-off counters that answer the next `m`/`o` frame normally, then tear the
+         * whole node down (listener + every open connection, exactly like {@link #close()})
+         * immediately after — for regression coverage of a chunked multi-get/multi-set batch whose
+         * first sub-frame succeeds but whose next one hits a connection failure that the client's
+         * own built-in reconnect-and-retry can't recover from either, since the listener itself is
+         * gone by the time it redials.
+         */
         private final AtomicInteger closeAfterMultiGet = new AtomicInteger();
+
         private final AtomicInteger closeAfterMultiSet = new AtomicInteger();
         private volatile boolean silent = false;
-        /** While non-null, an `A` (auth) request is read in full and then
-         * left unanswered until the latch is released — a dial whose
-         * handshake takes as long as the test needs, for races between a
-         * redial and a concurrent refresh or close(). See {@link
-         * #holdAuthReplies}. */
+
+        /**
+         * While non-null, an `A` (auth) request is read in full and then left unanswered until the
+         * latch is released — a dial whose handshake takes as long as the test needs, for races
+         * between a redial and a concurrent refresh or close(). See {@link #holdAuthReplies}.
+         */
         private volatile java.util.concurrent.CountDownLatch authGate;
-        private final java.util.concurrent.Semaphore authHeld = new java.util.concurrent.Semaphore(0);
-        /** The TTL (whole seconds; 0 if omitted on the wire) from the
-         * most recent S request this server received. */
+
+        private final java.util.concurrent.Semaphore authHeld =
+                new java.util.concurrent.Semaphore(0);
+
+        /**
+         * The TTL (whole seconds; 0 if omitted on the wire) from the most recent S request this
+         * server received.
+         */
         volatile long lastSetTtl = 0;
+
         private final byte[] requiredSecret;
-        /** echoed response tags: acknowledge an extended `A ... T` with `OnT\n` and
-         * echo tags on that connection's G/S/D replies. Off by default so
-         * the bulk of the suite keeps exercising the legacy untagged
-         * path. */
+
+        /**
+         * echoed response tags: acknowledge an extended `A ... T` with `OnT\n` and echo tags on
+         * that connection's G/S/D replies. Off by default so the bulk of the suite keeps exercising
+         * the legacy untagged path.
+         */
         private final boolean supportTags;
-        /** echoed response tags: behave like a pre-0019 server — an extended
-         * `A ... T` is a parse error, so close the connection without
-         * replying. */
+
+        /**
+         * echoed response tags: behave like a pre-0019 server — an extended `A ... T` is a parse
+         * error, so close the connection without replying.
+         */
         private final boolean closeOnExtendedAuth;
-        /** issue #125: behave like a server that supports the `T` tag
-         * capability but predates the further-extended `R` retryable-error
-         * token — accepts `A <len> T` normally, but the doubly-extended
-         * `A <len> T R` is a parse error to it, so close without replying
-         * (forcing the client's middle fallback stage: full → tags-only).
-         * Independent of {@link #closeOnExtendedAuth}, which closes on
-         * either extension. */
+
+        /**
+         * issue #125: behave like a server that supports the `T` tag capability but predates the
+         * further-extended `R` retryable-error token — accepts `A <len> T` normally, but the
+         * doubly-extended `A <len> T R` is a parse error to it, so close without replying (forcing
+         * the client's middle fallback stage: full → tags-only). Independent of {@link
+         * #closeOnExtendedAuth}, which closes on either extension.
+         */
         private final boolean closeOnRetryToken;
+
         private final ServerSocket server;
         private final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
         private final List<Thread> threads = new CopyOnWriteArrayList<>();
@@ -246,64 +330,87 @@ final class MockServers {
             this(requiredSecret, false, false, null, 0);
         }
 
-        /** Listens on a caller-chosen port instead of an ephemeral one —
-         * for tests that need a node to come back up on the exact address
-         * discovery already listed (issue #67, redial after a bootstrap
-         * dial failed and the address's cooldown has passed). */
+        /**
+         * Listens on a caller-chosen port instead of an ephemeral one — for tests that need a node
+         * to come back up on the exact address discovery already listed (issue #67, redial after a
+         * bootstrap dial failed and the address's cooldown has passed).
+         */
         static MockNode onPort(int port) throws IOException {
             return new MockNode(null, false, false, null, port);
         }
 
-        /** echoed response tags: a node that negotiates tags — accepts `A ... T`
-         * with `OnT\n` and echoes tags on that connection's replies. */
+        /**
+         * echoed response tags: a node that negotiates tags — accepts `A ... T` with `OnT\n` and
+         * echoes tags on that connection's replies.
+         */
         static MockNode withTagSupport() throws IOException {
             return new MockNode(null, true, false, null);
         }
 
-        /** echoed response tags: a pre-0019 node — the extended `A ... T` is a parse
-         * error, so it closes the connection without replying, forcing
-         * the caller's transparent untagged fallback. */
+        /**
+         * echoed response tags: a pre-0019 node — the extended `A ... T` is a parse error, so it
+         * closes the connection without replying, forcing the caller's transparent untagged
+         * fallback.
+         */
         static MockNode legacyServer() throws IOException {
             return new MockNode(null, false, true, null);
         }
 
-        /** issue #125: a node that supports `T` (issue #19) but predates
-         * `R` — accepts `A <len> T` exactly like {@link #withTagSupport},
-         * but closes without replying on the further-extended `A <len> T
-         * R`, forcing the client's middle fallback stage (full →
-         * tags-only) rather than all the way down to plain. */
+        /**
+         * issue #125: a node that supports `T` (issue #19) but predates `R` — accepts `A <len> T`
+         * exactly like {@link #withTagSupport}, but closes without replying on the further-extended
+         * `A <len> T R`, forcing the client's middle fallback stage (full → tags-only) rather than
+         * all the way down to plain.
+         */
         static MockNode predatesRetryCapability() throws IOException {
             return new MockNode(null, true, false, null, 0, true);
         }
 
-        /** J1: a node that speaks TLS, presenting whatever certificate
-         * {@code serverTls} was built with (see {@link Tls#generate}).
-         * Everything past the handshake (A/G/S/D) is identical to a plain
-         * MockNode — an {@link javax.net.ssl.SSLSocket} is a {@link
-         * Socket}, so {@link #serve} needs no TLS-specific code at all. */
+        /**
+         * J1: a node that speaks TLS, presenting whatever certificate {@code serverTls} was built
+         * with (see {@link Tls#generate}). Everything past the handshake (A/G/S/D) is identical to
+         * a plain MockNode — an {@link javax.net.ssl.SSLSocket} is a {@link Socket}, so {@link
+         * #serve} needs no TLS-specific code at all.
+         */
         static MockNode withTls(SSLContext serverTls) throws IOException {
             return new MockNode(null, false, false, serverTls);
         }
 
-        private MockNode(byte[] requiredSecret, boolean supportTags, boolean closeOnExtendedAuth,
-                SSLContext serverTls) throws IOException {
+        private MockNode(
+                byte[] requiredSecret,
+                boolean supportTags,
+                boolean closeOnExtendedAuth,
+                SSLContext serverTls)
+                throws IOException {
             this(requiredSecret, supportTags, closeOnExtendedAuth, serverTls, 0);
         }
 
-        private MockNode(byte[] requiredSecret, boolean supportTags, boolean closeOnExtendedAuth,
-                SSLContext serverTls, int port) throws IOException {
+        private MockNode(
+                byte[] requiredSecret,
+                boolean supportTags,
+                boolean closeOnExtendedAuth,
+                SSLContext serverTls,
+                int port)
+                throws IOException {
             this(requiredSecret, supportTags, closeOnExtendedAuth, serverTls, port, false);
         }
 
-        private MockNode(byte[] requiredSecret, boolean supportTags, boolean closeOnExtendedAuth,
-                SSLContext serverTls, int port, boolean closeOnRetryToken) throws IOException {
+        private MockNode(
+                byte[] requiredSecret,
+                boolean supportTags,
+                boolean closeOnExtendedAuth,
+                SSLContext serverTls,
+                int port,
+                boolean closeOnRetryToken)
+                throws IOException {
             this.requiredSecret = requiredSecret;
             this.supportTags = supportTags;
             this.closeOnExtendedAuth = closeOnExtendedAuth;
             this.closeOnRetryToken = closeOnRetryToken;
-            this.server = serverTls == null
-                    ? new ServerSocket(port)
-                    : serverTls.getServerSocketFactory().createServerSocket(port);
+            this.server =
+                    serverTls == null
+                            ? new ServerSocket(port)
+                            : serverTls.getServerSocketFactory().createServerSocket(port);
             Thread acceptor = new Thread(this::acceptLoop, "mock-node-accept");
             acceptor.setDaemon(true);
             acceptor.start();
@@ -322,15 +429,18 @@ final class MockServers {
             wrongNodeReplies.incrementAndGet();
         }
 
-        /** Queue a one-off reply for the next G request on a tagged
-         * connection that echoes the WRONG tag (echoed response tags). */
+        /**
+         * Queue a one-off reply for the next G request on a tagged connection that echoes the WRONG
+         * tag (echoed response tags).
+         */
         void answerWrongTagOnce() {
             wrongTagReplies.incrementAndGet();
         }
 
-        /** Swallow the next G request entirely (no reply) — the
-         * off-by-one stream desync where every later response answers
-         * the previous request (echoed response tags). */
+        /**
+         * Swallow the next G request entirely (no reply) — the off-by-one stream desync where every
+         * later response answers the previous request (echoed response tags).
+         */
         void swallowGetOnce() {
             swallowedGets.incrementAndGet();
         }
@@ -340,37 +450,45 @@ final class MockServers {
             malformedValueReplies.incrementAndGet();
         }
 
-        /** Queue a one-off G reply whose `V` length field is {@code
-         * lengthField} verbatim (e.g. {@code "+5"}) instead of the real
-         * value length — issue #462. */
+        /**
+         * Queue a one-off G reply whose `V` length field is {@code lengthField} verbatim (e.g.
+         * {@code "+5"}) instead of the real value length — issue #462.
+         */
         void answerValueLengthOnce(String lengthField) {
             customValueLengthField.set(lengthField);
         }
 
-        /** Reply {@code S} to the next G — a well-formed frame of the
-         * wrong kind, as a desynced (off-by-one) stream would produce. */
+        /**
+         * Reply {@code S} to the next G — a well-formed frame of the wrong kind, as a desynced
+         * (off-by-one) stream would produce.
+         */
         void answerStoredToGetOnce() {
             storedToGetReplies.incrementAndGet();
         }
 
-        /** Queue a one-off G reply that streams a `V` marker followed by
-         * bytes with no '\n' ever — a malicious/buggy node's header that
-         * would otherwise grow the client's line buffer without bound. */
+        /**
+         * Queue a one-off G reply that streams a `V` marker followed by bytes with no '\n' ever — a
+         * malicious/buggy node's header that would otherwise grow the client's line buffer without
+         * bound.
+         */
         void answerRunawayHeaderOnce() {
             runawayHeaderReplies.incrementAndGet();
         }
 
-        /** Queue a one-off G miss (`N`) reply whose second byte is not
-         * '\n' — the untagged fixed-shape response is always exactly two
-         * bytes on the wire, so anything else here is a desync. */
+        /**
+         * Queue a one-off G miss (`N`) reply whose second byte is not '\n' — the untagged
+         * fixed-shape response is always exactly two bytes on the wire, so anything else here is a
+         * desync.
+         */
         void answerBadTrailerOnce() {
             badTrailerReplies.incrementAndGet();
         }
 
-        /** Answer the next {@code count} data requests
-         * (`G`/`S`/`D`/`g`/`s`/`d`/`c`/`F`) with a transient `R` instead
-         * of their real reply — issue #125's retryable-error status,
-         * tagged correctly (`R <tag>`) on a tagged connection. */
+        /**
+         * Answer the next {@code count} data requests (`G`/`S`/`D`/`g`/`s`/`d`/`c`/`F`) with a
+         * transient `R` instead of their real reply — issue #125's retryable-error status, tagged
+         * correctly (`R <tag>`) on a tagged connection.
+         */
         void answerRetryableFor(int count) {
             retryableReplies.addAndGet(count);
         }
@@ -383,16 +501,18 @@ final class MockServers {
             }
         }
 
-        /** From now on, answers no `A` request until {@link
-         * #releaseAuthReplies}: the dial that sent it stays in its
-         * handshake. {@link #awaitAuthHeld} tells a test when one has
-         * arrived. */
+        /**
+         * From now on, answers no `A` request until {@link #releaseAuthReplies}: the dial that sent
+         * it stays in its handshake. {@link #awaitAuthHeld} tells a test when one has arrived.
+         */
         void holdAuthReplies() {
             authGate = new java.util.concurrent.CountDownLatch(1);
         }
 
-        /** Answers every `A` request held since {@link #holdAuthReplies},
-         * and every later one, normally. */
+        /**
+         * Answers every `A` request held since {@link #holdAuthReplies}, and every later one,
+         * normally.
+         */
         void releaseAuthReplies() {
             java.util.concurrent.CountDownLatch gate = authGate;
             authGate = null;
@@ -404,33 +524,38 @@ final class MockServers {
             return authHeld.tryAcquire(millis, java.util.concurrent.TimeUnit.MILLISECONDS);
         }
 
-        /** Holds every future S reply for {@code millis} first — for tests
-         * proving a caller isn't blocked on a slow replica leg
-         * (fire-and-forget replica writes). */
+        /**
+         * Holds every future S reply for {@code millis} first — for tests proving a caller isn't
+         * blocked on a slow replica leg (fire-and-forget replica writes).
+         */
         void delaySets(long millis) {
             setDelayMillis = millis;
         }
 
-        /** Holds every future G reply for {@code millis} first — a
-         * slow-but-alive node, for hedged-read tests (issue #64). */
+        /**
+         * Holds every future G reply for {@code millis} first — a slow-but-alive node, for
+         * hedged-read tests (issue #64).
+         */
         void delayGets(long millis) {
             getDelayMillis = millis;
         }
 
-        /** Drops the connection (server-side reset) on every S instead of
-         * acking it, so a write here fails with a connection error — for
-         * tests that need a repair/replica write to deterministically
-         * fail without racing a close(). Reads (G) are unaffected, so a
-         * node can still miss the initial lookup that triggers the repair. */
+        /**
+         * Drops the connection (server-side reset) on every S instead of acking it, so a write here
+         * fails with a connection error — for tests that need a repair/replica write to
+         * deterministically fail without racing a close(). Reads (G) are unaffected, so a node can
+         * still miss the initial lookup that triggers the repair.
+         */
         void failSets() {
             failSets = true;
         }
 
-        /** Queue one connection reset (server-side, no reply) for the
-         * next `c`/`F` frame instead of acking it — for tests of
-         * clear()/clearAll()'s partial-failure and refresh-and-retry
-         * paths (issue #106). Call it twice to outlast a single fan-out
-         * pass's own {@code applyReconnecting} redial-retry. */
+        /**
+         * Queue one connection reset (server-side, no reply) for the next `c`/`F` frame instead of
+         * acking it — for tests of clear()/clearAll()'s partial-failure and refresh-and-retry paths
+         * (issue #106). Call it twice to outlast a single fan-out pass's own {@code
+         * applyReconnecting} redial-retry.
+         */
         void failClearOnce() {
             clearFailures.incrementAndGet();
         }
@@ -443,8 +568,10 @@ final class MockServers {
             }
         }
 
-        /** issue #411: answer the next `m` frame normally, then tear this
-         * whole node down — see {@link #closeAfterMultiGet}. */
+        /**
+         * issue #411: answer the next `m` frame normally, then tear this whole node down — see
+         * {@link #closeAfterMultiGet}.
+         */
         void closeAfterNextMultiGet() {
             closeAfterMultiGet.incrementAndGet();
         }
@@ -475,19 +602,20 @@ final class MockServers {
             }
         }
 
-        /** Makes this node a half-open server from this point on: it
-         * still accepts and completes the A handshake, and still reads
-         * every request frame off the wire (so the TCP stream stays
-         * well-formed), but never writes a reply — regression coverage
-         * for the request timeout (issue #42), mirroring the Go suite's
-         * hook of the same name. */
+        /**
+         * Makes this node a half-open server from this point on: it still accepts and completes the
+         * A handshake, and still reads every request frame off the wire (so the TCP stream stays
+         * well-formed), but never writes a reply — regression coverage for the request timeout
+         * (issue #42), mirroring the Go suite's hook of the same name.
+         */
         void goSilentAfterHandshake() {
             silent = true;
         }
 
-        /** issue #225: apply (and count) the next `i` request as usual,
-         * but close the connection instead of replying — see {@link
-         * #dropReplyAfterIncr}. */
+        /**
+         * issue #225: apply (and count) the next `i` request as usual, but close the connection
+         * instead of replying — see {@link #dropReplyAfterIncr}.
+         */
         void dropReplyAfterNextIncr() {
             dropReplyAfterIncr.incrementAndGet();
         }
@@ -500,9 +628,10 @@ final class MockServers {
             }
         }
 
-        /** issue #225: apply (and count) the next `k` request as usual,
-         * but close the connection instead of replying — see {@link
-         * #dropReplyAfterCasSet}. */
+        /**
+         * issue #225: apply (and count) the next `k` request as usual, but close the connection
+         * instead of replying — see {@link #dropReplyAfterCasSet}.
+         */
         void dropReplyAfterNextCasSet() {
             dropReplyAfterCasSet.incrementAndGet();
         }
@@ -515,8 +644,10 @@ final class MockServers {
             }
         }
 
-        /** issue #825: apply (and log) the next `t` request as usual, but
-         * close the connection instead of replying. */
+        /**
+         * issue #825: apply (and log) the next `t` request as usual, but close the connection
+         * instead of replying.
+         */
         /** See {@link #touchReplyDelayMillis}. */
         void delayTouchRepliesBy(long millis) {
             touchReplyDelayMillis = millis;
@@ -544,8 +675,10 @@ final class MockServers {
             }
         }
 
-        /** issue #871: from now on answer every `y` like a node that knows
-         * `t` but predates `y` — `En`, then close. */
+        /**
+         * issue #871: from now on answer every `y` like a node that knows `t` but predates `y` —
+         * `En`, then close.
+         */
         void rejectMultiTouchLikeAnOldServer() {
             rejectMultiTouch = true;
         }
@@ -560,8 +693,9 @@ final class MockServers {
             multiTouchBadCount.set(count);
         }
 
-        /** issue #825: from now on answer every `t` like a node that
-         * predates it — `En`, then close. */
+        /**
+         * issue #825: from now on answer every `t` like a node that predates it — `En`, then close.
+         */
         void rejectTouchLikeAnOldServer() {
             rejectTouch = true;
         }
@@ -647,9 +781,10 @@ final class MockServers {
                                 return;
                             }
                             byte[] secret = in.readNBytes(Integer.parseInt(parts[1]));
-                            boolean accepted = requiredSecret == null
-                                    ? secret.length > 0
-                                    : java.util.Arrays.equals(secret, requiredSecret);
+                            boolean accepted =
+                                    requiredSecret == null
+                                            ? secret.length > 0
+                                            : java.util.Arrays.equals(secret, requiredSecret);
                             java.util.concurrent.CountDownLatch gate = authGate;
                             if (gate != null) {
                                 authHeld.release();
@@ -660,9 +795,14 @@ final class MockServers {
                                     return;
                                 }
                             }
-                            tagged = accepted && supportTags && parts.length > 2 && parts[2].equals("T");
-                            out.write((accepted ? (tagged ? "OnT\n" : "On\n") : "En\n")
-                                    .getBytes(StandardCharsets.US_ASCII));
+                            tagged =
+                                    accepted
+                                            && supportTags
+                                            && parts.length > 2
+                                            && parts[2].equals("T");
+                            out.write(
+                                    (accepted ? (tagged ? "OnT\n" : "On\n") : "En\n")
+                                            .getBytes(StandardCharsets.US_ASCII));
                             out.flush();
                             if (!accepted) return;
                         }
@@ -682,7 +822,9 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -694,7 +836,9 @@ final class MockServers {
                                 // 1) — the desync a pre-tag stream
                                 // misalignment would produce.
                                 long wrongTag = Long.parseLong(parts[2]) + 1;
-                                out.write(("N " + wrongTag + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("N " + wrongTag + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -705,13 +849,16 @@ final class MockServers {
                             }
                             String customLength = customValueLengthField.getAndSet(null);
                             if (customLength != null) {
-                                out.write(("V " + customLength + tagSuffix + "\n")
-                                        .getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("V " + customLength + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (storedToGetReplies.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
-                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("S" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -728,23 +875,31 @@ final class MockServers {
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("W" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 byte[] value = store.get(key);
                                 if (value == null) {
-                                    if (badTrailerReplies.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                                    if (badTrailerReplies.getAndUpdate(n -> Math.max(0, n - 1))
+                                            > 0) {
                                         // Two bytes, as the untagged form
                                         // always is, but the second isn't
                                         // '\n' — a desync the client must
                                         // catch rather than silently accept.
-                                        out.write(("N" + tagSuffix).getBytes(StandardCharsets.US_ASCII));
+                                        out.write(
+                                                ("N" + tagSuffix)
+                                                        .getBytes(StandardCharsets.US_ASCII));
                                         out.write('X');
                                     } else {
-                                        out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                        out.write(
+                                                ("N" + tagSuffix + "\n")
+                                                        .getBytes(StandardCharsets.US_ASCII));
                                     }
                                 } else {
-                                    out.write(("V " + value.length + tagSuffix + "\n")
-                                            .getBytes(StandardCharsets.US_ASCII));
+                                    out.write(
+                                            ("V " + value.length + tagSuffix + "\n")
+                                                    .getBytes(StandardCharsets.US_ASCII));
                                     out.write(value);
                                 }
                             }
@@ -763,7 +918,9 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -783,11 +940,15 @@ final class MockServers {
                                 }
                             }
                             if (takeWrongNode()) {
-                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("W" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 store.put(key, value);
                                 namespacedPutTtl("", key, lastSetTtl);
-                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("S" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
@@ -798,15 +959,22 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("W" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             } else {
-                                out.write((store.remove(key) != null ? "D" + tagSuffix + "\n" : "N" + tagSuffix + "\n")
-                                        .getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        (store.remove(key) != null
+                                                        ? "D" + tagSuffix + "\n"
+                                                        : "N" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
@@ -837,19 +1005,26 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("W" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 byte[] value = namespacedGet(ns, key);
                                 if (value == null) {
-                                    out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                    out.write(
+                                            ("N" + tagSuffix + "\n")
+                                                    .getBytes(StandardCharsets.US_ASCII));
                                 } else {
-                                    out.write(("V " + value.length + tagSuffix + "\n")
-                                            .getBytes(StandardCharsets.US_ASCII));
+                                    out.write(
+                                            ("V " + value.length + tagSuffix + "\n")
+                                                    .getBytes(StandardCharsets.US_ASCII));
                                     out.write(value);
                                 }
                             }
@@ -870,7 +1045,9 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -886,11 +1063,15 @@ final class MockServers {
                                 }
                             }
                             if (takeWrongNode()) {
-                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("W" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 namespacedPut(ns, key, value);
                                 namespacedPutTtl(ns, key, lastSetTtl);
-                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("S" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
@@ -911,31 +1092,45 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("W" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             byte[] existing = namespacedGet(ns, key);
                             if (existing == null) {
-                                out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("N" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             long updated;
                             try {
-                                updated = Math.addExact(
-                                        Long.parseLong(new String(existing, StandardCharsets.US_ASCII)), delta);
+                                updated =
+                                        Math.addExact(
+                                                Long.parseLong(
+                                                        new String(
+                                                                existing,
+                                                                StandardCharsets.US_ASCII)),
+                                                delta);
                             } catch (NumberFormatException | ArithmeticException notNumeric) {
-                                out.write(("T" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("T" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
-                            byte[] updatedValue = Long.toString(updated).getBytes(StandardCharsets.US_ASCII);
+                            byte[] updatedValue =
+                                    Long.toString(updated).getBytes(StandardCharsets.US_ASCII);
                             namespacedPut(ns, key, updatedValue);
                             if (takeDropReplyAfterIncr()) {
                                 // issue #225: applied, but the ack never
@@ -944,8 +1139,9 @@ final class MockServers {
                             }
                             Long ttl = namespacedTtl(ns, key);
                             String ttlField = ttl == null ? "" : " " + ttl;
-                            out.write(("I " + updatedValue.length + ttlField + tagSuffix + "\n")
-                                    .getBytes(StandardCharsets.US_ASCII));
+                            out.write(
+                                    ("I " + updatedValue.length + ttlField + tagSuffix + "\n")
+                                            .getBytes(StandardCharsets.US_ASCII));
                             out.write(updatedValue);
                             out.flush();
                         }
@@ -974,21 +1170,27 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("W" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             byte[] existing = namespacedGet(ns, key);
-                            boolean matches = switch (cond) {
-                                case "A" -> existing == null;
-                                case "P" -> existing != null;
-                                default -> existing != null && digestOf(existing).equals(cond);
-                            };
+                            boolean matches =
+                                    switch (cond) {
+                                        case "A" -> existing == null;
+                                        case "P" -> existing != null;
+                                        default ->
+                                                existing != null && digestOf(existing).equals(cond);
+                                    };
                             if (matches) {
                                 namespacedPut(ns, key, value);
                                 namespacedPutTtl(ns, key, ttlSeconds);
@@ -998,9 +1200,13 @@ final class MockServers {
                                     // dies here.
                                     return;
                                 }
-                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("S" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             } else {
-                                out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("N" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
@@ -1013,21 +1219,29 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("W" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             byte[] existing = namespacedGet(ns, key);
                             if (existing != null && digestOf(existing).equals(cond)) {
                                 namespacedRemove(ns, key);
-                                out.write(("D" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("D" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             } else {
-                                out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("N" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
@@ -1066,7 +1280,9 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1113,7 +1329,8 @@ final class MockServers {
                             }
                             int fixedFieldCount = 3 + n * 2;
                             int ttlFieldCount = parts.length - fixedFieldCount - (tagged ? 1 : 0);
-                            long ttlSeconds = ttlFieldCount > 0 ? Long.parseLong(parts[fixedFieldCount]) : 0;
+                            long ttlSeconds =
+                                    ttlFieldCount > 0 ? Long.parseLong(parts[fixedFieldCount]) : 0;
                             String[] keys = new String[n];
                             byte[][] values = new byte[n][];
                             for (int i = 0; i < n; i++) {
@@ -1130,7 +1347,9 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1166,16 +1385,22 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("W" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             } else {
-                                out.write((namespacedRemove(ns, key) != null
-                                        ? "D" + tagSuffix + "\n" : "N" + tagSuffix + "\n")
-                                        .getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        (namespacedRemove(ns, key) != null
+                                                        ? "D" + tagSuffix + "\n"
+                                                        : "N" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
@@ -1191,7 +1416,9 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1234,18 +1461,24 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("W" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             byte[] existing = namespacedGet(ns, key);
                             if (existing == null) {
-                                out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("N" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1259,11 +1492,17 @@ final class MockServers {
                                 return; // applied, but the ack never arrives
                             }
                             if (!withValue) {
-                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("S" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                             } else {
-                                String ttlField = ttlSeconds == null || ttlSeconds == 0 ? "" : " " + ttlSeconds;
-                                out.write(("V " + existing.length + ttlField + tagSuffix + "\n")
-                                        .getBytes(StandardCharsets.US_ASCII));
+                                String ttlField =
+                                        ttlSeconds == null || ttlSeconds == 0
+                                                ? ""
+                                                : " " + ttlSeconds;
+                                out.write(
+                                        ("V " + existing.length + ttlField + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.write(existing);
                             }
                             out.flush();
@@ -1289,7 +1528,8 @@ final class MockServers {
                                 if (parts[i].equals("G")) withValue = true;
                                 else ttlSeconds = Long.parseLong(parts[i]);
                             }
-                            multiTouchFrames.add(new MultiTouchFrame(ns, List.of(keys), ttlSeconds, withValue));
+                            multiTouchFrames.add(
+                                    new MultiTouchFrame(ns, List.of(keys), ttlSeconds, withValue));
                             touchReceiptNanos.add(System.nanoTime());
                             if (rejectTouch || rejectMultiTouch) {
                                 out.write("En\n".getBytes(StandardCharsets.US_ASCII));
@@ -1305,7 +1545,9 @@ final class MockServers {
                             }
                             if (failAfter > 0) multiTouchFailAfter.decrementAndGet();
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1342,14 +1584,18 @@ final class MockServers {
                             if (badCount >= 0) {
                                 while (tokens.size() > badCount) {
                                     String dropped = tokens.remove(tokens.size() - 1);
-                                    if (!dropped.equals("-") && !dropped.equals("W") && !dropped.equals("S")
+                                    if (!dropped.equals("-")
+                                            && !dropped.equals("W")
+                                            && !dropped.equals("S")
                                             && !dropped.equals("N")) {
                                         hits.remove(hits.size() - 1);
                                     }
                                 }
                                 while (tokens.size() < badCount) tokens.add(withValue ? "-" : "N");
                             }
-                            StringBuilder header = new StringBuilder(withValue ? "M " : "Y ").append(tokens.size());
+                            StringBuilder header =
+                                    new StringBuilder(withValue ? "M " : "Y ")
+                                            .append(tokens.size());
                             for (String token : tokens) header.append(' ').append(token);
                             header.append(tagSuffix).append('\n');
                             out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
@@ -1362,7 +1608,9 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+                                out.write(
+                                        ("R" + tagSuffix + "\n")
+                                                .getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1419,7 +1667,9 @@ final class MockServers {
                 store.put(key, value);
                 return;
             }
-            namespacedStores.computeIfAbsent(ns, ignored -> new ConcurrentHashMap<>()).put(key, value);
+            namespacedStores
+                    .computeIfAbsent(ns, ignored -> new ConcurrentHashMap<>())
+                    .put(key, value);
         }
 
         private byte[] namespacedRemove(String ns, String key) {
@@ -1433,20 +1683,24 @@ final class MockServers {
             return nsStore == null ? null : nsStore.remove(key);
         }
 
-        /** As {@link #namespacedPut}, for a key's TTL (issue #129) —
-         * {@code ttlSeconds <= 0} means no expiry, matching the wire's own
-         * "omitted means no TTL" convention (see {@link #lastSetTtl}). */
+        /**
+         * As {@link #namespacedPut}, for a key's TTL (issue #129) — {@code ttlSeconds <= 0} means
+         * no expiry, matching the wire's own "omitted means no TTL" convention (see {@link
+         * #lastSetTtl}).
+         */
         private void namespacedPutTtl(String ns, String key, long ttlSeconds) {
             if (ns.isEmpty()) {
-                if (ttlSeconds > 0) ttls.put(key, ttlSeconds); else ttls.remove(key);
+                if (ttlSeconds > 0) ttls.put(key, ttlSeconds);
+                else ttls.remove(key);
                 return;
             }
-            Map<String, Long> nsTtls = namespacedTtls.computeIfAbsent(ns, ignored -> new ConcurrentHashMap<>());
-            if (ttlSeconds > 0) nsTtls.put(key, ttlSeconds); else nsTtls.remove(key);
+            Map<String, Long> nsTtls =
+                    namespacedTtls.computeIfAbsent(ns, ignored -> new ConcurrentHashMap<>());
+            if (ttlSeconds > 0) nsTtls.put(key, ttlSeconds);
+            else nsTtls.remove(key);
         }
 
-        /** As {@link #namespacedGet}, for a key's TTL (issue #129) —
-         * {@code null} means no TTL. */
+        /** As {@link #namespacedGet}, for a key's TTL (issue #129) — {@code null} means no TTL. */
         private Long namespacedTtl(String ns, String key) {
             if (ns.isEmpty()) return ttls.get(key);
             Map<String, Long> nsTtls = namespacedTtls.get(ns);
@@ -1457,17 +1711,18 @@ final class MockServers {
             return new String(key, StandardCharsets.ISO_8859_1);
         }
 
-        /** The CAS digest (issue #141): SHA-256 of {@code value}, truncated
-         * to its first 16 bytes, lowercase hex-encoded. Deliberately its
-         * own independent implementation rather than a call to {@link
-         * NanocachedClient#contentDigest} — this mock stands in for the
-         * server, and a real server implementation is independent of this
-         * SDK's own, so a bug shared between the SDK and this mock
-         * wouldn't be caught by any test that only compares the two
-         * against each other. */
+        /**
+         * The CAS digest (issue #141): SHA-256 of {@code value}, truncated to its first 16 bytes,
+         * lowercase hex-encoded. Deliberately its own independent implementation rather than a call
+         * to {@link NanocachedClient#contentDigest} — this mock stands in for the server, and a
+         * real server implementation is independent of this SDK's own, so a bug shared between the
+         * SDK and this mock wouldn't be caught by any test that only compares the two against each
+         * other.
+         */
         private static String digestOf(byte[] value) {
             try {
-                java.security.MessageDigest sha256 = java.security.MessageDigest.getInstance("SHA-256");
+                java.security.MessageDigest sha256 =
+                        java.security.MessageDigest.getInstance("SHA-256");
                 byte[] digest = sha256.digest(value);
                 StringBuilder hex = new StringBuilder(32);
                 for (int i = 0; i < 16; i++) {
@@ -1483,38 +1738,47 @@ final class MockServers {
 
     static final class MockDiscovery implements AutoCloseable {
         volatile List<DiscoveredNode> nodes;
-        /** SDK proxy mode (issue #122): the roster `Q` answers with —
-         * reuses {@link DiscoveredNode} exactly like a real proxy
-         * announce does on the wire (name/address, no replication field),
-         * even though a proxy's "name" has no routing meaning to a
-         * client. Empty by default; a test sets this directly (mirrors
-         * {@link #warmingUp}/{@link #rawListResponse} below) — including
-         * mid-test, for a "roster changed under a live client" case. A
-         * "proxy" here is nothing more than a {@link MockNode}: that is
-         * literally what a proxy looks like to a client (full G/S/D,
-         * never W). */
+
+        /**
+         * SDK proxy mode (issue #122): the roster `Q` answers with — reuses {@link DiscoveredNode}
+         * exactly like a real proxy announce does on the wire (name/address, no replication field),
+         * even though a proxy's "name" has no routing meaning to a client. Empty by default; a test
+         * sets this directly (mirrors {@link #warmingUp}/{@link #rawListResponse} below) —
+         * including mid-test, for a "roster changed under a live client" case. A "proxy" here is
+         * nothing more than a {@link MockNode}: that is literally what a proxy looks like to a
+         * client (full G/S/D, never W).
+         */
         volatile List<DiscoveredNode> proxies = List.of();
+
         volatile boolean warmingUp = false;
         final int replication;
         private final ServerSocket server;
-        /** When set, an L request gets this exact text instead of the
-         * normally generated frame — for tests that need to claim things
-         * about the node list a real registry couldn't (an over-the-cap
-         * count, a malformed header, an entry whose declared length
-         * would blow the aggregate response cap) without actually
-         * holding that much node data in memory. */
+
+        /**
+         * When set, an L request gets this exact text instead of the normally generated frame — for
+         * tests that need to claim things about the node list a real registry couldn't (an
+         * over-the-cap count, a malformed header, an entry whose declared length would blow the
+         * aggregate response cap) without actually holding that much node data in memory.
+         */
         volatile String rawListResponse;
-        /** Every accepted connection, including the client's bootstrap
-         * one — lets a test count the refreshes a client actually ran. */
+
+        /**
+         * Every accepted connection, including the client's bootstrap one — lets a test count the
+         * refreshes a client actually ran.
+         */
         final AtomicInteger connectionCount = new AtomicInteger();
-        /** When positive, every `L` after the first connection's is
-         * answered only after this many milliseconds — a discovery
-         * server that is slow once the client is up, so a test can tell
-         * N serialized refreshes (N delays) from one shared refresh. */
+
+        /**
+         * When positive, every `L` after the first connection's is answered only after this many
+         * milliseconds — a discovery server that is slow once the client is up, so a test can tell
+         * N serialized refreshes (N delays) from one shared refresh.
+         */
         volatile long laterListDelayMillis = 0;
-        /** When positive, every `L` reply is written one byte at a time
-         * with this many milliseconds between bytes — a peer that keeps
-         * the identify exchange alive without ever going silent. */
+
+        /**
+         * When positive, every `L` reply is written one byte at a time with this many milliseconds
+         * between bytes — a peer that keeps the identify exchange alive without ever going silent.
+         */
         volatile long listByteDelayMillis = 0;
 
         MockDiscovery(List<DiscoveredNode> nodes, int replication) throws IOException {
@@ -1563,7 +1827,9 @@ final class MockServers {
                         // requests (L is a one-shot), but the ack must
                         // still parse.
                         boolean requestedTags = parts.length > 2 && parts[2].equals("T");
-                        out.write((requestedTags ? "OdT\n" : "Od\n").getBytes(StandardCharsets.US_ASCII));
+                        out.write(
+                                (requestedTags ? "OdT\n" : "Od\n")
+                                        .getBytes(StandardCharsets.US_ASCII));
                         out.flush();
                     } else if (parts[0].equals("L")) {
                         if (warmingUp) {
@@ -1580,12 +1846,17 @@ final class MockServers {
                         long delay = connectionCount.get() > 1 ? laterListDelayMillis : 0;
                         if (delay > 0) Thread.sleep(delay);
                         List<DiscoveredNode> snapshot = nodes;
-                        StringBuilder frame = new StringBuilder(
-                                "N " + snapshot.size() + " " + replication + "\n");
+                        StringBuilder frame =
+                                new StringBuilder(
+                                        "N " + snapshot.size() + " " + replication + "\n");
                         for (DiscoveredNode node : snapshot) {
-                            frame.append(node.name().length()).append(' ')
-                                    .append(node.address().length()).append('\n')
-                                    .append(node.name()).append(node.address()).append('\n');
+                            frame.append(node.name().length())
+                                    .append(' ')
+                                    .append(node.address().length())
+                                    .append('\n')
+                                    .append(node.name())
+                                    .append(node.address())
+                                    .append('\n');
                         }
                         byte[] bytes = frame.toString().getBytes(StandardCharsets.UTF_8);
                         long byteDelay = listByteDelayMillis;
@@ -1612,9 +1883,13 @@ final class MockServers {
                         List<DiscoveredNode> snapshot = proxies;
                         StringBuilder frame = new StringBuilder("N " + snapshot.size() + "\n");
                         for (DiscoveredNode proxy : snapshot) {
-                            frame.append(proxy.name().length()).append(' ')
-                                    .append(proxy.address().length()).append('\n')
-                                    .append(proxy.name()).append(proxy.address()).append('\n');
+                            frame.append(proxy.name().length())
+                                    .append(' ')
+                                    .append(proxy.address().length())
+                                    .append('\n')
+                                    .append(proxy.name())
+                                    .append(proxy.address())
+                                    .append('\n');
                         }
                         out.write(frame.toString().getBytes(StandardCharsets.UTF_8));
                         out.flush();
@@ -1631,46 +1906,64 @@ final class MockServers {
     }
 
     /**
-     * J1 test support: throwaway self-signed TLS certificates, generated
-     * with the JDK's own {@code keytool} binary (shipped with every JDK
-     * install — this adds no Maven/Gradle test dependency) rather than a
-     * TLS/crypto library this SDK doesn't otherwise need. Each certificate
-     * is self-signed and used as its own trust anchor, mirroring how a
-     * real deployment's private CA is passed to {@code Options.ca(Path)}.
+     * J1 test support: throwaway self-signed TLS certificates, generated with the JDK's own {@code
+     * keytool} binary (shipped with every JDK install — this adds no Maven/Gradle test dependency)
+     * rather than a TLS/crypto library this SDK doesn't otherwise need. Each certificate is
+     * self-signed and used as its own trust anchor, mirroring how a real deployment's private CA is
+     * passed to {@code Options.ca(Path)}.
      */
     static final class Tls {
         private static final char[] PASSWORD = "changeit".toCharArray();
+
         private Tls() {}
 
         record Generated(SSLContext serverContext, Path pemCert) {}
 
-        /** {@code subjectAltName} is a keytool {@code -ext SAN=...} value,
-         * e.g. {@code "ip:127.0.0.1"} or {@code "dns:wrong.example.test"} —
-         * this is exactly the value the JDK's HTTPS endpoint-identification
-         * algorithm (issue J1) checks the connected-to host against. */
-        static Generated generate(Path dir, String commonName, String subjectAltName) throws Exception {
+        /**
+         * {@code subjectAltName} is a keytool {@code -ext SAN=...} value, e.g. {@code
+         * "ip:127.0.0.1"} or {@code "dns:wrong.example.test"} — this is exactly the value the JDK's
+         * HTTPS endpoint-identification algorithm (issue J1) checks the connected-to host against.
+         */
+        static Generated generate(Path dir, String commonName, String subjectAltName)
+                throws Exception {
             Path keystore = dir.resolve("node.p12");
             Path pem = dir.resolve("node.pem");
 
-            runKeytool(dir,
+            runKeytool(
+                    dir,
                     "-genkeypair",
-                    "-alias", "node",
-                    "-keyalg", "RSA",
-                    "-keysize", "2048",
-                    "-validity", "3650",
-                    "-storetype", "PKCS12",
-                    "-keystore", keystore.toString(),
-                    "-storepass", new String(PASSWORD),
-                    "-keypass", new String(PASSWORD),
-                    "-dname", "CN=" + commonName,
-                    "-ext", "SAN=" + subjectAltName);
-            runKeytool(dir,
+                    "-alias",
+                    "node",
+                    "-keyalg",
+                    "RSA",
+                    "-keysize",
+                    "2048",
+                    "-validity",
+                    "3650",
+                    "-storetype",
+                    "PKCS12",
+                    "-keystore",
+                    keystore.toString(),
+                    "-storepass",
+                    new String(PASSWORD),
+                    "-keypass",
+                    new String(PASSWORD),
+                    "-dname",
+                    "CN=" + commonName,
+                    "-ext",
+                    "SAN=" + subjectAltName);
+            runKeytool(
+                    dir,
                     "-exportcert",
-                    "-alias", "node",
-                    "-keystore", keystore.toString(),
-                    "-storepass", new String(PASSWORD),
+                    "-alias",
+                    "node",
+                    "-keystore",
+                    keystore.toString(),
+                    "-storepass",
+                    new String(PASSWORD),
                     "-rfc",
-                    "-file", pem.toString());
+                    "-file",
+                    pem.toString());
 
             KeyStore serverKeystore = KeyStore.getInstance("PKCS12");
             try (InputStream in = Files.newInputStream(keystore)) {
@@ -1684,33 +1977,40 @@ final class MockServers {
             return new Generated(serverContext, pem);
         }
 
-        private static void runKeytool(Path workingDir, String... args) throws IOException, InterruptedException {
+        private static void runKeytool(Path workingDir, String... args)
+                throws IOException, InterruptedException {
             List<String> command = new java.util.ArrayList<>();
-            command.add(System.getProperty("java.home") + File.separator + "bin" + File.separator + "keytool");
+            command.add(
+                    System.getProperty("java.home")
+                            + File.separator
+                            + "bin"
+                            + File.separator
+                            + "keytool");
             command.addAll(List.of(args));
-            Process process = new ProcessBuilder(command)
-                    .directory(workingDir.toFile())
-                    .redirectErrorStream(true)
-                    .start();
-            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            Process process =
+                    new ProcessBuilder(command)
+                            .directory(workingDir.toFile())
+                            .redirectErrorStream(true)
+                            .start();
+            String output =
+                    new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
             if (!process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)) {
                 process.destroyForcibly();
                 throw new IOException("keytool timed out: " + command);
             }
             if (process.exitValue() != 0) {
-                throw new IOException("keytool failed (exit " + process.exitValue() + "): " + output);
+                throw new IOException(
+                        "keytool failed (exit " + process.exitValue() + "): " + output);
             }
         }
     }
 
     /**
-     * A node that answers each {@code t} / {@code y} frame with whatever
-     * bytes a script returns for its header line, so a test can put an
-     * exact wire reply (the proxy's {@code R}, a bare {@code E}, ...) in
-     * front of the client. {@code null} from the script closes the
-     * connection. Only the touch frames are understood after the
-     * handshake; each one is counted in {@link #frames} and recorded in
-     * {@link #headers}.
+     * A node that answers each {@code t} / {@code y} frame with whatever bytes a script returns for
+     * its header line, so a test can put an exact wire reply (the proxy's {@code R}, a bare {@code
+     * E}, ...) in front of the client. {@code null} from the script closes the connection. Only the
+     * touch frames are understood after the handshake; each one is counted in {@link #frames} and
+     * recorded in {@link #headers}.
      */
     static final class ScriptedNode implements AutoCloseable {
         final ServerSocket server;
@@ -1723,7 +2023,8 @@ final class MockServers {
             this(false, script);
         }
 
-        ScriptedNode(boolean acceptTags, java.util.function.Function<String, String> script) throws IOException {
+        ScriptedNode(boolean acceptTags, java.util.function.Function<String, String> script)
+                throws IOException {
             this.acceptTags = acceptTags;
             this.script = script;
             this.server = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());

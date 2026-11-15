@@ -10,11 +10,11 @@ import java.io.Serializable;
 import org.junit.jupiter.api.Test;
 
 /**
- * Proves {@link JdkCacheValueSerializer#deserialize} actually applies an {@link
- * ObjectInputFilter} (issue #232's trust-boundary fix), using the constructor overload rather
- * than {@link ObjectInputFilter.Config#setSerialFilter} — that JVM-wide setter can only
- * succeed once per process, so mutating it here would be order-dependent and could break any
- * other test in the same JVM that deserializes afterward.
+ * Proves {@link JdkCacheValueSerializer#deserialize} actually applies an {@link ObjectInputFilter}
+ * (issue #232's trust-boundary fix), using the constructor overload rather than {@link
+ * ObjectInputFilter.Config#setSerialFilter} — that JVM-wide setter can only succeed once per
+ * process, so mutating it here would be order-dependent and could break any other test in the same
+ * JVM that deserializes afterward.
  */
 class JdkCacheValueSerializerTest {
 

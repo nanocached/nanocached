@@ -25,13 +25,12 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /**
- * The statistics each {@link Cache} operation records, as an application
- * reads them: through the {@link CacheStatisticsMXBean} the cache registers
- * with the platform MBean server. The expected counts are the ones JSR-107
- * 1.1.1's "Statistics Effects of Cache Operations" table lists, with the
- * ambiguous cells (an operation that is both a hit and a miss "depending
- * on the mapping") resolved the way the reference implementation
- * ({@code RICache}) and the TCK's {@code CacheMBStatisticsBeanTest} do.
+ * The statistics each {@link Cache} operation records, as an application reads them: through the
+ * {@link CacheStatisticsMXBean} the cache registers with the platform MBean server. The expected
+ * counts are the ones JSR-107 1.1.1's "Statistics Effects of Cache Operations" table lists, with
+ * the ambiguous cells (an operation that is both a hit and a miss "depending on the mapping")
+ * resolved the way the reference implementation ({@code RICache}) and the TCK's {@code
+ * CacheMBStatisticsBeanTest} do.
  */
 class NanocachedCacheStatisticsTest {
 
@@ -53,8 +52,12 @@ class NanocachedCacheStatisticsTest {
         config.setStatisticsEnabled(true);
         cache = manager.createCache("stats", config);
         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        ObjectName objectName = new ObjectName("javax.cache:type=CacheStatistics,CacheManager="
-                + ObjectName.quote(manager.getURI().toString()) + ",Cache=" + ObjectName.quote("stats"));
+        ObjectName objectName =
+                new ObjectName(
+                        "javax.cache:type=CacheStatistics,CacheManager="
+                                + ObjectName.quote(manager.getURI().toString())
+                                + ",Cache="
+                                + ObjectName.quote("stats"));
         statistics = JMX.newMXBeanProxy(mbs, objectName, CacheStatisticsMXBean.class);
     }
 

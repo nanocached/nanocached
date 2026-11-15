@@ -20,121 +20,139 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
 /**
- * One already-identified connection to a single nanocached-node, speaking
- * the cache protocol ({@code G}/{@code S}/{@code D} — the {@code A}
- * identify exchange happens in {@link Identify} before a Connection
- * exists). Requests are pipelined onto the socket and matched to
- * responses in send order (request pipelining): a dedicated reader thread
- * consumes responses and dispatches each to the oldest still-pending
- * request, since nanocached-node itself only ever answers in the order it
- * received requests. Claiming the tag, enqueuing the pending slot and
- * writing the frame happen under one writer lock (see {@link #writeLock}),
- * so concurrent callers' queue order always matches the order their
- * frames actually hit the wire.
+ * One already-identified connection to a single nanocached-node, speaking the cache protocol
+ * ({@code G}/{@code S}/{@code D} — the {@code A} identify exchange happens in {@link Identify}
+ * before a Connection exists). Requests are pipelined onto the socket and matched to responses in
+ * send order (request pipelining): a dedicated reader thread consumes responses and dispatches each
+ * to the oldest still-pending request, since nanocached-node itself only ever answers in the order
+ * it received requests. Claiming the tag, enqueuing the pending slot and writing the frame happen
+ * under one writer lock (see {@link #writeLock}), so concurrent callers' queue order always matches
+ * the order their frames actually hit the wire.
  */
 final class Connection {
-    /** Bounds how long the connection may go without progress while
-     * requests are outstanding (issue #42) — each response must arrive
-     * within this window of the previous one (or of its own send, when
-     * the queue was empty): without it, a half-open server that accepts
-     * the TCP connection but never writes back — or stops mid-stream —
-     * would hang get/set/delete forever in {@code future.join()}.
-     * Generous versus the server's own 10s outbound timeouts, and the
-     * same 30s the Go and Rust SDKs use. Non-final only so tests can
-     * shorten it, mirroring {@code keepAliveIntervalMillis}. */
+    /**
+     * Bounds how long the connection may go without progress while requests are outstanding (issue
+     * #42) — each response must arrive within this window of the previous one (or of its own send,
+     * when the queue was empty): without it, a half-open server that accepts the TCP connection but
+     * never writes back — or stops mid-stream — would hang get/set/delete forever in {@code
+     * future.join()}. Generous versus the server's own 10s outbound timeouts, and the same 30s the
+     * Go and Rust SDKs use. Non-final only so tests can shorten it, mirroring {@code
+     * keepAliveIntervalMillis}.
+     */
     static volatile long requestTimeoutMillis = 30_000;
 
     private final Socket socket;
     private final InputStream in;
     private final OutputStream out;
     private final Runnable onClose;
-    /** Fired once for every {@code R} (transient-failure, issue #125)
-     * response this connection sees, win or lose — {@link
-     * NanocachedClient} wires its own {@code transientRetries} counter
-     * here; every test that constructs a {@code Connection} directly via
-     * the 3-arg constructor gets a no-op instead. */
+
+    /**
+     * Fired once for every {@code R} (transient-failure, issue #125) response this connection sees,
+     * win or lose — {@link NanocachedClient} wires its own {@code transientRetries} counter here;
+     * every test that constructs a {@code Connection} directly via the 3-arg constructor gets a
+     * no-op instead.
+     */
     private final Runnable onTransientRetry;
-    /** echoed response tags: negotiated during identify — when true, every request
-     * carries a tag the server echoes, and {@link #readLoop} verifies the
-     * echo against the oldest pending request before dispatching it. */
+
+    /**
+     * echoed response tags: negotiated during identify — when true, every request carries a tag the
+     * server echoes, and {@link #readLoop} verifies the echo against the oldest pending request
+     * before dispatching it.
+     */
     private final boolean tagged;
+
     private int nextTag = 0;
     private final Deque<Pending> pending = new ArrayDeque<>();
-    /** Serializes request writers: one request's tag claim, pending-queue
-     * append and socket write happen under it together, so tag order,
-     * queue order and wire order can never skew. Deliberately separate
-     * from this connection's monitor, which guards {@link #pending} and
-     * {@code closed} and which {@link #readLoop} needs to dispatch each
-     * response: a large write blocked on a server that has stopped reading
-     * (because it is itself blocked writing responses nobody is reading)
-     * must not hold up the reader, or neither side can make progress until
-     * the request deadline poisons the connection, failing every pending
-     * request. Lock order is writeLock, then the monitor, then
-     * deadlineLock; {@link #poison} and the reader never take
-     * writeLock. */
+
+    /**
+     * Serializes request writers: one request's tag claim, pending-queue append and socket write
+     * happen under it together, so tag order, queue order and wire order can never skew.
+     * Deliberately separate from this connection's monitor, which guards {@link #pending} and
+     * {@code closed} and which {@link #readLoop} needs to dispatch each response: a large write
+     * blocked on a server that has stopped reading (because it is itself blocked writing responses
+     * nobody is reading) must not hold up the reader, or neither side can make progress until the
+     * request deadline poisons the connection, failing every pending request. Lock order is
+     * writeLock, then the monitor, then deadlineLock; {@link #poison} and the reader never take
+     * writeLock.
+     */
     private final Object writeLock = new Object();
+
     private volatile boolean closed = false;
     private volatile long lastUsedNanos = System.nanoTime();
 
-    /** The progress-based request deadline (issue #42), guarded by
-     * {@link #deadlineLock} — its own lock, not this connection's
-     * monitor, so the watchdog never waits on a thread that holds the
-     * monitor. (A writer blocked in {@code out.write} holds only
-     * {@link #writeLock}, never the monitor; the watchdog closes the
-     * socket to unblock it.) Lock order is always monitor → deadlineLock;
-     * the watchdog takes deadlineLock alone and releases it before
-     * poisoning. 0 means unarmed. */
+    /**
+     * The progress-based request deadline (issue #42), guarded by {@link #deadlineLock} — its own
+     * lock, not this connection's monitor, so the watchdog never waits on a thread that holds the
+     * monitor. (A writer blocked in {@code out.write} holds only {@link #writeLock}, never the
+     * monitor; the watchdog closes the socket to unblock it.) Lock order is always monitor →
+     * deadlineLock; the watchdog takes deadlineLock alone and releases it before poisoning. 0 means
+     * unarmed.
+     */
     private final Object deadlineLock = new Object();
+
     private long requestDeadlineNanos = 0;
-    /** The check scheduled on {@link #WATCHDOG} for the armed deadline,
-     * guarded by {@link #deadlineLock}; null while none is armed. */
+
+    /**
+     * The check scheduled on {@link #WATCHDOG} for the armed deadline, guarded by {@link
+     * #deadlineLock}; null while none is armed.
+     */
     private ScheduledFuture<?> deadlineTask;
-    /** Bumped by every {@link #clearDeadline}, and by every schedule, so a
-     * check that was already running when its deadline was cleared and
-     * re-armed sees it is not the current one and does nothing — the
-     * newer check owns the deadline. Guarded by {@link #deadlineLock}. */
+
+    /**
+     * Bumped by every {@link #clearDeadline}, and by every schedule, so a check that was already
+     * running when its deadline was cleared and re-armed sees it is not the current one and does
+     * nothing — the newer check owns the deadline. Guarded by {@link #deadlineLock}.
+     */
     private long deadlineGeneration;
 
-    /** One request-timeout watchdog for every connection in the process.
-     * A connection used to carry a watchdog thread of its own, parked in
-     * {@code wait()} between requests, so a roster of N nodes cost 2N
-     * platform threads (20,062 threads and 1 GiB of RSS at N = 10,000,
-     * measured). A deadline is now one scheduled task on this
-     * single-thread pool, and the thread each connection owns is its
-     * reader alone. The task only decides and re-schedules; the expiry
-     * itself (closing the socket, failing every pending request, which
-     * runs their continuations) goes to a thread of its own, so one
-     * connection's slow continuation cannot hold up every other
-     * connection's deadline. Daemon, so it never keeps a JVM alive;
-     * remove-on-cancel, so a cleared deadline leaves nothing queued. */
+    /**
+     * One request-timeout watchdog for every connection in the process. A connection used to carry
+     * a watchdog thread of its own, parked in {@code wait()} between requests, so a roster of N
+     * nodes cost 2N platform threads (20,062 threads and 1 GiB of RSS at N = 10,000, measured). A
+     * deadline is now one scheduled task on this single-thread pool, and the thread each connection
+     * owns is its reader alone. The task only decides and re-schedules; the expiry itself (closing
+     * the socket, failing every pending request, which runs their continuations) goes to a thread
+     * of its own, so one connection's slow continuation cannot hold up every other connection's
+     * deadline. Daemon, so it never keeps a JVM alive; remove-on-cancel, so a cleared deadline
+     * leaves nothing queued.
+     */
     private static final ScheduledThreadPoolExecutor WATCHDOG = newWatchdogPool();
 
     private static ScheduledThreadPoolExecutor newWatchdogPool() {
-        ScheduledThreadPoolExecutor pool = new ScheduledThreadPoolExecutor(1, runnable -> {
-            Thread thread = new Thread(runnable, "nanocached-request-watchdog");
-            thread.setDaemon(true);
-            return thread;
-        });
+        ScheduledThreadPoolExecutor pool =
+                new ScheduledThreadPoolExecutor(
+                        1,
+                        runnable -> {
+                            Thread thread = new Thread(runnable, "nanocached-request-watchdog");
+                            thread.setDaemon(true);
+                            return thread;
+                        });
         pool.setRemoveOnCancelPolicy(true);
         return pool;
     }
-    /** Set by the watchdog just before it closes the socket, so the
-     * poison() that actually wins — often the reader's, reacting to the
-     * close with a generic IOException — still reports the timeout. */
+
+    /**
+     * Set by the watchdog just before it closes the socket, so the poison() that actually wins —
+     * often the reader's, reacting to the close with a generic IOException — still reports the
+     * timeout.
+     */
     private volatile NanocachedException timedOutError;
 
-    /** {@code onClose} fires exactly once, the first time this connection
-     * closes for any reason — used by {@link NanocachedClient} to keep its
-     * forgotten-close open-sockets tracker accurate without every call
-     * site remembering to decrement it by hand. */
+    /**
+     * {@code onClose} fires exactly once, the first time this connection closes for any reason —
+     * used by {@link NanocachedClient} to keep its forgotten-close open-sockets tracker accurate
+     * without every call site remembering to decrement it by hand.
+     */
     Connection(Socket socket, boolean tagged, Runnable onClose) throws IOException {
         this(socket, tagged, onClose, () -> {});
     }
 
-    /** As {@link #Connection(Socket, boolean, Runnable)}, additionally
-     * reporting every {@code R} response via {@code onTransientRetry} (see
-     * that field's doc). */
-    Connection(Socket socket, boolean tagged, Runnable onClose, Runnable onTransientRetry) throws IOException {
+    /**
+     * As {@link #Connection(Socket, boolean, Runnable)}, additionally reporting every {@code R}
+     * response via {@code onTransientRetry} (see that field's doc).
+     */
+    Connection(Socket socket, boolean tagged, Runnable onClose, Runnable onTransientRetry)
+            throws IOException {
         this.socket = socket;
         this.tagged = tagged;
         this.onClose = onClose;
@@ -146,8 +164,10 @@ final class Connection {
         reader.start();
     }
 
-    /** Called with the monitor held (see {@link #deadlineLock}'s lock
-     * order). Arms — or, on progress, re-arms — the request deadline. */
+    /**
+     * Called with the monitor held (see {@link #deadlineLock}'s lock order). Arms — or, on
+     * progress, re-arms — the request deadline.
+     */
     private void armDeadline() {
         synchronized (deadlineLock) {
             requestDeadlineNanos = System.nanoTime() + requestTimeoutMillis * 1_000_000L;
@@ -161,8 +181,10 @@ final class Connection {
         }
     }
 
-    /** Called from readLoop's dispatch (monitor held) and from poison()
-     * (monitor released) — safe either way; see {@link #armDeadline}. */
+    /**
+     * Called from readLoop's dispatch (monitor held) and from poison() (monitor released) — safe
+     * either way; see {@link #armDeadline}.
+     */
     private void clearDeadline() {
         synchronized (deadlineLock) {
             requestDeadlineNanos = 0;
@@ -174,19 +196,23 @@ final class Connection {
         }
     }
 
-    /** With {@link #deadlineLock} held: queues the deadline check on the
-     * shared watchdog, {@code delayNanos} from now. */
+    /**
+     * With {@link #deadlineLock} held: queues the deadline check on the shared watchdog, {@code
+     * delayNanos} from now.
+     */
     private void schedule(long delayNanos) {
         long generation = ++deadlineGeneration;
-        deadlineTask = WATCHDOG.schedule(() -> checkDeadline(generation), delayNanos, TimeUnit.NANOSECONDS);
+        deadlineTask =
+                WATCHDOG.schedule(
+                        () -> checkDeadline(generation), delayNanos, TimeUnit.NANOSECONDS);
     }
 
-    /** Runs on the shared watchdog when a scheduled check comes due. The
-     * deadline has since been cleared (nothing to do), or moved on with
-     * progress (come back for what remains), or expired with requests
-     * still pending (expire, on a thread of this connection's own).
-     * Takes {@link #deadlineLock} alone and releases it before expiring,
-     * as the per-connection watchdog did. */
+    /**
+     * Runs on the shared watchdog when a scheduled check comes due. The deadline has since been
+     * cleared (nothing to do), or moved on with progress (come back for what remains), or expired
+     * with requests still pending (expire, on a thread of this connection's own). Takes {@link
+     * #deadlineLock} alone and releases it before expiring, as the per-connection watchdog did.
+     */
     private void checkDeadline(long generation) {
         synchronized (deadlineLock) {
             if (generation != deadlineGeneration) return;
@@ -212,13 +238,13 @@ final class Connection {
         }
     }
 
-    /** The deadline expired with requests still pending: poisons the
-     * connection, which unblocks the reader — and any blocked writer —
-     * with a socket error. {@code generation} is the check's own: a
-     * response that landed between the check and this running re-armed
-     * (progress) or cleared (nothing left) the deadline, and each of
-     * those moves the generation, so the expiry is decided again here
-     * under the lock rather than closing a connection that is answering. */
+    /**
+     * The deadline expired with requests still pending: poisons the connection, which unblocks the
+     * reader — and any blocked writer — with a socket error. {@code generation} is the check's own:
+     * a response that landed between the check and this running re-armed (progress) or cleared
+     * (nothing left) the deadline, and each of those moves the generation, so the expiry is decided
+     * again here under the lock rather than closing a connection that is answering.
+     */
     private void expireDeadline(long generation) {
         if (closed) return;
         synchronized (deadlineLock) {
@@ -234,10 +260,14 @@ final class Connection {
         // close the socket *before* trying to poison: poison() takes the
         // monitor, and a writer wedged in out.write holds it — only the
         // close itself can unblock that writer (and the blocked reader).
-        timedOutError = new NanocachedException.ConnectionLost(
-                "nanocached: no response from server within " + requestTimeoutMillis
-                        + "ms (request timed out)",
-                null, false, true);
+        timedOutError =
+                new NanocachedException.ConnectionLost(
+                        "nanocached: no response from server within "
+                                + requestTimeoutMillis
+                                + "ms (request timed out)",
+                        null,
+                        false,
+                        true);
         try {
             socket.close();
         } catch (IOException ignored) {
@@ -259,7 +289,8 @@ final class Connection {
     }
 
     byte[] get(byte[] key) {
-        Response response = request(tag -> frame("G " + key.length + tagSuffix(tag) + "\n", key, null));
+        Response response =
+                request(tag -> frame("G " + key.length + tagSuffix(tag) + "\n", key, null));
         return switch (response.marker) {
             case 'V' -> plainValue(response);
             case 'N' -> null;
@@ -268,9 +299,10 @@ final class Connection {
         };
     }
 
-    /** A {@code V} answering a plain get. One carrying a TTL only ever
-     * answers a get-and-touch (issue #825), so it means the streams are
-     * misaligned. */
+    /**
+     * A {@code V} answering a plain get. One carrying a TTL only ever answers a get-and-touch
+     * (issue #825), so it means the streams are misaligned.
+     */
     private byte[] plainValue(Response response) {
         if (response.ttlSeconds != null) throw mismatch(response.marker);
         return response.value;
@@ -282,11 +314,18 @@ final class Connection {
     // `set`, where 0 never reaches the wire. A hit answers `S` (or, with
     // `G`, `V <len> [<ttl>]`), a miss `N`; a touch never creates a key.
 
-    /** One plain {@code t} to this node only — cluster fan-out to every
-     * owner is the client's job, as for a set. Returns whether the key
-     * existed. */
+    /**
+     * One plain {@code t} to this node only — cluster fan-out to every owner is the client's job,
+     * as for a set. Returns whether the key existed.
+     */
     boolean touch(byte[] namespace, byte[] key, Long ttlSeconds) {
-        Response response = request(tag -> frame(touchHeader(namespace, key, ttlSeconds, false, tag), namespace, key, null));
+        Response response =
+                request(tag ->
+                        frame(
+                                touchHeader(namespace, key, ttlSeconds, false, tag),
+                                namespace,
+                                key,
+                                null));
         return switch (response.marker) {
             case 'S' -> true;
             case 'N' -> false;
@@ -295,11 +334,18 @@ final class Connection {
         };
     }
 
-    /** {@code t ... G}: replaces the TTL and returns the raw value, or
-     * {@code null} on a miss. The reply's own TTL field (the TTL now in
-     * effect) is read and dropped — the caller just set it. */
+    /**
+     * {@code t ... G}: replaces the TTL and returns the raw value, or {@code null} on a miss. The
+     * reply's own TTL field (the TTL now in effect) is read and dropped — the caller just set it.
+     */
     byte[] getAndTouch(byte[] namespace, byte[] key, Long ttlSeconds) {
-        Response response = request(tag -> frame(touchHeader(namespace, key, ttlSeconds, true, tag), namespace, key, null));
+        Response response =
+                request(tag ->
+                        frame(
+                                touchHeader(namespace, key, ttlSeconds, true, tag),
+                                namespace,
+                                key,
+                                null));
         return switch (response.marker) {
             case 'V' -> response.value;
             case 'N' -> null;
@@ -308,26 +354,41 @@ final class Connection {
         };
     }
 
-    private static String touchHeader(byte[] namespace, byte[] key, Long ttlSeconds, boolean get, Integer tag) {
-        return "t " + namespace.length + " " + key.length
+    private static String touchHeader(
+            byte[] namespace, byte[] key, Long ttlSeconds, boolean get, Integer tag) {
+        return "t "
+                + namespace.length
+                + " "
+                + key.length
                 + (ttlSeconds == null ? "" : " " + ttlSeconds)
                 + (get ? " G" : "")
-                + tagSuffix(tag) + "\n";
+                + tagSuffix(tag)
+                + "\n";
     }
 
     void set(byte[] key, byte[] value, Long ttlSeconds) {
-        Response response = request(tag -> {
-            String header = ttlSeconds == null
-                    ? "S " + key.length + " " + value.length + tagSuffix(tag) + "\n"
-                    : "S " + key.length + " " + value.length + " " + ttlSeconds + tagSuffix(tag) + "\n";
-            return frame(header, key, value);
-        });
+        Response response =
+                request(tag -> {
+                    String header =
+                            ttlSeconds == null
+                                    ? "S " + key.length + " " + value.length + tagSuffix(tag) + "\n"
+                                    : "S "
+                                            + key.length
+                                            + " "
+                                            + value.length
+                                            + " "
+                                            + ttlSeconds
+                                            + tagSuffix(tag)
+                                            + "\n";
+                    return frame(header, key, value);
+                });
         if (response.marker == 'W') throw new NanocachedException.WrongNode();
         if (response.marker != 'S') throw mismatch(response.marker);
     }
 
     boolean delete(byte[] key) {
-        Response response = request(tag -> frame("D " + key.length + tagSuffix(tag) + "\n", key, null));
+        Response response =
+                request(tag -> frame("D " + key.length + tagSuffix(tag) + "\n", key, null));
         return switch (response.marker) {
             case 'D' -> true;
             case 'N' -> false;
@@ -348,8 +409,13 @@ final class Connection {
 
     byte[] get(byte[] namespace, byte[] key) {
         if (namespace.length == 0) return get(key);
-        Response response = request(tag -> frame(
-                "g " + namespace.length + " " + key.length + tagSuffix(tag) + "\n", namespace, key, null));
+        Response response =
+                request(tag ->
+                        frame(
+                                "g " + namespace.length + " " + key.length + tagSuffix(tag) + "\n",
+                                namespace,
+                                key,
+                                null));
         return switch (response.marker) {
             case 'V' -> plainValue(response);
             case 'N' -> null;
@@ -363,21 +429,43 @@ final class Connection {
             set(key, value, ttlSeconds);
             return;
         }
-        Response response = request(tag -> {
-            String header = ttlSeconds == null
-                    ? "s " + namespace.length + " " + key.length + " " + value.length + tagSuffix(tag) + "\n"
-                    : "s " + namespace.length + " " + key.length + " " + value.length + " " + ttlSeconds
-                            + tagSuffix(tag) + "\n";
-            return frame(header, namespace, key, value);
-        });
+        Response response =
+                request(tag -> {
+                    String header =
+                            ttlSeconds == null
+                                    ? "s "
+                                            + namespace.length
+                                            + " "
+                                            + key.length
+                                            + " "
+                                            + value.length
+                                            + tagSuffix(tag)
+                                            + "\n"
+                                    : "s "
+                                            + namespace.length
+                                            + " "
+                                            + key.length
+                                            + " "
+                                            + value.length
+                                            + " "
+                                            + ttlSeconds
+                                            + tagSuffix(tag)
+                                            + "\n";
+                    return frame(header, namespace, key, value);
+                });
         if (response.marker == 'W') throw new NanocachedException.WrongNode();
         if (response.marker != 'S') throw mismatch(response.marker);
     }
 
     boolean delete(byte[] namespace, byte[] key) {
         if (namespace.length == 0) return delete(key);
-        Response response = request(tag -> frame(
-                "d " + namespace.length + " " + key.length + tagSuffix(tag) + "\n", namespace, key, null));
+        Response response =
+                request(tag ->
+                        frame(
+                                "d " + namespace.length + " " + key.length + tagSuffix(tag) + "\n",
+                                namespace,
+                                key,
+                                null));
         return switch (response.marker) {
             case 'D' -> true;
             case 'N' -> false;
@@ -394,17 +482,18 @@ final class Connection {
     // / F — clear a namespace, flush everything"), so a node never answers
     // either with `W`; only `C`.
 
-    /** Drops every entry in one namespace on this connection's node —
-     * {@code namespace.length == 0} clears the default namespace
-     * ({@code c 0}). */
+    /**
+     * Drops every entry in one namespace on this connection's node — {@code namespace.length == 0}
+     * clears the default namespace ({@code c 0}).
+     */
     void clear(byte[] namespace) {
-        Response response = request(tag -> frame(
-                "c " + namespace.length + tagSuffix(tag) + "\n", namespace, null));
+        Response response =
+                request(tag ->
+                        frame("c " + namespace.length + tagSuffix(tag) + "\n", namespace, null));
         if (response.marker != 'C') throw mismatch(response.marker);
     }
 
-    /** Drops every namespace on this connection's node, the default one
-     * included. */
+    /** Drops every namespace on this connection's node, the default one included. */
     void clearAll() {
         Response response = request(tag -> frame("F" + tagSuffix(tag) + "\n"));
         if (response.marker != 'C') throw mismatch(response.marker);
@@ -423,15 +512,27 @@ final class Connection {
     // null-on-miss convention below); a non-numeric stored value or an
     // overflowing delta answers `T`, a marker no other op uses.
 
-    /** The outcome of a successful INCR: the new counter value, and —
-     * only when the entry carries a TTL — its remaining seconds. {@code
-     * null} on a miss (see {@link #incr}), never on a hit. */
+    /**
+     * The outcome of a successful INCR: the new counter value, and — only when the entry carries a
+     * TTL — its remaining seconds. {@code null} on a miss (see {@link #incr}), never on a hit.
+     */
     record IncrResult(long value, Long ttlSeconds) {}
 
     IncrResult incr(byte[] namespace, byte[] key, long delta) {
-        Response response = request(tag -> frame(
-                "i " + namespace.length + " " + key.length + " " + delta + tagSuffix(tag) + "\n",
-                namespace, key, null));
+        Response response =
+                request(tag ->
+                        frame(
+                                "i "
+                                        + namespace.length
+                                        + " "
+                                        + key.length
+                                        + " "
+                                        + delta
+                                        + tagSuffix(tag)
+                                        + "\n",
+                                namespace,
+                                key,
+                                null));
         return switch (response.marker) {
             case 'I' -> new IncrResult(parseCounterValue(response.value), response.ttlSeconds);
             case 'N' -> null;
@@ -441,21 +542,19 @@ final class Connection {
         };
     }
 
-    /** Parses an {@code I} response's value body — decimal ASCII, the
-     * same grammar as {@code delta} (see {@link #incr}) — back to a
-     * {@code long}. A non-canonical body is protocol garbage: the
-     * connection is desynced mid-frame and must be poisoned, exactly like
-     * {@link #readResponse}'s own malformed-length checks (this one runs
-     * on the caller's thread rather than the reader thread, so — unlike
-     * those — it must poison explicitly rather than rely on {@link
-     * #readLoop}'s catch). A leading {@code '-'} is the one exception to
-     * {@link #isDigitsOnly}'s grammar allowed here — INCR/DECR deltas (and
-     * so counter values) can go negative, unlike every other wire-derived
-     * integer field — but a leading {@code '+'} is still rejected: {@link
-     * Long#parseLong} would otherwise accept it (issue #462), and the
-     * wire grammar never permits it even here. Mirrors .NET's
-     * {@code TryParseWireCounter}'s explicit {@code body[0] == '+'}
-     * check. */
+    /**
+     * Parses an {@code I} response's value body — decimal ASCII, the same grammar as {@code delta}
+     * (see {@link #incr}) — back to a {@code long}. A non-canonical body is protocol garbage: the
+     * connection is desynced mid-frame and must be poisoned, exactly like {@link #readResponse}'s
+     * own malformed-length checks (this one runs on the caller's thread rather than the reader
+     * thread, so — unlike those — it must poison explicitly rather than rely on {@link #readLoop}'s
+     * catch). A leading {@code '-'} is the one exception to {@link #isDigitsOnly}'s grammar allowed
+     * here — INCR/DECR deltas (and so counter values) can go negative, unlike every other
+     * wire-derived integer field — but a leading {@code '+'} is still rejected: {@link
+     * Long#parseLong} would otherwise accept it (issue #462), and the wire grammar never permits it
+     * even here. Mirrors .NET's {@code TryParseWireCounter}'s explicit {@code body[0] == '+'}
+     * check.
+     */
     private long parseCounterValue(byte[] value) {
         String text = new String(value, StandardCharsets.US_ASCII);
         boolean negative = text.startsWith("-");
@@ -467,8 +566,9 @@ final class Connection {
                 // fall through to poison below
             }
         }
-        NanocachedException error = new NanocachedException.ConnectionLost(
-                "nanocached: invalid INCR value in response (connection desynced)", null);
+        NanocachedException error =
+                new NanocachedException.ConnectionLost(
+                        "nanocached: invalid INCR value in response (connection desynced)", null);
         poison(error);
         throw error;
     }
@@ -488,20 +588,40 @@ final class Connection {
     // remaining owners as an ordinary set/delete, never by replaying
     // k/x itself.
 
-    /** Sends {@code k} — stores {@code value} at {@code key} only if
-     * {@code cond} holds against the key's current stored bytes.
-     * Returns {@code true} on success ({@code S}), {@code false} on a
-     * condition mismatch ({@code N}) — a normal outcome, not an
-     * exception. */
+    /**
+     * Sends {@code k} — stores {@code value} at {@code key} only if {@code cond} holds against the
+     * key's current stored bytes. Returns {@code true} on success ({@code S}), {@code false} on a
+     * condition mismatch ({@code N}) — a normal outcome, not an exception.
+     */
     boolean casSet(byte[] namespace, byte[] key, byte[] value, Long ttlSeconds, String cond) {
-        Response response = request(tag -> {
-            String header = ttlSeconds == null
-                    ? "k " + namespace.length + " " + key.length + " " + value.length + " " + cond
-                            + tagSuffix(tag) + "\n"
-                    : "k " + namespace.length + " " + key.length + " " + value.length + " " + cond + " "
-                            + ttlSeconds + tagSuffix(tag) + "\n";
-            return frame(header, namespace, key, value);
-        });
+        Response response =
+                request(tag -> {
+                    String header =
+                            ttlSeconds == null
+                                    ? "k "
+                                            + namespace.length
+                                            + " "
+                                            + key.length
+                                            + " "
+                                            + value.length
+                                            + " "
+                                            + cond
+                                            + tagSuffix(tag)
+                                            + "\n"
+                                    : "k "
+                                            + namespace.length
+                                            + " "
+                                            + key.length
+                                            + " "
+                                            + value.length
+                                            + " "
+                                            + cond
+                                            + " "
+                                            + ttlSeconds
+                                            + tagSuffix(tag)
+                                            + "\n";
+                    return frame(header, namespace, key, value);
+                });
         return switch (response.marker) {
             case 'S' -> true;
             case 'N' -> false;
@@ -510,15 +630,27 @@ final class Connection {
         };
     }
 
-    /** Sends {@code x} — removes {@code key} only if {@code cond} (always
-     * a digest — an absent/present-only conditioned delete is already the
-     * plain, unconditional {@code D}) holds. Returns {@code true} on
-     * success ({@code D}), {@code false} on a mismatch or missing key
-     * ({@code N}). */
+    /**
+     * Sends {@code x} — removes {@code key} only if {@code cond} (always a digest — an
+     * absent/present-only conditioned delete is already the plain, unconditional {@code D}) holds.
+     * Returns {@code true} on success ({@code D}), {@code false} on a mismatch or missing key
+     * ({@code N}).
+     */
     boolean casDelete(byte[] namespace, byte[] key, String cond) {
-        Response response = request(tag -> frame(
-                "x " + namespace.length + " " + key.length + " " + cond + tagSuffix(tag) + "\n",
-                namespace, key, null));
+        Response response =
+                request(tag ->
+                        frame(
+                                "x "
+                                        + namespace.length
+                                        + " "
+                                        + key.length
+                                        + " "
+                                        + cond
+                                        + tagSuffix(tag)
+                                        + "\n",
+                                namespace,
+                                key,
+                                null));
         return switch (response.marker) {
             case 'D' -> true;
             case 'N' -> false;
@@ -536,50 +668,56 @@ final class Connection {
     }
 
     /**
-     * A well-formed response of the wrong kind (a {@code S} answering a G)
-     * means the request/response streams are misaligned — every later
-     * response would answer the wrong request, silently returning other
-     * keys' data. Poison the connection, and classify as connection-level
-     * so the client's retry layer redials and retries once. Requests
-     * still pending behind this one may already have been resolved with
-     * misaligned data by the time this runs — an inherent limitation of
-     * matching-by-order pipelining (documented once, for every SDK, at docs/protocol.html#untagged-desync) shared with the TypeScript SDK's
-     * Connection (request pipelining), not something this SDK introduces.
+     * A well-formed response of the wrong kind (a {@code S} answering a G) means the
+     * request/response streams are misaligned — every later response would answer the wrong
+     * request, silently returning other keys' data. Poison the connection, and classify as
+     * connection-level so the client's retry layer redials and retries once. Requests still pending
+     * behind this one may already have been resolved with misaligned data by the time this runs —
+     * an inherent limitation of matching-by-order pipelining (documented once, for every SDK, at
+     * docs/protocol.html#untagged-desync) shared with the TypeScript SDK's Connection (request
+     * pipelining), not something this SDK introduces.
      */
     private NanocachedException mismatch(int marker) {
-        NanocachedException error = new NanocachedException.ConnectionLost(
-                "nanocached: response '" + (char) marker + "' does not match the request (connection desynced)",
-                null);
+        NanocachedException error =
+                new NanocachedException.ConnectionLost(
+                        "nanocached: response '"
+                                + (char) marker
+                                + "' does not match the request (connection desynced)",
+                        null);
         poison(error);
         return error;
     }
 
     /**
-     * An {@code M}/{@code O} response whose result-roster length doesn't
-     * match the request's key count: the streams are just as desynced as
-     * a kind mismatch ({@link #mismatch}), so this poisons the connection
-     * the same way.
+     * An {@code M}/{@code O} response whose result-roster length doesn't match the request's key
+     * count: the streams are just as desynced as a kind mismatch ({@link #mismatch}), so this
+     * poisons the connection the same way.
      */
     private NanocachedException desyncedEntryCount(String op, int got, int want) {
-        NanocachedException error = new NanocachedException.ConnectionLost(
-                "nanocached: " + op + " response roster length " + got
-                        + " does not match request key count " + want + " (connection desynced)",
-                null);
+        NanocachedException error =
+                new NanocachedException.ConnectionLost(
+                        "nanocached: "
+                                + op
+                                + " response roster length "
+                                + got
+                                + " does not match request key count "
+                                + want
+                                + " (connection desynced)",
+                        null);
         poison(error);
         return error;
     }
 
-    /** True iff every character of {@code field} is an ASCII digit and
-     * the string is non-empty — the wire's own integer grammar (issue
-     * #462; see {@code src/command.rs}'s {@code parse_length}, which
-     * loops byte-by-byte over ASCII digits with no leading-zero
-     * restriction but no leading {@code '+'} either). {@link
-     * Integer#parseInt}/{@link Long#parseLong} are looser than this grammar
-     * — both accept an optional leading {@code '+'} — so every
-     * wire-derived integer field (except the one exception, {@link
-     * #parseCounterValue}'s leading {@code '-'}) must pass this check
-     * before being handed to them. Package-private: shared with {@link
-     * Identify} and {@link NanocachedClient}, both in this package. */
+    /**
+     * True iff every character of {@code field} is an ASCII digit and the string is non-empty — the
+     * wire's own integer grammar (issue #462; see {@code src/command.rs}'s {@code parse_length},
+     * which loops byte-by-byte over ASCII digits with no leading-zero restriction but no leading
+     * {@code '+'} either). {@link Integer#parseInt}/{@link Long#parseLong} are looser than this
+     * grammar — both accept an optional leading {@code '+'} — so every wire-derived integer field
+     * (except the one exception, {@link #parseCounterValue}'s leading {@code '-'}) must pass this
+     * check before being handed to them. Package-private: shared with {@link Identify} and {@link
+     * NanocachedClient}, both in this package.
+     */
     static boolean isDigitsOnly(String field) {
         if (field.isEmpty()) {
             return false;
@@ -593,13 +731,13 @@ final class Connection {
         return true;
     }
 
-    /** Parses a decimal field as {@code readResponse}'s length/count
-     * fields do throughout: a field that isn't {@link #isDigitsOnly} (in
-     * particular one carrying a leading {@code '+'}, which {@link
-     * Integer#parseInt} would otherwise silently accept — issue #462) or
-     * that overflows an {@code int} is protocol garbage, reported here as
-     * -1 so every caller's existing {@code < 0} bounds check catches it
-     * uniformly. Package-private: shared with {@link Identify}. */
+    /**
+     * Parses a decimal field as {@code readResponse}'s length/count fields do throughout: a field
+     * that isn't {@link #isDigitsOnly} (in particular one carrying a leading {@code '+'}, which
+     * {@link Integer#parseInt} would otherwise silently accept — issue #462) or that overflows an
+     * {@code int} is protocol garbage, reported here as -1 so every caller's existing {@code < 0}
+     * bounds check catches it uniformly. Package-private: shared with {@link Identify}.
+     */
     static int parseNonNegativeInt(String field) {
         if (!isDigitsOnly(field)) {
             return -1;
@@ -611,8 +749,10 @@ final class Connection {
         }
     }
 
-    /** {@link #parseNonNegativeInt}, but for a {@code long}-sized field
-     * (the {@code I} response's optional TTL — issue #462). */
+    /**
+     * {@link #parseNonNegativeInt}, but for a {@code long}-sized field (the {@code I} response's
+     * optional TTL — issue #462).
+     */
     private static long parseNonNegativeLong(String field) {
         if (!isDigitsOnly(field)) {
             return -1;
@@ -634,12 +774,12 @@ final class Connection {
     // wrong-node retry, replica fan-out for multiSet) is
     // NanocachedClient's job, same split as every other op here.
 
-    /** Sends {@code m} — one round trip for every key in {@code keys}
-     * (docs/protocol.html#multi). {@code entries[i]} answers
-     * {@code keys[i]}, in request order. A reply whose roster length
-     * doesn't match {@code keys.length} is treated as a desynced
-     * connection, same stance as {@link #mismatch} — a malformed reply
-     * can't be trusted key-for-key. */
+    /**
+     * Sends {@code m} — one round trip for every key in {@code keys} (docs/protocol.html#multi).
+     * {@code entries[i]} answers {@code keys[i]}, in request order. A reply whose roster length
+     * doesn't match {@code keys.length} is treated as a desynced connection, same stance as {@link
+     * #mismatch} — a malformed reply can't be trusted key-for-key.
+     */
     List<MultiEntry> multiGet(byte[] namespace, byte[][] keys) {
         Response response = request(tag -> buildMultiGetFrame(namespace, keys, tag));
         if (response.marker() != 'M') throw mismatch(response.marker());
@@ -649,11 +789,13 @@ final class Connection {
         return response.entries();
     }
 
-    /** Builds an {@code m} request frame: {@code m <ns-len> <n>
-     * <key-len-1> ... <key-len-n>[ <tag>]\n<ns><key-1>...<key-n>}
-     * (docs/protocol.html#multi). */
+    /**
+     * Builds an {@code m} request frame: {@code m <ns-len> <n> <key-len-1> ... <key-len-n>[
+     * <tag>]\n<ns><key-1>...<key-n>} (docs/protocol.html#multi).
+     */
     private static byte[] buildMultiGetFrame(byte[] namespace, byte[][] keys, Integer tag) {
-        StringBuilder header = new StringBuilder("m ").append(namespace.length).append(' ').append(keys.length);
+        StringBuilder header =
+                new StringBuilder("m ").append(namespace.length).append(' ').append(keys.length);
         for (byte[] key : keys) {
             header.append(' ').append(key.length);
         }
@@ -677,18 +819,18 @@ final class Connection {
         return frame;
     }
 
-    /** Sends one plain {@code y} — batched touch (issue #871,
-     * docs/protocol.html "y — batched touch") — to this node only: cluster
-     * fan-out to every owner is the client's job, as for {@link
-     * #multiSet}. {@code ttlSeconds} null omits the TTL field (the node
-     * removes the TTL); 0 is sent and expires the keys at once — unlike
-     * {@code multiSet}, where 0 never reaches the wire. {@code entries[i]}
-     * answers {@code keys[i]}: {@code ok()} is {@code S} (touched), {@code
-     * wrongNode()} is {@code W}, neither is {@code N} (no live entry — a
-     * touch never creates one). As for {@link #multiGet}, only a desynced
-     * roster is an error. */
+    /**
+     * Sends one plain {@code y} — batched touch (issue #871, docs/protocol.html "y — batched
+     * touch") — to this node only: cluster fan-out to every owner is the client's job, as for
+     * {@link #multiSet}. {@code ttlSeconds} null omits the TTL field (the node removes the TTL); 0
+     * is sent and expires the keys at once — unlike {@code multiSet}, where 0 never reaches the
+     * wire. {@code entries[i]} answers {@code keys[i]}: {@code ok()} is {@code S} (touched), {@code
+     * wrongNode()} is {@code W}, neither is {@code N} (no live entry — a touch never creates one).
+     * As for {@link #multiGet}, only a desynced roster is an error.
+     */
     List<MultiEntry> multiTouch(byte[] namespace, byte[][] keys, Long ttlSeconds) {
-        Response response = request(tag -> buildMultiTouchFrame(namespace, keys, ttlSeconds, false, tag));
+        Response response =
+                request(tag -> buildMultiTouchFrame(namespace, keys, ttlSeconds, false, tag));
         if (response.marker() != 'Y') throw mismatch(response.marker());
         if (response.entries().size() != keys.length) {
             throw desyncedEntryCount("multi-touch", response.entries().size(), keys.length);
@@ -696,14 +838,15 @@ final class Connection {
         return response.entries();
     }
 
-    /** {@code y ... G}: the reply is {@link #multiGet}'s {@code M} roster
-     * for the keys the node touched — a hit's value carries the frame's
-     * TTL, a miss (or a value the node had no room for in its reply, which
-     * it also leaves untouched) is a clean miss, and a per-key {@code W}
-     * stays in the roster. Unlike {@link #getAndTouch} the reply carries no
-     * per-key TTL. */
+    /**
+     * {@code y ... G}: the reply is {@link #multiGet}'s {@code M} roster for the keys the node
+     * touched — a hit's value carries the frame's TTL, a miss (or a value the node had no room for
+     * in its reply, which it also leaves untouched) is a clean miss, and a per-key {@code W} stays
+     * in the roster. Unlike {@link #getAndTouch} the reply carries no per-key TTL.
+     */
     List<MultiEntry> multiGetAndTouch(byte[] namespace, byte[][] keys, Long ttlSeconds) {
-        Response response = request(tag -> buildMultiTouchFrame(namespace, keys, ttlSeconds, true, tag));
+        Response response =
+                request(tag -> buildMultiTouchFrame(namespace, keys, ttlSeconds, true, tag));
         if (response.marker() != 'M') throw mismatch(response.marker());
         if (response.entries().size() != keys.length) {
             throw desyncedEntryCount("multi-get", response.entries().size(), keys.length);
@@ -711,11 +854,14 @@ final class Connection {
         return response.entries();
     }
 
-    /** Builds a {@code y} request frame: {@code y <ns-len> <n> <key-len-1>
-     * ... <key-len-n>[ <ttl>][ G][ <tag>]\n<ns><key-1>...<key-n>}. */
+    /**
+     * Builds a {@code y} request frame: {@code y <ns-len> <n> <key-len-1> ... <key-len-n>[ <ttl>][
+     * G][ <tag>]\n<ns><key-1>...<key-n>}.
+     */
     private static byte[] buildMultiTouchFrame(
             byte[] namespace, byte[][] keys, Long ttlSeconds, boolean get, Integer tag) {
-        StringBuilder header = new StringBuilder("y ").append(namespace.length).append(' ').append(keys.length);
+        StringBuilder header =
+                new StringBuilder("y ").append(namespace.length).append(' ').append(keys.length);
         for (byte[] key : keys) {
             header.append(' ').append(key.length);
         }
@@ -741,14 +887,16 @@ final class Connection {
         return frame;
     }
 
-    /** Sends {@code o} — stores every key/value pair in one round trip,
-     * one shared {@code ttlSeconds} (null means no expiry) for the whole
-     * batch rather than per key (docs/protocol.html#multi).
-     * {@code entries[i]} answers {@code keys[i]}/{@code values[i]}, in
-     * request order; see {@link #multiGet} for the same "only a desynced
-     * roster is an error" stance. */
+    /**
+     * Sends {@code o} — stores every key/value pair in one round trip, one shared {@code
+     * ttlSeconds} (null means no expiry) for the whole batch rather than per key
+     * (docs/protocol.html#multi). {@code entries[i]} answers {@code keys[i]}/{@code values[i]}, in
+     * request order; see {@link #multiGet} for the same "only a desynced roster is an error"
+     * stance.
+     */
     List<MultiEntry> multiSet(byte[] namespace, byte[][] keys, byte[][] values, Long ttlSeconds) {
-        Response response = request(tag -> buildMultiSetFrame(namespace, keys, values, ttlSeconds, tag));
+        Response response =
+                request(tag -> buildMultiSetFrame(namespace, keys, values, ttlSeconds, tag));
         if (response.marker() != 'O') throw mismatch(response.marker());
         if (response.entries().size() != keys.length) {
             throw desyncedEntryCount("multi-set", response.entries().size(), keys.length);
@@ -756,14 +904,16 @@ final class Connection {
         return response.entries();
     }
 
-    /** Builds an {@code o} request frame: {@code o <ns-len> <n>
-     * <key-len-1> <value-len-1> ... <key-len-n> <value-len-n> [<ttl>][
-     * <tag>]\n<ns><key-1><value-1>...<key-n><value-n>}
-     * (docs/protocol.html#multi). The optional TTL sits ahead of the tag,
-     * same convention {@link #casSet}'s own {@code [ttl]} uses. */
+    /**
+     * Builds an {@code o} request frame: {@code o <ns-len> <n> <key-len-1> <value-len-1> ...
+     * <key-len-n> <value-len-n> [<ttl>][ <tag>]\n<ns><key-1><value-1>...<key-n><value-n>}
+     * (docs/protocol.html#multi). The optional TTL sits ahead of the tag, same convention {@link
+     * #casSet}'s own {@code [ttl]} uses.
+     */
     private static byte[] buildMultiSetFrame(
             byte[] namespace, byte[][] keys, byte[][] values, Long ttlSeconds, Integer tag) {
-        StringBuilder header = new StringBuilder("o ").append(namespace.length).append(' ').append(keys.length);
+        StringBuilder header =
+                new StringBuilder("o ").append(namespace.length).append(' ').append(keys.length);
         for (int i = 0; i < keys.length; i++) {
             header.append(' ').append(keys[i].length).append(' ').append(values[i].length);
         }
@@ -793,11 +943,9 @@ final class Connection {
     }
 
     /**
-     * Marks the connection closed, closes the socket, and rejects every
-     * still-pending request with error. Safe to call more than once —
-     * from a writer noticing a failed write, the reader thread noticing a
-     * failed read, or an explicit close() — only the first call has any
-     * effect.
+     * Marks the connection closed, closes the socket, and rejects every still-pending request with
+     * error. Safe to call more than once — from a writer noticing a failed write, the reader thread
+     * noticing a failed read, or an explicit close() — only the first call has any effect.
      */
     private void poison(NanocachedException error) {
         // A watchdog-recorded timeout is the root cause — the generic
@@ -824,16 +972,18 @@ final class Connection {
         onClose.run();
     }
 
-    /** A header-only frame with no key/namespace/value bytes to follow
-     * (issue #106's {@code F}, the only request this connection ever
-     * sends with an empty body). */
+    /**
+     * A header-only frame with no key/namespace/value bytes to follow (issue #106's {@code F}, the
+     * only request this connection ever sends with an empty body).
+     */
     private static byte[] frame(String header) {
         return header.getBytes(StandardCharsets.US_ASCII);
     }
 
     private static byte[] frame(String header, byte[] key, byte[] value) {
         byte[] headerBytes = header.getBytes(StandardCharsets.US_ASCII);
-        byte[] frame = new byte[headerBytes.length + key.length + (value == null ? 0 : value.length)];
+        byte[] frame =
+                new byte[headerBytes.length + key.length + (value == null ? 0 : value.length)];
         System.arraycopy(headerBytes, 0, frame, 0, headerBytes.length);
         System.arraycopy(key, 0, frame, headerBytes.length, key.length);
         if (value != null) {
@@ -842,9 +992,10 @@ final class Connection {
         return frame;
     }
 
-    /** As {@link #frame(String, byte[], byte[])}, with the namespace bytes
-     * leading the body ({@code <namespace><key>[<value>]}) — the `g`/`s`/`d`
-     * frame shape (namespaces, issue #105). */
+    /**
+     * As {@link #frame(String, byte[], byte[])}, with the namespace bytes leading the body ({@code
+     * <namespace><key>[<value>]}) — the `g`/`s`/`d` frame shape (namespaces, issue #105).
+     */
     private static byte[] frame(String header, byte[] namespace, byte[] key, byte[] value) {
         byte[] headerBytes = header.getBytes(StandardCharsets.US_ASCII);
         int valueLength = value == null ? 0 : value.length;
@@ -862,27 +1013,29 @@ final class Connection {
         return frame;
     }
 
-    /** {@code ttlSeconds} is only ever non-null for an {@code I} response
-     * that carried one (issue #129) — every other marker leaves it {@code
-     * null}. {@code entries} is only ever non-null for an {@code M}
-     * (multi-get) or {@code O} (multi-set) response (issue #151,
-     * docs/protocol.html#multi) — every other marker leaves it {@code
-     * null}, {@code value} unused for those two markers instead. */
-    private record Response(int marker, byte[] value, int tag, Long ttlSeconds, List<MultiEntry> entries) {}
+    /**
+     * {@code ttlSeconds} is only ever non-null for an {@code I} response that carried one (issue
+     * #129) — every other marker leaves it {@code null}. {@code entries} is only ever non-null for
+     * an {@code M} (multi-get) or {@code O} (multi-set) response (issue #151,
+     * docs/protocol.html#multi) — every other marker leaves it {@code null}, {@code value} unused
+     * for those two markers instead.
+     */
+    private record Response(
+            int marker, byte[] value, int tag, Long ttlSeconds, List<MultiEntry> entries) {}
 
-    /** One key's outcome inside an {@code M} (multi-get) or {@code O}
-     * (multi-set) response (issue #151, docs/protocol.html#multi) — a
-     * batch never fails as a whole, so each key's result is independent
-     * of every other key's, same as the server's own multi-ack. Reused
-     * for both response kinds rather than two near-identical types:
+    /**
+     * One key's outcome inside an {@code M} (multi-get) or {@code O} (multi-set) response (issue
+     * #151, docs/protocol.html#multi) — a batch never fails as a whole, so each key's result is
+     * independent of every other key's, same as the server's own multi-ack. Reused for both
+     * response kinds rather than two near-identical types:
+     *
      * <ul>
-     * <li>{@code M}: {@link #ok} true is a hit ({@link #value} holds the
-     * bytes, possibly empty); {@link #wrongNode} is a per-key {@code W};
-     * neither set is a clean miss ({@code -}).
-     * <li>{@code O}: {@link #ok} true is {@code S} (stored);
-     * {@link #wrongNode} is {@code W}; {@link #value} is always
-     * {@code null} — a set has nothing to echo back.
-     * </ul> */
+     *   <li>{@code M}: {@link #ok} true is a hit ({@link #value} holds the bytes, possibly empty);
+     *       {@link #wrongNode} is a per-key {@code W}; neither set is a clean miss ({@code -}).
+     *   <li>{@code O}: {@link #ok} true is {@code S} (stored); {@link #wrongNode} is {@code W};
+     *       {@link #value} is always {@code null} — a set has nothing to echo back.
+     * </ul>
+     */
     record MultiEntry(byte[] value, boolean ok, boolean wrongNode) {
         static MultiEntry ofHit(byte[] value) {
             return new MultiEntry(value, true, false);
@@ -901,16 +1054,18 @@ final class Connection {
         }
     }
 
-    /** A pending request's future paired with the tag its response must
-     * echo (echoed response tags) — meaningless (and never compared) on an untagged
-     * connection. */
+    /**
+     * A pending request's future paired with the tag its response must echo (echoed response tags)
+     * — meaningless (and never compared) on an untagged connection.
+     */
     private record Pending(CompletableFuture<Response> future, int tag) {}
 
-    /** A request's frame, fixed for the whole call including any
-     * transient ({@code R}) retries (issue #125) — a retry resends this
-     * exact same {@code frame}/{@code tag} pair, since it is the same
-     * logical request, not a new one; only the pending slot and its
-     * future are recreated per attempt. */
+    /**
+     * A request's frame, fixed for the whole call including any transient ({@code R}) retries
+     * (issue #125) — a retry resends this exact same {@code frame}/{@code tag} pair, since it is
+     * the same logical request, not a new one; only the pending slot and its future are recreated
+     * per attempt.
+     */
     private record PreparedRequest(byte[] frame, int tag) {}
 
     // Transient-error retry (issue #125): an `R` answer means THIS
@@ -924,28 +1079,27 @@ final class Connection {
     private static final int MAX_TRANSIENT_ATTEMPTS = 3;
     private static final long[] TRANSIENT_RETRY_DELAYS_MILLIS = {50, 100};
 
-    /** Enqueues a pending slot and writes frame under one monitor — see
-     * the class doc comment — then blocks this caller's own thread on
-     * its own future, not the socket. {@code build} receives this
-     * request's claimed tag ({@code null} on an untagged connection) and
-     * must return the frame to write.
+    /**
+     * Enqueues a pending slot and writes frame under one monitor — see the class doc comment — then
+     * blocks this caller's own thread on its own future, not the socket. {@code build} receives
+     * this request's claimed tag ({@code null} on an untagged connection) and must return the frame
+     * to write.
      *
-     * <p>An {@code R} response (issue #125) is never handed back to the
-     * caller: it is retried here, transparently, on this same connection
-     * — bounded by {@link #MAX_TRANSIENT_ATTEMPTS} — until either a real
-     * answer arrives or the budget is exhausted, at which point this
-     * throws {@link NanocachedException.RetryableError} without touching
-     * the connection's open/closed state. {@code R} is therefore never
-     * seen by {@link #readResponse}'s callers (the {@code get}/{@code
-     * set}/{@code delete}/etc. marker switches), exactly like a normal
-     * marker mismatch never is. */
+     * <p>An {@code R} response (issue #125) is never handed back to the caller: it is retried here,
+     * transparently, on this same connection — bounded by {@link #MAX_TRANSIENT_ATTEMPTS} — until
+     * either a real answer arrives or the budget is exhausted, at which point this throws {@link
+     * NanocachedException.RetryableError} without touching the connection's open/closed state.
+     * {@code R} is therefore never seen by {@link #readResponse}'s callers (the {@code get}/{@code
+     * set}/{@code delete}/etc. marker switches), exactly like a normal marker mismatch never is.
+     */
     private Response request(Function<Integer, byte[]> build) {
         if (isClosed()) {
             // notSent=true (issue #225): this call's frame never touched
             // the wire — the connection was already dead (e.g. an
             // idle-timeout FIN the reader thread already noticed), so a
             // non-idempotent caller may safely redial and resend.
-            throw new NanocachedException.ConnectionLost("nanocached: connection is closed", null, true);
+            throw new NanocachedException.ConnectionLost(
+                    "nanocached: connection is closed", null, true);
         }
 
         PreparedRequest prepared = null;
@@ -963,7 +1117,8 @@ final class Connection {
                         // hasn't been written; only a concurrent poison() (or
                         // an 'R' retry racing a close) landed between the
                         // check above and this one.
-                        throw new NanocachedException.ConnectionLost("nanocached: connection is closed", null, true);
+                        throw new NanocachedException.ConnectionLost(
+                                "nanocached: connection is closed", null, true);
                     }
                     lastUsedNanos = System.nanoTime();
                     if (prepared == null) {
@@ -1012,10 +1167,14 @@ final class Connection {
                     // fully sent.
                     boolean timedOut = timedOutError != null;
                     boolean notSent = !timedOut;
-                    poison(new NanocachedException.ConnectionLost(
-                            "nanocached: connection failed: " + error.getMessage(), error));
+                    poison(
+                            new NanocachedException.ConnectionLost(
+                                    "nanocached: connection failed: " + error.getMessage(), error));
                     throw new NanocachedException.ConnectionLost(
-                            "nanocached: connection failed: " + error.getMessage(), error, notSent, timedOut);
+                            "nanocached: connection failed: " + error.getMessage(),
+                            error,
+                            notSent,
+                            timedOut);
                 }
             }
 
@@ -1025,7 +1184,8 @@ final class Connection {
             } catch (CompletionException wrapped) {
                 Throwable cause = wrapped.getCause();
                 if (cause instanceof NanocachedException nanocachedError) throw nanocachedError;
-                throw new NanocachedException.ConnectionLost("nanocached: connection failed", cause);
+                throw new NanocachedException.ConnectionLost(
+                        "nanocached: connection failed", cause);
             }
 
             if (response.marker != 'R') return response;
@@ -1040,30 +1200,31 @@ final class Connection {
         }
     }
 
-    /** Sleeps between transient-error retries (issue #125) — an
-     * interruption here is treated like any other wait this SDK does on
-     * the caller's own thread (e.g. {@link
-     * NanocachedClient#readHedged}'s queue poll): the interrupt flag is
-     * restored and a {@link NanocachedException} surfaces rather than a
-     * raw {@link InterruptedException}, since every exception this SDK
-     * throws must extend it. */
+    /**
+     * Sleeps between transient-error retries (issue #125) — an interruption here is treated like
+     * any other wait this SDK does on the caller's own thread (e.g. {@link
+     * NanocachedClient#readHedged}'s queue poll): the interrupt flag is restored and a {@link
+     * NanocachedException} surfaces rather than a raw {@link InterruptedException}, since every
+     * exception this SDK throws must extend it.
+     */
     private static void sleepBeforeTransientRetry(long millis) {
         try {
             Thread.sleep(millis);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw new NanocachedException(
-                    "nanocached: interrupted while waiting to retry a transient (R) failure", interrupted);
+                    "nanocached: interrupted while waiting to retry a transient (R) failure",
+                    interrupted);
         }
     }
 
-    /** A connection-scoped u32 wrapping counter (echoed response tags), 0-based —
-     * only ever called from within the {@code synchronized (this)} block
-     * in {@link #request}, so no separate synchronization is needed here.
-     * Encoded/decoded as unsigned decimal text (see {@link #tagSuffix}
-     * and {@link #parseTag}) since a Java {@code int} wraps at the same
-     * 2^32 width as the wire's u32, just with a different sign
-     * interpretation. */
+    /**
+     * A connection-scoped u32 wrapping counter (echoed response tags), 0-based — only ever called
+     * from within the {@code synchronized (this)} block in {@link #request}, so no separate
+     * synchronization is needed here. Encoded/decoded as unsigned decimal text (see {@link
+     * #tagSuffix} and {@link #parseTag}) since a Java {@code int} wraps at the same 2^32 width as
+     * the wire's u32, just with a different sign interpretation.
+     */
     private int claimTag() {
         int tag = nextTag;
         nextTag++;
@@ -1113,26 +1274,26 @@ final class Connection {
     // had no cap at all).
     static final int MAX_HEADER_LINE_LENGTH = 4096;
 
-    /** This connection's only reader, for its whole lifetime — nothing
-     * else may read from {@code in}. Consumes responses off the wire and
-     * dispatches each to the oldest pending request (FIFO —
-     * Request pipelining).
+    /**
+     * This connection's only reader, for its whole lifetime — nothing else may read from {@code
+     * in}. Consumes responses off the wire and dispatches each to the oldest pending request (FIFO
+     * — Request pipelining).
      *
-     * <p>Issue #600: a {@code RuntimeException} out of the loop — none is
-     * known to be thrown, the parser reports every malformed field as a
-     * {@link NanocachedException} — used to end this thread through the
-     * JVM's default uncaught-exception handler with the connection never
-     * poisoned: the socket stayed open and every pending request waited
-     * for the watchdog (30&nbsp;s). It now poisons like an I/O failure,
-     * with the exception kept as the cause. An {@code Error} is left to
-     * the JVM: it is not a condition this SDK can recover from. The Python
-     * SDK's read loop guards the same hole (issue #8). */
+     * <p>Issue #600: a {@code RuntimeException} out of the loop — none is known to be thrown, the
+     * parser reports every malformed field as a {@link NanocachedException} — used to end this
+     * thread through the JVM's default uncaught-exception handler with the connection never
+     * poisoned: the socket stayed open and every pending request waited for the watchdog
+     * (30&nbsp;s). It now poisons like an I/O failure, with the exception kept as the cause. An
+     * {@code Error} is left to the JVM: it is not a condition this SDK can recover from. The Python
+     * SDK's read loop guards the same hole (issue #8).
+     */
     private void readLoop() {
         try {
             dispatchResponses();
         } catch (RuntimeException error) {
-            poison(new NanocachedException.ConnectionLost(
-                    "nanocached: connection failed: " + error, error));
+            poison(
+                    new NanocachedException.ConnectionLost(
+                            "nanocached: connection failed: " + error, error));
         }
     }
 
@@ -1142,8 +1303,9 @@ final class Connection {
             try {
                 response = readResponse();
             } catch (IOException error) {
-                poison(new NanocachedException.ConnectionLost(
-                        "nanocached: connection failed: " + error.getMessage(), error));
+                poison(
+                        new NanocachedException.ConnectionLost(
+                                "nanocached: connection failed: " + error.getMessage(), error));
                 return;
             } catch (NanocachedException.ServerRejected rejected) {
                 // Issue #1875: a node's `En` answers the oldest request
@@ -1159,8 +1321,9 @@ final class Connection {
                 synchronized (this) {
                     oldest = pending.pollFirst();
                 }
-                poison(new NanocachedException.ConnectionLost(
-                        "nanocached: connection closed by the server", null, true));
+                poison(
+                        new NanocachedException.ConnectionLost(
+                                "nanocached: connection closed by the server", null, true));
                 if (oldest != null) oldest.future().completeExceptionally(rejected);
                 return;
             } catch (NanocachedException error) {
@@ -1191,15 +1354,19 @@ final class Connection {
             // the connection; it isn't an answer to anything we sent
             // (mirrors the TypeScript SDK's Connection.onData).
             if (response.marker == 'B' && wasEmpty) {
-                poison(new NanocachedException.ConnectionLost(
-                        "nanocached: server rejected the connection (connection limit reached)", null));
+                poison(
+                        new NanocachedException.ConnectionLost(
+                                "nanocached: server rejected the connection (connection limit reached)",
+                                null));
                 return;
             }
             if (waiter == null) {
-                poison(new NanocachedException.ConnectionLost(
-                        "nanocached: unsolicited response '" + (char) response.marker
-                                + "' from server (connection desynced)",
-                        null));
+                poison(
+                        new NanocachedException.ConnectionLost(
+                                "nanocached: unsolicited response '"
+                                        + (char) response.marker
+                                        + "' from server (connection desynced)",
+                                null));
                 return;
             }
 
@@ -1209,10 +1376,14 @@ final class Connection {
             // the caller-side kind check (mismatch()), catching it here
             // stops the misdelivery instead of merely noticing it later.
             if (tagged && response.tag != waiter.tag()) {
-                NanocachedException error = new NanocachedException.ConnectionLost(
-                        "nanocached: response tag " + response.tag + " does not answer request tag "
-                                + waiter.tag() + " (connection desynced)",
-                        null);
+                NanocachedException error =
+                        new NanocachedException.ConnectionLost(
+                                "nanocached: response tag "
+                                        + response.tag
+                                        + " does not answer request tag "
+                                        + waiter.tag()
+                                        + " (connection desynced)",
+                                null);
                 poison(error);
                 // The polled waiter is no longer in `pending`, so poison()
                 // won't reach it — complete it here; the rest drain there.
@@ -1224,16 +1395,17 @@ final class Connection {
         }
     }
 
-    /** Reads the rest of a body-less roster reply ({@code O}, {@code Y})
-     * after its marker: {@code <n> <result-1> ... <result-n>[ <tag>]\n}.
-     * {@code entryOf} maps one result token to its entry, or {@code null}
-     * for a token the reply may not carry. No cumulative-bytes bound is
-     * needed here (issue #179): every token is a fixed one-character string
-     * with no length-prefixed body to read, so the loop's cost is already
-     * O(count), and count is already bounded by the header line's own
-     * length (capped like every other header, see readLine). */
+    /**
+     * Reads the rest of a body-less roster reply ({@code O}, {@code Y}) after its marker: {@code
+     * <n> <result-1> ... <result-n>[ <tag>]\n}. {@code entryOf} maps one result token to its entry,
+     * or {@code null} for a token the reply may not carry. No cumulative-bytes bound is needed here
+     * (issue #179): every token is a fixed one-character string with no length-prefixed body to
+     * read, so the loop's cost is already O(count), and count is already bounded by the header
+     * line's own length (capped like every other header, see readLine).
+     */
     private Response readAckRoster(
-            int marker, String what, java.util.function.Function<String, MultiEntry> entryOf) throws IOException {
+            int marker, String what, java.util.function.Function<String, MultiEntry> entryOf)
+            throws IOException {
         String[] fields = readLine().split(" ");
         if (fields.length < 1) {
             throw new NanocachedException.ConnectionLost(
@@ -1388,13 +1560,16 @@ final class Connection {
                             int length = parseNonNegativeInt(token);
                             if (length < 0 || length > MAX_VALUE_LENGTH) {
                                 throw new NanocachedException.ConnectionLost(
-                                        "nanocached: invalid multi-get result length in response", null);
+                                        "nanocached: invalid multi-get result length in response",
+                                        null);
                             }
                             totalBytes += length;
                             if (totalBytes > maxMultiGetResponseBytes) {
                                 throw new NanocachedException.ConnectionLost(
                                         "nanocached: multi-get response exceeds "
-                                                + maxMultiGetResponseBytes + " bytes", null);
+                                                + maxMultiGetResponseBytes
+                                                + " bytes",
+                                        null);
                             }
                             entries.add(MultiEntry.ofHit(readExactly(length)));
                         }
@@ -1420,11 +1595,15 @@ final class Connection {
             // many single-character tokens can fit on it in the first
             // place.
             case 'O' -> {
-                return readAckRoster(marker, "multi-set", token -> switch (token) {
-                    case "S" -> MultiEntry.ofStored();
-                    case "W" -> MultiEntry.ofWrongNode();
-                    default -> null;
-                });
+                return readAckRoster(
+                        marker,
+                        "multi-set",
+                        token ->
+                                switch (token) {
+                                    case "S" -> MultiEntry.ofStored();
+                                    case "W" -> MultiEntry.ofWrongNode();
+                                    default -> null;
+                                });
             }
             // 'Y' is batched touch's (issue #871, docs/protocol.html "y —
             // batched touch") reply: `Y <n> <result-1> ... <result-n>[
@@ -1432,12 +1611,16 @@ final class Connection {
             // entry, a clean miss) or "W" (wrong node). A `y ... G` is
             // answered with `M` instead, as `m` is.
             case 'Y' -> {
-                return readAckRoster(marker, "multi-touch", token -> switch (token) {
-                    case "S" -> MultiEntry.ofStored();
-                    case "N" -> MultiEntry.ofMiss();
-                    case "W" -> MultiEntry.ofWrongNode();
-                    default -> null;
-                });
+                return readAckRoster(
+                        marker,
+                        "multi-touch",
+                        token ->
+                                switch (token) {
+                                    case "S" -> MultiEntry.ofStored();
+                                    case "N" -> MultiEntry.ofMiss();
+                                    case "W" -> MultiEntry.ofWrongNode();
+                                    default -> null;
+                                });
             }
             // `En\n`: the node rejects the request and is closing the
             // connection. Told apart from other unexpected bytes so a touch
@@ -1468,28 +1651,28 @@ final class Connection {
                 throw new NanocachedException.ConnectionLost(
                         "nanocached: unexpected response from server: E", null);
             }
-            default -> throw new NanocachedException.ConnectionLost(
-                    "nanocached: unexpected response from server: " + (char) marker, null);
+            default ->
+                    throw new NanocachedException.ConnectionLost(
+                            "nanocached: unexpected response from server: " + (char) marker, null);
         }
     }
 
-    /** Parses a tag field (echoed response tags) as unsigned decimal text, matching
-     * the wire's u32 width — see {@link #claimTag}/{@link #tagSuffix}. A
-     * non-numeric (issue #462: including a leading {@code '+'}, which
-     * {@link Integer#parseUnsignedInt} would otherwise silently accept —
-     * confirmed by inspection, not just javadoc) or out-of-range field is
-     * protocol garbage: the connection is desynced and must be poisoned,
-     * connection-classified so the redial/retry layer handles it. */
+    /**
+     * Parses a tag field (echoed response tags) as unsigned decimal text, matching the wire's u32
+     * width — see {@link #claimTag}/{@link #tagSuffix}. A non-numeric (issue #462: including a
+     * leading {@code '+'}, which {@link Integer#parseUnsignedInt} would otherwise silently accept —
+     * confirmed by inspection, not just javadoc) or out-of-range field is protocol garbage: the
+     * connection is desynced and must be poisoned, connection-classified so the redial/retry layer
+     * handles it.
+     */
     private static int parseTag(String field) {
         if (!isDigitsOnly(field)) {
-            throw new NanocachedException.ConnectionLost(
-                    "nanocached: invalid response tag", null);
+            throw new NanocachedException.ConnectionLost("nanocached: invalid response tag", null);
         }
         try {
             return Integer.parseUnsignedInt(field);
         } catch (NumberFormatException malformed) {
-            throw new NanocachedException.ConnectionLost(
-                    "nanocached: invalid response tag", null);
+            throw new NanocachedException.ConnectionLost("nanocached: invalid response tag", null);
         }
     }
 
@@ -1499,25 +1682,27 @@ final class Connection {
         return value;
     }
 
-    /** Consumes one byte and verifies it is '\n' — used for the untagged
-     * fixed-shape responses (`S`/`D`/`N`/`W`/`B`), which are exactly two
-     * bytes on the wire. A byte other than '\n' here means the streams
-     * are desynced (e.g. a server that unexpectedly tagged a response on
-     * an untagged connection) and every later response would be
-     * misaligned too, so this must poison the connection rather than
-     * silently ignore the extra byte. */
+    /**
+     * Consumes one byte and verifies it is '\n' — used for the untagged fixed-shape responses
+     * (`S`/`D`/`N`/`W`/`B`), which are exactly two bytes on the wire. A byte other than '\n' here
+     * means the streams are desynced (e.g. a server that unexpectedly tagged a response on an
+     * untagged connection) and every later response would be misaligned too, so this must poison
+     * the connection rather than silently ignore the extra byte.
+     */
     private void expectLf() throws IOException {
         int value = readByte();
         if (value != '\n') {
             throw new NanocachedException.ConnectionLost(
-                    "nanocached: unexpected byte after response marker (connection desynced)", null);
+                    "nanocached: unexpected byte after response marker (connection desynced)",
+                    null);
         }
     }
 
-    /** Reads up to (and consuming) the next '\n', returning what preceded
-     * it. Bounded by {@link #MAX_HEADER_LINE_LENGTH}: a malicious or
-     * buggy node streaming bytes with no '\n' must fail fast instead of
-     * growing this buffer without bound. */
+    /**
+     * Reads up to (and consuming) the next '\n', returning what preceded it. Bounded by {@link
+     * #MAX_HEADER_LINE_LENGTH}: a malicious or buggy node streaming bytes with no '\n' must fail
+     * fast instead of growing this buffer without bound.
+     */
     private String readLine() throws IOException {
         ByteArrayOutputStream line = new ByteArrayOutputStream();
         for (int b = readByte(); b != '\n'; b = readByte()) {
