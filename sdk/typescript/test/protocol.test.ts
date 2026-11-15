@@ -486,6 +486,20 @@ describe("tryParseResponse of a get-and-touch reply (issue #825)", () => {
   });
 });
 
+describe("tryParseResponse of a split incremented reply with a u64 TTL (issue #1887)", () => {
+  it("waits for the LF instead of rejecting the header", () => {
+    for (const [header, tagged, tag] of [
+      ["I 1 9000000000000000000", false, undefined],
+      ["I 1 9000000000000000000 123456789", true, 123456789],
+    ] as const) {
+      assert.equal(tryParseResponse(Buffer.from(header), tagged), null);
+      const parsed = tryParseResponse(Buffer.from(`${header}\n5`), tagged);
+      assert.equal(parsed?.response.ttlSeconds, 9000000000000000000);
+      assert.equal(parsed?.response.tag, tag);
+    }
+  });
+});
+
 describe("encodeTouch (issue #825)", () => {
   const key = Buffer.from("k");
 
