@@ -19,6 +19,7 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- In a cluster `delete` sent the other owners their delete at the same time as the primary. When the primary failed or answered `W`, the retry reached a replica that had already deleted its copy and resolved `false` for a key that existed. The other owners are now sent the delete only after the primary has answered, as for an expiring touch (#934).
 - `connect({ authSecret: "" })` sent the empty secret as `A 0`, which every server answers `En` as malformed, so the client could not connect even to a server without a secret and threw `AuthenticationError`. An empty secret now means no secret, as in the Rust, Go, Java and .NET SDKs.
 - Keep-alive skipped every connection idle for less than its 30 s interval, so a connection used just after a tick was pinged at almost 60 s idle, the node's idle timeout: any timer drift let the node close a healthy connection (a redial on next use, or `ConnectionLostError` for an `incr` racing the close). A tick now pings every connection idle for at least half the interval, so a healthy connection goes at most about 45 s without traffic. (#1894)
 - An `incr`/`decr` reply carrying a remaining TTL of 10^18 seconds or more (set by another SDK) failed the connection with `invalid value length in response (missing header terminator)` when a TCP segment boundary split its header before the LF, failing every request pipelined on it. The header search now leaves room for a TTL of up to a u64's 20 digits, as it already did for a `getAndTouch` reply. (#1887)

@@ -178,8 +178,11 @@ The cluster's replication factor R (how many nodes hold each key — set by
 `nanocached-discovery --replication-factor`, default 2) rides along with
 the node list, so the SDK needs no configuration:
 
-- `set`/`delete` fan out to all R owners in parallel. The primary's result
-  is the operation's result; a dead replica never fails a write.
+- `set` fans out to all R owners in parallel; `delete` goes to the
+  primary first and to the other owners once it has answered, so a primary
+  that fails or answers `W` is rerouted before any replica lost its copy.
+  The primary's result is the operation's result; a dead replica never
+  fails a write.
 - `get` asks the primary and falls over to the next owner only when the
   holder is unreachable — a node death costs no cached data, not even a
   latency blip on keys whose primary survived.

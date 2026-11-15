@@ -1634,7 +1634,11 @@ export class NanocachedClient {
     return this.setInNamespace(EMPTY_NAMESPACE, key, value, ttlSeconds);
   }
 
-  /** Returns whether the key existed before this call. */
+  /** Returns whether the key existed before this call. In a cluster the
+   * other owners are sent the delete only after the primary has answered
+   * (issue #934's ordering for an expiring touch): a replica deleted up
+   * front would answer `N` when a primary that fails or answers `W` is
+   * rerouted to it. The primary's answer is returned. */
   async delete(key: string | Uint8Array): Promise<boolean> {
     return this.deleteInNamespace(EMPTY_NAMESPACE, key);
   }
@@ -1901,9 +1905,11 @@ export class NanocachedClient {
   private async deleteInNamespace(namespace: Uint8Array, key: string | Uint8Array): Promise<boolean> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
+    // Replicas only after the primary answered: a reroute to a replica
+    // deleted up front would answer `N` for a key that existed.
     return this.withWrongNodeRetry(() =>
       this.target.kind === "cluster"
-        ? this.writeToOwners(key, namespace, (connection, bytes) => connection.delete(bytes.key, namespace))
+        ? this.writeToOwners(key, namespace, (connection, bytes) => connection.delete(bytes.key, namespace), undefined, false, true)
         : this.connectionForSingleTarget().then((connection) => connection.delete(key, namespace)),
     );
   }

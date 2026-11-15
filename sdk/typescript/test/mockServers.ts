@@ -64,6 +64,10 @@ export interface MockNode extends MockServerBase {
    * node executed it. A touch is idempotent, so the client may resend it
    * (unlike an `i`; see `dropAfterIncrOnce`). */
   dropAfterTouchOnce(): void;
+  /** Delay every `D`/`d` reply by `ms` (0 turns it off). The delete is
+   * applied at once; only the reply is late — what lets a test look at the
+   * replica while the primary has not answered. */
+  setDeleteReplyDelay(ms: number): void;
   /** Issue #934: delay every `t`/`y` reply by `ms` (0 turns it off). The
    * request is logged and applied at once; only the reply is late — what
    * lets a test look at the other nodes while a primary has not answered. */
@@ -138,6 +142,9 @@ export interface MockNode extends MockServerBase {
    * for the delete side: a replica must receive a plain `delete`/`d`, and
    * must NEVER receive an `x` frame. */
   casDeleteCount(): number;
+  /** How many `D`/`d` (plain delete) requests this server has received,
+   * counted before any `R`/`W` hook answers. */
+  deleteCount(): number;
   /** How many `c`/`F` (clear/flush, issue #106) requests this server has
    * ever received — lets a test assert a clear fanned out to every node,
    * even one holding no keys in the cleared namespace. */
@@ -440,6 +447,8 @@ export async function startMockNode(
   let incrTtlOverride: string | undefined; // issue #501, see answerIncrTtlOnce
   let dropAfterCas = 0;
   let dropAfterTouch = 0;
+  let deleteReplyDelayMs = 0;
+  let deleteRequests = 0;
   const multiTouchLog: Array<{ namespace: string; keys: string[]; ttl: number | null; get: boolean }> = [];
   let multiTouchFailAfter: number | undefined;
   let multiTouchBadCount: number | undefined;
@@ -855,6 +864,7 @@ export async function startMockNode(
             buffer = buffer.subarray(bodyStart + namespaceLength + keyLength);
 
             if (silent) break;
+            deleteRequests++;
 
             if (retryableReplies > 0) {
               retryableReplies--;
@@ -870,7 +880,9 @@ export async function startMockNode(
 
             const deleted = storeFor(namespace).delete(key);
             ttlsFor(namespace).delete(key);
-            socket.write(deleted ? `D${tag}\n` : `N${tag}\n`);
+            const deleteReply = deleted ? `D${tag}\n` : `N${tag}\n`;
+            if (deleteReplyDelayMs > 0) setTimeout(() => socket.write(deleteReply), deleteReplyDelayMs);
+            else socket.write(deleteReply);
             break;
           }
 
@@ -1372,6 +1384,9 @@ export async function startMockNode(
     dropAfterTouchOnce: () => {
       dropAfterTouch++;
     },
+    setDeleteReplyDelay: (ms) => {
+      deleteReplyDelayMs = ms;
+    },
     setTouchReplyDelay: (ms) => {
       touchReplyDelayMs = ms;
     },
@@ -1408,6 +1423,7 @@ export async function startMockNode(
     },
     casCount: () => casRequests,
     casDeleteCount: () => casDeleteRequests,
+    deleteCount: () => deleteRequests,
     clearCount: () => clears,
     multiGetCount: () => multiGets,
     multiSetCount: () => multiSets,
