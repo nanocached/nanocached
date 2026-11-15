@@ -2845,7 +2845,10 @@ public final class NanocachedClient implements AutoCloseable {
         return delete(utf8(key, "key"));
     }
 
-    /** Returns whether the key existed before this call. */
+    /** Returns whether the key existed before this call. In a cluster the
+     * other owners are sent the delete only after the primary has
+     * answered, so a primary that has to be rerouted never finds its
+     * replicas have already deleted the key. */
     public boolean delete(byte[] key) {
         return delete(EMPTY_NAMESPACE, key);
     }
@@ -3720,8 +3723,14 @@ public final class NanocachedClient implements AutoCloseable {
         // Issue #1255: the op below also runs as a background replica leg.
         byte[] ownedNamespace = ownedForBackground(namespace);
         byte[] ownedKey = ownedForBackground(key);
+        // As for an expiring touch (issue #934): the other owners are sent
+        // the delete only after the primary has answered. Sent together, a
+        // replica would delete its copy while a primary that failed or
+        // answered W is rerouted to it, and the call would return false for
+        // a key that existed.
         return withWrongNodeRetry(
-                () -> write(namespace, key, connection -> connection.delete(ownedNamespace, ownedKey)));
+                () -> write(namespace, key, connection -> connection.delete(ownedNamespace, ownedKey),
+                        null, null, true, false, true));
     }
 
     public void setMany(Map<String, String> values) {

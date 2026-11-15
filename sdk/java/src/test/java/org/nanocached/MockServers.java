@@ -163,6 +163,8 @@ final class MockServers {
         /** As {@link #dropReplyAfterIncr}, for `t`: a touch is idempotent, so
          * the client resends it where it must not resend an INCR. */
         private final AtomicInteger dropReplyAfterTouch = new AtomicInteger();
+        /** Every `D` / `d` frame received, answered or not (a `W` included). */
+        final AtomicInteger deleteFrames = new AtomicInteger();
         /** issue #825: behave like a node that predates `t` — an unknown
          * command is answered `En` and the connection closed. */
         private volatile boolean rejectTouch = false;
@@ -791,6 +793,7 @@ final class MockServers {
                         }
                         case "D" -> {
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
+                            deleteFrames.incrementAndGet();
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
                             }
@@ -1158,6 +1161,7 @@ final class MockServers {
                             String ns = keyOf(in.readNBytes(Integer.parseInt(parts[1])));
                             String key = keyOf(in.readNBytes(Integer.parseInt(parts[2])));
                             namespacedCommandCount.incrementAndGet();
+                            deleteFrames.incrementAndGet();
                             if (silent) {
                                 break; // half-open: frame consumed, never answered
                             }
