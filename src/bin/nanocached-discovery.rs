@@ -3565,6 +3565,10 @@ fn drop_replaced_from_current_join(
                     }
                 }
                 if pending.completed.len() >= pending.expected.len() {
+                    // Same as `handle_complete` (issue #1870): a retried
+                    // `M` that finds this join gone must see it completed
+                    // and send no `X`.
+                    pending.late.promoted.store(true, Ordering::Release);
                     join_guard.take().map(|pending| pending.joining_name)
                 } else {
                     None
@@ -15345,6 +15349,48 @@ mod tests {
                 .iter()
                 .map(|frame| String::from_utf8_lossy(frame).into_owned())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// The #1870 mark on the other way a join finishes: the one member it
+    /// still waited for is replaced, and every remaining one had reported
+    /// `C`. A retried `M` that finds the join gone must see it promoted, not
+    /// abandoned, or it sends an `X` for a handoff that completed.
+    #[test]
+    fn a_join_finished_by_dropping_a_replaced_member_counts_as_promoted() {
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-j".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:3".to_string(),
+                NodeState::Joining,
+                "tk-node-j".to_string(),
+            ),
+        );
+        let late = LateHandoffs::default();
+        let promoted = Arc::clone(&late.promoted);
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-j".to_string(),
+            expected: [
+                ("node-a".to_string(), "tk-node-a".to_string()),
+                ("node-b".to_string(), "tk-node-b".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            completed: ["node-a".to_string()].into_iter().collect(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            generation: 4,
+            roster: Arc::new(Vec::new()),
+            late,
+        })));
+
+        drop_replaced_from_current_join(&registry, &current_join, &["node-b".to_string()]);
+
+        assert_eq!(lock(&registry)["node-j"].state, NodeState::Joined);
+        assert_eq!(
+            join_status(&current_join, "node-j", 4, &promoted),
+            JoinStatus::Promoted
         );
     }
 
