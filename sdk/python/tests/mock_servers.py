@@ -207,6 +207,10 @@ class MockNode:
         # apply_and_drop_next_incr()/apply_and_drop_next_cas_set().
         self._drop_next_incr_reply = False
         self._drop_next_cas_set_reply = False
+        # Every `D`/`d` received as (namespace, key), and see
+        # hold_delete_replies(): None means "answer at once".
+        self.deletes: list[tuple[bytes, bytes]] = []
+        self._delete_gate: asyncio.Event | None = None
         # Malformed incr value body (audit follow-up to issue #129): when
         # set, the next `I` reply's <value> body is replaced with this
         # exact bytes instead of the genuinely-computed counter value —
@@ -323,6 +327,12 @@ class MockNode:
         A touch is idempotent, so the client may resend it, unlike an
         incr (see apply_and_drop_next_incr)."""
         self._drop_next_touch_reply = True
+
+    def hold_delete_replies(self) -> asyncio.Event:
+        """Holds every later `D`/`d` (recorded in ``deletes`` on arrival,
+        nothing applied or answered) until the returned event is set."""
+        self._delete_gate = asyncio.Event()
+        return self._delete_gate
 
     def answer_next_touch_with_wrong_kind(self) -> None:
         """Applies the next `t` request, then answers it with a `D` — a
@@ -705,6 +715,9 @@ class MockNode:
                     else:
                         namespace = b""
                         key = await reader.readexactly(int(parts[1]))
+                    self.deletes.append((namespace, key))
+                    if self._delete_gate is not None:
+                        await self._delete_gate.wait()
                     if self._silent:
                         continue
                     if self._retryable_replies > 0:

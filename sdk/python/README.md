@@ -107,6 +107,9 @@ SDK needs no configuration: `set`/`delete` fan out to all R owners of a
 key (the primary's result decides; a dead replica never fails a write),
 and `get` asks the primary, falling over to the next owner only when the
 holder is unreachable. `client.replication` exposes the factor in use.
+A `delete` goes to the primary first and to the other owners only once the
+primary has answered, so a reroute after a failed or wrong-node primary still
+finds the key and returns `True`.
 
 ## Namespaces
 
