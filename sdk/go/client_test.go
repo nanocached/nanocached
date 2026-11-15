@@ -3284,13 +3284,16 @@ func TestKeepAlivePingsIdleConnectionsInParallel(t *testing.T) {
 		connections = append(connections, conn)
 	}
 
-	// idle() must already exceed the interval for pingIdleConnections to
-	// probe a connection at all.
+	// idle() must already reach half the interval for pingIdleConnections
+	// to probe a connection at all.
 	interval := time.Millisecond
 	time.Sleep(2 * time.Millisecond)
 
 	started := time.Now()
-	pingIdleConnections(connections, interval)
+	var pings sync.WaitGroup
+	var inFlight sync.Map
+	pingIdleConnections(connections, interval, &pings, &inFlight)
+	pings.Wait()
 	elapsed := time.Since(started)
 
 	// Sequential pinging of 5 connections each delayed 150ms would take
@@ -3298,6 +3301,76 @@ func TestKeepAlivePingsIdleConnectionsInParallel(t *testing.T) {
 	if elapsed > 400*time.Millisecond {
 		t.Fatalf("pingIdleConnections(%d connections, %v delay each) took %v, want well under %v (sequential would take ~%v)",
 			nodeCount, delay, elapsed, 400*time.Millisecond, time.Duration(nodeCount)*delay)
+	}
+}
+
+// TestKeepAlivePingsAConnectionIdleForHalfTheInterval is a regression for
+// issue #1894: a tick skipped every connection idle for less than a full
+// interval, so one used just after a tick went almost two intervals —
+// the server's 60s idle limit — before its ping. A connection idle for
+// more than half the interval must be pinged at this tick; one just used
+// still must not.
+func TestKeepAlivePingsAConnectionIdleForHalfTheInterval(t *testing.T) {
+	const interval = 200 * time.Millisecond
+	idleNode := startMockNode(t, nil)
+	busyNode := startMockNode(t, nil)
+	open := func(node *mockNode) *connection {
+		result, err := connectAndIdentify(node.address(), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn := newConnection(result.conn, func() {}, result.tagged, nil)
+		t.Cleanup(conn.close)
+		return conn
+	}
+	idle := open(idleNode)
+	time.Sleep(interval/2 + 20*time.Millisecond) // idle past half the interval, short of a full one
+	busy := open(busyNode)
+
+	var pings sync.WaitGroup
+	var inFlight sync.Map
+	pingIdleConnections([]*connection{idle, busy}, interval, &pings, &inFlight)
+	pings.Wait()
+
+	if got := idleNode.getCount.Load(); got != 1 {
+		t.Fatalf("pings to the connection idle for %v of a %v interval = %d, want 1", interval/2+20*time.Millisecond, interval, got)
+	}
+	if got := busyNode.getCount.Load(); got != 0 {
+		t.Fatalf("pings to the connection just opened = %d, want 0", got)
+	}
+}
+
+// TestKeepAlivePingsTheOtherNodesWhileOneNodeIsHung is a regression for
+// issue #1894: each round waited for all of its pings, so a half-open
+// node — its ping held for the request timeout (1.5s here, 30s in the
+// field) — started every later round that much late, and the healthy
+// nodes went unpinged in the meantime.
+func TestKeepAlivePingsTheOtherNodesWhileOneNodeIsHung(t *testing.T) {
+	defaultInterval := keepAliveInterval
+	keepAliveInterval = 50 * time.Millisecond
+	defer func() { keepAliveInterval = defaultInterval }()
+
+	hung := startMockNode(t, nil)
+	healthy := startMockNode(t, nil)
+	hung.delayGets(1500 * time.Millisecond)
+	discovery := startMockDiscovery(t, []discoveredNode{
+		{Name: testNames[0], Address: hung.address()},
+		{Name: testNames[1], Address: healthy.address()},
+	}, 1)
+	connectCluster(t, discovery, Config{})
+
+	// Joined rounds give the healthy node one ping per 1.5s; unjoined
+	// ones, one per 50ms tick.
+	deadline := time.Now().Add(time.Second)
+	for healthy.getCount.Load() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("healthy node got %d keep-alive pings in 1s while the other node's ping hung, want at least 3", healthy.getCount.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// Later ticks skip a connection whose previous ping hasn't returned.
+	if got := hung.getCount.Load(); got != 1 {
+		t.Fatalf("pings to the hung node = %d, want 1", got)
 	}
 }
 

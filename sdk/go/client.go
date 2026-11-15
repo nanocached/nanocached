@@ -405,8 +405,10 @@ var maxInFlightHedgeReadLosers = 256
 var maxConcurrentDials = 64
 
 // keepAliveInterval is the always-on keep-alive cadence (issue #27):
-// half the server's 60s idle timeout, so it never severs a healthy
-// client. A variable only so tests can shorten it.
+// half the server's 60s idle timeout. Each tick pings every connection
+// idle for at least half an interval (issue #1894), so a healthy
+// connection goes at most 1.5 intervals (45s) without traffic — 15s
+// short of the server's cutoff. A variable only so tests can shorten it.
 var keepAliveInterval = 30 * time.Second
 
 // readRepairTTL is the TTL a read-repair write applies to the primary
@@ -3784,6 +3786,14 @@ func (c *Client) startKeepalive(interval time.Duration) {
 		defer c.keepaliveWG.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		// Issue #1894: a round no longer waits for its pings — a ping to a
+		// half-open node blocks for the whole request timeout, and joining
+		// it started every later round that much late. Outstanding pings
+		// are joined only on the way out, so Close() still never tears a
+		// connection down under a ping in flight (issue #192).
+		var pings sync.WaitGroup
+		defer pings.Wait()
+		var inFlight sync.Map
 		for {
 			select {
 			case <-c.stopKeepalive:
@@ -3801,32 +3811,39 @@ func (c *Client) startKeepalive(interval time.Duration) {
 			}
 			c.mu.Unlock()
 
-			pingIdleConnections(connections, interval)
+			pingIdleConnections(connections, interval, &pings, &inFlight)
 		}
 	}()
 }
 
-// pingIdleConnections sends a keepalive probe to every idle connection in
-// connections, in parallel — one goroutine per connection, all joined
-// before this returns (issue #192). Previously this ran sequentially, so
-// a slow or hung node delayed the ping reaching every other member until
-// its own request finished or timed out; bounded parallelism here means
-// one slow connection no longer holds up the rest. Extracted from
-// startKeepalive's loop body so it can be driven directly, with a
-// controlled connection order, in tests.
-func pingIdleConnections(connections []*connection, interval time.Duration) {
-	var pings sync.WaitGroup
+// pingIdleConnections starts a keepalive probe on every idle connection
+// in connections, one goroutine per connection so a slow or hung node
+// doesn't hold up the rest (issue #192), and returns without waiting for
+// them (issue #1894): each ping is added to pings, and inFlight holds the
+// connections whose ping hasn't returned, which later rounds skip so a
+// hung node costs one pending request rather than one per tick.
+// Extracted from startKeepalive's loop body so it can be driven directly,
+// with a controlled connection order, in tests.
+func pingIdleConnections(connections []*connection, interval time.Duration, pings *sync.WaitGroup, inFlight *sync.Map) {
 	for _, conn := range connections {
-		if conn.isClosed() || conn.idle() < interval {
+		// Issue #1894: skip only a connection used within the last half
+		// interval. Skipping every one idle for less than a full interval
+		// left a connection used just after a tick unpinged until almost
+		// two intervals — the server's 60s idle limit — so any tick drift
+		// or late round let the server close it.
+		if conn.isClosed() || conn.idle() < interval/2 {
 			continue // dead ones stay lazy; busy ones don't need a ping
+		}
+		if _, pending := inFlight.LoadOrStore(conn, struct{}{}); pending {
+			continue // its last ping is still waiting on a hung node
 		}
 		pings.Add(1)
 		go func(conn *connection) {
 			defer pings.Done()
+			defer inFlight.Delete(conn)
 			// Any parseable reply proves liveness — N, or W from a
 			// non-owner — and resets the server's idle timer.
 			_, _, _ = conn.get(keepaliveKey)
 		}(conn)
 	}
-	pings.Wait()
 }

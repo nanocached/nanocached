@@ -3262,6 +3262,32 @@ class NanocachedClientTest {
     }
 
     @Test
+    void keepAlivePingsAConnectionIdleForMoreThanHalfTheInterval() throws Exception {
+        // Issue #1894: a tick skipped every connection idle for less than a
+        // full interval, so one used just after a tick went almost two
+        // intervals — the server's 60s idle limit — before its ping.
+        long defaultInterval = NanocachedClient.keepAliveIntervalMillis;
+        long interval = 300;
+        NanocachedClient.keepAliveIntervalMillis = interval;
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                waitFor(() -> node.getCount.get() >= 1, "the first keep-alive ping");
+                // Used just after that tick, so the next one finds it idle
+                // for more than half an interval but less than a full one.
+                client.set("k", "v");
+                long deadline = System.nanoTime()
+                        + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(interval * 3 / 2);
+                while (node.getCount.get() < 2) {
+                    assertTrue(System.nanoTime() < deadline, "no keep-alive ping at the next tick");
+                    Thread.sleep(5);
+                }
+            }
+        } finally {
+            NanocachedClient.keepAliveIntervalMillis = defaultInterval;
+        }
+    }
+
+    @Test
     void aRequestToAHalfOpenServerFailsWithinTheTimeoutInsteadOfHanging() throws Exception {
         // Regression (issue #42): a server that completes the A handshake
         // but then never answers a G/S/D used to hang get/set/delete

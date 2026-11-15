@@ -4017,8 +4017,11 @@ class NanocachedClient:
 
     def _start_keepalive(self) -> None:
         # Always on, with an internal interval (issue #27): half the
-        # server's 60s idle timeout, so it never severs a healthy client.
-        # Module-level only so tests can shorten it.
+        # server's 60s idle timeout. Each tick pings every connection idle
+        # for at least half an interval (issue #1894), so a healthy
+        # connection goes at most 1.5 intervals (45s) without traffic —
+        # 15s short of the server's cutoff, far more than this loop's
+        # sleep() drift. Module-level only so tests can shorten it.
         interval = _KEEPALIVE_INTERVAL
 
         async def ping(connection: Connection) -> None:
@@ -4068,7 +4071,13 @@ class NanocachedClient:
                             continue  # dead connections stay lazy, redialed on use
                         if connection in pings:
                             continue  # its last ping is still waiting on a hung node
-                        if connection.idle_seconds() < interval:
+                        # Issue #1894: skip only a connection used within
+                        # the last half interval. Skipping every one idle
+                        # for less than a full interval left a connection
+                        # used just after a tick unpinged until almost two
+                        # intervals — the server's 60s idle limit — so the
+                        # sleep() drift alone let the server close it.
+                        if connection.idle_seconds() < interval / 2:
                             continue  # real traffic already reset the server's timer
                         pings[connection] = asyncio.ensure_future(ping(connection))
             finally:

@@ -541,8 +541,10 @@ limit.
 ## Reconnect and keep-alive
 
 `nanocached-node` closes connections idle for 60 seconds; the SDK keeps
-its connections warm automatically, pinging any connection that real
-traffic has left idle for 30 seconds — so an idle timeout never severs a
+its connections warm automatically: every 30 seconds it pings any
+connection that real traffic has left idle for 15 seconds or more, so a
+healthy connection never goes much past 45 seconds without traffic and an
+idle timeout never severs a
 healthy client. A request that finds its connection already closed (a node
 restart, a network blip) redials it before sending. In cluster mode a
 request whose connection is lost is also retried once, after a node-list

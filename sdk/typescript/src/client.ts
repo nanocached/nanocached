@@ -432,9 +432,10 @@ export const HEDGE_READ_TUNING = { maxLoserLegs: 256, suspectLateLegs: 32 };
 
 /** Keep-alive is always on and internal (issue #27): every interval, a
  * lightweight request goes out on each connection real traffic has left
- * idle for at least that long, so the server's 60s idle timeout never
- * severs a healthy client. Half the idle timeout by design; exported as
- * a mutable object only so tests can shorten it. */
+ * idle for at least half an interval (issue #1894), so a healthy
+ * connection goes at most 1.5 intervals (45s) without traffic — 15s short
+ * of the server's 60s idle timeout. Half the idle timeout by design;
+ * exported as a mutable object only so tests can shorten it. */
 export const KEEPALIVE_TUNING = { intervalMs: 30_000 };
 
 function splitHostPort(address: string): { host: string; port: number } {
@@ -4668,7 +4669,7 @@ export class NanocachedClient {
 
   /** See KEEPALIVE_TUNING. Each tick pings only
    * connections that are open (dead ones stay lazy, reconnected on use)
-   * and that real traffic has left idle for at least a full interval. Any
+   * and that real traffic has left idle for at least half an interval. Any
    * parseable reply proves liveness and resets the server's idle timer —
    * `N` from a node without the key, or `W` from a clustered node that
    * doesn't own it (there is no dedicated ping in the wire protocol, so
@@ -4692,7 +4693,12 @@ export class NanocachedClient {
 
       for (const connection of connections) {
         if (connection.isClosed()) continue;
-        if (connection.idleMs() < intervalMs) continue;
+        // Issue #1894: skip only a connection used within the last half
+        // interval. Skipping every one idle for less than a full interval
+        // left a connection used just after a tick unpinged until almost
+        // two intervals — the server's 60s idle limit — so any timer
+        // drift let the server close it.
+        if (connection.idleMs() < intervalMs / 2) continue;
         connection.get(KEEPALIVE_KEY).catch(() => {});
       }
     }, intervalMs);
