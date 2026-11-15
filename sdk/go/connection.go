@@ -376,13 +376,7 @@ func appendSetFrame(namespace, key, value []byte, ttlSeconds int64, tagged bool,
 	return append(frame, value...)
 }
 
-// delete sends the default-namespace `D` frame — equivalent to
-// deleteNS(nil, key).
-func (c *connection) delete(key []byte) (bool, error) {
-	return c.deleteNS(nil, key)
-}
-
-// deleteNS is delete scoped to namespace (issue #105) — see getNS.
+// deleteNS sends the `D` frame for key in namespace (issue #105) — see getNS.
 func (c *connection) deleteNS(namespace, key []byte) (bool, error) {
 	marker, _, _, _, err := c.request(func(tag uint32) []byte {
 		return appendDeleteFrame(namespace, key, c.tagged, tag)

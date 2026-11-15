@@ -734,6 +734,15 @@ together with the error; retry only the keys that are missing from them.
   in turn; share one client, or use a multi-address config, if that is
   your shape.
 
+## Build
+
+```sh
+gofmt -l .        # lists files that need formatting; CI requires none
+go vet ./...
+go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+go test ./...
+```
+
 ## License
 
 MIT

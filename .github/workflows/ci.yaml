@@ -405,11 +405,12 @@ jobs:
           # Stdlib-only module: there is no go.sum to key a cache on.
           cache: false
 
-      - name: Check formatting and vet
+      - name: Check formatting, vet and staticcheck
         working-directory: sdk/go
         run: |
           test -z "$(gofmt -l .)"
           go vet ./...
+          go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
 
       - name: Run tests
         working-directory: sdk/go
