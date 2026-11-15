@@ -7386,6 +7386,18 @@ impl ClientReply {
             charge: None,
         }
     }
+
+    /// Issue #1891: the `E` for the client's own protocol error (a request
+    /// before authentication, a second `A`, a malformed or oversized
+    /// frame). Resolved as an ordinary reply, not `Err`: the writer counts
+    /// every `Err` in `upstream_failures_total`, and no backend failed
+    /// here. The reader closes the connection right after queueing it, so
+    /// the writer still sends nothing behind this `E`.
+    fn protocol_error() -> Self {
+        let (response_tx, response_rx) = oneshot::channel();
+        let _ = response_tx.send(Ok(b"E\n".to_vec()));
+        Self::uncharged(response_rx)
+    }
 }
 
 /// The per-connection, per-source-IP and proxy-wide reservations of one
@@ -8151,9 +8163,7 @@ async fn handle_client(
                         // violation — answer `E` and close (the node's
                         // stance on any protocol error) rather than let it
                         // re-negotiate tagging on a live connection.
-                        let (response_tx, response_rx) = oneshot::channel();
-                        let _ = response_tx.send(Err(Fatal::Transient));
-                        let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
+                        let _ = fifo_tx.send(ClientReply::protocol_error()).await;
                         break 'connection Ok(());
                     }
                     let accepted = match &context.secret {
@@ -8191,9 +8201,7 @@ async fn handle_client(
                 }
                 Ok(ParseOutcome::Ready(request, tag)) => {
                     if !authenticated {
-                        let (response_tx, response_rx) = oneshot::channel();
-                        let _ = response_tx.send(Err(Fatal::Transient));
-                        let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
+                        let _ = fifo_tx.send(ClientReply::protocol_error()).await;
                         break 'connection Ok(());
                     }
                     // The writer is gone (it answered `E`, or a write
@@ -8317,9 +8325,7 @@ async fn handle_client(
                     // charged now, while no per-key memory exists, and the
                     // parse that follows hands the request this charge.
                     if !authenticated {
-                        let (response_tx, response_rx) = oneshot::channel();
-                        let _ = response_tx.send(Err(Fatal::Transient));
-                        let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
+                        let _ = fifo_tx.send(ClientReply::protocol_error()).await;
                         break 'connection Ok(());
                     }
                     if fifo_tx.is_closed() {
@@ -8400,9 +8406,7 @@ async fn handle_client(
                     // below the loop); before that, a peer does not get to
                     // hold its connection for that long.
                     drain_rejected = authenticated;
-                    let (response_tx, response_rx) = oneshot::channel();
-                    let _ = response_tx.send(Err(Fatal::Transient));
-                    let _ = fifo_tx.send(ClientReply::uncharged(response_rx)).await;
+                    let _ = fifo_tx.send(ClientReply::protocol_error()).await;
                     break 'connection Ok(());
                 }
             }
@@ -13726,6 +13730,58 @@ mod tests {
         // The connection is closed: the next read sees EOF.
         let n = stream.read_buf(&mut buf).await.unwrap();
         assert_eq!(n, 0, "the proxy must close the connection after the E");
+    }
+
+    /// Issue #1891: the `E` for the client's own protocol error (a request
+    /// before `A`, a malformed frame, a second `A`) was counted in
+    /// `upstream_failures_total`, so anyone who could reach the port raised
+    /// the proxy's upstream error rate without a request or a backend
+    /// involved. Only a backend failure counts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_protocol_errors_are_not_counted_as_upstream_failures() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap().to_string();
+        let discovery = start_mock_discovery(vec![("node-dead".to_string(), dead_addr)], 1).await;
+        let (proxy, _drain, context) = start_proxy_full(
+            &discovery,
+            Some("s3cret"),
+            test_limits(64),
+            None,
+            Arc::new(SharedBackends::new()),
+        )
+        .await;
+        drop(listener);
+        let failures = || {
+            context
+                .upstream_failures_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        for (sent, replies) in [
+            (&b"G 3\nkey"[..], &["E"][..]),
+            (&b"hello world\n"[..], &["E"][..]),
+            (&b"A 6\ns3cretA 6\ns3cret"[..], &["On", "E"][..]),
+        ] {
+            let mut stream = TcpStream::connect(&proxy).await.unwrap();
+            stream.write_all(sent).await.unwrap();
+            let mut buf = BytesMut::new();
+            for reply in replies {
+                assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), *reply);
+            }
+            // The proxy closes after the `E`, and only after its writer
+            // has finished: the counter is settled by then.
+            assert_eq!(stream.read_buf(&mut buf).await.unwrap(), 0);
+        }
+        assert_eq!(failures(), 0, "protocol errors are not upstream failures");
+
+        // A request the (dead) backend fails still counts.
+        let mut stream = TcpStream::connect(&proxy).await.unwrap();
+        stream.write_all(b"A 6\ns3cretG 4\nname").await.unwrap();
+        let mut buf = BytesMut::new();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "On");
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+        assert_eq!(stream.read_buf(&mut buf).await.unwrap(), 0);
+        assert_eq!(failures(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

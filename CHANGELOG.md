@@ -14,6 +14,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: `nanocached_proxy_upstream_failures_total` no longer counts the `E`
+  the proxy answers a client's own protocol error with (a request before
+  authentication, a second `A`, a malformed or oversized frame). No backend
+  was involved, and none of these counts in `..._requests_total`, so anyone
+  who could reach the port could raise the proxy's upstream error rate
+  (#1891).
+
 - Discovery: when a ready member's `M` ack was lost or slow and the member
   reported its handoff complete in the meantime, the retry of that `M` found
   the join gone and sent the member an `X` as if the join had been
