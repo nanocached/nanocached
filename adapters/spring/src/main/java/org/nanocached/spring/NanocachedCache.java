@@ -86,7 +86,10 @@ public final class NanocachedCache extends AbstractValueAdaptingCache {
             return 0;
         }
         long seconds = ttl.getSeconds();
-        if (ttl.getNano() > 0) {
+        // Issue #1886: saturate at Long.MAX_VALUE. ChronoUnit.FOREVER has
+        // getSeconds() == Long.MAX_VALUE and a non-zero nano part; seconds++
+        // used to wrap to Long.MIN_VALUE, which Math.max turned into 1s.
+        if (ttl.getNano() > 0 && seconds < Long.MAX_VALUE) {
             seconds++;
         }
         return Math.max(1, seconds);

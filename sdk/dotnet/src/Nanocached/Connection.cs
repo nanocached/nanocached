@@ -219,8 +219,28 @@ internal sealed class Connection
         lock (_deadlineGate)
         {
             long deadline = Volatile.Read(ref _deadlineTicks);
-            if (deadline == 0 || Environment.TickCount64 < deadline) return;
+            if (deadline == 0) return;
             if (Volatile.Read(ref _outstanding) == 0) return; // answered, about to be cleared
+            long remaining = deadline - Environment.TickCount64;
+            if (remaining > 0)
+            {
+                // Issue #1895: not due yet. Either the deadline was pushed
+                // forward (a newer Change already covers it, and re-arming
+                // for the same instant is harmless) or the timer fired
+                // early — the runtime's timer clock isn't TickCount64 on
+                // every platform (dotnet/runtime#100455). A one-shot timer
+                // won't fire again by itself, so re-arm for what's left;
+                // returning here would let a stalled request hang forever.
+                try
+                {
+                    _watchdog.Change(TimeSpan.FromMilliseconds(remaining), Timeout.InfiniteTimeSpan);
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Same benign race as in ArmDeadline.
+                }
+                return;
+            }
         }
         // Poison with the timeout as the drain reason: CloseWithReason
         // disposes the stream, which is what actually unblocks the read
@@ -229,6 +249,15 @@ internal sealed class Connection
         CloseWithReason(new ConnectionLostException(
             $"nanocached: no response from server within {(long)RequestTimeout.TotalMilliseconds}ms "
             + "(request timed out)", requestNotSent: false, timedOut: true));
+    }
+
+    /// <summary>Test seam (issue #1895): simulates the one-shot watchdog
+    /// firing before the deadline — cancels the pending timer, as a fire
+    /// consumes it, then runs the callback now.</summary>
+    internal void FireWatchdogEarlyForTest()
+    {
+        lock (_deadlineGate) _watchdog.Change(Timeout.Infinite, Timeout.Infinite);
+        OnRequestTimeout(null);
     }
 
     internal bool IsClosed => Volatile.Read(ref _closedFlag) != 0;

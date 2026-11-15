@@ -21,6 +21,14 @@ framework adapters at one version, whether or not a component changed.
   who could reach the port could raise the proxy's upstream error rate
   (#1891).
 
+- Discovery: the 4 KiB request limit was checked against everything buffered
+  on a connection rather than the frame being parsed, so a connection whose
+  frames were each within the limit was closed when they arrived together,
+  and a frame really over the limit got a bare close instead of the `Ed` the
+  protocol lists. The limit now applies per frame, a frame over it is
+  answered `Ed` before the connection closes, and discovery refuses to start
+  with a secret too long for an `A` frame to fit the limit (#1890).
+
 - Discovery: when a ready member's `M` ack was lost or slow and the member
   reported its handoff complete in the meantime, the retry of that `M` found
   the join gone and sent the member an `X` as if the join had been

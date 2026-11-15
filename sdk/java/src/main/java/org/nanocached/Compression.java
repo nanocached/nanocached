@@ -41,6 +41,11 @@ final class Compression {
     // other five SDKs.
     static volatile long maxMultiGetDecompressedBytes = 256L * 1024 * 1024;
 
+    // What one DEFLATE decompression reserves from the budget below: the
+    // per-value cap plus the one byte decompressValue's buffer may grow
+    // past it to tell an output of exactly the cap from a bomb.
+    static final long INFLATE_RESERVATION = MAX_DECOMPRESSED_LENGTH + 1L;
+
     // Bounds how many bytes of DEFLATE output one client may be producing
     // at any one time, across every concurrent get/getMany. The two caps
     // above are per call: N concurrent reads of a value that expands to
@@ -51,8 +56,9 @@ final class Compression {
     // advance) and releases it when it returns, so at most four run at
     // once by default; the rest wait. What a caller holds after a read
     // returns is the caller's. Mutable, not final, only so a test can
-    // lower it; read once, when a client is built.
-    static volatile long maxInflightDecompressedBytes = 256L * 1024 * 1024;
+    // lower it; read once, when a client is built. Issue #1896: it was a
+    // flat 256 MiB, 4 bytes short of four reservations, so only three ran.
+    static volatile long maxInflightDecompressedBytes = 4 * INFLATE_RESERVATION;
 
     /** {@link #maxInflightDecompressedBytes} as a counting semaphore of
      * bytes, one per {@link NanocachedClient}. */
@@ -170,7 +176,7 @@ final class Compression {
         }
 
         if (marker == MARKER_DEFLATE) {
-            long reserved = budget == null ? 0 : budget.acquire(MAX_DECOMPRESSED_LENGTH + 1L);
+            long reserved = budget == null ? 0 : budget.acquire(INFLATE_RESERVATION);
             java.util.function.Consumer<String> hook = inflateTestHook;
             if (hook != null) hook.accept("start");
             Inflater inflater = new Inflater(true);
