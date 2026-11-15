@@ -2021,7 +2021,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         ? Task.FromCanceled<bool>(cancellationToken)
         : Cancellation.Abandonable(DeleteAsync(EmptyNamespace, key), cancellationToken);
 
-    /// <summary>Returns whether the key existed before this call.</summary>
+    /// <summary>Returns whether the key existed before this call.
+    ///
+    /// <para>In a cluster the other owners are sent their delete only after
+    /// the primary has answered, not alongside it (as for a touch with TTL
+    /// 0), so a primary that cannot be reached or answers <c>W</c> is
+    /// rerouted while the surviving owner still holds the entry.</para></summary>
     public Task<bool> DeleteAsync(byte[] key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
@@ -2043,7 +2048,8 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         key = OwnedForBackgroundLegs(key);
         await BeforeOperationAsync().ConfigureAwait(false);
         return await WithClusterRetryAsync(
-            () => WriteAsync(namespaceBytes, key, connection => connection.DeleteAsync(namespaceBytes, key)))
+            () => WriteAsync(
+                namespaceBytes, key, connection => connection.DeleteAsync(namespaceBytes, key), primaryFirst: true))
             .ConfigureAwait(false);
     }
 
@@ -4792,13 +4798,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         // entry) the primary leg is resent only when its request provably
         // never reached the wire; the replica legs keep the plain retry.
         //
-        // issue #934: with primaryFirst (the same ttl == 0 touch) the
-        // replica legs are not sent alongside the primary but only after it
-        // has answered S/V/N, to the owners of the ring in force then. A
-        // primary that cannot be reached, or answers W, is rerouted by
-        // WithClusterRetryAsync with no replica touched — a concurrent
-        // replica leg would already have expired the copy the reroute needs
-        // (and, for get-and-touch, consumed the value). These replica legs
+        // issue #934: with primaryFirst (the same ttl == 0 touch, and a
+        // delete) the replica legs are not sent alongside the primary but
+        // only after it has answered, to the owners of the ring in force
+        // then. A primary that cannot be reached, or answers W, is
+        // rerouted by WithClusterRetryAsync with no replica touched — a
+        // concurrent replica leg would already have expired or deleted the
+        // copy the reroute needs (and, for get-and-touch, consumed the
+        // value), so the reroute would answer a miss. These replica legs
         // run after the primary answered, outside the pipelined-order
         // guarantee, the same class as the retry paths.
         if (_ring is null)
@@ -4891,13 +4898,16 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
 
         if (primaryFirst)
         {
-            // Throws (no replica touched) on W, a not-sent failure or a
-            // post-send loss: the caller's reroute / failure rules apply.
-            T answer = await ApplyReconnectingUnlessSentAsync(names[0], op).ConfigureAwait(false);
+            // Throws (no replica touched) on W or a failure the primary's
+            // retry policy does not resend: the caller's reroute / failure
+            // rules apply.
+            T answer = replaySafe
+                ? await ApplyReconnectingAsync(names[0], op).ConfigureAwait(false)
+                : await ApplyReconnectingUnlessSentAsync(names[0], op).ConfigureAwait(false);
 
-            // The primary answered S/V/N: expire the other owners' copies,
-            // on the ring in force now. The node that answered is not sent
-            // the touch again.
+            // The primary answered: send the other owners theirs, on the
+            // ring in force now. The node that answered is not sent the
+            // request again.
             IEnumerable<string> others = OwnerNames(namespaceBytes, key).Where(name => name != names[0]);
             foreach (Task replicaWrite in StartReplicaWrites(others))
             {
