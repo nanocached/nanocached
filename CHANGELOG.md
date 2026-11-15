@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: in a cluster a `D`/`d` sent the other owners their delete at the
+  same time as the primary. When the primary failed or answered `W`, the
+  retry reached a replica that had already deleted its copy and answered the
+  client `N` for a key that existed. The other owners are now sent the
+  delete only after the primary has answered, as for an expiring touch
+  (#934), and a later request on the key from the same client connection
+  waits for those legs, as behind an expiring touch (#1847).
+
 - Discovery: a join that finished because the last member it still waited
   for was replaced (a restart under a new name at the same address) was
   not marked completed, unlike one finished by a `C`. An `M` send of that
