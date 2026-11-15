@@ -4959,6 +4959,45 @@ describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
     });
   });
 
+  // A delete sent to the replicas up front would have removed the copy a
+  // primary that fails or answers `W` is rerouted to: `false` for a key
+  // that existed. The replicas get it only once the primary has answered.
+  for (const reroute of ["dead", "wrong-node"] as const) {
+    it(`a delete to a ${reroute} primary leaves the replica alone until the reroute`, async () => {
+      await withCluster(async (client, cluster) => {
+        const { primary, replica } = cluster.ownerOf("k");
+        await client.set("k", "payload");
+        if (reroute === "dead") {
+          await primary.mock.close();
+          await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
+        } else {
+          primary.mock.answerWrongNodeOnce();
+        }
+        cluster.discovery.setNodes([{ name: replica.name, address: replica.mock.address }]);
+        assert.equal(await client.delete("k"), true);
+        assert.equal(replica.mock.deleteCount(), 1);
+        assert.equal(replica.mock.store.has("k"), false);
+      });
+    });
+  }
+
+  it("a delete reaches the replica only after the primary answered", async () => {
+    await withCluster(async (client, cluster) => {
+      const { primary, replica } = cluster.ownerOf("k");
+      await client.set("k", "payload");
+      primary.mock.setDeleteReplyDelay(300);
+      const call = client.delete("k");
+      await waitFor(() => primary.mock.deleteCount() === 1, "the primary to see the delete");
+      // Real sockets: an absence has no event to await, so give a replica
+      // leg the time to arrive (as the ttl=0 touch test above does).
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      assert.equal(replica.mock.deleteCount(), 0, "the replica was sent the delete before the primary answered");
+      assert.equal(await call, true);
+      assert.equal(replica.mock.deleteCount(), 1);
+      assert.equal(replica.mock.store.has("k"), false);
+    });
+  });
+
   it("a touch with a live or removed TTL still fans out to every owner at once (issue #934)", async () => {
     await withCluster(async (client, cluster) => {
       const { primary, replica } = cluster.ownerOf("k");
