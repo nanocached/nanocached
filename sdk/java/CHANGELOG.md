@@ -21,6 +21,7 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- In a cluster `delete` sent the other owners their delete at the same time as the primary. When the primary failed or answered `W`, the retry reached a replica that had already deleted its copy and returned `false` for a key that existed. The other owners are now sent the delete only after the primary has answered, as for an expiring touch (#934).
 - Keep-alive skipped every connection idle for less than its 30 s interval,
   so a connection used just after a tick was pinged at almost 60 s idle, the
   node's idle timeout: any tick drift let the node close a healthy

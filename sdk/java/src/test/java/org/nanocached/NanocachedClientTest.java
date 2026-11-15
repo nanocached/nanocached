@@ -1778,6 +1778,48 @@ class NanocachedClientTest {
         }
     }
 
+    // Issue #934's ordering for delete: a replica deleted alongside a primary
+    // that is then rerouted would make the call answer false.
+
+    @Test
+    void aDeleteRerouteFromADeadPrimaryFindsTheKeyBecauseNoReplicaWasDeletedFirst() throws Exception {
+        for (boolean namespaced : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    NanocachedClient.Namespace ns = client.namespace("tenant");
+                    String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                    if (namespaced) ns.set(key, "v"); else client.set(key, "v");
+                    MockNode survivor = cluster.nodes().get(NAMES.get(1));
+                    removeFromDiscovery(cluster, NAMES.get(0), cluster.nodes().get(NAMES.get(0)));
+
+                    assertTrue(namespaced ? ns.delete(key) : client.delete(key));
+                    assertEquals(1, survivor.deleteFrames.get());
+                }
+            }
+        }
+    }
+
+    @Test
+    void aDeleteAnsweredWrongNodeDeletesTheReplicaOnlyWithTheFinalAnswer() throws Exception {
+        for (boolean namespaced : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                    NanocachedClient.Namespace ns = client.namespace("tenant");
+                    String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                    if (namespaced) ns.set(key, "v"); else client.set(key, "v");
+                    MockNode primary = cluster.nodes().get(NAMES.get(0));
+                    MockNode replica = cluster.nodes().get(NAMES.get(1));
+                    primary.answerWrongNodeOnce();
+
+                    assertTrue(namespaced ? ns.delete(key) : client.delete(key));
+                    assertEquals(2, primary.deleteFrames.get(), "W, then the retried delete");
+                    assertEquals(1, replica.deleteFrames.get(),
+                            "one delete, sent after the primary's definitive answer");
+                }
+            }
+        }
+    }
+
     @Test
     void aTouchThatDoesNotExpireStillGoesToEveryOwnerAtOnce() throws Exception {
         for (long ttl : new long[] {30, NanocachedClient.REMOVE_TTL}) {
