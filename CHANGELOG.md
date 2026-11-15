@@ -14,6 +14,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: a shared backend connection with nothing pending watches its socket
+  for the node closing it or sending unsolicited data. If a request was
+  queued, written and answered between the reader finding nothing pending
+  and its read of the socket, the start of that reply was taken for
+  unsolicited data: the connection was poisoned and every request already
+  written on it failed, an `i`/`k`/`x` with a fatal `E` that disconnected
+  the client. Data that arrives while the reader is idle now goes to a
+  request queued in the meantime, and is still treated as a desync only
+  when none is (#1892).
+
 - Discovery: when a ready member's `M` ack was lost or slow and the member
   reported its handoff complete in the meantime, the retry of that `M` found
   the join gone and sent the member an `X` as if the join had been

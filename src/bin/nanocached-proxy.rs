@@ -2969,14 +2969,10 @@ async fn run_backend(
             // until the next frame — up to a whole keep-alive interval —
             // was written into the dead connection and answered with a
             // plain error: for an INCR/CAS one the client could not
-            // retry, although the frame never reached a node. `biased`
-            // so a reservation that is already queued is always taken
-            // first, and the idle read is a readiness poll that consumes
-            // nothing unless it completes.
-            let next = tokio::select! {
-                biased;
-                slot = pending_rx.recv() => slot,
-                idle = watch_idle_backend(&mut read_half, &mut buf) => {
+            // retry, although the frame never reached a node.
+            let next = match next_reply_slot(&mut read_half, &mut buf, &mut pending_rx).await {
+                Ok(next) => next,
+                Err(idle) => {
                     // Nothing was pending, so no client request is on
                     // this connection: the writer's next reservation
                     // fails before it writes (`not_sent`, redialled).
@@ -3209,22 +3205,49 @@ async fn run_backend(
     }
 }
 
-/// Waits, while no reply is pending on a shared backend connection, for
-/// the node to close it (EOF) or to fail it; resolves to what happened,
-/// for the log line. Data arriving with nothing pending is a desynced
-/// stream (the node never speaks unsolicited once authenticated), so it
-/// counts as a failure too rather than being parsed against a later
-/// reply. Cancel-safe: `read` consumes bytes only when it completes, so
-/// a reservation winning the `select!` leaves the stream untouched.
-async fn watch_idle_backend<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut BytesMut) -> String {
+/// The reader's next reserved reply slot (`None` once the writer is gone
+/// and the queue is drained), watching the socket while no reply is
+/// pending for the node to close it (EOF) or to fail it; `Err` is what
+/// happened, for the log line. Data arriving with nothing pending is a
+/// desynced stream (the node never speaks unsolicited once
+/// authenticated), so it counts as a failure too rather than being parsed
+/// against a later reply. `biased` so a reservation that is already
+/// queued is always taken first, and the idle read is a readiness poll
+/// that consumes nothing unless it completes: a reservation winning the
+/// `select!` leaves the stream untouched.
+///
+/// Issue #1892: the queue was empty when `select!` polled it, but the
+/// writer runs on another thread and can reserve a request, write it and
+/// be answered before this one polls the read — it only has to be
+/// preempted for a node round trip in between. The read then returns the
+/// start of that request's reply, which used to be taken for unsolicited
+/// data: the connection was poisoned and the request failed as written
+/// (an `E` for an INCR/CAS). So once data has arrived the queue is checked
+/// again. The writer reserves before it writes, so any request the data
+/// can answer is queued by now, and its reply is read on from the bytes
+/// already in `buf`; only data with still nothing reserved is a desync
+/// (and bytes that are not that reply fail its tag check).
+async fn next_reply_slot<S: AsyncRead + Unpin, T>(
+    stream: &mut S,
+    buf: &mut BytesMut,
+    pending: &mut mpsc::Receiver<T>,
+) -> Result<Option<T>, String> {
     let mut chunk = [0u8; 64];
-    match stream.read(&mut chunk).await {
-        Ok(0) => "closed by the node while idle".to_string(),
+    let read = tokio::select! {
+        biased;
+        slot = pending.recv() => return Ok(slot),
+        read = stream.read(&mut chunk) => read,
+    };
+    match read {
+        Ok(0) => Err("closed by the node while idle".to_string()),
         Ok(n) => {
             buf.extend_from_slice(&chunk[..n]);
-            "sent data with no request pending".to_string()
+            pending
+                .try_recv()
+                .map(Some)
+                .map_err(|_| "sent data with no request pending".to_string())
         }
-        Err(error) => format!("failed while idle ({error})"),
+        Err(error) => Err(format!("failed while idle ({error})")),
     }
 }
 
@@ -15314,6 +15337,79 @@ mod tests {
             node.auth_count.load(Ordering::SeqCst),
             2,
             "exactly one redial, made by the request"
+        );
+    }
+
+    // Issue #1892: a shared backend connection's read half on which the
+    // race lands. The reader has just found its pending queue empty, and
+    // inside its idle read — after that check, before the read returns —
+    // the writer reserves a request (`reserve`) and the node's reply to it
+    // starts to arrive. Later reads hand out the rest, then EOF.
+    struct RacingBackendRead {
+        pending: mpsc::Sender<u32>,
+        reserve: Option<u32>,
+        chunks: std::collections::VecDeque<&'static [u8]>,
+    }
+
+    impl tokio::io::AsyncRead for RacingBackendRead {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if let Some(tag) = self.reserve.take() {
+                self.pending.try_send(tag).unwrap();
+            }
+            if let Some(chunk) = self.chunks.pop_front() {
+                buf.put_slice(chunk);
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reply_that_arrives_as_the_idle_reader_finds_nothing_pending_is_read_as_the_reply() {
+        // Issue #1892: the request is reserved after the reader saw its
+        // queue empty and before its idle read, which returns the start of
+        // that request's reply. That used to be taken for unsolicited data
+        // and poisoned the connection under a request already written (an
+        // `E` for an INCR/CAS). The data is that request's: its slot is
+        // returned and its reply read on from the bytes already buffered.
+        let (pending_tx, mut pending_rx) = mpsc::channel(MAX_BACKEND_IN_FLIGHT);
+        let mut stream = RacingBackendRead {
+            pending: pending_tx,
+            reserve: Some(7),
+            chunks: [&b"V 5 7\nhel"[..], &b"lo"[..]].into(),
+        };
+        let mut buf = BytesMut::new();
+
+        assert_eq!(
+            next_reply_slot(&mut stream, &mut buf, &mut pending_rx).await,
+            Ok(Some(7)),
+            "the data answers the request reserved meanwhile"
+        );
+        let reply = read_reply_and_shrink(&mut stream, &mut buf, 7, Expect::Value)
+            .await
+            .expect("the buffered bytes are the start of its reply");
+        assert_eq!(reply, NodeReply::Value(Bytes::from_static(b"hello")));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn data_from_the_node_with_no_request_pending_still_poisons_the_connection() {
+        // Issue #1892: checking the queue again once data arrives must not
+        // let genuinely unsolicited bytes through. With nothing reserved
+        // they are a desynced stream, not parsed against a later reply.
+        let (pending_tx, mut pending_rx) = mpsc::channel::<u32>(MAX_BACKEND_IN_FLIGHT);
+        let mut stream = RacingBackendRead {
+            pending: pending_tx,
+            reserve: None,
+            chunks: [&b"V 5 7\nhello"[..]].into(),
+        };
+        let mut buf = BytesMut::new();
+
+        assert_eq!(
+            next_reply_slot(&mut stream, &mut buf, &mut pending_rx).await,
+            Err("sent data with no request pending".to_string())
         );
     }
 
