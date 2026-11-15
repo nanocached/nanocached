@@ -14,6 +14,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node: a discovery replica whose host vanished without closing the
+  connection (power loss, a black-holed route) right after the node
+  re-registered with it held that registration until shutdown: the node
+  waited for the answer to its `P` with no timeout, so it never redialed or
+  heartbeated that replica again and, if it was the primary, stopped adopting
+  its rosters. The answer is now awaited for 10 s like the heartbeat ack, and
+  the node redials after that; the node's connection to discovery also has TCP
+  keepalive on, so a join waiting on a vanished host ends too (#1893).
+
 - Proxy: a shared backend connection with nothing pending watches its socket
   for the node closing it or sending unsolicited data. If a request was
   queued, written and answered between the reader finding nothing pending
