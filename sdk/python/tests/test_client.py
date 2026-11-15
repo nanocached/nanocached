@@ -2749,6 +2749,83 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
             await self.stop(client, discovery, nodes)
 
 
+class DeleteClusterTests(unittest.IsolatedAsyncioTestCase):
+    # A delete answers whether the key existed. Like an expiring touch
+    # (issue #934), the replicas are sent it only after the primary has
+    # answered, so a primary that fails or answers `W` is rerouted to a
+    # replica that still holds the key.
+
+    start_cluster = TouchClusterTests.start_cluster
+    stop = TouchClusterTests.stop
+
+    def owners_of(self, key: str, namespace: bytes = b""):
+        return HashRing(NAMES).owners(key.encode(), 2, namespace=namespace)
+
+    async def test_a_delete_reaches_the_replica_only_after_the_primary_answered(self):
+        for ns in (None, "ns"):
+            with self.subTest(ns=ns):
+                nodes, discovery = await self.start_cluster()
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    target = client if ns is None else client.namespace(ns)
+                    ns_bytes = b"" if ns is None else ns.encode()
+                    primary_name, replica_name = self.owners_of("k", ns_bytes)
+                    primary, replica = nodes[primary_name], nodes[replica_name]
+                    await target.set("k", "v")
+                    gate = primary.hold_delete_replies()
+                    task = asyncio.ensure_future(target.delete("k"))
+                    await wait_for(lambda: primary.deletes, "the primary to receive the delete")
+                    await asyncio.sleep(0.1)
+                    self.assertEqual(replica.deletes, [])
+                    gate.set()
+                    self.assertTrue(await task)
+                    self.assertEqual(replica.deletes, [(ns_bytes, b"k")])
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+    async def test_a_delete_rerouted_from_a_dead_primary_returns_true(self):
+        for ns in (None, "ns"):
+            with self.subTest(ns=ns):
+                nodes, discovery = await self.start_cluster()
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    target = client if ns is None else client.namespace(ns)
+                    primary_name, replica_name = self.owners_of(
+                        "k", b"" if ns is None else ns.encode()
+                    )
+                    replica = nodes[replica_name]
+                    await target.set("k", "v")
+                    await nodes[primary_name].close()
+                    discovery.nodes = [(replica_name, replica.address)]
+                    await wait_for(
+                        lambda: client._members[primary_name].connection.closed,
+                        "the client to see the FIN",
+                    )
+                    self.assertTrue(await target.delete("k"))
+                    self.assertEqual(len(replica.deletes), 1)
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+    async def test_a_cluster_delete_rerouted_after_a_wrong_node_answer_returns_true(self):
+        for ns in (None, "ns"):
+            with self.subTest(ns=ns):
+                nodes, discovery = await self.start_cluster()
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    target = client if ns is None else client.namespace(ns)
+                    primary_name, replica_name = self.owners_of(
+                        "k", b"" if ns is None else ns.encode()
+                    )
+                    replica = nodes[replica_name]
+                    await target.set("k", "v")
+                    nodes[primary_name].answer_wrong_node_once()
+                    discovery.nodes = [(replica_name, replica.address)]
+                    self.assertTrue(await target.delete("k"))
+                    self.assertEqual(len(replica.deletes), 1)
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+
 class BatchChunkBoundsTests(unittest.TestCase):
     def test_o_and_y_chunks_stay_within_the_namespace_times_keys_limit(self):
         from nanocached._client import _MAX_MULTI_NAMESPACE_KEY_BYTES, _batch_chunk_bounds

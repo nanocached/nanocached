@@ -1394,7 +1394,15 @@ class NanocachedClient:
         )
 
     async def delete(self, key: str | bytes) -> bool:
-        """Returns whether the key existed before this call."""
+        """Returns whether the key existed before this call.
+
+        In a cluster the primary is sent the delete alone and the other
+        owners only once it has answered, as for a ``0``-TTL touch (issue
+        #934): a primary that is unreachable or answers wrong-node has
+        deleted no replica's copy when the call is rerouted, so the reroute
+        still finds the key. Those replica deletes run after the primary's
+        answer, outside the pipelined-order guarantee, like the retry
+        paths."""
         return await self._delete(b"", key)
 
     async def _delete(self, namespace: bytes, key: str | bytes) -> bool:
@@ -1405,8 +1413,11 @@ class NanocachedClient:
         await self._before_operation()
         return await self._with_wrong_node_retry(
             lambda: self._write(
-                namespace, key_bytes, lambda connection: connection.delete(key_bytes, namespace)
-            )
+                namespace,
+                key_bytes,
+                lambda connection: connection.delete(key_bytes, namespace),
+                primary_first=True,
+            ),
         )
 
     # ── Touch (issue #825) ─────────────────────────────────────────────
