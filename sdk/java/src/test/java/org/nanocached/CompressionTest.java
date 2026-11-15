@@ -3,6 +3,7 @@ package org.nanocached;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.security.SecureRandom;
@@ -117,5 +118,18 @@ class CompressionTest {
     void corruptDeflateMarkedValueThrows() {
         assertThrows(NanocachedException.DecompressionFailed.class,
                 () -> Compression.decompressValue(new byte[] {0x01, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF}));
+    }
+
+    @Test
+    void theDefaultInflateBudgetHoldsFourReservationsAtOnce() {
+        // Issue #1896: the default budget was 256 MiB, 4 bytes short of four
+        // 64 MiB + 1 reservations, so the fourth acquire blocked until
+        // another decompression released (here: forever, on one thread).
+        Compression.InflateBudget budget = new Compression.InflateBudget(Compression.maxInflightDecompressedBytes);
+        assertTimeoutPreemptively(java.time.Duration.ofSeconds(10), () -> {
+            for (int i = 0; i < 4; i++) {
+                assertEquals(Compression.INFLATE_RESERVATION, budget.acquire(Compression.INFLATE_RESERVATION));
+            }
+        });
     }
 }
