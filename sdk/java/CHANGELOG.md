@@ -21,6 +21,13 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- Keep-alive skipped every connection idle for less than its 30 s interval,
+  so a connection used just after a tick was pinged at almost 60 s idle, the
+  node's idle timeout: any tick drift let the node close a healthy
+  connection (a redial on next use, or `ConnectionLost` for an `incr` racing
+  the close). A tick now pings every connection idle for at least half the
+  interval, so a healthy connection goes at most about 45 s without traffic
+  (#1894).
 - A node's `En` (a command it does not know, such as a `touchMany` sent to a
   node that predates it) failed every request pipelined behind the refused
   one as sent with an unknown outcome, so an `incr`, a `putIfAbsent` or a

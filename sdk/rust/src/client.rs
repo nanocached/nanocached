@@ -1934,12 +1934,16 @@ impl NanocachedClient {
         });
 
         // Keep-alive is always on, with an internal interval (issue #27):
-        // half the server's 60s idle timeout, so it never severs a healthy
-        // client. A per-client `Options::keep_alive_interval` wins; otherwise
-        // the `KEEPALIVE_INTERVAL_MS` static supplies the default. Read once
-        // per connect. (The per-client override is why tests no longer need
-        // to mutate the shared static — which, read on connect while the
-        // suite runs concurrently, could perturb an unrelated test.)
+        // half the server's 60s idle timeout. Each tick pings every
+        // connection idle for at least half an interval (issue #1894), so a
+        // healthy connection goes at most 1.5 intervals (45s) without
+        // traffic — 15s short of the server's cutoff, far more than this
+        // loop's sleep drift. A per-client `Options::keep_alive_interval`
+        // wins; otherwise the `KEEPALIVE_INTERVAL_MS` static supplies the
+        // default. Read once per connect. (The per-client override is why
+        // tests no longer need to mutate the shared static — which, read on
+        // connect while the suite runs concurrently, could perturb an
+        // unrelated test.)
         let interval = options.keep_alive_interval.unwrap_or_else(|| {
             Duration::from_millis(KEEPALIVE_INTERVAL_MS.load(std::sync::atomic::Ordering::SeqCst))
         });
@@ -1991,7 +1995,13 @@ impl NanocachedClient {
                     // waiting on their node.
                     while pings.try_join_next().is_some() {}
                     for connection in connections {
-                        if connection.is_closed() || connection.idle() < interval {
+                        // Issue #1894: skip only a connection used within
+                        // the last half interval. Skipping every one idle
+                        // for less than a full interval left a connection
+                        // used just after a tick unpinged until almost two
+                        // intervals — the server's 60s idle limit — so any
+                        // tick drift let the server close it.
+                        if connection.is_closed() || connection.idle() < interval / 2 {
                             continue; // dead ones stay lazy; busy ones don't need a ping
                         }
                         // The previous ping on this connection is still

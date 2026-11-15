@@ -1245,6 +1245,30 @@ class KeepAliveTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
+    async def test_pings_a_connection_idle_for_more_than_half_the_interval(self):
+        # Issue #1894: a tick skipped every connection idle for less than a
+        # full interval, so one used just after a tick went almost two
+        # intervals — the server's 60s idle limit — before its ping.
+        node = await MockNode().start()
+        try:
+            interval = 0.3
+            self._client_module._KEEPALIVE_INTERVAL = interval
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await wait_for(lambda: node.get_count >= 1, "the first keep-alive ping")
+                # Used just after that tick, so the next one finds it idle
+                # for more than half an interval but less than a full one.
+                await client.set("k", "v")
+                await wait_for(
+                    lambda: node.get_count >= 2,
+                    "a keep-alive ping at the next tick",
+                    timeout=1.5 * interval,
+                )
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
     async def test_stops_after_close(self):
         node = await MockNode().start()
         try:
