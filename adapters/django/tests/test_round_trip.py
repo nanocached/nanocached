@@ -11,9 +11,12 @@ import pickle
 import socket
 import time
 import unittest
+from typing import cast
 
 from support import PREFIX_NODE, ROUNDTRIP_NODE
+
 from django.core.cache import caches
+
 from nanocached_django import NanocachedCache
 
 
@@ -39,7 +42,7 @@ class _Point:
 
 class RoundTripTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.cache = caches["default"]
+        self.cache = cast(NanocachedCache, caches["default"])
         self.cache.clear()
 
     def test_round_trip_string(self) -> None:
@@ -164,7 +167,7 @@ class RoundTripTests(unittest.TestCase):
         self.cache.set("racy", "old", timeout=300)
         wire_key = self.cache.make_key("racy", version=self.cache.version).encode()
         namespace, value = b"django", pickle.dumps("new")
-        fired = []
+        fired: list[bool] = []
 
         def concurrent_set() -> None:
             if fired:
@@ -191,9 +194,7 @@ class RoundTripTests(unittest.TestCase):
         prefixed.set("pv", "value", timeout=300)
         self.assertTrue(prefixed.touch("pv", timeout=60))
         self.assertFalse(prefixed.touch("pv", timeout=60, version=9))
-        self.assertEqual(
-            PREFIX_NODE.ttls[(b"prefixed", b"myprefix:3:pv")], 60
-        )
+        self.assertEqual(PREFIX_NODE.ttls[(b"prefixed", b"myprefix:3:pv")], 60)
 
     def _wire_ttl(self, key: str) -> int:
         wire_key = self.cache.make_key(key, version=self.cache.version).encode()
@@ -279,7 +280,7 @@ class RoundTripTests(unittest.TestCase):
 
         # Only get_many degrades per-key — a direct get() on the same
         # corrupt key still raises/propagates exactly as it did before.
-        with self.assertRaises(Exception):
+        with self.assertRaises(pickle.UnpicklingError):
             self.cache.get("bad")
 
     def test_delete_many_waits_for_every_leg_then_raises_on_a_failure(self) -> None:
@@ -369,6 +370,7 @@ class RoundTripTests(unittest.TestCase):
 
     def test_ints_beyond_the_counter_range_are_pickled_and_round_trip(self) -> None:
         import pickle
+
         from nanocached import NotNumericError
 
         def stored(key: str) -> bytes:
@@ -408,7 +410,7 @@ class RoundTripTests(unittest.TestCase):
         self.cache.set("wired", "on-the-wire")
         wire_key = self.cache.make_key("wired", version=self.cache.version)
         stored = ROUNDTRIP_NODE.ns_store.get((b"django", wire_key.encode()))
-        self.assertIsNotNone(stored)
+        assert stored is not None
         self.assertEqual(pickle.loads(stored), "on-the-wire")
 
 

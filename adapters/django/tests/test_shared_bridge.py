@@ -16,9 +16,11 @@ import unittest
 from unittest import mock
 
 import support  # noqa: F401 - configures settings.CACHES / django.setup()
+
+from nanocached import NanocachedClient
+
 from mock_node import MockNode
 from nanocached_django import NanocachedCache
-from nanocached_django.backend import NanocachedClient
 
 
 def _loop_threads() -> set[threading.Thread]:
@@ -57,7 +59,7 @@ class SharedBridgeTests(unittest.TestCase):
                 backend = self._new_backend()
                 backend.set(f"k{n}", n)
                 self.assertEqual(backend.get(f"k{n}"), n)
-            except BaseException as error:  # noqa: BLE001 - reported below
+            except BaseException as error:  # reported below
                 errors.append(error)
 
         with mock.patch.object(NanocachedClient, "connect", counting_connect):

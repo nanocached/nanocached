@@ -8,8 +8,10 @@ import ssl
 import time
 import traceback
 import unittest
+from typing import cast
 from unittest import mock
 
+from mock_servers import MockDiscovery, MockNode, unused_port
 from nanocached import (
     AlreadyClosedError,
     AuthenticationError,
@@ -31,9 +33,7 @@ from nanocached import (
     WrongNodeError,
     content_digest,
 )
-
 from nanocached._hashring import HashRing
-from mock_servers import MockDiscovery, MockNode, unused_port
 
 NAMES = [
     "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6",
@@ -262,7 +262,9 @@ class SingleNodeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(results[0], "v")
             self.assertIsInstance(results[1], ValueError)
             self.assertEqual(results[2], "v")
-            self.assertEqual(self.node.connection_count, 1, "an empty-key rejection triggered a reconnect")
+            self.assertEqual(
+                self.node.connection_count, 1, "an empty-key rejection triggered a reconnect"
+            )
         finally:
             await client.close()
 
@@ -393,7 +395,9 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
-    async def test_an_oversized_value_is_rejected_before_compression_even_if_it_would_compress_under_the_cap(self):
+    async def test_an_oversized_value_is_rejected_before_compression_even_if_it_would_compress_under_the_cap(
+        self,
+    ):
         # Regression (issue #47 audit item 3): the request-size cap must be
         # checked against the *original* value, matching Rust's and Go's
         # Set — not the compressed frame, which a highly repetitive value
@@ -463,13 +467,20 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
 class ReadHedgeAfterRangeTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_zero_negative_non_numeric_and_above_24_hours(self):
         for bad in (0, -1, float("nan"), 24 * 60 * 60 + 1, float("inf")):
-            with self.assertRaisesRegex(ValueError, "read_hedge_after must be a positive number of seconds"):
+            with self.assertRaisesRegex(
+                ValueError, "read_hedge_after must be a positive number of seconds"
+            ):
                 await NanocachedClient.connect([("127.0.0.1", 1)], read_hedge_after=bad)
 
 
 class ReconnectCooldownOptionTests(unittest.IsolatedAsyncioTestCase):
     async def test_zero_and_omitted_mean_the_default_and_only_the_switch_turns_it_off(self):
-        from nanocached._client import _DEFAULT_RECONNECT_COOLDOWN as default, _resolve_reconnect_cooldown as resolve
+        from nanocached._client import (
+            _DEFAULT_RECONNECT_COOLDOWN as default,
+        )
+        from nanocached._client import (
+            _resolve_reconnect_cooldown as resolve,
+        )
 
         self.assertEqual(resolve(None, False), default)
         self.assertEqual(resolve(0, False), default)
@@ -480,7 +491,9 @@ class ReconnectCooldownOptionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_rejects_negative_non_finite_and_contradictory_values(self):
         for bad in (-1, float("nan"), float("inf")):
-            with self.assertRaisesRegex(ValueError, "reconnect_cooldown must be a non-negative number"):
+            with self.assertRaisesRegex(
+                ValueError, "reconnect_cooldown must be a non-negative number"
+            ):
                 await NanocachedClient.connect([("127.0.0.1", 1)], reconnect_cooldown=bad)
         with self.assertRaisesRegex(ValueError, "contradicts a non-zero reconnect_cooldown"):
             await NanocachedClient.connect(
@@ -569,7 +582,8 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         port = node.port
         client = await NanocachedClient.connect(
             [("127.0.0.1", port)],
-            # Timing: a wide cooldown window and fast-rejection bound keep this from flaking on loaded CI runners.
+            # Timing: a wide cooldown window and fast-rejection bound keep this
+            # from flaking on loaded CI runners.
             reconnect_cooldown=1.0,
         )
         try:
@@ -627,7 +641,9 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ConnectionError):
                     await client.get("k")
                 elapsed = asyncio.get_running_loop().time() - start
-                self.assertLess(elapsed, 0.5, f"expected a cooldown-fast rejection, took {elapsed}s")
+                self.assertLess(
+                    elapsed, 0.5, f"expected a cooldown-fast rejection, took {elapsed}s"
+                )
                 self.assertEqual(connections, 0, "the cooldown did not prevent a redial")
 
                 # Once the cooldown window has passed, the address is
@@ -1001,7 +1017,9 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
             silent.close()
             await silent.wait_closed()
 
-    async def test_a_listed_address_that_answers_as_a_discovery_server_is_a_dead_member_at_connect(self):
+    async def test_a_listed_address_that_answers_as_a_discovery_server_is_a_dead_member_at_connect(
+        self,
+    ):
         # A roster address whose IP another kind of process has reused
         # (here a discovery server) must not keep a new client from
         # starting: it is installed like a failed dial, with its cooldown
@@ -1023,10 +1041,14 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(stored, ConnectFailedError)
 
                 good_key = next(
-                    f"k{i}" for i in range(1000) if client._ring.owners(f"k{i}".encode(), 1)[0] == good
+                    f"k{i}"
+                    for i in range(1000)
+                    if client._ring.owners(f"k{i}".encode(), 1)[0] == good
                 )
                 bad_key = next(
-                    f"k{i}" for i in range(1000) if client._ring.owners(f"k{i}".encode(), 1)[0] == bad
+                    f"k{i}"
+                    for i in range(1000)
+                    if client._ring.owners(f"k{i}".encode(), 1)[0] == bad
                 )
                 await client.set(good_key, "v")
                 self.assertEqual(await client.get(good_key), "v")
@@ -1196,7 +1218,9 @@ class IdentifyMalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await discovery.close()
 
-    async def test_an_oversized_node_list_response_fails_instead_of_buffering_unbounded_memory(self):
+    async def test_an_oversized_node_list_response_fails_instead_of_buffering_unbounded_memory(
+        self,
+    ):
         # Regression: bounds a malicious discovery server's memory
         # pressure with an aggregate cap on the whole `N ...` response
         # (16 MiB), independent of the per-field caps — this same
@@ -1486,9 +1510,7 @@ class StalledPeerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.3)
             self.assertFalse(any(task.done() for task in tasks))
             await asyncio.wait_for(client.close(), 5.0)
-            outcomes = await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True), 2.0
-            )
+            outcomes = await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 2.0)
             self.assertTrue(
                 all(isinstance(outcome, ConnectionError) for outcome in outcomes), outcomes
             )
@@ -1511,7 +1533,7 @@ class StalledPeerTests(unittest.IsolatedAsyncioTestCase):
         async def timed_out_set(client, i):
             try:
                 await asyncio.wait_for(client.set(f"k{i}", b"x" * 900_000), 0.3)
-            except (asyncio.TimeoutError, ConnectionError):
+            except (TimeoutError, ConnectionError):
                 # Timed out, or failed because an earlier cancellation
                 # poisoned the connection under it.
                 pass
@@ -1673,7 +1695,7 @@ class DialFailureTests(unittest.IsolatedAsyncioTestCase):
             # reset discards the B it is queued behind.
             try:
                 await asyncio.wait_for(reader.read(), 2)
-            except (asyncio.TimeoutError, ConnectionError):
+            except (TimeoutError, ConnectionError):
                 pass
             writer.close()
 
@@ -1699,9 +1721,7 @@ class CloseWarningTests(unittest.IsolatedAsyncioTestCase):
             with contextlib.redirect_stderr(captured):
                 await client.close()  # the forgotten second close — warns once
             self.assertTrue(client.closed)
-            warnings = captured.getvalue().count(
-                "close() called again on an already-closed client"
-            )
+            warnings = captured.getvalue().count("close() called again on an already-closed client")
             self.assertEqual(warnings, 1)
         finally:
             await node.close()
@@ -1732,9 +1752,7 @@ class CloseWarningTests(unittest.IsolatedAsyncioTestCase):
         node = await MockNode().start()
         other = await unused_port()
         try:
-            first = await NanocachedClient.connect(
-                [("127.0.0.1", node.port), ("127.0.0.1", other)]
-            )
+            first = await NanocachedClient.connect([("127.0.0.1", node.port), ("127.0.0.1", other)])
             try:
                 captured = io.StringIO()
                 with contextlib.redirect_stderr(captured):
@@ -1790,10 +1808,21 @@ class StrictUintParsingTests(unittest.TestCase):
     def test_rejects_everything_bare_int_would_wrongly_accept(self):
         from nanocached._connection import _parse_strict_uint
 
-        for field in [b"+5", b" 5", b"5 ", b"1_000", b"1e2", b"-5", b"", b" ", b"5\n", b"0x5", b"5.0"]:
-            with self.subTest(field=field):
-                with self.assertRaises(ValueError):
-                    _parse_strict_uint(field)
+        for field in [
+            b"+5",
+            b" 5",
+            b"5 ",
+            b"1_000",
+            b"1e2",
+            b"-5",
+            b"",
+            b" ",
+            b"5\n",
+            b"0x5",
+            b"5.0",
+        ]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                _parse_strict_uint(field)
 
     def test_identify_module_reuses_the_same_helper(self):
         # Not a separate reimplementation with its own (possibly
@@ -1920,14 +1949,14 @@ class IncrEncodingTests(unittest.TestCase):
     def test_encodes_tagged_namespaced_incr(self):
         from nanocached._connection import _encode_incr
 
-        self.assertEqual(
-            _encode_incr(b"k", 5, tag=7, namespace=b"users"), b"i 5 1 5 7\nusersk"
-        )
+        self.assertEqual(_encode_incr(b"k", 5, tag=7, namespace=b"users"), b"i 5 1 5 7\nusersk")
 
     def test_namespace_may_contain_arbitrary_bytes(self):
         from nanocached._connection import _encode_incr
 
-        self.assertEqual(_encode_incr(b"beta", -1, namespace=b"\xff\x00"), b"i 2 4 -1\n\xff\x00beta")
+        self.assertEqual(
+            _encode_incr(b"beta", -1, namespace=b"\xff\x00"), b"i 2 4 -1\n\xff\x00beta"
+        )
 
 
 class IncrTests(unittest.IsolatedAsyncioTestCase):
@@ -2106,8 +2135,8 @@ class IncrReplicationTests(unittest.IsolatedAsyncioTestCase):
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
         try:
             key = "counter-with-ttl"
-            primary_name, replica_name = self.owners_of(key)
-            primary, replica = nodes[primary_name], nodes[replica_name]
+            _primary_name, replica_name = self.owners_of(key)
+            replica = nodes[replica_name]
 
             await client.set(key, "10", ttl_seconds=120)
             self.assertEqual(await client.incr(key, 1), 11)
@@ -2184,7 +2213,9 @@ class IncrReplicationTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
-    async def test_a_lost_reply_after_the_primary_applies_the_increment_is_not_retried_via_ring_refresh(self):
+    async def test_a_lost_reply_after_the_primary_applies_the_increment_is_not_retried_via_ring_refresh(
+        self,
+    ):
         # issue #225: _with_wrong_node_retry is the *only* retry layer
         # incr() has — it both redials/reconnects and, in cluster mode,
         # refreshes the ring and resends. A `W` (test above) always
@@ -2238,7 +2269,9 @@ class TouchEncodingTests(unittest.TestCase):
     def test_encodes_namespace_and_tag(self):
         from nanocached._connection import _encode_touch
 
-        self.assertEqual(_encode_touch(b"k", 30, True, tag=7, namespace=b"users"), b"t 5 1 30 G 7\nusersk")
+        self.assertEqual(
+            _encode_touch(b"k", 30, True, tag=7, namespace=b"users"), b"t 5 1 30 G 7\nusersk"
+        )
         self.assertEqual(_encode_touch(b"k", None, False, tag=7), b"t 0 1 7\nk")
 
 
@@ -2451,7 +2484,7 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
         try:
-            primary_name, replica_name = self.owners_of("k")
+            _primary_name, replica_name = self.owners_of("k")
             # Only the replica holds the key: a read would find it, a
             # write-ish read answers for the primary alone.
             nodes[replica_name].store[b"k"] = b"v"
@@ -2837,7 +2870,9 @@ class BatchChunkBoundsTests(unittest.TestCase):
             for start, end in bounds:
                 self.assertLessEqual(namespace_len * (end - start), _MAX_MULTI_NAMESPACE_KEY_BYTES)
         # At the threshold a full chunk is still 400 keys; `m` is uncapped.
-        self.assertEqual(_batch_chunk_bounds(b"n" * 167_772, [2] * 400, [1] * 400, True), [(0, 400)])
+        self.assertEqual(
+            _batch_chunk_bounds(b"n" * 167_772, [2] * 400, [1] * 400, True), [(0, 400)]
+        )
         self.assertEqual(_batch_chunk_bounds(b"n" * 170_000, [2] * 400, None), [(0, 400)])
         self.assertEqual(_batch_chunk_bounds(b"", [2] * 400, None, True), [(0, 400)])
 
@@ -2931,7 +2966,9 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
             # A touch never creates a key.
             self.assertNotIn(b"missing", self.node.store)
             # One frame for the whole batch, plain.
-            self.assertEqual(self.node.multi_touch_frames, [(b"", [b"a", b"missing", b"b"], 100, False)])
+            self.assertEqual(
+                self.node.multi_touch_frames, [(b"", [b"a", b"missing", b"b"], 100, False)]
+            )
             self.assertEqual(self.node.touches, [])
         finally:
             await client.close()
@@ -2942,9 +2979,7 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
         client = await self.connect()
         try:
             await client.set_many({"a": "1"}, ttl_seconds=10)
-            self.assertEqual(
-                await client.touch_many(["a", b"a"], 100), {"a": True, b"a": True}
-            )
+            self.assertEqual(await client.touch_many(["a", b"a"], 100), {"a": True, b"a": True})
             self.assertEqual(
                 await client.get_many_and_touch([b"a", "a"], 100), {"a": "1", b"a": "1"}
             )
@@ -2981,8 +3016,12 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(self.node.entry_ttl[(b"", b"a")], 60)
             self.assertEqual(self.node.entry_ttl[(b"", b"b")], 60)
-            self.assertEqual(self.node.multi_touch_frames, [(b"", [b"a", b"missing", b"b"], 60, True)])
-            self.assertEqual(await client.get_many_and_touch_bytes([b"a", "b"], None), {b"a": b"1", "b": b"2"})
+            self.assertEqual(
+                self.node.multi_touch_frames, [(b"", [b"a", b"missing", b"b"], 60, True)]
+            )
+            self.assertEqual(
+                await client.get_many_and_touch_bytes([b"a", "b"], None), {b"a": b"1", "b": b"2"}
+            )
             self.assertEqual(self.node.entry_ttl[(b"", b"a")], 0)
             self.assertEqual(await client.get_many_and_touch(["missing"], 5), {})
         finally:
@@ -3002,7 +3041,9 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
         try:
             await client.set("a", "1")
             self.assertEqual(await client.touch_many(["a", b"a", "a"], 30), {"a": True, b"a": True})
-            self.assertEqual(await client.get_many_and_touch(["a", b"a"], 30), {"a": "1", b"a": "1"})
+            self.assertEqual(
+                await client.get_many_and_touch(["a", b"a"], 30), {"a": "1", b"a": "1"}
+            )
             self.assertEqual([frame[1] for frame in self.node.multi_touch_frames], [[b"a"], [b"a"]])
         finally:
             await client.close()
@@ -3078,7 +3119,9 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(len(frames), 1)
             for frame_namespace, frame_keys, _ttl, _get in frames:
                 self.assertEqual(frame_namespace, namespace)
-                self.assertLessEqual(len(namespace) * len(frame_keys), _MAX_MULTI_NAMESPACE_KEY_BYTES)
+                self.assertLessEqual(
+                    len(namespace) * len(frame_keys), _MAX_MULTI_NAMESPACE_KEY_BYTES
+                )
             self.assertEqual(sum(len(f[1]) for f in frames), 400)
         finally:
             await client.close()
@@ -3091,10 +3134,13 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
             values = {f"k{i}": f"v{i}" for i in range(_MAX_BATCH_KEYS * 2 + 5)}
             await client.set_many(values)
             self.assertEqual(await client.get_many_and_touch(list(values), 30), values)
-            self.assertEqual([len(f[1]) for f in self.node.multi_touch_frames], [_MAX_BATCH_KEYS, _MAX_BATCH_KEYS, 5])
+            self.assertEqual(
+                [len(f[1]) for f in self.node.multi_touch_frames],
+                [_MAX_BATCH_KEYS, _MAX_BATCH_KEYS, 5],
+            )
             self.node.multi_touch_frames.clear()
-            result = await client.touch_many(list(values) + ["missing"], 30)
-            self.assertEqual(result, {**{key: True for key in values}, "missing": False})
+            result = await client.touch_many([*values, "missing"], 30)
+            self.assertEqual(result, {**dict.fromkeys(values, True), "missing": False})
             self.assertEqual(len(self.node.multi_touch_frames), 3)
         finally:
             await client.close()
@@ -3102,7 +3148,11 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_keys_and_bad_ttls_are_rejected_before_any_io(self):
         client = await self.connect()
         try:
-            for call in (client.touch_many, client.get_many_and_touch, client.get_many_and_touch_bytes):
+            for call in (
+                client.touch_many,
+                client.get_many_and_touch,
+                client.get_many_and_touch_bytes,
+            ):
                 with self.assertRaises(ValueError):
                     await call([], 30)
                 for bad in (-1, 1.5, True, "5"):
@@ -3132,7 +3182,9 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
         try:
             await client.set_many({"a": "1", "b": "2"})
             self.assertEqual(await client.touch_many(["a", "nope"], 30), {"a": True, "nope": False})
-            self.assertEqual(await client.get_many_and_touch(["a", "b", "nope"], 60), {"a": "1", "b": "2"})
+            self.assertEqual(
+                await client.get_many_and_touch(["a", "b", "nope"], 60), {"a": "1", "b": "2"}
+            )
             self.assertEqual(node.multi_touch_frames[-1], (b"", [b"a", b"b", b"nope"], 60, True))
         finally:
             await client.close()
@@ -3294,7 +3346,8 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
         return HashRing(NAMES).owners(key.encode(), replication)
 
     def keys_by_primary(self, primary: str, count: int, prefix: str = "mt") -> list[str]:
-        keys, i = [], 0
+        keys: list[str] = []
+        i = 0
         while len(keys) < count:
             candidate = f"{prefix}-{i}"
             if self.owners_of(candidate)[0] == primary:
@@ -3316,8 +3369,11 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
         try:
             keys = [f"k{i}" for i in range(20)]
-            await client.set_many({key: "v" for key in keys}, ttl_seconds=10)
-            self.assertEqual(await client.touch_many(keys + ["nope"], 77), {**{k: True for k in keys}, "nope": False})
+            await client.set_many(dict.fromkeys(keys, "v"), ttl_seconds=10)
+            self.assertEqual(
+                await client.touch_many([*keys, "nope"], 77),
+                {**dict.fromkeys(keys, True), "nope": False},
+            )
             for node in nodes.values():
                 # R=2 over two nodes: both hold every key, and each got a
                 # single plain frame for all of them.
@@ -3335,7 +3391,9 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
         try:
             keys = [f"k{i}" for i in range(24)]
             primary_of = {key: self.owners_of(key)[0] for key in keys}
-            self.assertEqual(set(primary_of.values()), set(NAMES), "the keys must give both nodes primaries")
+            self.assertEqual(
+                set(primary_of.values()), set(NAMES), "the keys must give both nodes primaries"
+            )
             values = {key: f"v-{key}" for key in keys}
             await client.set_many(values)
             self.assertEqual(await client.get_many_and_touch(keys, 40), values)
@@ -3346,10 +3404,12 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
                 by_form = {frame[3]: frame for frame in node.multi_touch_frames}
                 self.assertEqual(len(node.multi_touch_frames), 2)
                 self.assertEqual(
-                    sorted(by_form[True][1]), sorted(k.encode() for k in keys if primary_of[k] == name)
+                    sorted(by_form[True][1]),
+                    sorted(k.encode() for k in keys if primary_of[k] == name),
                 )
                 self.assertEqual(
-                    sorted(by_form[False][1]), sorted(k.encode() for k in keys if primary_of[k] != name)
+                    sorted(by_form[False][1]),
+                    sorted(k.encode() for k in keys if primary_of[k] != name),
                 )
                 for key in keys:
                     self.assertEqual(node.entry_ttl[(b"", key.encode())], 40)
@@ -3385,7 +3445,7 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
                 node.answer_wrong_node_for_keys(stale, times=0)
             for name in NAMES:
                 nodes[name].answer_wrong_node_for_keys(stale, times=1)
-            self.assertEqual(await client.touch_many(keys, 41), {key: True for key in keys})
+            self.assertEqual(await client.touch_many(keys, 41), dict.fromkeys(keys, True))
         finally:
             await self.stop(client, discovery, nodes)
 
@@ -3504,10 +3564,13 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
                             await asyncio.sleep(0.1)
                             self.assertEqual(replica.multi_touch_frames, [])
                         gate.set()
-                        self.assertEqual(await task, values if get else {key: True for key in keys})
+                        self.assertEqual(await task, values if get else dict.fromkeys(keys, True))
                         self.assertEqual(len(replica.multi_touch_frames), 1)
-                        namespace, sent, sent_ttl, sent_get = replica.multi_touch_frames[0]
-                        self.assertEqual((sorted(sent), sent_ttl, sent_get), (sorted(k.encode() for k in keys), ttl, False))
+                        _namespace, sent, sent_ttl, sent_get = replica.multi_touch_frames[0]
+                        self.assertEqual(
+                            (sorted(sent), sent_ttl, sent_get),
+                            (sorted(k.encode() for k in keys), ttl, False),
+                        )
                     finally:
                         await self.stop(client, discovery, nodes)
 
@@ -3530,7 +3593,9 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
                     if get:
                         self.assertEqual(await client.get_many_and_touch(keys, 0), values)
                     else:
-                        self.assertEqual(await client.touch_many(keys, 0), {key: True for key in keys})
+                        self.assertEqual(
+                            await client.touch_many(keys, 0), dict.fromkeys(keys, True)
+                        )
                     # One frame, the reroute's: the value-carrying form for a
                     # get, with no plain frame sent beforehand.
                     self.assertEqual(
@@ -3563,7 +3628,7 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
             keys = self.keys_by_primary(NAMES[0], 3)
             for key in keys:
                 nodes[NAMES[1]].store[key.encode()] = b"v"
-            self.assertEqual(await client.touch_many(keys, 0), {key: False for key in keys})
+            self.assertEqual(await client.touch_many(keys, 0), dict.fromkeys(keys, False))
             self.assertEqual(nodes[NAMES[1]].store, {})
         finally:
             await self.stop(client, discovery, nodes)
@@ -3621,7 +3686,7 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
             # Counted per key, as set_many counts a failed replica leg.
             self.assertEqual(await client.get_many_and_touch(keys, 30), values)
             self.assertEqual(client.stats().replica_write_failures, 3)
-            self.assertEqual(await client.touch_many(keys, 30), {key: True for key in keys})
+            self.assertEqual(await client.touch_many(keys, 30), dict.fromkeys(keys, True))
             self.assertEqual(client.stats().replica_write_failures, 6)
         finally:
             await self.stop(client, discovery, nodes)
@@ -3634,7 +3699,7 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
         try:
             keys = self.keys_by_primary(NAMES[0], 3)
-            await client.set_many({key: "v" for key in keys})
+            await client.set_many(dict.fromkeys(keys, "v"))
             nodes[NAMES[0]].legacy_without_multi_touch = True
             with self.assertRaises(ServerTooOldError):
                 await client.get_many_and_touch(keys, 30)
@@ -3687,7 +3752,7 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
         try:
             keys = self.keys_by_primary(NAMES[0], 3)
-            await client.set_many({key: "v" for key in keys})
+            await client.set_many(dict.fromkeys(keys, "v"))
             old = nodes[NAMES[0]]
             old.legacy_without_multi_touch = True
             for call in (client.touch_many, client.get_many_and_touch):
@@ -3735,7 +3800,9 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
             live_keys = [key for key in keys if self.owners_of(key, 1)[0] == live]
             self.assertTrue(live_keys and len(live_keys) < len(keys))
             await nodes[dead].close()
-            await wait_for(lambda: client._members[dead].connection.closed, "the client to see the FIN")
+            await wait_for(
+                lambda: client._members[dead].connection.closed, "the client to see the FIN"
+            )
             with self.assertRaises(PartialConnectionLostError) as raised:
                 await client.get_many_and_touch(keys, 30)
             self.assertNotIsInstance(raised.exception, WrongNodeError)
@@ -3743,7 +3810,9 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(raised.exception.__cause__)
             with self.assertRaises(ConnectionError) as raised_plain:
                 await client.touch_many(keys, 30)
-            self.assertNotIsInstance(raised_plain.exception, (WrongNodeError, PartialConnectionLostError))
+            self.assertNotIsInstance(
+                raised_plain.exception, (WrongNodeError, PartialConnectionLostError)
+            )
         finally:
             await self.stop(client, discovery, nodes)
 
@@ -3895,9 +3964,7 @@ class CasEncodingTests(unittest.TestCase):
         from nanocached._connection import _encode_cas_set
 
         digest = content_digest(b"old").encode()
-        self.assertEqual(
-            _encode_cas_set(b"k", b"v", digest), b"k 0 1 1 %b\nkv" % digest
-        )
+        self.assertEqual(_encode_cas_set(b"k", b"v", digest), b"k 0 1 1 %b\nkv" % digest)
 
     def test_encodes_set_with_ttl(self):
         from nanocached._connection import CAS_ABSENT, _encode_cas_set
@@ -3917,9 +3984,7 @@ class CasEncodingTests(unittest.TestCase):
     def test_encodes_tagged_set(self):
         from nanocached._connection import CAS_ABSENT, _encode_cas_set
 
-        self.assertEqual(
-            _encode_cas_set(b"k", b"v", CAS_ABSENT, tag=7), b"k 0 1 1 A 7\nkv"
-        )
+        self.assertEqual(_encode_cas_set(b"k", b"v", CAS_ABSENT, tag=7), b"k 0 1 1 A 7\nkv")
 
     def test_encodes_tagged_set_with_ttl(self):
         from nanocached._connection import CAS_ABSENT, _encode_cas_set
@@ -3939,9 +4004,7 @@ class CasEncodingTests(unittest.TestCase):
         from nanocached._connection import _encode_cas_delete
 
         digest = content_digest(b"old").encode()
-        self.assertEqual(
-            _encode_cas_delete(b"k", digest, tag=3), b"x 0 1 %b 3\nk" % digest
-        )
+        self.assertEqual(_encode_cas_delete(b"k", digest, tag=3), b"x 0 1 %b 3\nk" % digest)
 
     def test_encodes_namespaced_delete(self):
         from nanocached._connection import _encode_cas_delete
@@ -3985,23 +4048,17 @@ class MultiEncodingTests(unittest.TestCase):
     def test_namespace_may_contain_arbitrary_bytes(self):
         from nanocached._connection import _encode_multi_get
 
-        self.assertEqual(
-            _encode_multi_get([b"k"], namespace=b"\xff\x00"), b"m 2 1 1\n\xff\x00k"
-        )
+        self.assertEqual(_encode_multi_get([b"k"], namespace=b"\xff\x00"), b"m 2 1 1\n\xff\x00k")
 
     def test_encodes_untagged_multi_set_without_ttl(self):
         from nanocached._connection import _encode_multi_set
 
-        self.assertEqual(
-            _encode_multi_set([b"a", b"bb"], [b"1", b"22"]), b"o 0 2 1 1 2 2\na1bb22"
-        )
+        self.assertEqual(_encode_multi_set([b"a", b"bb"], [b"1", b"22"]), b"o 0 2 1 1 2 2\na1bb22")
 
     def test_encodes_multi_set_with_ttl(self):
         from nanocached._connection import _encode_multi_set
 
-        self.assertEqual(
-            _encode_multi_set([b"k"], [b"v"], ttl_seconds=60), b"o 0 1 1 1 60\nkv"
-        )
+        self.assertEqual(_encode_multi_set([b"k"], [b"v"], ttl_seconds=60), b"o 0 1 1 1 60\nkv")
 
     def test_encodes_namespaced_multi_set(self):
         from nanocached._connection import _encode_multi_set
@@ -4489,8 +4546,8 @@ class CasReplicationTests(unittest.IsolatedAsyncioTestCase):
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
         try:
             key = "cas-key-with-ttl"
-            primary_name, replica_name = self.owners_of(key)
-            primary, replica = nodes[primary_name], nodes[replica_name]
+            _primary_name, replica_name = self.owners_of(key)
+            replica = nodes[replica_name]
 
             self.assertTrue(await client.put_if_absent(key, "v1", ttl_seconds=120))
 
@@ -4575,7 +4632,9 @@ class CasReplicationTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
-    async def test_a_lost_reply_after_the_primary_applies_the_cas_is_not_retried_via_ring_refresh(self):
+    async def test_a_lost_reply_after_the_primary_applies_the_cas_is_not_retried_via_ring_refresh(
+        self,
+    ):
         # issue #225: see IncrReplicationTests' own version of this test
         # — _with_wrong_node_retry is the only retry layer replace() has,
         # and a ConnectionLostError must skip its ring-refresh-and-retry
@@ -5135,7 +5194,9 @@ class FireAndForgetReplicaWritesTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
-    async def test_a_write_starting_after_close_falls_back_to_synchronous_instead_of_registering(self):
+    async def test_a_write_starting_after_close_falls_back_to_synchronous_instead_of_registering(
+        self,
+    ):
         # Regression (issue #47 audit item 4): the fire_and_forget_replicas
         # admission check in _write() must recheck self._closed immediately
         # before registering a background task. Without it, a write that
@@ -5310,7 +5371,9 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(value, b"from-replica")  # the probe itself still ran
             self.assertEqual(client._background_replica_writes, set())
-            self.assertNotIn(b"k", nodes[primary].store, "the repair write-back should have been skipped")
+            self.assertNotIn(
+                b"k", nodes[primary].store, "the repair write-back should have been skipped"
+            )
         finally:
             await client.close()
             await discovery.close()
@@ -5444,7 +5507,9 @@ class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(value, "v")
                 self.assertLess(elapsed, 0.4 - self.TIMING_TOLERANCE_S, elapsed)
                 self.assertGreaterEqual(elapsed, 0.05 - self.TIMING_TOLERANCE_S, elapsed)
-                self.assertEqual(nodes[replica].get_count, 1, "the replica should have been hedged to")
+                self.assertEqual(
+                    nodes[replica].get_count, 1, "the replica should have been hedged to"
+                )
             finally:
                 await client.close()
             # The slow primary's leg was left to finish, not cancelled, and
@@ -5654,8 +5719,7 @@ class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(
                     client._hedged_reads,
                     set(),
-                    "both legs finished in the same wait() call, but one "
-                    "was left behind uncounted",
+                    "both legs finished in the same wait() call, but one was left behind uncounted",
                 )
             finally:
                 await client.close()
@@ -5709,9 +5773,7 @@ class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
                     return await real_wait(fs, **kwargs)
 
                 with mock.patch("asyncio.wait", patched_wait):
-                    self.assertEqual(
-                        await client._read_hedged(b"k", op, names), "v"
-                    )
+                    self.assertEqual(await client._read_hedged(b"k", op, names), "v")
             finally:
                 await client.close()
         finally:
@@ -5839,7 +5901,9 @@ class HedgedReadInflightCapTests(unittest.IsolatedAsyncioTestCase):
                 elapsed = asyncio.get_running_loop().time() - start
 
                 self.assertEqual(value, "v")
-                self.assertEqual(nodes[replica].get_count, 1, "the replica should have been hedged to")
+                self.assertEqual(
+                    nodes[replica].get_count, 1, "the replica should have been hedged to"
+                )
                 # With no room under the cap, the slow primary's losing
                 # leg is awaited right here instead of being detached —
                 # the call doesn't return until it finishes, unlike the
@@ -5880,7 +5944,7 @@ class HedgedReadInflightCapTests(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 await client.set("k", "v")
-                primary, replica = self.owners_of("k")
+                primary, _replica = self.owners_of("k")
                 nodes[primary].delay_gets(0.3)
 
                 # The replica answers right away once hedged to (a
@@ -6186,7 +6250,7 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
         for i, name in enumerate(NAMES):
             if name in dead:
                 entries[i] = (name, f"127.0.0.1:{await unused_port()}")
-        discovery.nodes = entries
+        discovery.nodes = cast(list[tuple[str, str]], entries)  # every slot is filled by now
         return nodes, discovery
 
     def owners_of(self, key: str):
@@ -6243,7 +6307,7 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 await node.close()
 
     async def test_an_unreachable_node_is_redialed_once_the_cooldown_has_passed(self):
-        dead, live = NAMES[0], NAMES[1]
+        dead = NAMES[0]
         nodes, discovery = await self.start_cluster({dead})
         try:
             client = await NanocachedClient.connect(
@@ -6252,7 +6316,7 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
             try:
                 # Bring the "dead" node up on the address discovery listed.
                 dead_address = client._members[dead].address
-                host, port = dead_address.rsplit(":", 1)
+                _host, port = dead_address.rsplit(":", 1)
                 revived = await MockNode().start(port=int(port))
                 nodes[dead] = revived
                 await asyncio.sleep(0.1)
@@ -6346,7 +6410,9 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
-    async def test_failed_operations_against_a_dead_listed_primary_do_not_each_open_a_discovery_connection(self):
+    async def test_failed_operations_against_a_dead_listed_primary_do_not_each_open_a_discovery_connection(
+        self,
+    ):
         # While discovery still lists a dead node (its liveness window),
         # every operation routed to it failed and forced a refresh, and
         # each refresh asked discovery for the same list over a new
@@ -6404,7 +6470,7 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 original = list(discovery.nodes)
-                discovery.nodes = original + [(new, f"127.0.0.1:{other.port}")]
+                discovery.nodes = [*original, (new, f"127.0.0.1:{other.port}")]
                 await client._refresh_node_list()
                 stored = client._redial_cooldowns[f"127.0.0.1:{other.port}"][1]
                 self.assertIsInstance(stored, ConnectFailedError)
@@ -6467,7 +6533,9 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
         server = await asyncio.start_server(handle, "127.0.0.1", 0)
         return server, server.sockets[0].getsockname()[1]
 
-    async def test_operations_routed_to_an_address_that_answers_the_handshake_with_garbage_refresh_and_reroute(self):
+    async def test_operations_routed_to_an_address_that_answers_the_handshake_with_garbage_refresh_and_reroute(
+        self,
+    ):
         # An HTTP server's 400 instead of a handshake reply raised a plain
         # NanocachedError, which _with_wrong_node_retry does not act on:
         # the operation kept failing until the 30 s staleness refresh, even
@@ -6484,7 +6552,7 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
                     )
                     try:
                         original = list(discovery.nodes)
-                        discovery.nodes = original + [(new, f"127.0.0.1:{garbage_port}")]
+                        discovery.nodes = [*original, (new, f"127.0.0.1:{garbage_port}")]
                         await client._refresh_node_list()
                         stored = client._redial_cooldowns[f"127.0.0.1:{garbage_port}"][1]
 
@@ -6520,7 +6588,9 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
                     for node in nodes.values():
                         await node.close()
 
-    async def test_redialing_a_member_that_now_answers_the_handshake_with_garbage_is_a_connect_failure(self):
+    async def test_redialing_a_member_that_now_answers_the_handshake_with_garbage_is_a_connect_failure(
+        self,
+    ):
         nodes, discovery = await self.start_cluster(set())
         garbage, garbage_port = await self.start_garbage_listener()
         try:
@@ -6547,7 +6617,9 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
                 async def getter():
                     return await client._open_node_connection(f"127.0.0.1:{garbage_port}")
 
-                _, error, failed_at, sent_end = await client._multi_touch_chunked(getter, b"", [b"k"], 0, False)
+                _, error, failed_at, sent_end = await client._multi_touch_chunked(
+                    getter, b"", [b"k"], 0, False
+                )
                 self.assertIsNotNone(error)
                 self.assertEqual((failed_at, sent_end), (0, 0), "the chunk never left")
             finally:
@@ -6707,9 +6779,11 @@ class RosterDialTests(unittest.IsolatedAsyncioTestCase):
             [(NAMES[0], node.address), (NAMES[1], "127.0.0.1:1")], replication=2
         ).start()
         try:
-            with mock.patch.object(client_module, "connect_and_identify", fake):
-                with self.assertRaises(RuntimeError):
-                    await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            with (
+                mock.patch.object(client_module, "connect_and_identify", fake),
+                self.assertRaises(RuntimeError),
+            ):
+                await NanocachedClient.connect([("127.0.0.1", discovery.port)])
             self.assertEqual(len(opened), 1)
             self.assertTrue(opened[0].writer.is_closing(), "the sibling's socket was left open")
         finally:
@@ -6742,9 +6816,11 @@ class RosterDialTests(unittest.IsolatedAsyncioTestCase):
                     ("new-bad", "127.0.0.1:1"),
                 ]
                 opened.clear()
-                with mock.patch.object(client_module, "connect_and_identify", fake):
-                    with self.assertRaises(RuntimeError):
-                        await client._refresh_node_list()
+                with (
+                    mock.patch.object(client_module, "connect_and_identify", fake),
+                    self.assertRaises(RuntimeError),
+                ):
+                    await client._refresh_node_list()
                 # The refresh's own discovery fetch goes through the patched
                 # function too, but only node dials are NodeTargets.
                 node_targets = [t for t in opened if hasattr(t, "writer")]
@@ -6783,8 +6859,9 @@ class RosterDialTests(unittest.IsolatedAsyncioTestCase):
         discovery = await MockDiscovery(roster, replication=2).start()
         counting, state = self.counting_dial(client_module)
         try:
-            with mock.patch.object(client_module, "_MAX_CONCURRENT_DIALS", 4), mock.patch.object(
-                client_module, "connect_and_identify", counting
+            with (
+                mock.patch.object(client_module, "_MAX_CONCURRENT_DIALS", 4),
+                mock.patch.object(client_module, "connect_and_identify", counting),
             ):
                 client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
             try:
@@ -6812,8 +6889,9 @@ class RosterDialTests(unittest.IsolatedAsyncioTestCase):
                 discovery.nodes = [(NAMES[0], existing.address)] + [
                     (f"node-{i:03d}", node.address) for i in range(30)
                 ]
-                with mock.patch.object(client_module, "_MAX_CONCURRENT_DIALS", 4), mock.patch.object(
-                    client_module, "connect_and_identify", counting
+                with (
+                    mock.patch.object(client_module, "_MAX_CONCURRENT_DIALS", 4),
+                    mock.patch.object(client_module, "connect_and_identify", counting),
                 ):
                     await client._maybe_refresh(force=True)
                 self.assertEqual(len(client._members), 31)
@@ -6940,12 +7018,10 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
         # *write-backs* only, matching the other five SDKs — a failed
         # owner probe during the repair scan is swallowed silently.
         nodes, discovery = await self.start_cluster()
-        client = await NanocachedClient.connect(
-            [("127.0.0.1", discovery.port)], read_repair=True
-        )
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)], read_repair=True)
         try:
             key = "read-repair-swallow"
-            primary, replica = self.owners_of(key)
+            _primary, replica = self.owners_of(key)
             await nodes[replica].close()
             await wait_for(
                 lambda: client._members[replica].connection.closed,
@@ -6971,9 +7047,7 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
         # the replica's value is still returned to the caller, but the
         # background repair write to the primary fails and is counted.
         nodes, discovery = await self.start_cluster()
-        client = await NanocachedClient.connect(
-            [("127.0.0.1", discovery.port)], read_repair=True
-        )
+        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)], read_repair=True)
         try:
             key = "read-repair-write-back"
             primary, replica = self.owners_of(key)
@@ -7054,12 +7128,14 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             await node.close()
 
-    async def test_a_programming_error_from_a_replica_leg_does_not_swallow_or_clobber_a_successful_write(self):
+    async def test_a_programming_error_from_a_replica_leg_does_not_swallow_or_clobber_a_successful_write(
+        self,
+    ):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
         try:
             key = "boom-key"
-            primary, replica = self.owners_of(key)
+            _primary, replica = self.owners_of(key)
 
             # Establish real connections to both owners first...
             await client.set(key, "v")
@@ -7072,7 +7148,9 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
             # set() must return normally rather than raise.
             replica_connection = client._members[replica].connection
 
-            async def boom(key: bytes, value: bytes, ttl_seconds: int, namespace: bytes = b"") -> None:
+            async def boom(
+                key: bytes, value: bytes, ttl_seconds: int, namespace: bytes = b""
+            ) -> None:
                 raise TypeError("injected programming bug")
 
             replica_connection.set = boom
@@ -7129,7 +7207,9 @@ class StatsTests(unittest.IsolatedAsyncioTestCase):
             # in this SDK's own code.
             replica_connection = client._members[replica].connection
 
-            async def boom(key: bytes, value: bytes, ttl_seconds: int, namespace: bytes = b"") -> None:
+            async def boom(
+                key: bytes, value: bytes, ttl_seconds: int, namespace: bytes = b""
+            ) -> None:
                 raise TypeError("injected programming bug")
 
             replica_connection.set = boom
@@ -7214,7 +7294,9 @@ class ForcedRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.client._fetch_node_list = fetch
         return gate, calls
 
-    async def test_a_forced_caller_scheduled_right_after_a_refresh_ends_does_not_start_another(self):
+    async def test_a_forced_caller_scheduled_right_after_a_refresh_ends_does_not_start_another(
+        self,
+    ):
         # Issue #1607: the refresh's end time was recorded by a done
         # callback, one loop iteration after the task completed. A forced
         # caller whose step ran in that gap saw the task done and the old
@@ -7229,7 +7311,9 @@ class ForcedRefreshTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(asyncio.gather(first, second), 5)
         self.assertEqual(len(calls), 1, "the second forced caller started another refresh")
 
-    async def test_a_forced_caller_that_waited_out_an_older_refresh_sleeps_the_interval_before_its_own(self):
+    async def test_a_forced_caller_that_waited_out_an_older_refresh_sleeps_the_interval_before_its_own(
+        self,
+    ):
         # The waited_out_older_refresh branch of _maybe_refresh (issues
         # #1200, #1529): a forced caller that arrives while a refresh is in
         # flight cannot take its result (it began before the failure), and
@@ -7240,7 +7324,9 @@ class ForcedRefreshTests(unittest.IsolatedAsyncioTestCase):
         gate, calls = self.script_fetch()
         older = asyncio.ensure_future(self.client._maybe_refresh(force=True))
         await wait_for(lambda: calls, "the older refresh to reach the fetch")
-        await asyncio.sleep(0.01)  # the failure this caller reacts to is later than the refresh's start
+        await asyncio.sleep(
+            0.01
+        )  # the failure this caller reacts to is later than the refresh's start
         waiter = asyncio.ensure_future(self.client._maybe_refresh(force=True))
         await asyncio.sleep(0.01)  # let it queue behind the older refresh
         self.assertFalse(waiter.done())
@@ -7399,7 +7485,9 @@ class NamespaceTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
-    async def test_a_handle_survives_the_client_it_is_bound_to_being_open_but_raises_after_close(self):
+    async def test_a_handle_survives_the_client_it_is_bound_to_being_open_but_raises_after_close(
+        self,
+    ):
         client = await self.connect()
         users = client.namespace("users")
         await users.set("k", "v")  # the handle works fine before close()
@@ -7714,7 +7802,9 @@ class ResponseTagTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
-    async def test_a_desynced_stream_is_caught_by_the_tag_check_before_any_caller_sees_wrong_data(self):
+    async def test_a_desynced_stream_is_caught_by_the_tag_check_before_any_caller_sees_wrong_data(
+        self,
+    ):
         # The exact misdelivery request pipelining left open: the server (as a
         # stand-in for any off-by-one stream corruption) never answers
         # the first GET, so the second GET's response arrives at the
@@ -7954,9 +8044,7 @@ class RetryableErrorTests(unittest.IsolatedAsyncioTestCase):
             nodes=[(NAMES[0], "127.0.0.1:1")], proxies=[(NAMES[1], proxy.address)]
         ).start()
         try:
-            client = await NanocachedClient.connect(
-                [("127.0.0.1", discovery.port)], via_proxy=True
-            )
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)], via_proxy=True)
             try:
                 await client.set("k", "v")
                 requests_before = proxy.get_count
@@ -7992,9 +8080,7 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
             proxies=[(NAMES[1], proxy.address)],
         ).start()
         try:
-            client = await NanocachedClient.connect(
-                [("127.0.0.1", discovery.port)], via_proxy=True
-            )
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)], via_proxy=True)
             try:
                 await client.set("k", "v")
                 self.assertEqual(await client.get("k"), "v")
@@ -8049,9 +8135,7 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
             proxies=[(NAMES[0], f"127.0.0.1:{dead_port}"), (NAMES[1], live.address)],
         ).start()
         try:
-            client = await NanocachedClient.connect(
-                [("127.0.0.1", discovery.port)], via_proxy=True
-            )
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)], via_proxy=True)
             try:
                 await client.set("k", "v")
                 self.assertEqual(await client.get("k"), "v")
@@ -8086,9 +8170,7 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
         discovery = await MockDiscovery(nodes=[], proxies=[]).start()
         try:
             with self.assertRaisesRegex(NanocachedError, "no proxies registered"):
-                await NanocachedClient.connect(
-                    [("127.0.0.1", discovery.port)], via_proxy=True
-                )
+                await NanocachedClient.connect([("127.0.0.1", discovery.port)], via_proxy=True)
         finally:
             await discovery.close()
 
@@ -8114,7 +8196,9 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 connected_address = client._single_address
                 dead, survivor = (
-                    (proxy_a, proxy_b) if connected_address == proxy_a.address else (proxy_b, proxy_a)
+                    (proxy_a, proxy_b)
+                    if connected_address == proxy_a.address
+                    else (proxy_b, proxy_a)
                 )
 
                 # The proxy this client is pinned to goes away for good
@@ -8170,7 +8254,9 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
             try:
                 connected_address = client._single_address
                 dead, survivor = (
-                    (proxy_a, proxy_b) if connected_address == proxy_a.address else (proxy_b, proxy_a)
+                    (proxy_a, proxy_b)
+                    if connected_address == proxy_a.address
+                    else (proxy_b, proxy_a)
                 )
 
                 # Plant a stale cooldown entry for an address that is
@@ -8213,13 +8299,9 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
         # server-side (docs/protocol.html "m / o"); this client just
         # sends one (possibly chunked) sub-frame straight to it.
         proxy = await MockNode().start()
-        discovery = await MockDiscovery(
-            nodes=[], proxies=[(NAMES[0], proxy.address)]
-        ).start()
+        discovery = await MockDiscovery(nodes=[], proxies=[(NAMES[0], proxy.address)]).start()
         try:
-            client = await NanocachedClient.connect(
-                [("127.0.0.1", discovery.port)], via_proxy=True
-            )
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)], via_proxy=True)
             try:
                 await client.set_many({"a": "1", "b": "2"})
                 self.assertEqual(await client.get_many(["a", "b"]), {"a": "1", "b": "2"})
@@ -8236,9 +8318,7 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
         # configured read_hedge_after can never take effect — connect()
         # rejects the combination instead of ignoring it.
         proxy = await MockNode().start()
-        discovery = await MockDiscovery(
-            nodes=[], proxies=[(NAMES[0], proxy.address)]
-        ).start()
+        discovery = await MockDiscovery(nodes=[], proxies=[(NAMES[0], proxy.address)]).start()
         try:
             with self.assertRaises(ValueError) as ctx:
                 await NanocachedClient.connect(
@@ -8290,9 +8370,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
                 {"a": "va", b"a": "va", "b": "vb"},
             )
             self.assertEqual(self.node.multi_get_count, 1)
-            self.assertEqual(
-                await client.get_many_bytes([b"a", "a"]), {b"a": b"va", "a": b"va"}
-            )
+            self.assertEqual(await client.get_many_bytes([b"a", "a"]), {b"a": b"va", "a": b"va"})
             # A list that is nothing but copies of one key costs one
             # key's worth of request and reply.
             self.node.multi_get_frame_sizes.clear()
@@ -8325,9 +8403,7 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         try:
             await client.set("a", "va")
             await client.set("b", "vb")
-            self.assertEqual(
-                await client.get_many(["a", "b", "missing"]), {"a": "va", "b": "vb"}
-            )
+            self.assertEqual(await client.get_many(["a", "b", "missing"]), {"a": "va", "b": "vb"})
             self.assertEqual(
                 await client.get_many_bytes(["a", "b", "missing"]),
                 {"a": b"va", "b": b"vb"},
@@ -8343,9 +8419,11 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         try:
             await client.set("a", "12")
             await client.set("c", "34")
-            with mock.patch("nanocached._client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1):
-                with self.assertRaises(DecompressionError):
-                    await client.get_many_bytes(["a", "c"])
+            with (
+                mock.patch("nanocached._client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1),
+                self.assertRaises(DecompressionError),
+            ):
+                await client.get_many_bytes(["a", "c"])
         finally:
             await client.close()
 
@@ -8359,9 +8437,11 @@ class MultiGetSetTests(unittest.IsolatedAsyncioTestCase):
         client = await self.connect(compress=True)
         try:
             await client.set("a", "12")
-            with mock.patch("nanocached._client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1):
-                with self.assertRaises(DecompressionError):
-                    await client.get_many_bytes(["a"])
+            with (
+                mock.patch("nanocached._client._MAX_MULTIGET_DECOMPRESSED_BYTES", 1),
+                self.assertRaises(DecompressionError),
+            ):
+                await client.get_many_bytes(["a"])
         finally:
             await client.close()
 
@@ -8767,7 +8847,9 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
-    async def test_get_many_retries_only_the_unresolved_tail_when_a_later_chunk_fails_in_cluster_mode(self):
+    async def test_get_many_retries_only_the_unresolved_tail_when_a_later_chunk_fails_in_cluster_mode(
+        self,
+    ):
         # Issue #485: in cluster mode a connection-level failure on chunk
         # N>1 of one owner's group used to throw away the chunks that
         # had already succeeded and resend the whole group. The resolved
@@ -8811,8 +8893,14 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(replica.multi_get_count, 1)
                 sizes = primary.multi_get_frame_sizes
                 tail = replica.multi_get_frame_sizes[0]
-                self.assertLess(tail, sizes[0], f"the moved frame should carry only the tail: {sizes} / {tail}")
-                self.assertEqual(tail, sizes[1], f"the moved frame should equal the failed chunk: {sizes} / {tail}")
+                self.assertLess(
+                    tail, sizes[0], f"the moved frame should carry only the tail: {sizes} / {tail}"
+                )
+                self.assertEqual(
+                    tail,
+                    sizes[1],
+                    f"the moved frame should equal the failed chunk: {sizes} / {tail}",
+                )
             finally:
                 await client.close()
         finally:
@@ -8862,7 +8950,7 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(good.multi_set_key_counts, [12])
                 self.assertEqual(bad.multi_set_key_counts, [12, 6])
                 self.assertEqual(
-                    {k: v for k, v in good.store.items()},
+                    dict(good.store.items()),
                     {k.encode(): v.encode() for k, v in values.items()},
                 )
             finally:
@@ -8872,7 +8960,9 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
-    async def test_set_many_reports_a_key_stored_when_its_acknowledging_replica_becomes_the_primary(self):
+    async def test_set_many_reports_a_key_stored_when_its_acknowledging_replica_becomes_the_primary(
+        self,
+    ):
         # R=2 over {a, b, c}, c unreachable. The first key's primary a
         # answers W and its replica b acknowledges; a then leaves the
         # roster, so after the refresh the key's owners are [b, c]: b,
@@ -8893,11 +8983,13 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
         try:
             before = HashRing(names)
             promoted_key = next(
-                f"key-{i}" for i in range(10_000)
+                f"key-{i}"
+                for i in range(10_000)
                 if before.owners(f"key-{i}".encode(), 2) == [names[0], names[1]]
             )
             unreachable_key = next(
-                f"key-{i}" for i in range(10_000)
+                f"key-{i}"
+                for i in range(10_000)
                 if before.owners(f"key-{i}".encode(), 2)[0] == names[2]
             )
             node_a.answer_wrong_node_for_keys({promoted_key.encode()}, 1)
@@ -8927,7 +9019,7 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
             client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
             try:
                 keys = [f"key-{i}" for i in range(30)]
-                await client.set_many({key: "v" for key in keys})
+                await client.set_many(dict.fromkeys(keys, "v"))
                 for key in keys:
                     for owner in self.owners_of(key):
                         self.assertIn(
@@ -8998,9 +9090,7 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
                 owner = nodes[self.owners_of(key)[0]]
 
                 owner.answer_wrong_node_for_keys({key.encode()}, times=1)
-                self.assertEqual(
-                    await client.get_many([key, other]), {key: "v", other: "v2"}
-                )
+                self.assertEqual(await client.get_many([key, other]), {key: "v", other: "v2"})
             finally:
                 await client.close()
         finally:
@@ -9056,7 +9146,9 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
                 keys = [f"k{i}" for i in range(24)]
                 await client.set_many({key: f"v{key}" for key in keys})
                 dead, live = NAMES[0], NAMES[1]
-                live_keys = [key for key in keys if HashRing(NAMES).owners(key.encode(), 1)[0] == live]
+                live_keys = [
+                    key for key in keys if HashRing(NAMES).owners(key.encode(), 1)[0] == live
+                ]
                 self.assertTrue(live_keys and len(live_keys) < len(keys))
                 await nodes[dead].close()
                 await wait_for(
@@ -9066,7 +9158,9 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(PartialConnectionLostError) as ctx:
                     await client.get_many(keys)
                 self.assertNotIsInstance(ctx.exception, WrongNodeError)
-                self.assertEqual(ctx.exception.partial_values, {key: f"v{key}" for key in live_keys})
+                self.assertEqual(
+                    ctx.exception.partial_values, {key: f"v{key}" for key in live_keys}
+                )
                 self.assertIsNotNone(ctx.exception.__cause__)
             finally:
                 await client.close()
@@ -9253,7 +9347,9 @@ class IdentifyFailureRetiresTheSocketTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(waiter.done())
                 retrieved = not waiter._log_traceback
                 self.assertIsInstance(waiter.exception(), ConnectionResetError)
-                self.assertTrue(retrieved, "connection_lost error left unretrieved on the close waiter")
+                self.assertTrue(
+                    retrieved, "connection_lost error left unretrieved on the close waiter"
+                )
         finally:
             server.close()
             await server.wait_closed()
@@ -9393,8 +9489,11 @@ class RedialAfterCloseTests(unittest.IsolatedAsyncioTestCase):
             try:
                 with self.assertRaises(AlreadyClosedError):
                     await asyncio.wait_for(asyncio.shield(request), 3)
-            except asyncio.TimeoutError:
-                self.fail("get() still waiting 3 s after close(): it redialed the node instead of failing as closed")
+            except TimeoutError:
+                self.fail(
+                    "get() still waiting 3 s after close(): it redialed the node "
+                    "instead of failing as closed"
+                )
             finally:
                 request.cancel()
                 with contextlib.suppress(BaseException):
@@ -9464,8 +9563,11 @@ class RedialAfterCloseTests(unittest.IsolatedAsyncioTestCase):
             try:
                 with self.assertRaises(AlreadyClosedError):
                     await asyncio.wait_for(asyncio.shield(request), 3)
-            except asyncio.TimeoutError:
-                self.fail("get() still waiting 3 s after close(): it dialed discovery instead of failing as closed")
+            except TimeoutError:
+                self.fail(
+                    "get() still waiting 3 s after close(): it dialed discovery "
+                    "instead of failing as closed"
+                )
             finally:
                 request.cancel()
                 with contextlib.suppress(BaseException):

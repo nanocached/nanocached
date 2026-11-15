@@ -8,7 +8,9 @@ from __future__ import annotations
 import unittest
 
 import support  # noqa: F401 - configures settings.CACHES / django.setup()
+
 from django.core.exceptions import ImproperlyConfigured
+
 from nanocached_django import NanocachedCache
 
 

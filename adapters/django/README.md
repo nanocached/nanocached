@@ -333,8 +333,17 @@ one.
 
 ```sh
 cd adapters/django
-PYTHONPATH=src:../../sdk/python/src python3 -m unittest discover -s tests -v
+python3 -m venv .venv && .venv/bin/python -m pip install --group dev  # pip >= 25.1
+.venv/bin/ruff format --check .   # `ruff format .` applies it
+.venv/bin/ruff check .
+.venv/bin/mypy                    # strict on src/, non-strict on tests/
+PYTHONPATH=src:../../sdk/python/src .venv/bin/python -m unittest discover -s tests -v
 ```
+
+The `dev` dependency group in `pyproject.toml` pins ruff, mypy and
+django-stubs (it pulls in Django too); `uv venv && uv pip install --group
+dev` does the same. mypy reads the sibling SDK's sources for its types, as
+the tests do.
 
 Tests run against a small in-module `MockNode` (`tests/mock_node.py`, a
 trimmed re-implementation of the SDK's own test double, which is private

@@ -74,6 +74,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor declared in sdk/python/pyproject.toml (requires-python
+        # >=3.11) and the newest CPython release.
+        python-version: ["3.11", "3.15"]
+
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -81,7 +88,27 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install the pinned dev tools
+        working-directory: sdk/python
+        # `--group` (PEP 735 dependency groups) needs pip 25.1+, and pip's
+        # vendored CA bundle is only as current as the runner's interpreter.
+        run: |
+          python -m pip install --upgrade "pip>=26.2.2"
+          python -m pip install --group dev
+
+      - name: Check formatting
+        working-directory: sdk/python
+        run: ruff format --check .
+
+      - name: Lint
+        working-directory: sdk/python
+        run: ruff check .
+
+      - name: Typecheck
+        working-directory: sdk/python
+        run: mypy
 
       - name: Run tests
         working-directory: sdk/python
@@ -197,10 +224,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The floor pinned in adapters/django/pyproject.toml (5.2 LTS) and
-        # the current line, so the floor is actually exercised rather than
-        # whatever `Django>=` happens to resolve to.
-        django: ["Django~=5.2.0", "Django>=6.0"]
+        # The floor pinned in adapters/django/pyproject.toml (5.2 LTS) on the
+        # floor Python (3.11), and the current line on the newest Python —
+        # Django 6 needs 3.12+, so the floors pair up. Pinning Django here
+        # means the floor is actually exercised rather than whatever
+        # `Django>=` happens to resolve to.
+        include:
+          - python-version: "3.11"
+            django: "Django~=5.2.0"
+          - python-version: "3.15"
+            django: "Django>=6.0"
 
     steps:
       - name: Check out repository
@@ -209,15 +242,31 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
-      - name: Install Django
+      - name: Install the pinned dev tools and Django
+        working-directory: adapters/django
         # pip carries its own CA bundle (a vendored certifi), so the pip that
         # ships with the runner's interpreter is only as current as that
-        # interpreter's last release: upgrade it before it downloads anything.
+        # interpreter's last release: upgrade it before it downloads anything
+        # (and `--group` needs pip 25.1+). Django last, so the matrix's pin
+        # wins over whatever django-stubs pulled in.
         run: |
           python -m pip install --upgrade "pip>=26.2.2"
+          python -m pip install --group dev
           python -m pip install "${{ matrix.django }}"
+
+      - name: Check formatting
+        working-directory: adapters/django
+        run: ruff format --check .
+
+      - name: Lint
+        working-directory: adapters/django
+        run: ruff check .
+
+      - name: Typecheck
+        working-directory: adapters/django
+        run: mypy
 
       - name: Run tests
         working-directory: adapters/django

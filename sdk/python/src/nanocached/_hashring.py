@@ -157,7 +157,7 @@ class HashRing:
             # large: the plain full sort.
             scored = [
                 (-fmix64(node_hash ^ hashed_key), node)
-                for node_hash, node in zip(self._node_hashes, self._nodes)
+                for node_hash, node in zip(self._node_hashes, self._nodes, strict=True)
             ]
             scored.sort()
             return [node for _, node in scored[:replicas]]
@@ -169,7 +169,7 @@ class HashRing:
         top: list[tuple[int, str]] = []
         mask = _MASK_64
         floor = -1  # the lowest score kept, once `top` is full
-        for node_hash, node in zip(self._node_hashes, self._nodes):
+        for node_hash, node in zip(self._node_hashes, self._nodes, strict=True):
             # fmix64(node_hash ^ hashed_key), inlined: this loop scores
             # every node on every lookup, and the call overhead alone was
             # a fifth of it. test_hashring.py pins it against fmix64().

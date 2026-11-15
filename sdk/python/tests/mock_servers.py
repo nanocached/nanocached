@@ -470,7 +470,7 @@ class MockNode:
         of the same name."""
         self._silent = True
 
-    async def start(self, port: int = 0, recv_buffer: int | None = None) -> "MockNode":
+    async def start(self, port: int = 0, recv_buffer: int | None = None) -> MockNode:
         """``port`` pins the listener — for a node that comes back on the
         address discovery already advertised (issue #67 tests).
         ``recv_buffer`` sets SO_RCVBUF on the listener before it listens,
@@ -831,7 +831,9 @@ class MockNode:
                     if self._malformed_incr_value is not None:
                         reply_bytes = self._malformed_incr_value
                         self._malformed_incr_value = None
-                    writer.write(b"I %d%b%b\n%b" % (len(reply_bytes), ttl_field, tag_suffix, reply_bytes))
+                    writer.write(
+                        b"I %d%b%b\n%b" % (len(reply_bytes), ttl_field, tag_suffix, reply_bytes)
+                    )
                     await writer.drain()
 
                 elif parts[0] == b"t":
@@ -846,8 +848,8 @@ class MockNode:
                     get = bool(tail) and tail[-1] == b"G"
                     if get:
                         tail = tail[:-1]
-                    ttl = int(tail[0]) if tail else None
-                    self.touches.append((namespace, key, ttl, get))
+                    touch_ttl = int(tail[0]) if tail else None
+                    self.touches.append((namespace, key, touch_ttl, get))
                     if self._touch_gate is not None:
                         await self._touch_gate.wait()
                     if self.legacy_without_touch:
@@ -877,11 +879,11 @@ class MockNode:
                         writer.write(b"N" + tag_suffix + b"\n")
                         await writer.drain()
                         continue
-                    if ttl == 0:
+                    if touch_ttl == 0:
                         self._delete_entry(namespace, key)
                         self.entry_ttl.pop((namespace, key), None)
                     else:
-                        self.entry_ttl[(namespace, key)] = ttl or 0
+                        self.entry_ttl[(namespace, key)] = touch_ttl or 0
                     if self._drop_next_touch_reply:
                         self._drop_next_touch_reply = False
                         writer.close()
@@ -895,8 +897,10 @@ class MockNode:
                         self._wrong_tag_after_apply.discard(b"t")
                         tag_suffix = b" %d" % (int(parts[-1]) + 5)
                     if get:
-                        ttl_field = b" %d" % ttl if ttl is not None else b""
-                        writer.write(b"V %d%b%b\n%b" % (len(current), ttl_field, tag_suffix, current))
+                        ttl_field = b" %d" % touch_ttl if touch_ttl is not None else b""
+                        writer.write(
+                            b"V %d%b%b\n%b" % (len(current), ttl_field, tag_suffix, current)
+                        )
                     else:
                         writer.write(b"S" + tag_suffix + b"\n")
                     await writer.drain()
@@ -989,7 +993,9 @@ class MockNode:
                     key_lengths = [int(x) for x in parts[3 : 3 + count]]
                     keys = [await reader.readexactly(length) for length in key_lengths]
                     self.multi_get_count += 1
-                    self.multi_get_frame_sizes.append(len(header) + len(namespace) + sum(key_lengths))
+                    self.multi_get_frame_sizes.append(
+                        len(header) + len(namespace) + sum(key_lengths)
+                    )
                     if self._silent:
                         continue
                     if self._multi_get_fail_after is not None:
@@ -1031,7 +1037,9 @@ class MockNode:
                     roster_tokens = [token for token, _ in results]
                     body = b"".join(value for _, value in results if value is not None)
                     header = (
-                        b" ".join([b"M", b"%d" % len(roster_tokens), *roster_tokens]) + tag_suffix + b"\n"
+                        b" ".join([b"M", b"%d" % len(roster_tokens), *roster_tokens])
+                        + tag_suffix
+                        + b"\n"
                     )
                     writer.write(header + body)
                     await writer.drain()
@@ -1053,8 +1061,8 @@ class MockNode:
                     get = bool(tail) and tail[-1] == b"G"
                     if get:
                         tail = tail[:-1]
-                    ttl = int(tail[0]) if tail else None
-                    self.multi_touch_frames.append((namespace, keys, ttl, get))
+                    touch_ttl = int(tail[0]) if tail else None
+                    self.multi_touch_frames.append((namespace, keys, touch_ttl, get))
                     if self._touch_gate is not None:
                         await self._touch_gate.wait()
                     if self.legacy_without_touch or self.legacy_without_multi_touch:
@@ -1084,7 +1092,7 @@ class MockNode:
                     consume_wrong = self._multi_wrong_node_times > 0
                     if consume_wrong:
                         self._multi_wrong_node_times -= 1
-                    results: list[tuple[bytes, bytes | None]] = []
+                    results = []
                     for key in keys:
                         if consume_wrong and key in self._multi_wrong_node_keys:
                             results.append((b"W", None))
@@ -1093,11 +1101,11 @@ class MockNode:
                         if current is None:
                             results.append((b"-" if get else b"N", None))
                             continue
-                        if ttl == 0:
+                        if touch_ttl == 0:
                             self._delete_entry(namespace, key)
                             self.entry_ttl.pop((namespace, key), None)
                         else:
-                            self.entry_ttl[(namespace, key)] = ttl or 0
+                            self.entry_ttl[(namespace, key)] = touch_ttl or 0
                         if get:
                             results.append((b"%d" % len(current), current))
                         else:
@@ -1133,7 +1141,7 @@ class MockNode:
                     self.last_set_ttl = ttl
                     keys = []
                     values = []
-                    for key_len, value_len in zip(key_lengths, value_lengths):
+                    for key_len, value_len in zip(key_lengths, value_lengths, strict=True):
                         keys.append(await reader.readexactly(key_len))
                         values.append(await reader.readexactly(value_len))
                     self.multi_set_count += 1
@@ -1162,7 +1170,7 @@ class MockNode:
                     if consume_wrong:
                         self._multi_wrong_node_times -= 1
                     roster_tokens = []
-                    for key, value in zip(keys, values):
+                    for key, value in zip(keys, values, strict=True):
                         if consume_wrong and key in self._multi_wrong_node_keys:
                             roster_tokens.append(b"W")
                             continue
@@ -1179,7 +1187,9 @@ class MockNode:
                         else:
                             roster_tokens = roster_tokens + [b"S"] * (override - len(roster_tokens))
                     header = (
-                        b" ".join([b"O", b"%d" % len(roster_tokens), *roster_tokens]) + tag_suffix + b"\n"
+                        b" ".join([b"O", b"%d" % len(roster_tokens), *roster_tokens])
+                        + tag_suffix
+                        + b"\n"
                     )
                     writer.write(header)
                     await writer.drain()
@@ -1229,7 +1239,7 @@ class MockDiscovery:
         answer_unterminated_value_once on the cache-node path."""
         self._unterminated_list_replies += 1
 
-    async def start(self) -> "MockDiscovery":
+    async def start(self) -> MockDiscovery:
         self._server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
         self.port = self._server.sockets[0].getsockname()[1]
         return self

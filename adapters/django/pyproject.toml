@@ -35,3 +35,92 @@ Issues = "https://github.com/nanocached/nanocached/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# PEP 735: the pinned dev toolchain CI and contributors install
+# (`pip install --group dev` / `uv pip install --group dev`). Not part of the
+# published package's metadata.
+[dependency-groups]
+dev = ["ruff==0.17.5", "mypy==2.4.1", "django-stubs==6.1.2", "django-stubs-ext==6.1.2"]
+
+[tool.ruff]
+target-version = "py311"
+# The width the code was already written to; measured, not reflowed.
+line-length = 100
+# First-party roots for import sorting: the package and the test helpers
+# (support, mock_node), which the tests import as top-level modules.
+src = ["src", "tests"]
+# ruff also formats Python blocks inside Markdown; the README's examples keep
+# their hand-aligned comments.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",  # pycodestyle
+  "F",       # pyflakes
+  "I",       # isort
+  "B",       # flake8-bugbear
+  "UP",      # pyupgrade
+  "SIM",     # flake8-simplify
+  "RUF",     # ruff-specific
+  "ASYNC",   # flake8-async
+  "PERF",    # perflint
+  "C4",      # flake8-comprehensions
+  "PIE",     # flake8-pie
+  "PGH",     # pygrep-hooks
+  "FURB",    # refurb
+  "LOG",     # flake8-logging
+  "T10",     # flake8-debugger
+  "DJ",      # flake8-django
+]
+# PT (flake8-pytest-style) is not selected: the suite is unittest, and PT's
+# rules push pytest idioms (PT009 would rewrite every self.assertEqual).
+ignore = [
+  # try/except/pass is this codebase's idiom, each with the reason it is safe
+  # to swallow; contextlib.suppress adds nothing but a context manager.
+  "SIM105",
+]
+
+[tool.ruff.lint.isort]
+# Every test module imports `support` (settings.configure() + django.setup(),
+# once per process) before any Django import — see tests/support.py. Its own
+# section, ahead of third-party, keeps that order enforced instead of sorted away.
+section-order = [
+  "future", "standard-library", "django-bootstrap", "third-party", "first-party", "local-folder",
+]
+
+[tool.ruff.lint.isort.sections]
+django-bootstrap = ["support"]
+
+[tool.mypy]
+python_version = "3.11"
+# The sibling SDK sources, the same way the tests put them on PYTHONPATH:
+# its py.typed annotations are what this adapter is checked against.
+mypy_path = "../../sdk/python/src"
+files = ["src", "tests"]
+strict = true
+# warn_unreachable stays off: mypy keeps a checked global narrowed across a
+# lock acquisition, so double-checked locking would read as unreachable.
+enable_error_code = ["ignore-without-code"]
+
+[[tool.mypy.overrides]]
+# Errors inside the SDK are the SDK's own mypy run's to report (sdk/python).
+module = ["nanocached", "nanocached.*"]
+follow_imports = "silent"
+
+[[tool.mypy.overrides]]
+# The unittest suite is checked non-strictly (list a new test module here):
+# helpers may stay unannotated, and tests may read the backend's Optional
+# lifecycle state right after starting it and monkeypatch methods on purpose.
+module = [
+  "mock_node", "support", "test_auth", "test_cache_page", "test_close",
+  "test_connect_options", "test_isolation", "test_location",
+  "test_partial_failure_retry", "test_round_trip", "test_shared_bridge",
+  "test_timeouts", "test_unknown_options",
+]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disallow_any_generics = false
+warn_return_any = false
+implicit_reexport = true
+disable_error_code = ["union-attr", "method-assign"]
