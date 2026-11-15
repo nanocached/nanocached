@@ -162,7 +162,7 @@ public class HashRingTests
     /// every node's score, then take the front — kept independent of
     /// HashRing.Owners' own bounded-insertion logic so it can serve as a
     /// ground truth for the property test above.</summary>
-    private static IReadOnlyList<string> NaiveOwners(string[] nodeNames, byte[] key, int replicas)
+    private static string[] NaiveOwners(string[] nodeNames, byte[] key, int replicas)
     {
         ulong keyHash = HashRing.Fnv1a(key);
         List<(ulong Score, string Node)> scored = nodeNames

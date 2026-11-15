@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Globalization;
-using System.Linq;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -1748,7 +1747,7 @@ internal static class Wire
 
     private static readonly object DeadPortLock = new();
     private static readonly HashSet<int> HandedOutPorts = new();
-    private static int nextDeadPort = 20000;
+    private static int _nextDeadPort = 20000;
 
     /// <summary>
     /// A loopback port nothing in this process will listen on: the address
@@ -1771,8 +1770,8 @@ internal static class Wire
         {
             for (int tried = 0; tried < 1000; tried++)
             {
-                int candidate = nextDeadPort;
-                nextDeadPort = candidate == 20999 ? 20000 : candidate + 1;
+                int candidate = _nextDeadPort;
+                _nextDeadPort = candidate == 20999 ? 20000 : candidate + 1;
                 if (HandedOutPorts.Contains(candidate)) continue;
                 var listener = new TcpListener(IPAddress.Loopback, candidate);
                 try

@@ -219,7 +219,13 @@ jobs:
       - name: Set up .NET
         uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
-          dotnet-version: "10.0.x"
+          global-json-file: global.json
+
+      - name: Check formatting, code style and analyzers
+        working-directory: adapters/dotnet
+        run: |
+          dotnet format src/Nanocached.Caching --verify-no-changes
+          dotnet format tests/Nanocached.Caching.Tests --verify-no-changes
 
       - name: Run tests
         working-directory: adapters/dotnet
@@ -451,7 +457,13 @@ jobs:
       - name: Set up .NET
         uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
-          dotnet-version: "10.0.x"
+          global-json-file: global.json
+
+      - name: Check formatting, code style and analyzers
+        working-directory: sdk/dotnet
+        run: |
+          dotnet format src/Nanocached --verify-no-changes
+          dotnet format tests/Nanocached.Tests --verify-no-changes
 
       - name: Run tests
         working-directory: sdk/dotnet

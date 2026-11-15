@@ -1,0 +1,7 @@
+<Project>
+
+  <!-- The same analysis settings as the SDK, which the adapter builds from
+       the sibling checkout. -->
+  <Import Project="../../sdk/dotnet/Directory.Build.props" />
+
+</Project>
