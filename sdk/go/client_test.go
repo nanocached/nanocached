@@ -205,6 +205,8 @@ type mockNode struct {
 	// reply lost after the node executed it. A touch is idempotent, so the
 	// client resends it (unlike an `i`; see applyThenCloseLeft).
 	applyThenCloseTouchLeft atomic.Int32
+	// deletesReceived counts every `D`/`d` this node received, applied or not.
+	deletesReceived atomic.Int32
 	// touchDelay (issue #934): every `t`/`y` request sleeps this many
 	// nanoseconds after it is logged and before it is applied and answered,
 	// so a test can look at what the OTHER owners have seen while this node
@@ -1395,6 +1397,7 @@ func (m *mockNode) serve(conn net.Conn) {
 				}
 				continue
 			}
+			m.deletesReceived.Add(1)
 			reply := "N" + tagSuffix + "\n"
 			if m.takeWrongNode() {
 				reply = "W" + tagSuffix + "\n"
@@ -1422,6 +1425,7 @@ func (m *mockNode) serve(conn net.Conn) {
 				}
 				continue
 			}
+			m.deletesReceived.Add(1)
 			reply := "N" + tagSuffix + "\n"
 			if m.takeWrongNode() {
 				reply = "W" + tagSuffix + "\n"
