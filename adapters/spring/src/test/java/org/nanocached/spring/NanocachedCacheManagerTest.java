@@ -13,6 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Objects;
@@ -150,6 +151,20 @@ class NanocachedCacheManagerTest {
         assertEquals(0, node.entry("forever", key).ttlSeconds());
         assertEquals(1, node.entry("blink", key).ttlSeconds());
         assertEquals(3, node.entry("fractional", key).ttlSeconds());
+    }
+
+    @Test
+    void foreverTtlSaturatesInsteadOfWrappingToOneSecond() {
+        // Issue #1886: ChronoUnit.FOREVER is Duration.ofSeconds(Long.MAX_VALUE,
+        // 999_999_999); rounding its nano part up used to wrap the seconds to
+        // Long.MIN_VALUE, which Math.max(1, ..) turned into a 1s TTL.
+        NanocachedCacheManager manager = manager()
+                .ttl("forever", ChronoUnit.FOREVER.getDuration())
+                .build();
+        manager.getCache("forever").put("k", new User("Alice", 30));
+
+        byte[] key = "String:k".getBytes(StandardCharsets.UTF_8);
+        assertEquals(Long.MAX_VALUE, node.entry("forever", key).ttlSeconds());
     }
 
     @Test
