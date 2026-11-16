@@ -6,9 +6,9 @@ checks. For what nanocached is and how to use it, see the
 
 ## Requirements
 
-- Rust 1.99.1. The repository includes `rust-toolchain.toml`, so Rustup
-  selects the required toolchain and installs the Clippy and rustfmt
-  components automatically.
+- Rust at the version pinned in `rust-toolchain.toml`. Rustup reads that
+  file, so it selects the required toolchain and installs the Clippy and
+  rustfmt components automatically.
 - [`cargo-nextest`](https://nexte.st), which `make test` runs.
 - [`cargo-mutants`](https://mutants.rs), for mutation testing.
 

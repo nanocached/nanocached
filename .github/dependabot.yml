@@ -22,6 +22,11 @@ updates:
     directory: /sdk/go
     schedule:
       interval: weekly
+  # The Go SDK's development tools (staticcheck), kept out of its go.mod.
+  - package-ecosystem: gomod
+    directory: /sdk/go/tools
+    schedule:
+      interval: weekly
   - package-ecosystem: pip
     directory: /sdk/python
     schedule:
