@@ -1,0 +1,8 @@
+# Formatter-only commits, skipped by `git blame` on GitHub and, after
+# `git config blame.ignoreRevsFile .git-blame-ignore-revs`, locally too.
+# List a commit here only if it changes nothing but formatting.
+
+# sdk/java, Java adapters: reformat with google-java-format (AOSP)
+76bcbffb784936732db3397c8652b7d832112aba
+# sdk/java, Java adapters: reformat with palantir-java-format
+f48cbc7d9f8231abe2c5d491cb695eaced250ff9
