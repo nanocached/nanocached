@@ -145,7 +145,7 @@ only.
 ```
 cd adapters/spring-boot-starter
 ./gradlew spotlessApply   # format sources and build scripts (palantir-java-format)
-./gradlew check           # spotlessCheck + compile with javac -Xlint:all -Werror + tests
+./gradlew check           # spotlessCheck + javac -Xlint:all -Werror + Javadoc (doclint) + tests
 ./gradlew test            # tests only
 ```
 

@@ -68,6 +68,19 @@ tasks.withType(JavaCompile).configureEach {
         '-Xlint:-serial',
         '-Werror'
     ]
+    options.encoding = 'UTF-8'
+}
+
+// The Javadoc ships in the -javadoc jar, so doclint errors (broken links and
+// references, malformed HTML) fail `check`. `missing` stays off, as CS1591 in
+// the .NET build: a @param/@return on every self-explanatory member is noise.
+tasks.withType(Javadoc).configureEach {
+    options.encoding = 'UTF-8'
+    options.addBooleanOption('Xdoclint:all,-missing', true)
+    options.addBooleanOption('Werror', true)
+}
+tasks.named('check') {
+    dependsOn tasks.named('javadoc')
 }
 
 // -try, tests only: tests deliberately close() a resource mid-body to test
