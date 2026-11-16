@@ -152,18 +152,14 @@ public final class NanocachedCache extends AbstractValueAdaptingCache {
                     // Whatever ended the run, the waiters are released:
                     // a no-op after load() settled the outcome itself.
                     mine.outcome()
-                            .completeExceptionally(
-                                    new IllegalStateException(
-                                            "nanocached-spring: the value loader for key "
-                                                    + key
-                                                    + " did not complete"));
+                            .completeExceptionally(new IllegalStateException(
+                                    "nanocached-spring: the value loader for key " + key + " did not complete"));
                 }
             }
             if (running.owner() == Thread.currentThread()) {
-                throw new IllegalStateException(
-                        "nanocached-spring: the value loader for key "
-                                + key
-                                + " re-entered get(key, valueLoader) for the same key on the same thread");
+                throw new IllegalStateException("nanocached-spring: the value loader for key "
+                        + key
+                        + " re-entered get(key, valueLoader) for the same key on the same thread");
             }
             try {
                 return (T) fromStoreValue(running.outcome().join());

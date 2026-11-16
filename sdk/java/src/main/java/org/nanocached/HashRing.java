@@ -102,9 +102,7 @@ final class HashRing {
         // encoding width every implementation uses, not a truncation
         // that could ever occur.
         int length = namespace.length;
-        byte[] namespaceLength = {
-            (byte) (length >>> 24), (byte) (length >>> 16), (byte) (length >>> 8), (byte) length
-        };
+        byte[] namespaceLength = {(byte) (length >>> 24), (byte) (length >>> 16), (byte) (length >>> 8), (byte) length};
 
         long hash = fnv1aContinue(0xcbf29ce484222325L, namespaceLength);
         hash = fnv1aContinue(hash, namespace);
@@ -174,11 +172,10 @@ final class HashRing {
 
     // Descending by UNSIGNED score; ties toward the lexicographically
     // smaller name — a total order every implementation agrees on.
-    private static final Comparator<Scored> ORDER =
-            (a, b) -> {
-                int byScore = Long.compareUnsigned(b.score(), a.score());
-                return byScore != 0 ? byScore : compareNames(a.node(), b.node());
-            };
+    private static final Comparator<Scored> ORDER = (a, b) -> {
+        int byScore = Long.compareUnsigned(b.score(), a.score());
+        return byScore != 0 ? byScore : compareNames(a.node(), b.node());
+    };
 
     /**
      * Orders node names by their UTF-8 bytes, unsigned — the server's {@code str::cmp} in {@code
@@ -188,8 +185,7 @@ final class HashRing {
      * three-byte one). Reached only on a score tie, so the allocation does not matter.
      */
     static int compareNames(String a, String b) {
-        return java.util.Arrays.compareUnsigned(
-                a.getBytes(StandardCharsets.UTF_8), b.getBytes(StandardCharsets.UTF_8));
+        return java.util.Arrays.compareUnsigned(a.getBytes(StandardCharsets.UTF_8), b.getBytes(StandardCharsets.UTF_8));
     }
 
     /** The key's primary — {@code owners(key, 1).get(0)}. */

@@ -129,16 +129,15 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             attempts++;
             long elapsedNanos = System.nanoTime() - started;
             if (elapsedNanos > TimeUnit.MILLISECONDS.toNanos(casRetryDeadlineMillis)) {
-                throw new CacheException(
-                        "nanocached-jcache: "
-                                + operation
-                                + " on key "
-                                + key
-                                + " gave up after "
-                                + attempts
-                                + " attempts over "
-                                + TimeUnit.NANOSECONDS.toMillis(elapsedNanos)
-                                + " ms: the stored value kept changing between the read and the compare-and-set");
+                throw new CacheException("nanocached-jcache: "
+                        + operation
+                        + " on key "
+                        + key
+                        + " gave up after "
+                        + attempts
+                        + " attempts over "
+                        + TimeUnit.NANOSECONDS.toMillis(elapsedNanos)
+                        + " ms: the stored value kept changing between the read and the compare-and-set");
             }
             long pause = Math.min(CAS_BACKOFF_MAX_NANOS, 20_000L << Math.min(attempts, 20));
             java.util.concurrent.locks.LockSupport.parkNanos(pause);
@@ -186,18 +185,17 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     static final ThreadPoolExecutor REMOVE_ALL_EXECUTOR = newRemoveAllExecutor();
 
     private static ThreadPoolExecutor newRemoveAllExecutor() {
-        ThreadPoolExecutor executor =
-                new ThreadPoolExecutor(
-                        MAX_CONCURRENT_REMOVES,
-                        MAX_CONCURRENT_REMOVES,
-                        REMOVE_ALL_IDLE_SECONDS,
-                        TimeUnit.SECONDS,
-                        new LinkedBlockingQueue<>(),
-                        runnable -> {
-                            Thread thread = new Thread(runnable, "nanocached-jcache-removeAll");
-                            thread.setDaemon(true);
-                            return thread;
-                        });
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+                MAX_CONCURRENT_REMOVES,
+                MAX_CONCURRENT_REMOVES,
+                REMOVE_ALL_IDLE_SECONDS,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "nanocached-jcache-removeAll");
+                    thread.setDaemon(true);
+                    return thread;
+                });
         executor.allowCoreThreadTimeOut(true);
         return executor;
     }
@@ -217,8 +215,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
 
     private final CompleteConfiguration<K, V> configuration;
     private final ExpiryPolicy expiryPolicy;
-    private final CopyOnWriteArrayList<RegisteredListener<K, V>> listeners =
-            new CopyOnWriteArrayList<>();
+    private final CopyOnWriteArrayList<RegisteredListener<K, V>> listeners = new CopyOnWriteArrayList<>();
     private final NanocachedCacheStatistics statistics = new NanocachedCacheStatistics();
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private volatile ObjectName statisticsObjectName;
@@ -259,10 +256,9 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         // longer be overwritten with the value this get observed, and the
         // value does not travel back to the node.
         Duration accessExpiry = expiryPolicy.getExpiryForAccess();
-        Optional<byte[]> raw =
-                accessExpiry == null
-                        ? namespace.getBytes(keyBytes)
-                        : namespace.getAndTouchBytes(keyBytes, touchTtlSeconds(accessExpiry));
+        Optional<byte[]> raw = accessExpiry == null
+                ? namespace.getBytes(keyBytes)
+                : namespace.getAndTouchBytes(keyBytes, touchTtlSeconds(accessExpiry));
         if (raw.isEmpty()) {
             statistics.recordMiss();
             return null;
@@ -306,11 +302,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             raw = getManyBytesResolvingWrongNode(namespace::getManyBytes, wireKeys, false);
         } else {
             long touchTtl = touchTtlSeconds(accessExpiry);
-            raw =
-                    getManyBytesResolvingWrongNode(
-                            pending -> namespace.getManyAndTouchBytes(pending, touchTtl),
-                            wireKeys,
-                            touchTtl == 0L);
+            raw = getManyBytesResolvingWrongNode(
+                    pending -> namespace.getManyAndTouchBytes(pending, touchTtl), wireKeys, touchTtl == 0L);
         }
 
         for (int i = 0; i < ordered.size(); i++) {
@@ -468,9 +461,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
 
         Optional<NanocachedClient.CasEntry> existing = namespace.getWithToken(keyBytes);
         Duration expiry =
-                existing.isPresent()
-                        ? expiryPolicy.getExpiryForUpdate()
-                        : expiryPolicy.getExpiryForCreation();
+                existing.isPresent() ? expiryPolicy.getExpiryForUpdate() : expiryPolicy.getExpiryForCreation();
         OptionalLong ttl = wireTtlSeconds(expiry);
         if (ttl.isEmpty()) {
             // Issue #278: an update resolving to Duration.ZERO deletes the
@@ -609,8 +600,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 loop.lostTheRace();
                 continue;
             }
-            if (namespace.replace(
-                    keyBytes, existing.get().token(), newValueBytes, ttl.getAsLong())) {
+            if (namespace.replace(keyBytes, existing.get().token(), newValueBytes, ttl.getAsLong())) {
                 statistics.recordHit();
                 statistics.recordPut();
                 fireUpdated(key, newValue, currentValue);
@@ -718,8 +708,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             n++;
         }
 
-        byte[][] existing =
-                getManyBytesResolvingWrongNode(namespace::getManyBytes, wireKeys, false);
+        byte[][] existing = getManyBytesResolvingWrongNode(namespace::getManyBytes, wireKeys, false);
 
         // Resolved TTL → the positions that share it. Insertion order is
         // kept so the groups' writes (and their listener events) follow
@@ -728,10 +717,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         for (int i = 0; i < n; i++) {
             boolean present = existing[i] != null;
             OptionalLong ttl =
-                    wireTtlSeconds(
-                            present
-                                    ? expiryPolicy.getExpiryForUpdate()
-                                    : expiryPolicy.getExpiryForCreation());
+                    wireTtlSeconds(present ? expiryPolicy.getExpiryForUpdate() : expiryPolicy.getExpiryForCreation());
             if (ttl.isEmpty()) {
                 // Issue #278: same as put()'s equivalent branch above —
                 // an update resolving to Duration.ZERO deletes the entry
@@ -943,7 +929,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             futures.add(CompletableFuture.runAsync(() -> remove(key), REMOVE_ALL_EXECUTOR));
         }
         try {
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0])).join();
+            CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[0]))
+                    .join();
         } catch (CompletionException wrapped) {
             Throwable cause = wrapped.getCause();
             if (cause instanceof RuntimeException runtimeException) {
@@ -978,29 +965,23 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     @Override
     public Iterator<Cache.Entry<K, V>> iterator() {
         throw new UnsupportedOperationException(
-                "nanocached-jcache: no key enumeration on the wire protocol — this cache cannot be"
-                        + " iterated");
+                "nanocached-jcache: no key enumeration on the wire protocol — this cache cannot be" + " iterated");
     }
 
     @Override
     public <T> T invoke(K key, EntryProcessor<K, V, T> entryProcessor, Object... arguments)
             throws EntryProcessorException {
-        throw new UnsupportedOperationException(
-                "nanocached-jcache: entry processors are not supported");
+        throw new UnsupportedOperationException("nanocached-jcache: entry processors are not supported");
     }
 
     @Override
     public <T> Map<K, EntryProcessorResult<T>> invokeAll(
             Set<? extends K> keys, EntryProcessor<K, V, T> entryProcessor, Object... arguments) {
-        throw new UnsupportedOperationException(
-                "nanocached-jcache: entry processors are not supported");
+        throw new UnsupportedOperationException("nanocached-jcache: entry processors are not supported");
     }
 
     @Override
-    public void loadAll(
-            Set<? extends K> keys,
-            boolean replaceExistingValues,
-            CompletionListener completionListener) {
+    public void loadAll(Set<? extends K> keys, boolean replaceExistingValues, CompletionListener completionListener) {
         requireNotClosed();
         // No CacheLoader is ever configured (rejected at createCache), so
         // per spec this completes immediately with nothing to do.
@@ -1017,8 +998,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         if (clazz.isInstance(configuration)) {
             return (C) configuration;
         }
-        throw new IllegalArgumentException(
-                "nanocached-jcache: configuration cannot be represented as " + clazz);
+        throw new IllegalArgumentException("nanocached-jcache: configuration cannot be represented as " + clazz);
     }
 
     @Override
@@ -1171,13 +1151,12 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     }
 
     private void logUndecodableOldValue(K key, Throwable e) {
-        System.err.println(
-                "nanocached-jcache: previous value of "
-                        + key
-                        + " in "
-                        + name
-                        + " cannot be deserialized; firing the event without an old value: "
-                        + e);
+        System.err.println("nanocached-jcache: previous value of "
+                + key
+                + " in "
+                + name
+                + " cannot be deserialized; firing the event without an old value: "
+                + e);
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
@@ -1186,8 +1165,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             return;
         }
         NanocachedCacheEntryEvent<K, V> event =
-                new NanocachedCacheEntryEvent<>(
-                        this, type, key, value, oldValue, oldValueAvailable);
+                new NanocachedCacheEntryEvent<>(this, type, key, value, oldValue, oldValueAvailable);
         List<CacheEntryEvent<? extends K, ? extends V>> events = List.of(event);
         for (RegisteredListener<K, V> registered : listeners) {
             if (registered.filter() != null && !registered.filter().evaluate(event)) {
@@ -1196,20 +1174,17 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             try {
                 switch (type) {
                     case CREATED -> {
-                        if (registered.listener()
-                                instanceof CacheEntryCreatedListener<?, ?> listener) {
+                        if (registered.listener() instanceof CacheEntryCreatedListener<?, ?> listener) {
                             ((CacheEntryCreatedListener) listener).onCreated((Iterable) events);
                         }
                     }
                     case UPDATED -> {
-                        if (registered.listener()
-                                instanceof CacheEntryUpdatedListener<?, ?> listener) {
+                        if (registered.listener() instanceof CacheEntryUpdatedListener<?, ?> listener) {
                             ((CacheEntryUpdatedListener) listener).onUpdated((Iterable) events);
                         }
                     }
                     case REMOVED -> {
-                        if (registered.listener()
-                                instanceof CacheEntryRemovedListener<?, ?> listener) {
+                        if (registered.listener() instanceof CacheEntryRemovedListener<?, ?> listener) {
                             ((CacheEntryRemovedListener) listener).onRemoved((Iterable) events);
                         }
                     }
@@ -1242,12 +1217,10 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             return;
         }
         try {
-            ObjectName objectName =
-                    new ObjectName(
-                            "javax.cache:type=CacheStatistics,CacheManager="
-                                    + ObjectName.quote(manager.getURI().toString())
-                                    + ",Cache="
-                                    + ObjectName.quote(name));
+            ObjectName objectName = new ObjectName("javax.cache:type=CacheStatistics,CacheManager="
+                    + ObjectName.quote(manager.getURI().toString())
+                    + ",Cache="
+                    + ObjectName.quote(name));
             ManagementFactory.getPlatformMBeanServer().registerMBean(statistics, objectName);
             statisticsObjectName = objectName;
         } catch (JMException e) {
@@ -1334,18 +1307,15 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         }
 
         private static RuntimeException wrapped(RuntimeException error) {
-            boolean backend =
-                    error instanceof NanocachedException
-                            || error instanceof IllegalArgumentException;
+            boolean backend = error instanceof NanocachedException || error instanceof IllegalArgumentException;
             return backend ? failure(error) : error;
         }
 
         private static RuntimeException wrappedUnlessBulkOutcome(RuntimeException error) {
-            boolean bulkOutcome =
-                    error instanceof NanocachedException.PartialWrongNodeRaw
-                            || error instanceof NanocachedException.PartialConnectionLostRaw
-                            || error instanceof NanocachedException.PartialConnectionLostSetRaw
-                            || error instanceof NanocachedException.WrongNode;
+            boolean bulkOutcome = error instanceof NanocachedException.PartialWrongNodeRaw
+                    || error instanceof NanocachedException.PartialConnectionLostRaw
+                    || error instanceof NanocachedException.PartialConnectionLostSetRaw
+                    || error instanceof NanocachedException.WrongNode;
             return bulkOutcome ? error : wrapped(error);
         }
 

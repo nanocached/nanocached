@@ -22,16 +22,13 @@ import org.springframework.core.type.AnnotatedTypeMetadata;
 class OnNanocachedAddressesCondition extends SpringBootCondition {
 
     @Override
-    public ConditionOutcome getMatchOutcome(
-            ConditionContext context, AnnotatedTypeMetadata metadata) {
-        List<String> addresses =
-                Binder.get(context.getEnvironment())
-                        .bind("nanocached.addresses", Bindable.listOf(String.class))
-                        .orElse(null);
+    public ConditionOutcome getMatchOutcome(ConditionContext context, AnnotatedTypeMetadata metadata) {
+        List<String> addresses = Binder.get(context.getEnvironment())
+                .bind("nanocached.addresses", Bindable.listOf(String.class))
+                .orElse(null);
         ConditionMessage.Builder message = ConditionMessage.forCondition("Nanocached addresses");
         if (addresses == null || addresses.isEmpty()) {
-            return ConditionOutcome.noMatch(
-                    message.didNotFind("property").items("nanocached.addresses"));
+            return ConditionOutcome.noMatch(message.didNotFind("property").items("nanocached.addresses"));
         }
         return ConditionOutcome.match(message.found("property").items("nanocached.addresses"));
     }

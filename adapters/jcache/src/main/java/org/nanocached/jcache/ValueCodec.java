@@ -31,9 +31,7 @@ final class ValueCodec {
     static byte[] serialize(Object value) {
         if (!(value instanceof Serializable)) {
             throw new IllegalArgumentException(
-                    "nanocached-jcache: value of type "
-                            + value.getClass().getName()
-                            + " is not Serializable");
+                    "nanocached-jcache: value of type " + value.getClass().getName() + " is not Serializable");
         }
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
@@ -70,8 +68,7 @@ final class ValueCodec {
         if (loader == null) {
             loader = ValueCodec.class.getClassLoader();
         }
-        try (ObjectInputStream in =
-                new LoaderObjectInputStream(new ByteArrayInputStream(bytes), loader)) {
+        try (ObjectInputStream in = new LoaderObjectInputStream(new ByteArrayInputStream(bytes), loader)) {
             ObjectInputFilter filter = ObjectInputFilter.Config.getSerialFilter();
             if (filter != null) {
                 in.setObjectInputFilter(filter);
@@ -91,8 +88,7 @@ final class ValueCodec {
         }
 
         @Override
-        protected Class<?> resolveClass(ObjectStreamClass desc)
-                throws IOException, ClassNotFoundException {
+        protected Class<?> resolveClass(ObjectStreamClass desc) throws IOException, ClassNotFoundException {
             try {
                 return Class.forName(desc.getName(), false, loader);
             } catch (ClassNotFoundException notInLoader) {

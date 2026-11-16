@@ -62,8 +62,7 @@ final class MockNode implements AutoCloseable {
      * Every {@code y} (batched touch, issue #871) header line received verbatim, e.g. {@code "y 7 2
      * 1 1 30 G 0"}.
      */
-    final java.util.List<String> multiTouchFrames =
-            new java.util.concurrent.CopyOnWriteArrayList<>();
+    final java.util.List<String> multiTouchFrames = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     /**
      * When set, every {@code y} is answered like a node that knows {@code t} but predates {@code
@@ -147,31 +146,30 @@ final class MockNode implements AutoCloseable {
 
     MockNode() throws IOException {
         server = new ServerSocket(0, 16, InetAddress.getLoopbackAddress());
-        acceptLoop =
-                new Thread(() -> {
-                    while (true) {
-                        try {
-                            Socket socket = server.accept();
-                            synchronized (lifecycle) {
-                                if (closed) {
-                                    // accept() won against close(): the connection
-                                    // arrived while the listener was going away. It
-                                    // must not be served by a node that has already
-                                    // been closed.
-                                    socket.close();
-                                    return;
-                                }
-                                accepted.add(socket);
-                                Thread serve = new Thread(() -> serve(socket));
-                                serve.setDaemon(true);
-                                serveThreads.add(serve);
-                                serve.start();
-                            }
-                        } catch (IOException stop) {
+        acceptLoop = new Thread(() -> {
+            while (true) {
+                try {
+                    Socket socket = server.accept();
+                    synchronized (lifecycle) {
+                        if (closed) {
+                            // accept() won against close(): the connection
+                            // arrived while the listener was going away. It
+                            // must not be served by a node that has already
+                            // been closed.
+                            socket.close();
                             return;
                         }
+                        accepted.add(socket);
+                        Thread serve = new Thread(() -> serve(socket));
+                        serve.setDaemon(true);
+                        serveThreads.add(serve);
+                        serve.start();
                     }
-                });
+                } catch (IOException stop) {
+                    return;
+                }
+            }
+        });
         acceptLoop.setDaemon(true);
         acceptLoop.start();
     }
@@ -186,8 +184,7 @@ final class MockNode implements AutoCloseable {
 
     Map<ByteBuffer, Entry> store(String namespace) {
         return stores.computeIfAbsent(
-                ByteBuffer.wrap(namespace.getBytes(StandardCharsets.UTF_8)),
-                unused -> new ConcurrentHashMap<>());
+                ByteBuffer.wrap(namespace.getBytes(StandardCharsets.UTF_8)), unused -> new ConcurrentHashMap<>());
     }
 
     Entry entry(String namespace, byte[] key) {
@@ -250,8 +247,7 @@ final class MockNode implements AutoCloseable {
             thread.join(5_000);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
-            throw new java.io.InterruptedIOException(
-                    "interrupted while stopping a mock node thread");
+            throw new java.io.InterruptedIOException("interrupted while stopping a mock node thread");
         }
         if (thread.isAlive()) {
             throw new IOException("a mock node thread did not stop within 5 s of close()");
@@ -307,12 +303,7 @@ final class MockNode implements AutoCloseable {
                     case "d" -> {
                         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
                         deleteCount.incrementAndGet();
-                        delete(
-                                in,
-                                ns(namespace),
-                                Integer.parseInt(parts[2]),
-                                tagSuffix,
-                                deleteReplies);
+                        delete(in, ns(namespace), Integer.parseInt(parts[2]), tagSuffix, deleteReplies);
                     }
                     case "c" -> {
                         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
@@ -353,37 +344,34 @@ final class MockNode implements AutoCloseable {
      * stay in request order on the wire even though every delayed delete's own wait runs
      * concurrently with every other one's.
      */
-    private Thread startDeleteReplyWriter(
-            OutputStream out, BlockingQueue<CompletableFuture<byte[]>> replies) {
-        Thread writer =
-                new Thread(() -> {
+    private Thread startDeleteReplyWriter(OutputStream out, BlockingQueue<CompletableFuture<byte[]>> replies) {
+        Thread writer = new Thread(() -> {
+            try {
+                while (true) {
+                    byte[] line;
                     try {
-                        while (true) {
-                            byte[] line;
-                            try {
-                                line = replies.take().join();
-                            } catch (InterruptedException stop) {
-                                return;
-                            } catch (java.util.concurrent.CancellationException
-                                    | java.util.concurrent.CompletionException stopped) {
-                                return;
-                            }
-                            synchronized (out) {
-                                out.write(line);
-                                out.flush();
-                            }
-                        }
-                    } catch (IOException closed) {
-                        // The connection died under us — nothing left to answer.
+                        line = replies.take().join();
+                    } catch (InterruptedException stop) {
+                        return;
+                    } catch (java.util.concurrent.CancellationException
+                            | java.util.concurrent.CompletionException stopped) {
+                        return;
                     }
-                });
+                    synchronized (out) {
+                        out.write(line);
+                        out.flush();
+                    }
+                }
+            } catch (IOException closed) {
+                // The connection died under us — nothing left to answer.
+            }
+        });
         writer.setDaemon(true);
         writer.start();
         return writer;
     }
 
-    private void get(
-            InputStream in, OutputStream out, String namespace, int keyLength, String tagSuffix)
+    private void get(InputStream in, OutputStream out, String namespace, int keyLength, String tagSuffix)
             throws IOException {
         byte[] key = in.readNBytes(keyLength);
         Entry entry = entry(namespace, key);
@@ -396,9 +384,7 @@ final class MockNode implements AutoCloseable {
             return;
         }
         synchronized (out) {
-            out.write(
-                    ("V " + entry.value().length + tagSuffix + "\n")
-                            .getBytes(StandardCharsets.US_ASCII));
+            out.write(("V " + entry.value().length + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
             out.write(entry.value());
             out.flush();
         }
@@ -411,12 +397,7 @@ final class MockNode implements AutoCloseable {
      * <len> [<ttl-now-in-effect>] [<tag>]}.
      */
     private void touch(
-            InputStream in,
-            OutputStream out,
-            String namespace,
-            String[] parts,
-            boolean tagged,
-            String tagSuffix)
+            InputStream in, OutputStream out, String namespace, String[] parts, boolean tagged, String tagSuffix)
             throws IOException {
         byte[] key = in.readNBytes(Integer.parseInt(parts[2]));
         touchFrames.add(String.join(" ", parts));
@@ -451,20 +432,14 @@ final class MockNode implements AutoCloseable {
         String ttlField = ttl != null && ttl > 0 ? " " + ttl : "";
         synchronized (out) {
             out.write(
-                    ("V " + existing.value().length + ttlField + tagSuffix + "\n")
-                            .getBytes(StandardCharsets.US_ASCII));
+                    ("V " + existing.value().length + ttlField + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
             out.write(existing.value());
             out.flush();
         }
     }
 
     private void set(
-            InputStream in,
-            OutputStream out,
-            String namespace,
-            String[] parts,
-            boolean tagged,
-            String tagSuffix)
+            InputStream in, OutputStream out, String namespace, String[] parts, boolean tagged, String tagSuffix)
             throws IOException {
         int keyLength = Integer.parseInt(parts[2]);
         int valueLength = Integer.parseInt(parts[3]);
@@ -498,28 +473,23 @@ final class MockNode implements AutoCloseable {
         long delay = deleteDelayMillis;
         if (delay <= 0) {
             boolean existed = store(namespace).remove(ByteBuffer.wrap(key)) != null;
-            replies.add(
-                    CompletableFuture.completedFuture(
-                            ((existed ? "D" : "N") + tagSuffix + "\n")
-                                    .getBytes(StandardCharsets.US_ASCII)));
+            replies.add(CompletableFuture.completedFuture(
+                    ((existed ? "D" : "N") + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII)));
             return;
         }
         CompletableFuture<byte[]> future = new CompletableFuture<>();
         replies.add(future);
-        Thread worker =
-                new Thread(() -> {
-                    try {
-                        Thread.sleep(delay);
-                    } catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        future.cancel(false);
-                        return;
-                    }
-                    boolean existed = store(namespace).remove(ByteBuffer.wrap(key)) != null;
-                    future.complete(
-                            ((existed ? "D" : "N") + tagSuffix + "\n")
-                                    .getBytes(StandardCharsets.US_ASCII));
-                });
+        Thread worker = new Thread(() -> {
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                future.cancel(false);
+                return;
+            }
+            boolean existed = store(namespace).remove(ByteBuffer.wrap(key)) != null;
+            future.complete(((existed ? "D" : "N") + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
+        });
         worker.setDaemon(true);
         worker.start();
     }
@@ -531,8 +501,7 @@ final class MockNode implements AutoCloseable {
      * answers {@code W} for a key in {@link #forceWrongNodeCountsForGet} (issue #415's regression
      * tests), never on its own.
      */
-    private void multiGet(
-            InputStream in, OutputStream out, String namespace, String[] parts, String tagSuffix)
+    private void multiGet(InputStream in, OutputStream out, String namespace, String[] parts, String tagSuffix)
             throws IOException {
         int n = Integer.parseInt(parts[2]);
         int[] keyLengths = new int[n];
@@ -559,8 +528,7 @@ final class MockNode implements AutoCloseable {
             if (wrongNode[i]) {
                 header.append(" W");
             } else {
-                header.append(' ')
-                        .append(values[i] == null ? "-" : String.valueOf(values[i].length));
+                header.append(' ').append(values[i] == null ? "-" : String.valueOf(values[i].length));
             }
         }
         header.append(tagSuffix).append('\n');
@@ -583,12 +551,7 @@ final class MockNode implements AutoCloseable {
      * #forceWrongNodeCountsForGet} answers {@code W}, like {@link #multiGet}.
      */
     private void multiTouch(
-            InputStream in,
-            OutputStream out,
-            String namespace,
-            String[] parts,
-            boolean tagged,
-            String tagSuffix)
+            InputStream in, OutputStream out, String namespace, String[] parts, boolean tagged, String tagSuffix)
             throws IOException {
         int n = Integer.parseInt(parts[2]);
         int[] keyLengths = new int[n];
@@ -611,8 +574,7 @@ final class MockNode implements AutoCloseable {
         multiTouchFrames.add(String.join(" ", parts));
         if (takeDrop(multiTouchOkCountdown, multiTouchDropRemaining)) {
             // The frame was read in full, so the client counts it as sent.
-            throw new IOException(
-                    "nanocached-test: forced connection drop after a y frame (issue #938)");
+            throw new IOException("nanocached-test: forced connection drop after a y frame (issue #938)");
         }
         if (rejectMultiTouch) {
             reply(out, "En\n");
@@ -667,12 +629,7 @@ final class MockNode implements AutoCloseable {
      * — this single-node mock never answers {@code W} on its own.
      */
     private void multiSet(
-            InputStream in,
-            OutputStream out,
-            String namespace,
-            String[] parts,
-            boolean tagged,
-            String tagSuffix)
+            InputStream in, OutputStream out, String namespace, String[] parts, boolean tagged, String tagSuffix)
             throws IOException {
         int n = Integer.parseInt(parts[2]);
         int[] keyLengths = new int[n];
@@ -713,8 +670,7 @@ final class MockNode implements AutoCloseable {
      * after the three lengths; the optional {@code <ttl>} then the tag (on a tagged connection)
      * follow, mirroring {@code s}'s own trailing-field layout.
      */
-    private void casSet(
-            InputStream in, OutputStream out, String[] parts, boolean tagged, String tagSuffix)
+    private void casSet(InputStream in, OutputStream out, String[] parts, boolean tagged, String tagSuffix)
             throws IOException {
         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
         int keyLength = Integer.parseInt(parts[2]);
@@ -725,14 +681,13 @@ final class MockNode implements AutoCloseable {
         casSetCount.incrementAndGet();
 
         Entry existing = entry(ns(namespace), key);
-        boolean matches =
-                !forceCasMismatchOnce.compareAndSet(true, false)
-                        && !forceSustainedMismatch()
-                        && switch (cond) {
-                            case "A" -> existing == null;
-                            case "P" -> existing != null;
-                            default -> existing != null && digestOf(existing.value()).equals(cond);
-                        };
+        boolean matches = !forceCasMismatchOnce.compareAndSet(true, false)
+                && !forceSustainedMismatch()
+                && switch (cond) {
+                    case "A" -> existing == null;
+                    case "P" -> existing != null;
+                    default -> existing != null && digestOf(existing.value()).equals(cond);
+                };
         if (matches) {
             int ttlFieldCount = parts.length - 5 - (tagged ? 1 : 0);
             long ttlSeconds = ttlFieldCount > 0 ? Long.parseLong(parts[5]) : 0;
@@ -744,8 +699,7 @@ final class MockNode implements AutoCloseable {
     }
 
     /** {@code x <ns-len> <key-len> <cond> [tag]}. */
-    private void casDelete(InputStream in, OutputStream out, String[] parts, String tagSuffix)
-            throws IOException {
+    private void casDelete(InputStream in, OutputStream out, String[] parts, String tagSuffix) throws IOException {
         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
         int keyLength = Integer.parseInt(parts[2]);
         String cond = parts[3];
@@ -753,11 +707,10 @@ final class MockNode implements AutoCloseable {
         casDeleteCount.incrementAndGet();
 
         Entry existing = entry(ns(namespace), key);
-        boolean matches =
-                !forceCasMismatchOnce.compareAndSet(true, false)
-                        && !forceSustainedMismatch()
-                        && existing != null
-                        && digestOf(existing.value()).equals(cond);
+        boolean matches = !forceCasMismatchOnce.compareAndSet(true, false)
+                && !forceSustainedMismatch()
+                && existing != null
+                && digestOf(existing.value()).equals(cond);
         if (matches) {
             store(ns(namespace)).remove(ByteBuffer.wrap(key));
             reply(out, "D" + tagSuffix + "\n");
@@ -773,8 +726,7 @@ final class MockNode implements AutoCloseable {
     /** See {@link #forceWrongNodeCountsForGet}/{@link #forceWrongNodeCountsForSet}. */
     private static boolean forceWrongNode(Map<ByteBuffer, AtomicInteger> counts, byte[] key) {
         AtomicInteger remaining = counts.get(ByteBuffer.wrap(key));
-        return remaining != null
-                && remaining.getAndUpdate(count -> count > 0 ? count - 1 : count) > 0;
+        return remaining != null && remaining.getAndUpdate(count -> count > 0 ? count - 1 : count) > 0;
     }
 
     /**

@@ -33,14 +33,12 @@ public final class NanocachedCachingProvider implements CachingProvider {
 
     private static final URI DEFAULT_URI = URI.create("nanocached:jcache");
 
-    private final ConcurrentHashMap<ManagerKey, NanocachedCacheManager> managers =
-            new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<ManagerKey, NanocachedCacheManager> managers = new ConcurrentHashMap<>();
 
     @Override
     public CacheManager getCacheManager(URI uri, ClassLoader classLoader, Properties properties) {
         URI resolvedUri = uri != null ? uri : getDefaultURI();
-        ClassLoader resolvedClassLoader =
-                classLoader != null ? classLoader : getDefaultClassLoader();
+        ClassLoader resolvedClassLoader = classLoader != null ? classLoader : getDefaultClassLoader();
         ManagerKey key = new ManagerKey(resolvedUri, resolvedClassLoader);
 
         // Before the lookup, not inside connect(): a repeat call for a URI
@@ -63,20 +61,17 @@ public final class NanocachedCachingProvider implements CachingProvider {
         // that happened to land on the same bucket, not just this key.
         // Dial first, then atomically install-or-discard.
         NanocachedClient client = connect(properties != null ? properties : new Properties());
-        NanocachedCacheManager created =
-                new NanocachedCacheManager(this, resolvedUri, resolvedClassLoader, client);
+        NanocachedCacheManager created = new NanocachedCacheManager(this, resolvedUri, resolvedClassLoader, client);
 
         NanocachedCacheManager[] winner = new NanocachedCacheManager[1];
-        managers.compute(
-                key,
-                (unused, current) -> {
-                    if (current != null && !current.isClosed()) {
-                        winner[0] = current;
-                        return current;
-                    }
-                    winner[0] = created;
-                    return created;
-                });
+        managers.compute(key, (unused, current) -> {
+            if (current != null && !current.isClosed()) {
+                winner[0] = current;
+                return current;
+            }
+            winner[0] = created;
+            return created;
+        });
 
         if (winner[0] != created) {
             // Lost the race to another thread's connect for the same
@@ -92,18 +87,17 @@ public final class NanocachedCachingProvider implements CachingProvider {
     }
 
     /** Every {@code nanocached.*} property this provider reads. */
-    private static final java.util.Set<String> KNOWN_PROPERTIES =
-            java.util.Set.of(
-                    "nanocached.addresses",
-                    "nanocached.secret",
-                    "nanocached.tls",
-                    "nanocached.ca",
-                    "nanocached.compress",
-                    "nanocached.compression-threshold",
-                    "nanocached.fire-and-forget-replicas",
-                    "nanocached.read-repair",
-                    "nanocached.reconnect-cooldown-millis",
-                    "nanocached.read-hedge-after-millis");
+    private static final java.util.Set<String> KNOWN_PROPERTIES = java.util.Set.of(
+            "nanocached.addresses",
+            "nanocached.secret",
+            "nanocached.tls",
+            "nanocached.ca",
+            "nanocached.compress",
+            "nanocached.compression-threshold",
+            "nanocached.fire-and-forget-replicas",
+            "nanocached.read-repair",
+            "nanocached.reconnect-cooldown-millis",
+            "nanocached.read-hedge-after-millis");
 
     /**
      * A mistyped key (say {@code nanocached.tsl}) must not be ignored quietly: it would leave TLS
@@ -113,11 +107,10 @@ public final class NanocachedCachingProvider implements CachingProvider {
     private static void rejectUnknownProperties(Properties properties) {
         for (String name : properties.stringPropertyNames()) {
             if (name.startsWith("nanocached.") && !KNOWN_PROPERTIES.contains(name)) {
-                throw new CacheException(
-                        "nanocached-jcache: unknown property \""
-                                + name
-                                + "\"; the keys this provider reads are "
-                                + new java.util.TreeSet<>(KNOWN_PROPERTIES));
+                throw new CacheException("nanocached-jcache: unknown property \""
+                        + name
+                        + "\"; the keys this provider reads are "
+                        + new java.util.TreeSet<>(KNOWN_PROPERTIES));
             }
         }
     }
@@ -125,15 +118,13 @@ public final class NanocachedCachingProvider implements CachingProvider {
     private static NanocachedClient connect(Properties properties) {
         String addresses = properties.getProperty("nanocached.addresses");
         if (addresses == null || addresses.isBlank()) {
-            throw new CacheException(
-                    "nanocached-jcache: \"nanocached.addresses\" is required (comma-separated"
-                            + " host:port list) — pass it in the Properties given to"
-                            + " Caching.getCachingProvider().getCacheManager(uri, classLoader,"
-                            + " properties)");
+            throw new CacheException("nanocached-jcache: \"nanocached.addresses\" is required (comma-separated"
+                    + " host:port list) — pass it in the Properties given to"
+                    + " Caching.getCachingProvider().getCacheManager(uri, classLoader,"
+                    + " properties)");
         }
 
-        NanocachedClient.Options options =
-                new NanocachedClient.Options().addresses(parseAddresses(addresses));
+        NanocachedClient.Options options = new NanocachedClient.Options().addresses(parseAddresses(addresses));
 
         // Every property is parsed and applied under its own name: a
         // value the SDK or the parser rejects is a CacheException that
@@ -161,12 +152,9 @@ public final class NanocachedCachingProvider implements CachingProvider {
                     "nanocached.compression-threshold",
                     () -> options.compressionThreshold(Math.toIntExact(compressionThreshold)));
         }
-        Boolean fireAndForgetReplicas =
-                booleanProperty(properties, "nanocached.fire-and-forget-replicas");
+        Boolean fireAndForgetReplicas = booleanProperty(properties, "nanocached.fire-and-forget-replicas");
         if (fireAndForgetReplicas != null) {
-            apply(
-                    "nanocached.fire-and-forget-replicas",
-                    () -> options.fireAndForgetReplicas(fireAndForgetReplicas));
+            apply("nanocached.fire-and-forget-replicas", () -> options.fireAndForgetReplicas(fireAndForgetReplicas));
         }
         Boolean readRepair = booleanProperty(properties, "nanocached.read-repair");
         if (readRepair != null) {
@@ -174,22 +162,19 @@ public final class NanocachedCachingProvider implements CachingProvider {
         }
         // Durations are given in whole milliseconds here — a plain
         // Properties value has no ISO-8601 binder like Boot's does.
-        Long reconnectCooldownMillis =
-                longProperty(properties, "nanocached.reconnect-cooldown-millis");
+        Long reconnectCooldownMillis = longProperty(properties, "nanocached.reconnect-cooldown-millis");
         if (reconnectCooldownMillis != null) {
             // Zero means "no cooldown", as the Spring Boot starter reads
             // it; the SDK's own Duration.ZERO means "use the default", so
             // zero must route through disableReconnectCooldown() to take
             // effect.
-            apply(
-                    "nanocached.reconnect-cooldown-millis",
-                    () -> {
-                        if (reconnectCooldownMillis == 0) {
-                            options.disableReconnectCooldown();
-                        } else {
-                            options.reconnectCooldown(Duration.ofMillis(reconnectCooldownMillis));
-                        }
-                    });
+            apply("nanocached.reconnect-cooldown-millis", () -> {
+                if (reconnectCooldownMillis == 0) {
+                    options.disableReconnectCooldown();
+                } else {
+                    options.reconnectCooldown(Duration.ofMillis(reconnectCooldownMillis));
+                }
+            });
         }
         Long readHedgeAfterMillis = longProperty(properties, "nanocached.read-hedge-after-millis");
         if (readHedgeAfterMillis != null) {
@@ -221,8 +206,7 @@ public final class NanocachedCachingProvider implements CachingProvider {
         if (trimmed.equalsIgnoreCase("false")) {
             return Boolean.FALSE;
         }
-        throw new CacheException(
-                "nanocached-jcache: \"" + name + "\" must be true or false, got \"" + value + "\"");
+        throw new CacheException("nanocached-jcache: \"" + name + "\" must be true or false, got \"" + value + "\"");
     }
 
     private static Long longProperty(Properties properties, String name) {
@@ -234,12 +218,7 @@ public final class NanocachedCachingProvider implements CachingProvider {
             return Long.parseLong(value.trim());
         } catch (NumberFormatException e) {
             throw new CacheException(
-                    "nanocached-jcache: \""
-                            + name
-                            + "\" must be a whole number, got \""
-                            + value
-                            + "\"",
-                    e);
+                    "nanocached-jcache: \"" + name + "\" must be a whole number, got \"" + value + "\"", e);
         }
     }
 
@@ -258,8 +237,7 @@ public final class NanocachedCachingProvider implements CachingProvider {
                     .map(NanocachedCachingProvider::parseAddress)
                     .toList();
         } catch (IllegalArgumentException e) {
-            throw new CacheException(
-                    "nanocached-jcache: \"nanocached.addresses\": " + e.getMessage(), e);
+            throw new CacheException("nanocached-jcache: \"nanocached.addresses\": " + e.getMessage(), e);
         }
     }
 
@@ -327,15 +305,12 @@ public final class NanocachedCachingProvider implements CachingProvider {
     }
 
     private void closeMatching(java.util.function.Predicate<ManagerKey> matches) {
-        managers.keySet().stream()
-                .filter(matches)
-                .toList()
-                .forEach(key -> {
-                    NanocachedCacheManager manager = managers.remove(key);
-                    if (manager != null) {
-                        manager.close();
-                    }
-                });
+        managers.keySet().stream().filter(matches).toList().forEach(key -> {
+            NanocachedCacheManager manager = managers.remove(key);
+            if (manager != null) {
+                manager.close();
+            }
+        });
     }
 
     /**

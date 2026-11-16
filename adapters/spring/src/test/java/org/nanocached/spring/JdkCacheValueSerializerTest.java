@@ -40,8 +40,7 @@ class JdkCacheValueSerializerTest {
 
         byte[] bytes = serializer.serialize(new User("Alice", 30));
 
-        IllegalStateException thrown =
-                assertThrows(IllegalStateException.class, () -> serializer.deserialize(bytes));
+        IllegalStateException thrown = assertThrows(IllegalStateException.class, () -> serializer.deserialize(bytes));
         assertInstanceOf(InvalidClassException.class, thrown.getCause());
     }
 

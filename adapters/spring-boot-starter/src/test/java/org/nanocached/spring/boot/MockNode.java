@@ -32,19 +32,18 @@ final class MockNode implements AutoCloseable {
 
     MockNode() throws IOException {
         server = new ServerSocket(0, 16, java.net.InetAddress.getLoopbackAddress());
-        acceptLoop =
-                new Thread(() -> {
-                    while (true) {
-                        try {
-                            Socket socket = server.accept();
-                            Thread serve = new Thread(() -> serve(socket));
-                            serve.setDaemon(true);
-                            serve.start();
-                        } catch (IOException stop) {
-                            return;
-                        }
-                    }
-                });
+        acceptLoop = new Thread(() -> {
+            while (true) {
+                try {
+                    Socket socket = server.accept();
+                    Thread serve = new Thread(() -> serve(socket));
+                    serve.setDaemon(true);
+                    serve.start();
+                } catch (IOException stop) {
+                    return;
+                }
+            }
+        });
         acceptLoop.setDaemon(true);
         acceptLoop.start();
     }
@@ -55,8 +54,7 @@ final class MockNode implements AutoCloseable {
 
     Map<ByteBuffer, Entry> store(String namespace) {
         return stores.computeIfAbsent(
-                ByteBuffer.wrap(namespace.getBytes(StandardCharsets.UTF_8)),
-                unused -> new ConcurrentHashMap<>());
+                ByteBuffer.wrap(namespace.getBytes(StandardCharsets.UTF_8)), unused -> new ConcurrentHashMap<>());
     }
 
     Entry entry(String namespace, byte[] key) {
@@ -109,8 +107,7 @@ final class MockNode implements AutoCloseable {
         }
     }
 
-    private void get(InputStream in, OutputStream out, String namespace, int keyLength)
-            throws IOException {
+    private void get(InputStream in, OutputStream out, String namespace, int keyLength) throws IOException {
         byte[] key = in.readNBytes(keyLength);
         Entry entry = entry(namespace, key);
         if (entry == null) {
@@ -122,8 +119,7 @@ final class MockNode implements AutoCloseable {
         out.flush();
     }
 
-    private void set(InputStream in, OutputStream out, String namespace, String[] parts)
-            throws IOException {
+    private void set(InputStream in, OutputStream out, String namespace, String[] parts) throws IOException {
         int keyLength = Integer.parseInt(parts[2]);
         int valueLength = Integer.parseInt(parts[3]);
         long ttlSeconds = parts.length > 4 ? Long.parseLong(parts[4]) : 0;
@@ -133,8 +129,7 @@ final class MockNode implements AutoCloseable {
         reply(out, "S\n");
     }
 
-    private void delete(InputStream in, OutputStream out, String namespace, int keyLength)
-            throws IOException {
+    private void delete(InputStream in, OutputStream out, String namespace, int keyLength) throws IOException {
         byte[] key = in.readNBytes(keyLength);
         boolean existed = store(namespace).remove(ByteBuffer.wrap(key)) != null;
         reply(out, (existed ? "D" : "N") + "\n");

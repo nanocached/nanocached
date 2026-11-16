@@ -70,24 +70,16 @@ class BootAutoConfigurationInteractionTest {
     static class NanocachedBootConfig {
 
         @Bean(destroyMethod = "close")
-        NanocachedClient nanocachedClient(
-                @Value("${nanocached.addresses}") List<String> addresses) {
-            return NanocachedClient.connect(
-                    new NanocachedClient.Options()
-                            .addresses(
-                                    addresses.stream()
-                                            .map(address -> address.split(":", 2))
-                                            .map(address ->
-                                                    new NanocachedClient.Address(
-                                                            address[0],
-                                                            Integer.parseInt(address[1])))
-                                            .toList()));
+        NanocachedClient nanocachedClient(@Value("${nanocached.addresses}") List<String> addresses) {
+            return NanocachedClient.connect(new NanocachedClient.Options()
+                    .addresses(addresses.stream()
+                            .map(address -> address.split(":", 2))
+                            .map(address -> new NanocachedClient.Address(address[0], Integer.parseInt(address[1])))
+                            .toList()));
         }
 
         @Bean
-        CacheManager cacheManager(
-                NanocachedClient client,
-                @Value("${nanocached.default-ttl:0s}") Duration defaultTtl) {
+        CacheManager cacheManager(NanocachedClient client, @Value("${nanocached.default-ttl:0s}") Duration defaultTtl) {
             return NanocachedCacheManager.builder(client).defaultTtl(defaultTtl).build();
         }
 
@@ -128,10 +120,9 @@ class BootAutoConfigurationInteractionTest {
     }
 
     private ConfigurableApplicationContext boot(Class<?> config, String... properties) {
-        SpringApplicationBuilder builder =
-                new SpringApplicationBuilder(config)
-                        .web(WebApplicationType.NONE)
-                        .properties("nanocached.addresses=127.0.0.1:" + node.port());
+        SpringApplicationBuilder builder = new SpringApplicationBuilder(config)
+                .web(WebApplicationType.NONE)
+                .properties("nanocached.addresses=127.0.0.1:" + node.port());
         SpringApplication application = builder.properties(properties).build();
         context = application.run();
         return context;
@@ -167,9 +158,7 @@ class BootAutoConfigurationInteractionTest {
         assertEquals(
                 1,
                 node.store("users").keySet().stream()
-                        .filter(key ->
-                                new String(key.array(), StandardCharsets.UTF_8)
-                                        .equals("String:alice"))
+                        .filter(key -> new String(key.array(), StandardCharsets.UTF_8).equals("String:alice"))
                         .count());
     }
 

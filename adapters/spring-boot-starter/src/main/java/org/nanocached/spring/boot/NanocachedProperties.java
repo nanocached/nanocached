@@ -80,7 +80,8 @@ public class NanocachedProperties {
     @DurationUnit(ChronoUnit.MILLIS)
     private Duration readHedgeAfter;
 
-    @NestedConfigurationProperty private final Cache cache = new Cache();
+    @NestedConfigurationProperty
+    private final Cache cache = new Cache();
 
     public List<String> getAddresses() {
         return addresses;

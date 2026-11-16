@@ -85,8 +85,7 @@ final class Identify {
         }
     }
 
-    static Result connectAndIdentify(String host, int port, byte[] authSecret, SSLContext tls)
-            throws IOException {
+    static Result connectAndIdentify(String host, int port, byte[] authSecret, SSLContext tls) throws IOException {
         return connectAndIdentify(host, port, authSecret, tls, false);
     }
 
@@ -122,8 +121,7 @@ final class Identify {
      * only it knows whether this is the top-level connect address or a background re-fetch that
      * must never throw.
      */
-    static Result connectAndIdentify(
-            String host, int port, byte[] authSecret, SSLContext tls, boolean listProxies)
+    static Result connectAndIdentify(String host, int port, byte[] authSecret, SSLContext tls, boolean listProxies)
             throws IOException {
         try {
             return identifyOnce(host, port, authSecret, tls, ProbeStage.FULL, listProxies);
@@ -145,12 +143,7 @@ final class Identify {
     }
 
     private static Result identifyOnce(
-            String host,
-            int port,
-            byte[] authSecret,
-            SSLContext tls,
-            ProbeStage stage,
-            boolean listProxies)
+            String host, int port, byte[] authSecret, SSLContext tls, ProbeStage stage, boolean listProxies)
             throws IOException {
         // One absolute deadline for the whole dial: name resolution, the
         // TCP connect, the TLS handshake and every read of the identify
@@ -169,13 +162,12 @@ final class Identify {
 
             AuthIdentity identity;
             try {
-                out.write(
-                        ("A "
-                                        + secret.length
-                                        + (stage.requestTags ? " T" : "")
-                                        + (stage.requestRetryCapability ? " R" : "")
-                                        + "\n")
-                                .getBytes(StandardCharsets.US_ASCII));
+                out.write(("A "
+                                + secret.length
+                                + (stage.requestTags ? " T" : "")
+                                + (stage.requestRetryCapability ? " R" : "")
+                                + "\n")
+                        .getBytes(StandardCharsets.US_ASCII));
                 out.write(secret);
                 out.flush();
                 identity = readIdentity(socket.getInputStream());
@@ -188,22 +180,19 @@ final class Identify {
                 // connection open, it just didn't answer (issue #40) —
                 // stepping back a stage would only hang another
                 // CONNECT_TIMEOUT_MS.
-                boolean legacyShaped =
-                        stage.requestTags && !(error instanceof java.io.InterruptedIOException);
+                boolean legacyShaped = stage.requestTags && !(error instanceof java.io.InterruptedIOException);
                 throw legacyShaped ? new LegacyServerSignal(error) : error;
             }
 
             if (!identity.accepted()) {
                 if (authSecret == null) {
-                    throw new NanocachedException.AuthenticationFailed(
-                            "nanocached: "
-                                    + host
-                                    + ":"
-                                    + port
-                                    + " requires authentication, but no authSecret was given");
+                    throw new NanocachedException.AuthenticationFailed("nanocached: "
+                            + host
+                            + ":"
+                            + port
+                            + " requires authentication, but no authSecret was given");
                 }
-                throw new NanocachedException.AuthenticationFailed(
-                        "nanocached: authentication failed");
+                throw new NanocachedException.AuthenticationFailed("nanocached: authentication failed");
             }
 
             if (identity.kind() == 'n') {
@@ -280,8 +269,7 @@ final class Identify {
         }
 
         int remainingMillis() {
-            return (int)
-                    Math.max(1, TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
+            return (int) Math.max(1, TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
         }
 
         /**
@@ -289,18 +277,17 @@ final class Identify {
          * can block on the peer.
          */
         void watch(Socket socket) {
-            watchdog =
-                    WATCHDOG.schedule(
-                            () -> {
-                                if (!state.compareAndSet(RUNNING, FIRED)) return;
-                                try {
-                                    socket.close();
-                                } catch (IOException ignored) {
-                                    // The dialing thread's own failure is what gets reported.
-                                }
-                            },
-                            deadlineNanos - System.nanoTime(),
-                            TimeUnit.NANOSECONDS);
+            watchdog = WATCHDOG.schedule(
+                    () -> {
+                        if (!state.compareAndSet(RUNNING, FIRED)) return;
+                        try {
+                            socket.close();
+                        } catch (IOException ignored) {
+                            // The dialing thread's own failure is what gets reported.
+                        }
+                    },
+                    deadlineNanos - System.nanoTime(),
+                    TimeUnit.NANOSECONDS);
         }
 
         /**
@@ -324,14 +311,13 @@ final class Identify {
         }
 
         SocketTimeoutException timeout() {
-            return new SocketTimeoutException(
-                    "nanocached: "
-                            + host
-                            + ":"
-                            + port
-                            + " did not complete the identify exchange within "
-                            + timeoutMillis
-                            + "ms");
+            return new SocketTimeoutException("nanocached: "
+                    + host
+                    + ":"
+                    + port
+                    + " did not complete the identify exchange within "
+                    + timeoutMillis
+                    + "ms");
         }
     }
 
@@ -341,14 +327,11 @@ final class Identify {
     private static final ScheduledThreadPoolExecutor WATCHDOG = newWatchdogPool();
 
     private static ScheduledThreadPoolExecutor newWatchdogPool() {
-        ScheduledThreadPoolExecutor pool =
-                new ScheduledThreadPoolExecutor(
-                        1,
-                        runnable -> {
-                            Thread thread = new Thread(runnable, "nanocached-dial-watchdog");
-                            thread.setDaemon(true);
-                            return thread;
-                        });
+        ScheduledThreadPoolExecutor pool = new ScheduledThreadPoolExecutor(1, runnable -> {
+            Thread thread = new Thread(runnable, "nanocached-dial-watchdog");
+            thread.setDaemon(true);
+            return thread;
+        });
         pool.setRemoveOnCancelPolicy(true);
         return pool;
     }
@@ -430,18 +413,17 @@ final class Identify {
     private static final ThreadPoolExecutor RESOLVER = newResolverPool();
 
     private static ThreadPoolExecutor newResolverPool() {
-        ThreadPoolExecutor pool =
-                new ThreadPoolExecutor(
-                        MAX_RESOLVER_THREADS,
-                        MAX_RESOLVER_THREADS,
-                        60L,
-                        TimeUnit.SECONDS,
-                        new LinkedBlockingQueue<>(),
-                        runnable -> {
-                            Thread thread = new Thread(runnable, "nanocached-resolver");
-                            thread.setDaemon(true);
-                            return thread;
-                        });
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                MAX_RESOLVER_THREADS,
+                MAX_RESOLVER_THREADS,
+                60L,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "nanocached-resolver");
+                    thread.setDaemon(true);
+                    return thread;
+                });
         pool.allowCoreThreadTimeOut(true);
         return pool;
     }
@@ -456,8 +438,7 @@ final class Identify {
      * an unreachable address instead of hanging it: {@code new InetSocketAddress(host, port)}
      * resolves synchronously on the calling thread, outside the connect timeout.
      */
-    private static InetSocketAddress resolve(String host, int port, int timeoutMs)
-            throws IOException {
+    private static InetSocketAddress resolve(String host, int port, int timeoutMs) throws IOException {
         if (host.indexOf(':') >= 0 || IPV4_LITERAL.matcher(host).matches()) {
             return new InetSocketAddress(host, port);
         }
@@ -473,8 +454,7 @@ final class Identify {
         } catch (TimeoutException timeout) {
             lookup.cancel(true);
             RESOLVER.remove((Runnable) lookup);
-            throw new SocketTimeoutException(
-                    "nanocached: resolving " + host + " timed out after " + timeoutMs + "ms");
+            throw new SocketTimeoutException("nanocached: resolving " + host + " timed out after " + timeoutMs + "ms");
         } catch (ExecutionException failed) {
             Throwable cause = failed.getCause();
             if (cause instanceof IOException io) {
@@ -488,8 +468,7 @@ final class Identify {
         }
     }
 
-    private static Socket open(String host, int port, SSLContext tls, Deadline deadline)
-            throws IOException {
+    private static Socket open(String host, int port, SSLContext tls, Deadline deadline) throws IOException {
         // Both paths bound the TCP connect (issue #11): the TLS factory's
         // own connect(host, port) has no timeout, so an unresponsive
         // (packet-dropping) address would hang connect()/refresh forever
@@ -512,8 +491,7 @@ final class Identify {
             if (tls == null) {
                 return plain;
             }
-            SSLSocket socket =
-                    (SSLSocket) tls.getSocketFactory().createSocket(plain, host, port, true);
+            SSLSocket socket = (SSLSocket) tls.getSocketFactory().createSocket(plain, host, port, true);
             socket.setSoTimeout(deadline.remainingMillis());
             // Without this, the JDK verifies the certificate chain but
             // never checks it was actually issued to `host` — a valid
@@ -554,15 +532,13 @@ final class Identify {
             throw new NanocachedException.DiscoveryBusy();
         }
         if (!header.startsWith("N ")) {
-            throw new NanocachedException(
-                    "nanocached: unexpected response from discovery server: " + header);
+            throw new NanocachedException("nanocached: unexpected response from discovery server: " + header);
         }
 
         // `N <count> <r>\n` (client-side replication) — the replication factor rides along.
         String[] fields = header.substring(2).split(" ");
         if (fields.length != 2) {
-            throw new NanocachedException(
-                    "nanocached: invalid node-list header in discovery response");
+            throw new NanocachedException("nanocached: invalid node-list header in discovery response");
         }
         // Connection.parseNonNegativeInt enforces the wire's digits-only
         // integer grammar (issue #462: no leading '+', among other
@@ -574,8 +550,7 @@ final class Identify {
             throw new NanocachedException("nanocached: invalid node count in discovery response");
         }
         if (replication < 1) {
-            throw new NanocachedException(
-                    "nanocached: invalid replication factor in discovery response");
+            throw new NanocachedException("nanocached: invalid replication factor in discovery response");
         }
 
         return new ClusterTarget(readNodeEntries(in, count), replication);
@@ -594,8 +569,7 @@ final class Identify {
             throw new NanocachedException.DiscoveryBusy();
         }
         if (!header.startsWith("N ")) {
-            throw new NanocachedException(
-                    "nanocached: unexpected response from discovery server: " + header);
+            throw new NanocachedException("nanocached: unexpected response from discovery server: " + header);
         }
 
         int count = Connection.parseNonNegativeInt(header.substring(2));
@@ -611,8 +585,7 @@ final class Identify {
      * list and `Q`'s proxy roster (issue #122) — {@code count} is already validated against {@link
      * #MAX_NODE_COUNT} by the caller before this runs.
      */
-    private static List<DiscoveredNode> readNodeEntries(InputStream in, int count)
-            throws IOException {
+    private static List<DiscoveredNode> readNodeEntries(InputStream in, int count) throws IOException {
         // count is bounded by MAX_NODE_COUNT by the caller, so sizing the
         // list's capacity from it is safe — never trust an unvalidated
         // wire value for a pre-allocation, validated or not.
@@ -621,14 +594,12 @@ final class Identify {
         for (int i = 0; i < count; i++) {
             String[] lengths = readLine(in).split(" ");
             if (lengths.length != 2) {
-                throw new NanocachedException(
-                        "nanocached: invalid node entry header in discovery response");
+                throw new NanocachedException("nanocached: invalid node entry header in discovery response");
             }
             int nameLength = Connection.parseNonNegativeInt(lengths[0]);
             int addrLength = Connection.parseNonNegativeInt(lengths[1]);
             if (nameLength < 0 || addrLength < 0) {
-                throw new NanocachedException(
-                        "nanocached: invalid node entry header in discovery response");
+                throw new NanocachedException("nanocached: invalid node entry header in discovery response");
             }
 
             // Checked before allocating: a single absurd entry (or many
@@ -637,20 +608,16 @@ final class Identify {
             totalBytes += (long) nameLength + addrLength + 1;
             if (totalBytes > MAX_NODE_LIST_RESPONSE_BYTES) {
                 throw new NanocachedException(
-                        "nanocached: discovery node-list response exceeds "
-                                + MAX_NODE_LIST_RESPONSE_BYTES
-                                + " bytes");
+                        "nanocached: discovery node-list response exceeds " + MAX_NODE_LIST_RESPONSE_BYTES + " bytes");
             }
 
             byte[] body = readExactly(in, nameLength + addrLength + 1); // +1: trailing '\n'
             if (body[body.length - 1] != '\n') {
-                throw new NanocachedException(
-                        "nanocached: malformed node entry in discovery response");
+                throw new NanocachedException("nanocached: malformed node entry in discovery response");
             }
-            entries.add(
-                    new DiscoveredNode(
-                            new String(body, 0, nameLength, StandardCharsets.UTF_8),
-                            new String(body, nameLength, addrLength, StandardCharsets.UTF_8)));
+            entries.add(new DiscoveredNode(
+                    new String(body, 0, nameLength, StandardCharsets.UTF_8),
+                    new String(body, nameLength, addrLength, StandardCharsets.UTF_8)));
         }
         return entries;
     }
@@ -670,8 +637,7 @@ final class Identify {
         StringBuilder line = new StringBuilder();
         for (int b = read(in); b != '\n'; b = read(in)) {
             if (line.length() >= Connection.MAX_HEADER_LINE_LENGTH) {
-                throw new NanocachedException.ConnectionLost(
-                        "nanocached: response header line too long", null);
+                throw new NanocachedException.ConnectionLost("nanocached: response header line too long", null);
             }
             line.append((char) b);
         }

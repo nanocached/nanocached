@@ -45,8 +45,7 @@ import org.springframework.core.io.ResourceLoader;
  * own default cooldown, which is what a bare {@code Options.reconnectCooldown(Duration.ZERO)} call
  * means — see {@link NanocachedProperties#getReconnectCooldown()}.
  */
-@AutoConfiguration(
-        beforeName = "org.springframework.boot.cache.autoconfigure.CacheAutoConfiguration")
+@AutoConfiguration(beforeName = "org.springframework.boot.cache.autoconfigure.CacheAutoConfiguration")
 @EnableConfigurationProperties(NanocachedProperties.class)
 @ConditionalOnClass({NanocachedClient.class, CacheManager.class})
 @Conditional(OnNanocachedAddressesCondition.class)
@@ -103,10 +102,9 @@ public class NanocachedCacheAutoConfiguration {
             Environment environment) {
         rejectUnbindablePerCacheTtlKeys(environment);
         NanocachedProperties.Cache cache = properties.getCache();
-        NanocachedCacheManager.Builder builder =
-                NanocachedCacheManager.builder(client)
-                        .defaultTtl(cache.getDefaultTtl())
-                        .allowNullValues(cache.isAllowNullValues());
+        NanocachedCacheManager.Builder builder = NanocachedCacheManager.builder(client)
+                .defaultTtl(cache.getDefaultTtl())
+                .allowNullValues(cache.isAllowNullValues());
         // Cached values are deserialized with the application's own
         // class loader: with devtools the application classes live in a
         // restart loader this starter's loader cannot see, and every
@@ -123,8 +121,7 @@ public class NanocachedCacheAutoConfiguration {
         return builder.build();
     }
 
-    private static final ConfigurationPropertyName TTL_PREFIX =
-            ConfigurationPropertyName.of("nanocached.cache.ttl");
+    private static final ConfigurationPropertyName TTL_PREFIX = ConfigurationPropertyName.of("nanocached.cache.ttl");
 
     /**
      * Fails startup for a {@code nanocached.cache.ttl.*} property that can never bind (issue
@@ -181,8 +178,7 @@ public class NanocachedCacheAutoConfiguration {
     private static NanocachedClient.Address parseAddress(String address) {
         int colon = address.lastIndexOf(':');
         if (colon <= 0 || colon == address.length() - 1) {
-            throw new IllegalArgumentException(
-                    "nanocached.addresses: expected host:port, got \"" + address + "\"");
+            throw new IllegalArgumentException("nanocached.addresses: expected host:port, got \"" + address + "\"");
         }
         String host = address.substring(0, colon);
         if (host.startsWith("[") && host.endsWith("]")) {
@@ -192,12 +188,10 @@ public class NanocachedCacheAutoConfiguration {
         try {
             port = Integer.parseInt(address.substring(colon + 1));
         } catch (NumberFormatException e) {
-            throw new IllegalArgumentException(
-                    "nanocached.addresses: port is not a number in \"" + address + "\"");
+            throw new IllegalArgumentException("nanocached.addresses: port is not a number in \"" + address + "\"");
         }
         if (port < 1 || port > 65535) {
-            throw new IllegalArgumentException(
-                    "nanocached.addresses: port out of range in \"" + address + "\"");
+            throw new IllegalArgumentException("nanocached.addresses: port out of range in \"" + address + "\"");
         }
         return new NanocachedClient.Address(host, port);
     }

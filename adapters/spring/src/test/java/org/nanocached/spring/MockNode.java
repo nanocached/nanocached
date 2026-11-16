@@ -36,19 +36,18 @@ final class MockNode implements AutoCloseable {
 
     MockNode() throws IOException {
         server = new ServerSocket(0, 16, java.net.InetAddress.getLoopbackAddress());
-        acceptLoop =
-                new Thread(() -> {
-                    while (true) {
-                        try {
-                            Socket socket = server.accept();
-                            Thread serve = new Thread(() -> serve(socket));
-                            serve.setDaemon(true);
-                            serve.start();
-                        } catch (IOException stop) {
-                            return;
-                        }
-                    }
-                });
+        acceptLoop = new Thread(() -> {
+            while (true) {
+                try {
+                    Socket socket = server.accept();
+                    Thread serve = new Thread(() -> serve(socket));
+                    serve.setDaemon(true);
+                    serve.start();
+                } catch (IOException stop) {
+                    return;
+                }
+            }
+        });
         acceptLoop.setDaemon(true);
         acceptLoop.start();
     }
@@ -59,8 +58,7 @@ final class MockNode implements AutoCloseable {
 
     Map<ByteBuffer, Entry> store(String namespace) {
         return stores.computeIfAbsent(
-                ByteBuffer.wrap(namespace.getBytes(StandardCharsets.UTF_8)),
-                unused -> new ConcurrentHashMap<>());
+                ByteBuffer.wrap(namespace.getBytes(StandardCharsets.UTF_8)), unused -> new ConcurrentHashMap<>());
     }
 
     Entry entry(String namespace, byte[] key) {
@@ -128,8 +126,7 @@ final class MockNode implements AutoCloseable {
         }
     }
 
-    private void get(
-            InputStream in, OutputStream out, String namespace, int keyLength, String tagSuffix)
+    private void get(InputStream in, OutputStream out, String namespace, int keyLength, String tagSuffix)
             throws IOException {
         byte[] key = in.readNBytes(keyLength);
         Entry entry = entry(namespace, key);
@@ -137,9 +134,7 @@ final class MockNode implements AutoCloseable {
             reply(out, "N" + tagSuffix + "\n");
             return;
         }
-        out.write(
-                ("V " + entry.value().length + tagSuffix + "\n")
-                        .getBytes(StandardCharsets.US_ASCII));
+        out.write(("V " + entry.value().length + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
         out.write(entry.value());
         out.flush();
     }
@@ -165,8 +160,7 @@ final class MockNode implements AutoCloseable {
         reply(out, "S" + tagSuffix + "\n");
     }
 
-    private void delete(
-            InputStream in, OutputStream out, String namespace, int keyLength, String tagSuffix)
+    private void delete(InputStream in, OutputStream out, String namespace, int keyLength, String tagSuffix)
             throws IOException {
         byte[] key = in.readNBytes(keyLength);
         boolean existed = store(namespace).remove(ByteBuffer.wrap(key)) != null;
@@ -180,8 +174,7 @@ final class MockNode implements AutoCloseable {
      * check-then-put is synchronized on it so two connections racing on the same key really do
      * serialize the way the real server's CAS does, not just "usually" thanks to test timing.
      */
-    private void casSet(
-            InputStream in, OutputStream out, String[] parts, boolean tagged, String tagSuffix)
+    private void casSet(InputStream in, OutputStream out, String[] parts, boolean tagged, String tagSuffix)
             throws IOException {
         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
         int keyLength = Integer.parseInt(parts[2]);

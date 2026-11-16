@@ -84,8 +84,7 @@ final class Compression {
                     } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
                         throw new NanocachedException(
-                                "nanocached: interrupted while waiting for the decompression budget",
-                                interrupted);
+                                "nanocached: interrupted while waiting for the decompression budget", interrupted);
                     }
                 }
                 available -= n;
@@ -202,12 +201,7 @@ final class Compression {
                                             + "possible decompression bomb");
                         }
                         buffer =
-                                Arrays.copyOf(
-                                        buffer,
-                                        (int)
-                                                Math.min(
-                                                        2L * buffer.length,
-                                                        MAX_DECOMPRESSED_LENGTH + 1L));
+                                Arrays.copyOf(buffer, (int) Math.min(2L * buffer.length, MAX_DECOMPRESSED_LENGTH + 1L));
                     }
                     int produced = inflater.inflate(buffer, total, buffer.length - total);
                     if (produced == 0 && inflater.needsInput()) {
@@ -240,11 +234,10 @@ final class Compression {
             }
         }
 
-        throw new NanocachedException.DecompressionFailed(
-                "nanocached: unrecognized compression marker byte "
-                        + (marker & 0xFF)
-                        + " — was this value written by a client with compress disabled "
-                        + "(value compression)?");
+        throw new NanocachedException.DecompressionFailed("nanocached: unrecognized compression marker byte "
+                + (marker & 0xFF)
+                + " — was this value written by a client with compress disabled "
+                + "(value compression)?");
     }
 
     private static byte[] prefixed(byte marker, byte[] body) {

@@ -59,11 +59,10 @@ public final class DefaultCacheKeyConverter implements CacheKeyConverter {
             return (key.getClass().getSimpleName() + ":" + key).getBytes(StandardCharsets.UTF_8);
         }
         if (!(key instanceof Serializable)) {
-            throw new IllegalArgumentException(
-                    "nanocached-spring: cache key of type "
-                            + key.getClass().getName()
-                            + " is neither a simple type nor Serializable; configure a custom"
-                            + " CacheKeyConverter");
+            throw new IllegalArgumentException("nanocached-spring: cache key of type "
+                    + key.getClass().getName()
+                    + " is neither a simple type nor Serializable; configure a custom"
+                    + " CacheKeyConverter");
         }
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
@@ -84,9 +83,7 @@ public final class DefaultCacheKeyConverter implements CacheKeyConverter {
         for (int i = 0, n = text.length(); i < n; i++) {
             char c = text.charAt(i);
             if (!Character.isSurrogate(c)) continue;
-            if (Character.isHighSurrogate(c)
-                    && i + 1 < n
-                    && Character.isLowSurrogate(text.charAt(i + 1))) {
+            if (Character.isHighSurrogate(c) && i + 1 < n && Character.isLowSurrogate(text.charAt(i + 1))) {
                 i++;
                 continue;
             }

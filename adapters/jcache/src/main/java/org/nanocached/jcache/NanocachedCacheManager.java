@@ -28,15 +28,11 @@ public final class NanocachedCacheManager implements CacheManager {
     private final URI uri;
     private final ClassLoader classLoader;
     private final NanocachedClient client;
-    private final ConcurrentHashMap<String, NanocachedCache<?, ?>> caches =
-            new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, NanocachedCache<?, ?>> caches = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     NanocachedCacheManager(
-            NanocachedCachingProvider provider,
-            URI uri,
-            ClassLoader classLoader,
-            NanocachedClient client) {
+            NanocachedCachingProvider provider, URI uri, ClassLoader classLoader, NanocachedClient client) {
         this.provider = provider;
         this.uri = uri;
         this.classLoader = classLoader;
@@ -77,13 +73,11 @@ public final class NanocachedCacheManager implements CacheManager {
         CompleteConfiguration<K, V> complete = completeConfigurationOf(configuration);
         validateSupported(complete);
 
-        NanocachedCache<K, V> cache =
-                new NanocachedCache<>(this, cacheName, client.namespace(cacheName), complete);
+        NanocachedCache<K, V> cache = new NanocachedCache<>(this, cacheName, client.namespace(cacheName), complete);
 
         NanocachedCache<?, ?> raced = caches.putIfAbsent(cacheName, cache);
         if (raced != null) {
-            throw new CacheException(
-                    "nanocached-jcache: a cache named \"" + cacheName + "\" already exists");
+            throw new CacheException("nanocached-jcache: a cache named \"" + cacheName + "\" already exists");
         }
         // Issue #331: only register the statistics MBean once this cache
         // instance has actually won the putIfAbsent race above — doing it
@@ -104,8 +98,7 @@ public final class NanocachedCacheManager implements CacheManager {
      * MutableConfiguration} itself defaults to.
      */
     @SuppressWarnings("unchecked")
-    private static <K, V> CompleteConfiguration<K, V> completeConfigurationOf(
-            Configuration<K, V> configuration) {
+    private static <K, V> CompleteConfiguration<K, V> completeConfigurationOf(Configuration<K, V> configuration) {
         if (configuration instanceof CompleteConfiguration<K, V> complete) {
             return complete;
         }
@@ -125,19 +118,16 @@ public final class NanocachedCacheManager implements CacheManager {
                             + " the wire as bytes");
         }
         if (configuration.getCacheLoaderFactory() != null) {
-            throw new UnsupportedOperationException(
-                    "nanocached-jcache: read-through (CacheLoader) is not supported");
+            throw new UnsupportedOperationException("nanocached-jcache: read-through (CacheLoader) is not supported");
         }
         if (configuration.getCacheWriterFactory() != null) {
-            throw new UnsupportedOperationException(
-                    "nanocached-jcache: write-through (CacheWriter) is not supported");
+            throw new UnsupportedOperationException("nanocached-jcache: write-through (CacheWriter) is not supported");
         }
     }
 
     @Override
     @SuppressWarnings("unchecked")
-    public <K, V> javax.cache.Cache<K, V> getCache(
-            String cacheName, Class<K> keyType, Class<V> valueType) {
+    public <K, V> javax.cache.Cache<K, V> getCache(String cacheName, Class<K> keyType, Class<V> valueType) {
         requireNotClosed();
         NanocachedCache<?, ?> cache = caches.get(cacheName);
         if (cache == null) {
@@ -146,17 +136,16 @@ public final class NanocachedCacheManager implements CacheManager {
         Configuration<?, ?> configuration = cache.getConfiguration(Configuration.class);
         if (!configuration.getKeyType().equals(keyType)
                 || !configuration.getValueType().equals(valueType)) {
-            throw new ClassCastException(
-                    "nanocached-jcache: cache \""
-                            + cacheName
-                            + "\" was created with key type "
-                            + configuration.getKeyType().getName()
-                            + " and value type "
-                            + configuration.getValueType().getName()
-                            + ", not "
-                            + keyType.getName()
-                            + "/"
-                            + valueType.getName());
+            throw new ClassCastException("nanocached-jcache: cache \""
+                    + cacheName
+                    + "\" was created with key type "
+                    + configuration.getKeyType().getName()
+                    + " and value type "
+                    + configuration.getValueType().getName()
+                    + ", not "
+                    + keyType.getName()
+                    + "/"
+                    + valueType.getName());
         }
         return (javax.cache.Cache<K, V>) cache;
     }
@@ -256,8 +245,7 @@ public final class NanocachedCacheManager implements CacheManager {
         if (clazz.isInstance(client)) {
             return clazz.cast(client);
         }
-        throw new IllegalArgumentException(
-                "nanocached-jcache: cannot unwrap CacheManager as " + clazz);
+        throw new IllegalArgumentException("nanocached-jcache: cannot unwrap CacheManager as " + clazz);
     }
 
     private void requireNotClosed() {

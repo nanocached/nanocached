@@ -232,8 +232,7 @@ public final class NanocachedClient implements AutoCloseable {
             // — just not as a side effect of a duration that reads like
             // "immediately".)
             if (cooldown == null || cooldown.isNegative()) {
-                throw new IllegalArgumentException(
-                        "nanocached: reconnectCooldown must not be null or negative");
+                throw new IllegalArgumentException("nanocached: reconnectCooldown must not be null or negative");
             }
             requireWithinMaxDuration("reconnectCooldown", cooldown);
             this.reconnectCooldown = cooldown.isZero() ? DEFAULT_RECONNECT_COOLDOWN : cooldown;
@@ -395,11 +394,7 @@ public final class NanocachedClient implements AutoCloseable {
         @Override
         public int hashCode() {
             return java.util.Objects.hash(
-                    replicaWriteFailures,
-                    readRepairFailures,
-                    refreshFailures,
-                    backgroundWriteBugs,
-                    transientRetries);
+                    replicaWriteFailures, readRepairFailures, refreshFailures, backgroundWriteBugs, transientRetries);
         }
 
         @Override
@@ -447,12 +442,7 @@ public final class NanocachedClient implements AutoCloseable {
     private static void requireWithinMaxDuration(String option, Duration value) {
         if (value.compareTo(MAX_DURATION_OPTION) > 0) {
             throw new IllegalArgumentException(
-                    "nanocached: "
-                            + option
-                            + " must not exceed "
-                            + MAX_DURATION_OPTION
-                            + ", got "
-                            + value);
+                    "nanocached: " + option + " must not exceed " + MAX_DURATION_OPTION + ", got " + value);
         }
     }
 
@@ -630,8 +620,7 @@ public final class NanocachedClient implements AutoCloseable {
     // programming-error guard: catches "connect() called again for the
     // same target before the previous one was ever released" without
     // affecting behavior — connecting again still works, this only warns.
-    private static final ConcurrentHashMap<String, Integer> OPEN_TARGETS =
-            new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Integer> OPEN_TARGETS = new ConcurrentHashMap<>();
 
     private static void trackOpenTarget(String key) {
         OPEN_TARGETS.merge(key, 1, Integer::sum);
@@ -642,8 +631,7 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     private final Object stateLock = new Object();
-    private final java.util.concurrent.locks.ReentrantLock refreshLock =
-            new java.util.concurrent.locks.ReentrantLock();
+    private final java.util.concurrent.locks.ReentrantLock refreshLock = new java.util.concurrent.locks.ReentrantLock();
     private final ConcurrentHashMap<String, Object> redialLocks = new ConcurrentHashMap<>();
     private final List<Address> addresses;
     private final byte[] authSecret;
@@ -721,8 +709,7 @@ public final class NanocachedClient implements AutoCloseable {
      * reassigned to a different address by a refresh, but the address itself is what's actually
      * unreachable. Mirrors TypeScript's reconnectCooldowns.
      */
-    private final ConcurrentHashMap<String, CooldownEntry> reconnectCooldowns =
-            new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, CooldownEntry> reconnectCooldowns = new ConcurrentHashMap<>();
 
     private static final class CooldownEntry {
         final long untilNanos;
@@ -878,8 +865,7 @@ public final class NanocachedClient implements AutoCloseable {
 
     public static NanocachedClient connect(Options options) {
         if (options.addresses.isEmpty()) {
-            throw new IllegalArgumentException(
-                    "nanocached: connect() needs a non-empty addresses list");
+            throw new IllegalArgumentException("nanocached: connect() needs a non-empty addresses list");
         }
         // Mirrors the Go SDK's Connect-time rejection: a negative
         // threshold would otherwise silently force every set() to
@@ -887,16 +873,14 @@ public final class NanocachedClient implements AutoCloseable {
         // finding).
         if (options.compressionThreshold < 0) {
             throw new IllegalArgumentException(
-                    "nanocached: compressionThreshold must not be negative, got "
-                            + options.compressionThreshold);
+                    "nanocached: compressionThreshold must not be negative, got " + options.compressionThreshold);
         }
         // Issue #488: an option that can have no effect in this
         // configuration is a misconfiguration, not something to ignore
         // quietly.
         if (options.viaProxy && options.readHedgeAfter != null) {
-            throw new IllegalArgumentException(
-                    "nanocached: readHedgeAfter has no effect with viaProxy "
-                            + "(a proxy connection has no replicas to hedge to); unset one of them");
+            throw new IllegalArgumentException("nanocached: readHedgeAfter has no effect with viaProxy "
+                    + "(a proxy connection has no replicas to hedge to); unset one of them");
         }
         if (options.ca != null && !options.tls) {
             throw new IllegalArgumentException(
@@ -904,19 +888,18 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         SSLContext sslContext = buildSslContext(options.tls, options.ca);
-        NanocachedClient client =
-                new NanocachedClient(
-                        options.addresses,
-                        options.authSecret,
-                        sslContext,
-                        options.compress,
-                        options.compressionThreshold,
-                        options.fireAndForgetReplicas,
-                        options.readRepair,
-                        options.reconnectCooldown,
-                        options.reconnectCooldownDisabled,
-                        options.readHedgeAfter,
-                        options.viaProxy);
+        NanocachedClient client = new NanocachedClient(
+                options.addresses,
+                options.authSecret,
+                sslContext,
+                options.compress,
+                options.compressionThreshold,
+                options.fireAndForgetReplicas,
+                options.readRepair,
+                options.reconnectCooldown,
+                options.reconnectCooldownDisabled,
+                options.readHedgeAfter,
+                options.viaProxy);
 
         // SDK proxy mode (issue #122): a wholly different connect flow —
         // fetch a proxy roster via `Q` rather than a node list via `L`,
@@ -939,27 +922,23 @@ public final class NanocachedClient implements AutoCloseable {
             // connections to the same address makes this heuristic
             // false-positive (issue #12).
             if (client.addresses.size() == 1 && OPEN_TARGETS.containsKey(key)) {
-                System.err.println(
-                        "nanocached: connect() called for "
-                                + key
-                                + " while a previous connection to it is still open — was close() forgotten?");
+                System.err.println("nanocached: connect() called for "
+                        + key
+                        + " while a previous connection to it is still open — was close() forgotten?");
             }
 
             Identify.Result identified;
             try {
-                identified =
-                        Identify.connectAndIdentify(
-                                address.host(), address.port(), client.authSecret, client.tls);
+                identified = Identify.connectAndIdentify(address.host(), address.port(), client.authSecret, client.tls);
             } catch (Identify.UnexpectedHandshakeReply garbage) {
                 // The plain exception connect() is documented to throw (the
                 // handshake's own type is for the ring members' dial paths).
                 lastError = new NanocachedException(garbage.getMessage());
                 continue;
             } catch (IOException | RuntimeException error) {
-                lastError =
-                        error instanceof RuntimeException runtime
-                                ? runtime
-                                : new NanocachedException.ConnectionLost(error.getMessage(), error);
+                lastError = error instanceof RuntimeException runtime
+                        ? runtime
+                        : new NanocachedException.ConnectionLost(error.getMessage(), error);
                 continue;
             }
 
@@ -968,15 +947,14 @@ public final class NanocachedClient implements AutoCloseable {
 
                 if (identified instanceof Identify.NodeTarget node) {
                     if (client.addresses.size() > 1) {
-                        System.err.println(
-                                "nanocached: "
-                                        + key
-                                        + " is a cache node, so this client is pinned to that single server —"
-                                        + " the "
-                                        + (client.addresses.size() - 1)
-                                        + " remaining address(es)"
-                                        + " will not be used. Point addresses at discovery servers for cluster"
-                                        + " routing and failover.");
+                        System.err.println("nanocached: "
+                                + key
+                                + " is a cache node, so this client is pinned to that single server —"
+                                + " the "
+                                + (client.addresses.size() - 1)
+                                + " remaining address(es)"
+                                + " will not be used. Point addresses at discovery servers for cluster"
+                                + " routing and failover.");
                     }
                     client.single = client.newTrackedConnection(node.socket(), node.tagged());
                     client.singleAddress = key;
@@ -986,10 +964,8 @@ public final class NanocachedClient implements AutoCloseable {
 
                 Identify.ClusterTarget cluster = (Identify.ClusterTarget) identified;
                 if (cluster.nodes().isEmpty()) {
-                    lastError =
-                            new NanocachedException(
-                                    "nanocached: no live nodes registered with the discovery server at "
-                                            + key);
+                    lastError = new NanocachedException(
+                            "nanocached: no live nodes registered with the discovery server at " + key);
                     continue;
                 }
 
@@ -1005,9 +981,7 @@ public final class NanocachedClient implements AutoCloseable {
             }
         }
 
-        throw lastError != null
-                ? lastError
-                : new NanocachedException("nanocached: could not connect to any address");
+        throw lastError != null ? lastError : new NanocachedException("nanocached: could not connect to any address");
     }
 
     /**
@@ -1030,29 +1004,22 @@ public final class NanocachedClient implements AutoCloseable {
             String key = address.host() + ":" + address.port();
 
             if (client.addresses.size() == 1 && OPEN_TARGETS.containsKey(key)) {
-                System.err.println(
-                        "nanocached: connect() called for "
-                                + key
-                                + " while a previous connection to it is still open — was close() forgotten?");
+                System.err.println("nanocached: connect() called for "
+                        + key
+                        + " while a previous connection to it is still open — was close() forgotten?");
             }
 
             Identify.Result identified;
             try {
-                identified =
-                        Identify.connectAndIdentify(
-                                address.host(),
-                                address.port(),
-                                client.authSecret,
-                                client.tls,
-                                true);
+                identified = Identify.connectAndIdentify(
+                        address.host(), address.port(), client.authSecret, client.tls, true);
             } catch (Identify.UnexpectedHandshakeReply garbage) {
                 lastError = new NanocachedException(garbage.getMessage());
                 continue;
             } catch (IOException | RuntimeException error) {
-                lastError =
-                        error instanceof RuntimeException runtime
-                                ? runtime
-                                : new NanocachedException.ConnectionLost(error.getMessage(), error);
+                lastError = error instanceof RuntimeException runtime
+                        ? runtime
+                        : new NanocachedException.ConnectionLost(error.getMessage(), error);
                 continue;
             }
 
@@ -1065,17 +1032,13 @@ public final class NanocachedClient implements AutoCloseable {
                     // Best-effort cleanup — the config error below is what matters.
                 }
                 throw new NanocachedException(
-                        "nanocached: viaProxy requires a discovery address, but "
-                                + key
-                                + " is a cache node");
+                        "nanocached: viaProxy requires a discovery address, but " + key + " is a cache node");
             }
 
             List<DiscoveredNode> proxies = ((Identify.ProxyRosterTarget) identified).proxies();
             if (proxies.isEmpty()) {
-                lastError =
-                        new NanocachedException(
-                                "nanocached: no proxies registered with the discovery server at "
-                                        + key);
+                lastError = new NanocachedException(
+                        "nanocached: no proxies registered with the discovery server at " + key);
                 continue;
             }
 
@@ -1087,9 +1050,7 @@ public final class NanocachedClient implements AutoCloseable {
             }
         }
 
-        throw lastError != null
-                ? lastError
-                : new NanocachedException("nanocached: could not connect to any address");
+        throw lastError != null ? lastError : new NanocachedException("nanocached: could not connect to any address");
     }
 
     /**
@@ -1100,8 +1061,7 @@ public final class NanocachedClient implements AutoCloseable {
      * same dial this class uses for any ordinary node — is exactly right here too; every entry
      * unreachable is this SDK's normal connect error.
      */
-    private static NanocachedClient connectToOneProxy(
-            NanocachedClient client, List<DiscoveredNode> proxies) {
+    private static NanocachedClient connectToOneProxy(NanocachedClient client, List<DiscoveredNode> proxies) {
         List<DiscoveredNode> shuffled = new ArrayList<>(proxies);
         java.util.Collections.shuffle(shuffled);
 
@@ -1135,8 +1095,7 @@ public final class NanocachedClient implements AutoCloseable {
             try {
                 return SSLContext.getDefault();
             } catch (NoSuchAlgorithmException error) {
-                throw new NanocachedException(
-                        "nanocached: no default SSL context available: " + error.getMessage());
+                throw new NanocachedException("nanocached: no default SSL context available: " + error.getMessage());
             }
         }
 
@@ -1147,8 +1106,7 @@ public final class NanocachedClient implements AutoCloseable {
                 certificates = factory.generateCertificates(in);
             }
             if (certificates.isEmpty()) {
-                throw new NanocachedException(
-                        "nanocached: ca file " + ca + " contains no certificates");
+                throw new NanocachedException("nanocached: ca file " + ca + " contains no certificates");
             }
 
             KeyStore trustStore = KeyStore.getInstance(KeyStore.getDefaultType());
@@ -1193,11 +1151,7 @@ public final class NanocachedClient implements AutoCloseable {
             this(connection, error, hard, null);
         }
 
-        private DialOutcome(
-                Connection connection,
-                RuntimeException error,
-                boolean hard,
-                String nonNodeAddress) {
+        private DialOutcome(Connection connection, RuntimeException error, boolean hard, String nonNodeAddress) {
             this.connection = connection;
             this.error = error;
             this.hard = hard;
@@ -1237,11 +1191,8 @@ public final class NanocachedClient implements AutoCloseable {
         int separator = address.lastIndexOf(':');
         Integer port = separator == -1 ? null : parsePort(address.substring(separator + 1));
         if (separator == -1 || port == null) {
-            return DialOutcome.hard(
-                    new NanocachedException.ConnectionLost(
-                            "nanocached: invalid node address from discovery server: " + address,
-                            null,
-                            true));
+            return DialOutcome.hard(new NanocachedException.ConnectionLost(
+                    "nanocached: invalid node address from discovery server: " + address, null, true));
         }
         String host = address.substring(0, separator);
 
@@ -1255,11 +1206,7 @@ public final class NanocachedClient implements AutoCloseable {
                     error instanceof RuntimeException runtime
                             ? runtime
                             : new NanocachedException.ConnectionLost(
-                                    "nanocached: could not connect to "
-                                            + address
-                                            + ": "
-                                            + error.getMessage(),
-                                    error));
+                                    "nanocached: could not connect to " + address + ": " + error.getMessage(), error));
         }
 
         if (!(identified instanceof Identify.NodeTarget nodeTarget)) {
@@ -1269,23 +1216,15 @@ public final class NanocachedClient implements AutoCloseable {
             // not a reason to fail every new client's connect.
             return DialOutcome.nonNode(
                     new NanocachedException.ConnectionLost(
-                            "nanocached: " + address + " does not identify as a cache node",
-                            null,
-                            true),
+                            "nanocached: " + address + " does not identify as a cache node", null, true),
                     address);
         }
 
         try {
-            return DialOutcome.success(
-                    newTrackedConnection(nodeTarget.socket(), nodeTarget.tagged()));
+            return DialOutcome.success(newTrackedConnection(nodeTarget.socket(), nodeTarget.tagged()));
         } catch (IOException error) {
-            return DialOutcome.tolerable(
-                    new NanocachedException.ConnectionLost(
-                            "nanocached: could not connect to "
-                                    + address
-                                    + ": "
-                                    + error.getMessage(),
-                            error));
+            return DialOutcome.tolerable(new NanocachedException.ConnectionLost(
+                    "nanocached: could not connect to " + address + ": " + error.getMessage(), error));
         }
     }
 
@@ -1352,20 +1291,17 @@ public final class NanocachedClient implements AutoCloseable {
      * connect timeout per wave instead of k of them.
      */
     private List<DialOutcome> dialConcurrently(
-            List<DiscoveredNode> nodes,
-            java.util.function.Function<DiscoveredNode, DialOutcome> dial) {
+            List<DiscoveredNode> nodes, java.util.function.Function<DiscoveredNode, DialOutcome> dial) {
         List<DialOutcome> outcomes = new ArrayList<>(nodes.size());
         if (nodes.isEmpty()) {
             return outcomes;
         }
-        ExecutorService dialers =
-                Executors.newFixedThreadPool(
-                        Math.max(1, Math.min(nodes.size(), MAX_BOOTSTRAP_DIALER_THREADS)),
-                        runnable -> {
-                            Thread thread = new Thread(runnable, "nanocached-bootstrap-dial");
-                            thread.setDaemon(true);
-                            return thread;
-                        });
+        ExecutorService dialers = Executors.newFixedThreadPool(
+                Math.max(1, Math.min(nodes.size(), MAX_BOOTSTRAP_DIALER_THREADS)), runnable -> {
+                    Thread thread = new Thread(runnable, "nanocached-bootstrap-dial");
+                    thread.setDaemon(true);
+                    return thread;
+                });
         List<CompletableFuture<DialOutcome>> futures = new ArrayList<>(nodes.size());
         try {
             for (DiscoveredNode node : nodes) {
@@ -1425,23 +1361,18 @@ public final class NanocachedClient implements AutoCloseable {
                 // answer: a configuration error, as before (the dead
                 // members keep the not-sent lost-connection error).
                 throw new NanocachedException(
-                        "nanocached: discovery server returned a non-node address: "
-                                + lastNonNodeAddress);
+                        "nanocached: discovery server returned a non-node address: " + lastNonNodeAddress);
             }
             throw lastError != null
                     ? lastError
-                    : new NanocachedException(
-                            "nanocached: could not reach any node in the cluster");
+                    : new NanocachedException("nanocached: could not reach any node in the cluster");
         }
 
         ring = new HashRing(names);
         replication = cluster.replication();
         backgroundReplicaWritePermitCount = maxInFlightBackgroundReplicaWrites;
-        backgroundReplicaWritePermits =
-                new java.util.concurrent.Semaphore(backgroundReplicaWritePermitCount);
-        replicaWriters =
-                newReplicaWriterPool(
-                        backgroundReplicaWritePermitCount + REPLICA_WRITER_POOL_HEADROOM);
+        backgroundReplicaWritePermits = new java.util.concurrent.Semaphore(backgroundReplicaWritePermitCount);
+        replicaWriters = newReplicaWriterPool(backgroundReplicaWritePermitCount + REPLICA_WRITER_POOL_HEADROOM);
         backgroundLegs = newReplicaWriterPool(backgroundReplicaWritePermitCount);
         hedgeLegs = newHedgeLegPool(maxInFlightHedgeLoserLegs + HEDGE_LEG_POOL_HEADROOM);
     }
@@ -1453,24 +1384,23 @@ public final class NanocachedClient implements AutoCloseable {
      * can hold, not for the steady state.
      */
     static ExecutorService newHedgeLegPool(int threads) {
-        java.util.concurrent.ThreadPoolExecutor pool =
-                new java.util.concurrent.ThreadPoolExecutor(
-                        threads,
-                        threads,
-                        HEDGE_LEG_THREAD_KEEP_ALIVE_SECONDS,
-                        TimeUnit.SECONDS,
-                        new java.util.concurrent.ArrayBlockingQueue<>(threads),
-                        runnable -> {
-                            Thread thread = new Thread(runnable, "nanocached-hedge-leg");
-                            thread.setDaemon(true);
-                            return thread;
-                        },
-                        (runnable, executor) -> {
-                            if (executor.isShutdown()) {
-                                throw new RejectedExecutionException("hedge leg pool is shut down");
-                            }
-                            runnable.run();
-                        });
+        java.util.concurrent.ThreadPoolExecutor pool = new java.util.concurrent.ThreadPoolExecutor(
+                threads,
+                threads,
+                HEDGE_LEG_THREAD_KEEP_ALIVE_SECONDS,
+                TimeUnit.SECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(threads),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "nanocached-hedge-leg");
+                    thread.setDaemon(true);
+                    return thread;
+                },
+                (runnable, executor) -> {
+                    if (executor.isShutdown()) {
+                        throw new RejectedExecutionException("hedge leg pool is shut down");
+                    }
+                    runnable.run();
+                });
         pool.allowCoreThreadTimeOut(true);
         return pool;
     }
@@ -1492,25 +1422,23 @@ public final class NanocachedClient implements AutoCloseable {
      * case and leave its CompletableFuture never completing).
      */
     static ExecutorService newReplicaWriterPool(int threads) {
-        java.util.concurrent.ThreadPoolExecutor pool =
-                new java.util.concurrent.ThreadPoolExecutor(
-                        threads,
-                        threads,
-                        0L,
-                        java.util.concurrent.TimeUnit.MILLISECONDS,
-                        new java.util.concurrent.ArrayBlockingQueue<>(threads),
-                        runnable -> {
-                            Thread thread = new Thread(runnable, "nanocached-replica-writer");
-                            thread.setDaemon(true);
-                            return thread;
-                        },
-                        (runnable, executor) -> {
-                            if (executor.isShutdown()) {
-                                throw new RejectedExecutionException(
-                                        "replica writer pool is shut down");
-                            }
-                            runnable.run();
-                        });
+        java.util.concurrent.ThreadPoolExecutor pool = new java.util.concurrent.ThreadPoolExecutor(
+                threads,
+                threads,
+                0L,
+                java.util.concurrent.TimeUnit.MILLISECONDS,
+                new java.util.concurrent.ArrayBlockingQueue<>(threads),
+                runnable -> {
+                    Thread thread = new Thread(runnable, "nanocached-replica-writer");
+                    thread.setDaemon(true);
+                    return thread;
+                },
+                (runnable, executor) -> {
+                    if (executor.isShutdown()) {
+                        throw new RejectedExecutionException("replica writer pool is shut down");
+                    }
+                    runnable.run();
+                });
         return pool;
     }
 
@@ -1571,10 +1499,9 @@ public final class NanocachedClient implements AutoCloseable {
      */
     private static void validateToken(String token) {
         if (token == null || !CAS_TOKEN_PATTERN.matcher(token).matches()) {
-            throw new IllegalArgumentException(
-                    "nanocached: token must be a 32-character lowercase hex digest "
-                            + "(from contentDigest/getWithToken), got: "
-                            + token);
+            throw new IllegalArgumentException("nanocached: token must be a 32-character lowercase hex digest "
+                    + "(from contentDigest/getWithToken), got: "
+                    + token);
         }
     }
 
@@ -2097,9 +2024,7 @@ public final class NanocachedClient implements AutoCloseable {
     private byte[] readRawBytes(byte[] namespace, byte[] key) {
         validateKey(namespace, key);
         beforeOperation();
-        byte[] value =
-                withWrongNodeRetry(
-                        () -> read(namespace, key, connection -> connection.get(namespace, key)));
+        byte[] value = withWrongNodeRetry(() -> read(namespace, key, connection -> connection.get(namespace, key)));
         if (value == null && readRepair && ring != null) {
             value = tryReadRepair(namespace, key);
         }
@@ -2130,10 +2055,7 @@ public final class NanocachedClient implements AutoCloseable {
         for (String name : names.subList(1, names.size())) {
             byte[] value;
             try {
-                value =
-                        applyReconnecting(
-                                () -> memberConnection(name),
-                                connection -> connection.get(namespace, key));
+                value = applyReconnecting(() -> memberConnection(name), connection -> connection.get(namespace, key));
             } catch (RuntimeException ignored) {
                 continue;
             }
@@ -2152,40 +2074,32 @@ public final class NanocachedClient implements AutoCloseable {
                 byte[] repairNamespace = namespace.clone();
                 byte[] repairKey = key.clone();
                 byte[] repairValue = value.clone();
-                Runnable repair =
-                        () -> {
-                            try {
-                                applyReconnecting(
-                                        () -> memberConnection(primary),
-                                        connection -> {
-                                            connection.set(
-                                                    repairNamespace,
-                                                    repairKey,
-                                                    repairValue,
-                                                    READ_REPAIR_TTL_SECONDS);
-                                            return null;
-                                        });
-                            } catch (NanocachedException ignored) {
-                                // Swallowed by design — see the doc comment; now
-                                // counted via stats().readRepairFailures. Narrowed
-                                // to the connection layer's own failure types, so
-                                // a programming bug here (e.g. a
-                                // NullPointerException) propagates instead of
-                                // being treated identically to a dead primary.
-                                readRepairFailures.incrementAndGet();
-                            }
-                        };
+                Runnable repair = () -> {
+                    try {
+                        applyReconnecting(() -> memberConnection(primary), connection -> {
+                            connection.set(repairNamespace, repairKey, repairValue, READ_REPAIR_TTL_SECONDS);
+                            return null;
+                        });
+                    } catch (NanocachedException ignored) {
+                        // Swallowed by design — see the doc comment; now
+                        // counted via stats().readRepairFailures. Narrowed
+                        // to the connection layer's own failure types, so
+                        // a programming bug here (e.g. a
+                        // NullPointerException) propagates instead of
+                        // being treated identically to a dead primary.
+                        readRepairFailures.incrementAndGet();
+                    }
+                };
                 try {
-                    CompletableFuture.runAsync(repair, backgroundLegs)
-                            .whenComplete((ignoredResult, error) -> {
-                                backgroundReplicaWritePermits.release();
-                                // error is non-null only for a genuine bug
-                                // that escaped repair's own catch above —
-                                // see reportBackgroundWriteBug (issue:
-                                // audit finding, background writes
-                                // silently discarding this).
-                                reportBackgroundWriteBug(error);
-                            });
+                    CompletableFuture.runAsync(repair, backgroundLegs).whenComplete((ignoredResult, error) -> {
+                        backgroundReplicaWritePermits.release();
+                        // error is non-null only for a genuine bug
+                        // that escaped repair's own catch above —
+                        // see reportBackgroundWriteBug (issue:
+                        // audit finding, background writes
+                        // silently discarding this).
+                        reportBackgroundWriteBug(error);
+                    });
                 } catch (RejectedExecutionException rejected) {
                     // close() shut backgroundLegs down concurrently — see
                     // the matching handling in write(). The repair is
@@ -2202,7 +2116,10 @@ public final class NanocachedClient implements AutoCloseable {
 
     private static String decodeUtf8Strict(byte[] bytes) {
         try {
-            return StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
+            return StandardCharsets.UTF_8
+                    .newDecoder()
+                    .decode(ByteBuffer.wrap(bytes))
+                    .toString();
         } catch (CharacterCodingException malformed) {
             throw new UncheckedIOException(malformed);
         }
@@ -2248,8 +2165,7 @@ public final class NanocachedClient implements AutoCloseable {
         try {
             return decodeMany(getManyBytes(namespace, keys));
         } catch (NanocachedException.PartialWrongNode partial) {
-            throw new NanocachedException.PartialWrongNodeStrings(
-                    decodePartial(partial.partialValues));
+            throw new NanocachedException.PartialWrongNodeStrings(decodePartial(partial.partialValues));
         } catch (NanocachedException.PartialConnectionLost partial) {
             throw new NanocachedException.PartialConnectionLostStrings(
                     partial.getMessage(), partial.getCause(), decodePartial(partial.partialValues));
@@ -2317,8 +2233,7 @@ public final class NanocachedClient implements AutoCloseable {
      */
     Map<String, byte[]> getManyBytes(byte[] namespace, List<String> keys) {
         if (keys.isEmpty()) {
-            throw new IllegalArgumentException(
-                    "nanocached: getMany/getManyBytes requires at least one key");
+            throw new IllegalArgumentException("nanocached: getMany/getManyBytes requires at least one key");
         }
         byte[][] keyBytes = new byte[keys.size()][];
         for (int i = 0; i < keys.size(); i++) {
@@ -2330,9 +2245,7 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException.PartialWrongNode(spliceMany(keys, partial.partialValues));
         } catch (NanocachedException.PartialConnectionLostRaw partial) {
             throw new NanocachedException.PartialConnectionLost(
-                    partial.getMessage(),
-                    partial.getCause(),
-                    spliceMany(keys, partial.partialValues));
+                    partial.getMessage(), partial.getCause(), spliceMany(keys, partial.partialValues));
         }
     }
 
@@ -2380,15 +2293,12 @@ public final class NanocachedClient implements AutoCloseable {
      */
     byte[][] getManyBytes(byte[] namespace, byte[][] keys) {
         if (keys.length == 0) {
-            throw new IllegalArgumentException(
-                    "nanocached: getMany/getManyBytes requires at least one key");
+            throw new IllegalArgumentException("nanocached: getMany/getManyBytes requires at least one key");
         }
         Map<java.nio.ByteBuffer, Integer> firstPosition = new LinkedHashMap<>(keys.length);
         int[] distinctOf = new int[keys.length];
         for (int i = 0; i < keys.length; i++) {
-            Integer position =
-                    firstPosition.putIfAbsent(
-                            java.nio.ByteBuffer.wrap(keys[i]), firstPosition.size());
+            Integer position = firstPosition.putIfAbsent(java.nio.ByteBuffer.wrap(keys[i]), firstPosition.size());
             distinctOf[i] = position == null ? firstPosition.size() - 1 : position;
         }
         if (firstPosition.size() == keys.length) {
@@ -2474,8 +2384,7 @@ public final class NanocachedClient implements AutoCloseable {
                     unresolved.add(i);
                 }
             }
-            if (!unresolved.isEmpty())
-                throw new NanocachedException.PartialWrongNodeRaw(values, unresolved);
+            if (!unresolved.isEmpty()) throw new NanocachedException.PartialWrongNodeRaw(values, unresolved);
             return values;
         }
 
@@ -2506,8 +2415,7 @@ public final class NanocachedClient implements AutoCloseable {
             // connection failure when nothing resolved, exactly as read()
             // throws for a single key.
             if (lastError == null) {
-                lastError =
-                        new NanocachedException("nanocached: no owner is reachable for these keys");
+                lastError = new NanocachedException("nanocached: no owner is reachable for these keys");
             }
             boolean anyResolved = false;
             for (byte[] value : values) {
@@ -2606,9 +2514,7 @@ public final class NanocachedClient implements AutoCloseable {
         final List<Connection.MultiEntry> partialEntries;
         final NanocachedException.ConnectionLost cause;
 
-        ChunkedConnectionFailure(
-                List<Connection.MultiEntry> partialEntries,
-                NanocachedException.ConnectionLost cause) {
+        ChunkedConnectionFailure(List<Connection.MultiEntry> partialEntries, NanocachedException.ConnectionLost cause) {
             super(cause);
             this.partialEntries = partialEntries;
             this.cause = cause;
@@ -2635,10 +2541,7 @@ public final class NanocachedClient implements AutoCloseable {
          */
         final int sentEnd;
 
-        ChunkedTouchFailure(
-                List<Connection.MultiEntry> partialEntries,
-                NanocachedException cause,
-                int sentEnd) {
+        ChunkedTouchFailure(List<Connection.MultiEntry> partialEntries, NanocachedException cause, int sentEnd) {
             super(cause);
             this.partialEntries = partialEntries;
             this.cause = cause;
@@ -2663,20 +2566,15 @@ public final class NanocachedClient implements AutoCloseable {
      * there is nothing partial to carry.
      */
     private List<Connection.MultiEntry> multiGetChunked(
-            java.util.function.Supplier<Connection> connectionFor,
-            byte[] namespace,
-            byte[][] keys) {
-        List<Connection.MultiEntry> entries =
-                new ArrayList<>(Collections.nCopies(keys.length, null));
+            java.util.function.Supplier<Connection> connectionFor, byte[] namespace, byte[][] keys) {
+        List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
         int start = 0;
         while (start < keys.length) {
             int end = multiGetChunkEnd(namespace.length, keys, start);
             byte[][] chunk = Arrays.copyOfRange(keys, start, end);
             List<Connection.MultiEntry> chunkEntries;
             try {
-                chunkEntries =
-                        applyReconnecting(
-                                connectionFor, connection -> connection.multiGet(namespace, chunk));
+                chunkEntries = applyReconnecting(connectionFor, connection -> connection.multiGet(namespace, chunk));
             } catch (NanocachedException.ConnectionLost failure) {
                 if (start == 0) throw failure;
                 throw new ChunkedConnectionFailure(entries, failure);
@@ -2713,8 +2611,7 @@ public final class NanocachedClient implements AutoCloseable {
         return (int) Math.min(MAX_BATCH_KEYS, (64L * 1024 * 1024) / namespaceLength);
     }
 
-    private static int multiGetChunkEnd(
-            int namespaceLength, byte[][] keys, int start, int maxKeys) {
+    private static int multiGetChunkEnd(int namespaceLength, byte[][] keys, int start, int maxKeys) {
         int end = start + 1;
         long frameBytes = namespaceLength + multiGetEntryWireBytes(keys[start]);
         while (end < keys.length && end - start < maxKeys) {
@@ -2754,8 +2651,7 @@ public final class NanocachedClient implements AutoCloseable {
         final List<Integer> unreachable;
         final NanocachedException lastError;
 
-        MultiGetPassOutcome(
-                List<Integer> wrongNode, List<Integer> unreachable, NanocachedException lastError) {
+        MultiGetPassOutcome(List<Integer> wrongNode, List<Integer> unreachable, NanocachedException lastError) {
             this.wrongNode = wrongNode;
             this.unreachable = unreachable;
             this.lastError = lastError;
@@ -2780,11 +2676,7 @@ public final class NanocachedClient implements AutoCloseable {
      * and once more, if needed, after a single forced refresh.
      */
     private MultiGetPassOutcome multiGetPass(
-            byte[] namespace,
-            byte[][] keyBytes,
-            byte[][] values,
-            List<Integer> retryIndices,
-            long[] budget) {
+            byte[] namespace, byte[][] keyBytes, byte[][] values, List<Integer> retryIndices, long[] budget) {
         List<Integer> pending;
         if (retryIndices == null) {
             pending = new ArrayList<>(keyBytes.length);
@@ -2815,7 +2707,8 @@ public final class NanocachedClient implements AutoCloseable {
                 } else if (r >= owners.size()) {
                     unreachable.add(idx);
                 } else {
-                    groups.computeIfAbsent(owners.get(r), name -> new ArrayList<>()).add(idx);
+                    groups.computeIfAbsent(owners.get(r), name -> new ArrayList<>())
+                            .add(idx);
                 }
             }
             pending = new ArrayList<>();
@@ -2825,18 +2718,8 @@ public final class NanocachedClient implements AutoCloseable {
             for (Map.Entry<String, List<Integer>> group : groups.entrySet()) {
                 String owner = group.getKey();
                 List<Integer> groupIndices = group.getValue();
-                Runnable leg =
-                        () ->
-                                runMultiGetLeg(
-                                        namespace,
-                                        owner,
-                                        groupIndices,
-                                        keyBytes,
-                                        values,
-                                        wrongNode,
-                                        moved,
-                                        lastError,
-                                        budget);
+                Runnable leg = () -> runMultiGetLeg(
+                        namespace, owner, groupIndices, keyBytes, values, wrongNode, moved, lastError, budget);
                 // issue #277: routed through submitReplicaWrite (rather
                 // than a raw CompletableFuture.supplyAsync onto
                 // replicaWriters, as this used to be) so a leg racing
@@ -2962,8 +2845,7 @@ public final class NanocachedClient implements AutoCloseable {
      */
     void set(byte[] namespace, byte[] key, byte[] value, long ttlSeconds) {
         if (ttlSeconds < 0) {
-            throw new IllegalArgumentException(
-                    "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
+            throw new IllegalArgumentException("nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
         }
         validateKeyAndValue(namespace, key, value);
         beforeOperation();
@@ -2990,8 +2872,7 @@ public final class NanocachedClient implements AutoCloseable {
                         // every synchronous/joined leg (including the primary) keeps using
                         // the uncopied `outgoing` above, since it always finishes before
                         // this method returns and so can never observe a later mutation.
-                        byte[] backgroundSafe =
-                                compress ? outgoing : Arrays.copyOf(outgoing, outgoing.length);
+                        byte[] backgroundSafe = compress ? outgoing : Arrays.copyOf(outgoing, outgoing.length);
                         // Issue #1199: the same holds for the key and the namespace —
                         // the leg frames them only once it runs, so a caller that
                         // reuses those buffers must not change where the replica
@@ -2999,11 +2880,7 @@ public final class NanocachedClient implements AutoCloseable {
                         byte[] backgroundKey = key.clone();
                         byte[] backgroundNamespace = namespace.clone();
                         return connection -> {
-                            connection.set(
-                                    backgroundNamespace,
-                                    backgroundKey,
-                                    backgroundSafe,
-                                    wireTtlSeconds);
+                            connection.set(backgroundNamespace, backgroundKey, backgroundSafe, wireTtlSeconds);
                             return null;
                         };
                     });
@@ -3079,17 +2956,15 @@ public final class NanocachedClient implements AutoCloseable {
             boolean expiring = expiresAtOnce(wireTtl);
             return withTouchRetry(
                     expiring,
-                    () ->
-                            write(
-                                    namespace,
-                                    key,
-                                    connection ->
-                                            connection.touch(ownedNamespace, ownedKey, wireTtl),
-                                    null,
-                                    null,
-                                    !expiring,
-                                    true,
-                                    expiring));
+                    () -> write(
+                            namespace,
+                            key,
+                            connection -> connection.touch(ownedNamespace, ownedKey, wireTtl),
+                            null,
+                            null,
+                            !expiring,
+                            true,
+                            expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         }
@@ -3148,26 +3023,20 @@ public final class NanocachedClient implements AutoCloseable {
         byte[] raw;
         try {
             boolean expiring = expiresAtOnce(wireTtl);
-            raw =
-                    withTouchRetry(
-                            expiring,
-                            () ->
-                                    write(
-                                            namespace,
-                                            key,
-                                            connection ->
-                                                    connection.getAndTouch(
-                                                            ownedNamespace, ownedKey, wireTtl),
-                                            null,
-                                            // A replica is sent the plain touch: it has no value to
-                                            // return, and `G` there would only move the value over
-                                            // the wire for nothing.
-                                            connection ->
-                                                    connection.touch(
-                                                            ownedNamespace, ownedKey, wireTtl),
-                                            !expiring,
-                                            true,
-                                            expiring));
+            raw = withTouchRetry(
+                    expiring,
+                    () -> write(
+                            namespace,
+                            key,
+                            connection -> connection.getAndTouch(ownedNamespace, ownedKey, wireTtl),
+                            null,
+                            // A replica is sent the plain touch: it has no value to
+                            // return, and `G` there would only move the value over
+                            // the wire for nothing.
+                            connection -> connection.touch(ownedNamespace, ownedKey, wireTtl),
+                            !expiring,
+                            true,
+                            expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         }
@@ -3286,8 +3155,7 @@ public final class NanocachedClient implements AutoCloseable {
             if (outcome.wrongNode) throw new NanocachedException.WrongNode();
             throw outcome.cause != null
                     ? outcome.cause
-                    : new NanocachedException.ConnectionLost(
-                            "nanocached: no owner is reachable for these keys", null);
+                    : new NanocachedException.ConnectionLost("nanocached: no owner is reachable for these keys", null);
         }
         boolean[] touched = new boolean[keys.length];
         for (int i = 0; i < keys.length; i++) {
@@ -3343,13 +3211,11 @@ public final class NanocachedClient implements AutoCloseable {
      * Shared by {@link #getManyAndTouch(List, long)} and {@link Namespace#getManyAndTouch}: as
      * {@link #getManyDecoded}, for the touching read.
      */
-    private Map<String, String> getManyAndTouchDecoded(
-            byte[] namespace, List<String> keys, long ttlSeconds) {
+    private Map<String, String> getManyAndTouchDecoded(byte[] namespace, List<String> keys, long ttlSeconds) {
         try {
             return decodeMany(getManyAndTouchBytes(namespace, keys, ttlSeconds));
         } catch (NanocachedException.PartialWrongNode partial) {
-            throw new NanocachedException.PartialWrongNodeStrings(
-                    decodePartial(partial.partialValues));
+            throw new NanocachedException.PartialWrongNodeStrings(decodePartial(partial.partialValues));
         } catch (NanocachedException.PartialServerTooOld partial) {
             throw new NanocachedException.PartialServerTooOldStrings(
                     partial.getCause(), decodePartial(partial.partialValues));
@@ -3391,9 +3257,7 @@ public final class NanocachedClient implements AutoCloseable {
                     partial.getCause(), spliceMany(keys, partial.partialValues));
         } catch (NanocachedException.PartialConnectionLostRaw partial) {
             throw new NanocachedException.PartialConnectionLost(
-                    partial.getMessage(),
-                    partial.getCause(),
-                    spliceMany(keys, partial.partialValues));
+                    partial.getMessage(), partial.getCause(), spliceMany(keys, partial.partialValues));
         }
     }
 
@@ -3470,23 +3334,18 @@ public final class NanocachedClient implements AutoCloseable {
             // The hits other primaries returned ride along (issue #924):
             // a ttlSeconds == 0 call consumed them.
             if (!anyHit) throw new NanocachedException.ServerTooOld("y", outcome.cause);
-            throw new NanocachedException.PartialServerTooOldRaw(
-                    outcome.cause, values, outcome.unresolved);
+            throw new NanocachedException.PartialServerTooOldRaw(outcome.cause, values, outcome.unresolved);
         }
-        if (outcome.wrongNode)
-            throw new NanocachedException.PartialWrongNodeRaw(values, outcome.unresolved);
+        if (outcome.wrongNode) throw new NanocachedException.PartialWrongNodeRaw(values, outcome.unresolved);
         // No primary answered `W` for these keys: each one's primary was
         // unreachable on both passes. That is a connection loss, reported
         // with whatever did resolve attached — or as the bare connection
         // failure when nothing resolved, as getManyDistinct does.
-        NanocachedException cause =
-                outcome.cause != null
-                        ? outcome.cause
-                        : new NanocachedException.ConnectionLost(
-                                "nanocached: no owner is reachable for these keys", null);
+        NanocachedException cause = outcome.cause != null
+                ? outcome.cause
+                : new NanocachedException.ConnectionLost("nanocached: no owner is reachable for these keys", null);
         if (!anyHit) throw cause;
-        throw new NanocachedException.PartialConnectionLostRaw(
-                cause.getMessage(), cause, values, outcome.unresolved);
+        throw new NanocachedException.PartialConnectionLostRaw(cause.getMessage(), cause, values, outcome.unresolved);
     }
 
     /** The distinct keys of a batch, and where each caller position's key sits among them. */
@@ -3505,12 +3364,10 @@ public final class NanocachedClient implements AutoCloseable {
             Map<ByteBuffer, Integer> firstPosition = new LinkedHashMap<>(keys.length);
             int[] positionOf = new int[keys.length];
             for (int i = 0; i < keys.length; i++) {
-                Integer position =
-                        firstPosition.putIfAbsent(ByteBuffer.wrap(keys[i]), firstPosition.size());
+                Integer position = firstPosition.putIfAbsent(ByteBuffer.wrap(keys[i]), firstPosition.size());
                 positionOf[i] = position == null ? firstPosition.size() - 1 : position;
             }
-            if (firstPosition.size() == keys.length)
-                return new DistinctKeys(keys, positionOf, false);
+            if (firstPosition.size() == keys.length) return new DistinctKeys(keys, positionOf, false);
             byte[][] distinct = new byte[firstPosition.size()][];
             for (int i = 0; i < keys.length; i++) {
                 distinct[positionOf[i]] = keys[i];
@@ -3598,8 +3455,7 @@ public final class NanocachedClient implements AutoCloseable {
      * reports what resolved. Never throws a routing outcome — the callers turn {@link
      * MultiTouchOutcome} into the exception their API promises.
      */
-    private MultiTouchOutcome multiTouch(
-            byte[] namespace, byte[][] keys, long ttlSeconds, boolean get) {
+    private MultiTouchOutcome multiTouch(byte[] namespace, byte[][] keys, long ttlSeconds, boolean get) {
         Long wireTtl = touchWireTtl(ttlSeconds);
         for (byte[] key : keys) {
             validateKey(namespace, key);
@@ -3685,8 +3541,7 @@ public final class NanocachedClient implements AutoCloseable {
                 break;
             }
         }
-        return new MultiTouchOutcome(
-                answers, unresolved, wrongNode, state.lastCause.get(), state.rejected);
+        return new MultiTouchOutcome(answers, unresolved, wrongNode, state.lastCause.get(), state.rejected);
     }
 
     /**
@@ -3703,38 +3558,27 @@ public final class NanocachedClient implements AutoCloseable {
             byte[][] keys,
             Long wireTtl,
             boolean get) {
-        List<Connection.MultiEntry> entries =
-                new ArrayList<>(Collections.nCopies(keys.length, null));
+        List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
         boolean expiring = expiresAtOnce(wireTtl);
         int start = 0;
         while (start < keys.length) {
-            int end =
-                    multiGetChunkEnd(
-                            namespace.length,
-                            keys,
-                            start,
-                            maxKeysPerNamespaceChunk(namespace.length));
+            int end = multiGetChunkEnd(namespace.length, keys, start, maxKeysPerNamespaceChunk(namespace.length));
             byte[][] chunk = Arrays.copyOfRange(keys, start, end);
             List<Connection.MultiEntry> chunkEntries;
-            ConnectionOp<List<Connection.MultiEntry>> chunkOp =
-                    connection ->
-                            get
-                                    ? connection.multiGetAndTouch(namespace, chunk, wireTtl)
-                                    : connection.multiTouch(namespace, chunk, wireTtl);
+            ConnectionOp<List<Connection.MultiEntry>> chunkOp = connection -> get
+                    ? connection.multiGetAndTouch(namespace, chunk, wireTtl)
+                    : connection.multiTouch(namespace, chunk, wireTtl);
             try {
-                chunkEntries =
-                        expiring
-                                ? applyReconnectingUnlessSent(connectionFor, chunkOp)
-                                : applyReconnecting(connectionFor, chunkOp, true);
+                chunkEntries = expiring
+                        ? applyReconnectingUnlessSent(connectionFor, chunkOp)
+                        : applyReconnecting(connectionFor, chunkOp, true);
             } catch (NanocachedException.ConnectionLost failure) {
                 // Issue #901: with ttl 0 a chunk whose frame may have been
                 // applied (not provably unsent, and not an `En`, which
                 // applied nothing) must not be resent; later chunks were
                 // never sent.
                 boolean mayHaveApplied =
-                        expiring
-                                && !failure.notSent()
-                                && !(failure instanceof NanocachedException.ServerRejected);
+                        expiring && !failure.notSent() && !(failure instanceof NanocachedException.ServerRejected);
                 throw new ChunkedTouchFailure(entries, failure, mayHaveApplied ? end : 0);
             } catch (NanocachedException.RetryableError retryable) {
                 // Issue #937: the proxy's `R` means the request was NOT
@@ -3796,9 +3640,7 @@ public final class NanocachedClient implements AutoCloseable {
             for (int rank = 0; rank < (primaryOnly ? 1 : names.size()); rank++) {
                 boolean form = get && rank == 0;
                 String owner = names.get(rank);
-                TouchLeg leg =
-                        legs.computeIfAbsent(
-                                (form ? "G" : "P") + owner, id -> new TouchLeg(owner, form));
+                TouchLeg leg = legs.computeIfAbsent((form ? "G" : "P") + owner, id -> new TouchLeg(owner, form));
                 leg.indices.add(idx);
                 leg.isPrimary.add(rank == 0);
             }
@@ -3817,11 +3659,9 @@ public final class NanocachedClient implements AutoCloseable {
      * for it. A replica's failure is counted in {@link #replicaWriteFailures} and never fails the
      * batch, exactly as for the concurrent fan-out.
      */
-    private void multiTouchReplicas(
-            byte[] namespace, byte[][] keyBytes, Long wireTtl, MultiTouchState state) {
+    private void multiTouchReplicas(byte[] namespace, byte[][] keyBytes, Long wireTtl, MultiTouchState state) {
         Map<String, TouchLeg> legs = new LinkedHashMap<>();
-        for (Map.Entry<Integer, String> answered :
-                new java.util.TreeMap<>(state.answeredBy).entrySet()) {
+        for (Map.Entry<Integer, String> answered : new java.util.TreeMap<>(state.answeredBy).entrySet()) {
             int idx = answered.getKey();
             for (String owner : ownerNames(namespace, keyBytes[idx])) {
                 if (owner.equals(answered.getValue())) continue;
@@ -3832,13 +3672,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
         if (legs.isEmpty()) return;
         // Nothing can end up in `retry`: no leg holds a primary position.
-        dispatchTouchLegs(
-                namespace,
-                legs,
-                keyBytes,
-                wireTtl,
-                Collections.synchronizedList(new ArrayList<>()),
-                state);
+        dispatchTouchLegs(namespace, legs, keyBytes, wireTtl, Collections.synchronizedList(new ArrayList<>()), state);
     }
 
     /**
@@ -3859,38 +3693,26 @@ public final class NanocachedClient implements AutoCloseable {
             // branch, including its close()-race fallbacks. A pure-replica
             // leg holds no primary key, so it has nothing to put in
             // `retry`.
-            if (fireAndForgetReplicas
-                    && pureReplica
-                    && backgroundReplicaWritePermits.tryAcquire()) {
+            if (fireAndForgetReplicas && pureReplica && backgroundReplicaWritePermits.tryAcquire()) {
                 // Issue #1255: the leg frames its keys and namespace after the
                 // call returned; copy the keys it touches (the caller's own
                 // arrays for a positional byte[][] call) and the namespace.
                 byte[][] backgroundKeys = copyValuesForBackground(keyBytes, leg.indices);
                 byte[] backgroundNamespace = namespace.clone();
                 Runnable backgroundLeg =
-                        () ->
-                                runMultiTouchLeg(
-                                        backgroundNamespace,
-                                        leg,
-                                        backgroundKeys,
-                                        wireTtl,
-                                        retry,
-                                        state);
+                        () -> runMultiTouchLeg(backgroundNamespace, leg, backgroundKeys, wireTtl, retry, state);
                 try {
-                    CompletableFuture.runAsync(backgroundLeg, backgroundLegs)
-                            .whenComplete((ignoredResult, error) -> {
-                                backgroundReplicaWritePermits.release();
-                                reportBackgroundWriteBug(error);
-                            });
+                    CompletableFuture.runAsync(backgroundLeg, backgroundLegs).whenComplete((ignoredResult, error) -> {
+                        backgroundReplicaWritePermits.release();
+                        reportBackgroundWriteBug(error);
+                    });
                 } catch (RejectedExecutionException rejected) {
                     backgroundReplicaWritePermits.release();
                     backgroundLeg.run();
                 }
                 continue;
             }
-            futures.add(
-                    submitReplicaWrite(() ->
-                            runMultiTouchLeg(namespace, leg, keyBytes, wireTtl, retry, state)));
+            futures.add(submitReplicaWrite(() -> runMultiTouchLeg(namespace, leg, keyBytes, wireTtl, retry, state)));
         }
 
         // Always drain every leg, even after one has already failed — see
@@ -3925,13 +3747,7 @@ public final class NanocachedClient implements AutoCloseable {
         NanocachedException failure = null;
         int sentEnd = 0;
         try {
-            entries =
-                    multiTouchChunked(
-                            () -> memberConnection(leg.owner),
-                            namespace,
-                            groupKeys,
-                            wireTtl,
-                            leg.get);
+            entries = multiTouchChunked(() -> memberConnection(leg.owner), namespace, groupKeys, wireTtl, leg.get);
         } catch (ChunkedTouchFailure partial) {
             entries = partial.partialEntries;
             failure = partial.cause;
@@ -3984,16 +3800,15 @@ public final class NanocachedClient implements AutoCloseable {
         // replica would delete its copy while a primary that failed or
         // answered W is rerouted to it, and the call would return false for
         // a key that existed.
-        return withWrongNodeRetry(() ->
-                write(
-                        namespace,
-                        key,
-                        connection -> connection.delete(ownedNamespace, ownedKey),
-                        null,
-                        null,
-                        true,
-                        false,
-                        true));
+        return withWrongNodeRetry(() -> write(
+                namespace,
+                key,
+                connection -> connection.delete(ownedNamespace, ownedKey),
+                null,
+                null,
+                true,
+                false,
+                true));
     }
 
     public void setMany(Map<String, String> values) {
@@ -4061,9 +3876,7 @@ public final class NanocachedClient implements AutoCloseable {
             setManyBytes(namespace, keyBytes, valueBytes, ttlSeconds);
         } catch (NanocachedException.PartialConnectionLostSetRaw partial) {
             throw new NanocachedException.PartialConnectionLostSet(
-                    partial.getMessage(),
-                    partial.getCause(),
-                    spliceKeys(keyList, partial.succeededIndices));
+                    partial.getMessage(), partial.getCause(), spliceKeys(keyList, partial.succeededIndices));
         }
     }
 
@@ -4102,28 +3915,19 @@ public final class NanocachedClient implements AutoCloseable {
      */
     void setManyBytes(byte[] namespace, byte[][] keys, byte[][] values, long ttlSeconds) {
         if (keys.length == 0) {
-            throw new IllegalArgumentException(
-                    "nanocached: setMany/setManyBytes requires at least one key");
+            throw new IllegalArgumentException("nanocached: setMany/setManyBytes requires at least one key");
         }
         if (keys.length != values.length) {
             throw new IllegalArgumentException(
-                    "nanocached: setManyBytes got "
-                            + keys.length
-                            + " keys but "
-                            + values.length
-                            + " values");
+                    "nanocached: setManyBytes got " + keys.length + " keys but " + values.length + " values");
         }
         if (ttlSeconds < 0) {
-            throw new IllegalArgumentException(
-                    "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
+            throw new IllegalArgumentException("nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
         }
         byte[][] valueBytes = new byte[keys.length][];
         for (int i = 0; i < keys.length; i++) {
             validateKeyAndValue(namespace, keys[i], values[i]);
-            valueBytes[i] =
-                    compress
-                            ? Compression.compressValue(values[i], compressionThreshold)
-                            : values[i];
+            valueBytes[i] = compress ? Compression.compressValue(values[i], compressionThreshold) : values[i];
         }
         beforeOperation();
 
@@ -4137,13 +3941,7 @@ public final class NanocachedClient implements AutoCloseable {
         if (single) {
             List<Connection.MultiEntry> entries;
             try {
-                entries =
-                        multiSetChunked(
-                                this::singleConnection,
-                                namespace,
-                                keys,
-                                valueBytes,
-                                wireTtlSeconds);
+                entries = multiSetChunked(this::singleConnection, namespace, keys, valueBytes, wireTtlSeconds);
             } catch (ChunkedConnectionFailure partial) {
                 throw partialConnectionLostSetRaw(partial);
             }
@@ -4154,8 +3952,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         MultiSetTracker tracker = new MultiSetTracker();
-        List<Integer> retry =
-                multiSetPass(namespace, keys, valueBytes, wireTtlSeconds, null, tracker);
+        List<Integer> retry = multiSetPass(namespace, keys, valueBytes, wireTtlSeconds, null, tracker);
         if (retry.isEmpty()) return;
         maybeRefresh(true);
         retry = multiSetPass(namespace, keys, valueBytes, wireTtlSeconds, retry, tracker);
@@ -4170,19 +3967,15 @@ public final class NanocachedClient implements AutoCloseable {
         // do that for a dead node, and one that logs the message must
         // not be told the node answered.
         for (int idx : retry) {
-            if (!tracker.primaryUnreachable.contains(idx))
-                throw new NanocachedException.WrongNode();
+            if (!tracker.primaryUnreachable.contains(idx)) throw new NanocachedException.WrongNode();
         }
         NanocachedException cause = tracker.lastCause.get();
         if (cause == null) {
-            cause =
-                    new NanocachedException.ConnectionLost(
-                            "nanocached: no owner is reachable for these keys", null);
+            cause = new NanocachedException.ConnectionLost("nanocached: no owner is reachable for these keys", null);
         }
         List<Integer> succeeded = new ArrayList<>(tracker.primaryAcknowledged);
         Collections.sort(succeeded);
-        throw new NanocachedException.PartialConnectionLostSetRaw(
-                cause.getMessage(), cause, succeeded);
+        throw new NanocachedException.PartialConnectionLostSetRaw(cause.getMessage(), cause, succeeded);
     }
 
     /**
@@ -4209,7 +4002,9 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         void acknowledge(int idx, String owner) {
-            acknowledged.computeIfAbsent(idx, ignored -> ConcurrentHashMap.newKeySet()).add(owner);
+            acknowledged
+                    .computeIfAbsent(idx, ignored -> ConcurrentHashMap.newKeySet())
+                    .add(owner);
         }
     }
 
@@ -4248,8 +4043,7 @@ public final class NanocachedClient implements AutoCloseable {
             byte[][] keys,
             byte[][] values,
             Long ttlSeconds) {
-        List<Connection.MultiEntry> entries =
-                new ArrayList<>(Collections.nCopies(keys.length, null));
+        List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
         int start = 0;
         while (start < keys.length) {
             int end = multiSetChunkEnd(namespace.length, keys, values, start);
@@ -4257,12 +4051,8 @@ public final class NanocachedClient implements AutoCloseable {
             byte[][] valueChunk = Arrays.copyOfRange(values, start, end);
             List<Connection.MultiEntry> chunkEntries;
             try {
-                chunkEntries =
-                        applyReconnecting(
-                                connectionFor,
-                                connection ->
-                                        connection.multiSet(
-                                                namespace, keyChunk, valueChunk, ttlSeconds));
+                chunkEntries = applyReconnecting(
+                        connectionFor, connection -> connection.multiSet(namespace, keyChunk, valueChunk, ttlSeconds));
             } catch (NanocachedException.ConnectionLost failure) {
                 if (start == 0) throw failure;
                 throw new ChunkedConnectionFailure(entries, failure);
@@ -4288,8 +4078,7 @@ public final class NanocachedClient implements AutoCloseable {
      * entry — its handful of bytes are covered by {@link #MAX_REQUEST_BYTES}'s existing 256-byte
      * headroom below the server's actual 1 MiB cap.
      */
-    private static int multiSetChunkEnd(
-            int namespaceLength, byte[][] keys, byte[][] values, int start) {
+    private static int multiSetChunkEnd(int namespaceLength, byte[][] keys, byte[][] values, int start) {
         int end = start + 1;
         long frameBytes = namespaceLength + multiSetEntryWireBytes(keys[start], values[start]);
         int maxKeys = maxKeysPerNamespaceChunk(namespaceLength);
@@ -4308,11 +4097,7 @@ public final class NanocachedClient implements AutoCloseable {
      * writes for it (see {@link #decimalDigits}).
      */
     private static long multiSetEntryWireBytes(byte[] key, byte[] value) {
-        return key.length
-                + value.length
-                + 2L
-                + decimalDigits(key.length)
-                + decimalDigits(value.length);
+        return key.length + value.length + 2L + decimalDigits(key.length) + decimalDigits(value.length);
     }
 
     /**
@@ -4363,8 +4148,7 @@ public final class NanocachedClient implements AutoCloseable {
                 // An owner that already stored this position on the
                 // previous pass is not sent it again (see MultiSetTracker).
                 if (tracker.isAcknowledged(idx, names.get(rank))) continue;
-                OwnerBatch batch =
-                        owners.computeIfAbsent(names.get(rank), name -> new OwnerBatch());
+                OwnerBatch batch = owners.computeIfAbsent(names.get(rank), name -> new OwnerBatch());
                 batch.indices.add(idx);
                 batch.isPrimary.add(rank == 0);
             }
@@ -4381,9 +4165,7 @@ public final class NanocachedClient implements AutoCloseable {
             // background instead of being waited for below — mirrors
             // write()'s own fire-and-forget branch exactly, including its
             // close()-race fallbacks.
-            if (fireAndForgetReplicas
-                    && pureReplica
-                    && backgroundReplicaWritePermits.tryAcquire()) {
+            if (fireAndForgetReplicas && pureReplica && backgroundReplicaWritePermits.tryAcquire()) {
                 // issue #326: valueBytes[idx] may still be the caller's own
                 // array when compress is off (Compression#compressValue always
                 // allocates fresh — see set()'s matching comment — so this copy
@@ -4394,8 +4176,7 @@ public final class NanocachedClient implements AutoCloseable {
                 // arrays in place — so hand it a defensively-copied array
                 // instead of the shared, still-mutable one. Only the entries
                 // this leg actually touches are copied, not the whole batch.
-                byte[][] backgroundValues =
-                        compress ? valueBytes : copyValuesForBackground(valueBytes, batch.indices);
+                byte[][] backgroundValues = compress ? valueBytes : copyValuesForBackground(valueBytes, batch.indices);
                 // Issue #1199: the leg frames the keys and the namespace
                 // only once it runs, so copy those too (the keys this leg
                 // touches; a Map-based call built its own key arrays, a
@@ -4405,23 +4186,13 @@ public final class NanocachedClient implements AutoCloseable {
                 // Its outcome is never waited for, so it records nothing
                 // in the tracker: the retry pass (if any) sends this
                 // owner its positions again, as before.
-                Runnable backgroundLeg =
-                        () ->
-                                runMultiSetLeg(
-                                        backgroundNamespace,
-                                        name,
-                                        batch,
-                                        backgroundKeys,
-                                        backgroundValues,
-                                        ttlSeconds,
-                                        retry,
-                                        null);
+                Runnable backgroundLeg = () -> runMultiSetLeg(
+                        backgroundNamespace, name, batch, backgroundKeys, backgroundValues, ttlSeconds, retry, null);
                 try {
-                    CompletableFuture.runAsync(backgroundLeg, backgroundLegs)
-                            .whenComplete((ignoredResult, error) -> {
-                                backgroundReplicaWritePermits.release();
-                                reportBackgroundWriteBug(error);
-                            });
+                    CompletableFuture.runAsync(backgroundLeg, backgroundLegs).whenComplete((ignoredResult, error) -> {
+                        backgroundReplicaWritePermits.release();
+                        reportBackgroundWriteBug(error);
+                    });
                 } catch (RejectedExecutionException rejected) {
                     backgroundReplicaWritePermits.release();
                     backgroundLeg.run();
@@ -4430,16 +4201,7 @@ public final class NanocachedClient implements AutoCloseable {
             }
 
             Runnable leg =
-                    () ->
-                            runMultiSetLeg(
-                                    namespace,
-                                    name,
-                                    batch,
-                                    keyBytes,
-                                    valueBytes,
-                                    ttlSeconds,
-                                    retry,
-                                    tracker);
+                    () -> runMultiSetLeg(namespace, name, batch, keyBytes, valueBytes, ttlSeconds, retry, tracker);
             legs.add(submitReplicaWrite(leg));
         }
 
@@ -4552,21 +4314,14 @@ public final class NanocachedClient implements AutoCloseable {
 
         List<Connection.MultiEntry> entries;
         try {
-            entries =
-                    multiSetChunked(
-                            () -> memberConnection(name),
-                            namespace,
-                            groupKeys,
-                            groupValues,
-                            ttlSeconds);
+            entries = multiSetChunked(() -> memberConnection(name), namespace, groupKeys, groupValues, ttlSeconds);
         } catch (ChunkedConnectionFailure partial) {
             if (tracker != null) tracker.lastCause.set(partial.cause);
             applyLegOutcome(name, batch, partial.partialEntries, retry, tracker);
             return;
         } catch (NanocachedException connectionFailure) {
             if (tracker != null) tracker.lastCause.set(connectionFailure);
-            applyLegOutcome(
-                    name, batch, Collections.nCopies(batch.indices.size(), null), retry, tracker);
+            applyLegOutcome(name, batch, Collections.nCopies(batch.indices.size(), null), retry, tracker);
             return;
         }
 
@@ -4712,8 +4467,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
         validateKey(namespace, key);
         beforeOperation();
-        Connection.IncrResult result =
-                withWrongNodeRetry(() -> incrPrimaryThenReplicate(namespace, key, delta), false);
+        Connection.IncrResult result = withWrongNodeRetry(() -> incrPrimaryThenReplicate(namespace, key, delta), false);
         return result == null ? OptionalLong.empty() : OptionalLong.of(result.value());
     }
 
@@ -4861,8 +4615,7 @@ public final class NanocachedClient implements AutoCloseable {
      */
     private boolean cas(byte[] namespace, byte[] key, byte[] value, long ttlSeconds, String cond) {
         if (ttlSeconds < 0) {
-            throw new IllegalArgumentException(
-                    "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
+            throw new IllegalArgumentException("nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
         }
         validateKeyAndValue(namespace, key, value);
         beforeOperation();
@@ -4873,9 +4626,7 @@ public final class NanocachedClient implements AutoCloseable {
         // decompress it.
         byte[] outgoing = compress ? Compression.compressValue(value, compressionThreshold) : value;
         Long wireTtlSeconds = ttlSeconds == 0 ? null : ttlSeconds;
-        return withWrongNodeRetry(
-                () -> casPrimaryThenReplicate(namespace, key, outgoing, wireTtlSeconds, cond),
-                false);
+        return withWrongNodeRetry(() -> casPrimaryThenReplicate(namespace, key, outgoing, wireTtlSeconds, cond), false);
     }
 
     public boolean deleteIfMatches(String key, String token) {
@@ -4905,8 +4656,7 @@ public final class NanocachedClient implements AutoCloseable {
         validateToken(token);
         validateKey(namespace, key);
         beforeOperation();
-        return withWrongNodeRetry(
-                () -> casDeletePrimaryThenReplicate(namespace, key, token), false);
+        return withWrongNodeRetry(() -> casDeletePrimaryThenReplicate(namespace, key, token), false);
     }
 
     /**
@@ -4959,19 +4709,16 @@ public final class NanocachedClient implements AutoCloseable {
         for (int i = 0, n = text.length(); i < n; i++) {
             char c = text.charAt(i);
             if (!Character.isSurrogate(c)) continue;
-            if (Character.isHighSurrogate(c)
-                    && i + 1 < n
-                    && Character.isLowSurrogate(text.charAt(i + 1))) {
+            if (Character.isHighSurrogate(c) && i + 1 < n && Character.isLowSurrogate(text.charAt(i + 1))) {
                 i++;
                 continue;
             }
-            throw new IllegalArgumentException(
-                    "nanocached: "
-                            + what
-                            + " is not well-formed UTF-16 (a lone surrogate "
-                            + "at index "
-                            + i
-                            + " cannot be encoded as UTF-8)");
+            throw new IllegalArgumentException("nanocached: "
+                    + what
+                    + " is not well-formed UTF-16 (a lone surrogate "
+                    + "at index "
+                    + i
+                    + " cannot be encoded as UTF-8)");
         }
         return text.getBytes(StandardCharsets.UTF_8);
     }
@@ -4982,16 +4729,15 @@ public final class NanocachedClient implements AutoCloseable {
         }
         long total = (long) namespace.length + key.length;
         if (total > MAX_REQUEST_BYTES) {
-            throw new IllegalArgumentException(
-                    "nanocached: namespace ("
-                            + namespace.length
-                            + " bytes) + key ("
-                            + key.length
-                            + " bytes) = "
-                            + total
-                            + " bytes, which exceeds the "
-                            + MAX_REQUEST_BYTES
-                            + "-byte request limit (the server accepts requests of up to 1 MiB)");
+            throw new IllegalArgumentException("nanocached: namespace ("
+                    + namespace.length
+                    + " bytes) + key ("
+                    + key.length
+                    + " bytes) = "
+                    + total
+                    + " bytes, which exceeds the "
+                    + MAX_REQUEST_BYTES
+                    + "-byte request limit (the server accepts requests of up to 1 MiB)");
         }
     }
 
@@ -5006,18 +4752,17 @@ public final class NanocachedClient implements AutoCloseable {
         validateKey(namespace, key);
         long total = (long) namespace.length + key.length + value.length;
         if (total > MAX_REQUEST_BYTES) {
-            throw new IllegalArgumentException(
-                    "nanocached: namespace ("
-                            + namespace.length
-                            + " bytes) + key ("
-                            + key.length
-                            + " bytes) + value ("
-                            + value.length
-                            + " bytes) = "
-                            + total
-                            + " bytes, which exceeds the "
-                            + MAX_REQUEST_BYTES
-                            + "-byte request limit (the server accepts requests of up to 1 MiB)");
+            throw new IllegalArgumentException("nanocached: namespace ("
+                    + namespace.length
+                    + " bytes) + key ("
+                    + key.length
+                    + " bytes) + value ("
+                    + value.length
+                    + " bytes) = "
+                    + total
+                    + " bytes, which exceeds the "
+                    + MAX_REQUEST_BYTES
+                    + "-byte request limit (the server accepts requests of up to 1 MiB)");
         }
     }
 
@@ -5029,12 +4774,11 @@ public final class NanocachedClient implements AutoCloseable {
      */
     private static void validateNamespace(byte[] namespace) {
         if (namespace.length > MAX_REQUEST_BYTES) {
-            throw new IllegalArgumentException(
-                    "nanocached: namespace ("
-                            + namespace.length
-                            + " bytes) exceeds the "
-                            + MAX_REQUEST_BYTES
-                            + "-byte request limit (the server accepts requests of up to 1 MiB)");
+            throw new IllegalArgumentException("nanocached: namespace ("
+                    + namespace.length
+                    + " bytes) exceeds the "
+                    + MAX_REQUEST_BYTES
+                    + "-byte request limit (the server accepts requests of up to 1 MiB)");
         }
     }
 
@@ -5254,8 +4998,7 @@ public final class NanocachedClient implements AutoCloseable {
      * refresh-and-retry cannot double-apply anything and routes around a dead primary as it does
      * for set/get/delete.
      */
-    private <T> T withWrongNodeRetry(
-            java.util.function.Supplier<T> operation, boolean retryConnectionFailure) {
+    private <T> T withWrongNodeRetry(java.util.function.Supplier<T> operation, boolean retryConnectionFailure) {
         try {
             return operation.get();
         } catch (NanocachedException.WrongNode error) {
@@ -5328,8 +5071,7 @@ public final class NanocachedClient implements AutoCloseable {
      * already-succeeded CAS as a mismatch, if the primary actually applied the op and only its
      * reply was lost. See {@link #applyReconnectingNonIdempotent} instead.
      */
-    private <T> T applyReconnecting(
-            java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
+    private <T> T applyReconnecting(java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
         return applyReconnecting(source, op, false);
     }
 
@@ -5341,14 +5083,11 @@ public final class NanocachedClient implements AutoCloseable {
      * command keeps the retry it always had.
      */
     private <T> T applyReconnecting(
-            java.util.function.Supplier<Connection> source,
-            ConnectionOp<T> op,
-            boolean rejectionIsFinal) {
+            java.util.function.Supplier<Connection> source, ConnectionOp<T> op, boolean rejectionIsFinal) {
         try {
             return op.apply(source.get());
         } catch (NanocachedException.ConnectionLost retryable) {
-            if (rejectionIsFinal && retryable instanceof NanocachedException.ServerRejected)
-                throw retryable;
+            if (rejectionIsFinal && retryable instanceof NanocachedException.ServerRejected) throw retryable;
             // A request timeout is not the idle-FIN case this retry exists
             // for: the peer accepted the frame and simply never answered
             // within the request deadline, so a redial-and-resend would
@@ -5374,8 +5113,7 @@ public final class NanocachedClient implements AutoCloseable {
      * may well have applied it), so this surfaces {@link NanocachedException.ConnectionLost} to the
      * caller instead of ever resending it.
      */
-    private <T> T applyReconnectingNonIdempotent(
-            java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
+    private <T> T applyReconnectingNonIdempotent(java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
         // A failure to obtain the connection at all (a dial that failed, a
         // member with no connection) is proof nothing was sent, so it is
         // flagged notSent (see connectionNotSent) and surfaces without an
@@ -5398,8 +5136,7 @@ public final class NanocachedClient implements AutoCloseable {
      * proof that nothing was sent, so it is flagged {@code notSent} too and the caller may route
      * around the dead node after a refresh, as it always could.
      */
-    private <T> T applyReconnectingUnlessSent(
-            java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
+    private <T> T applyReconnectingUnlessSent(java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
         try {
             return op.apply(connectionNotSent(source));
         } catch (NanocachedException.ConnectionLost retryable) {
@@ -5412,8 +5149,7 @@ public final class NanocachedClient implements AutoCloseable {
         try {
             return source.get();
         } catch (NanocachedException.ConnectionLost dialFailure) {
-            if (dialFailure.getClass() != NanocachedException.ConnectionLost.class
-                    || dialFailure.notSent()) {
+            if (dialFailure.getClass() != NanocachedException.ConnectionLost.class || dialFailure.notSent()) {
                 throw dialFailure;
             }
             throw new NanocachedException.ConnectionLost(
@@ -5450,9 +5186,7 @@ public final class NanocachedClient implements AutoCloseable {
                 lastError = error;
             }
         }
-        throw lastError != null
-                ? lastError
-                : new NanocachedException("nanocached: no owner is reachable for this key");
+        throw lastError != null ? lastError : new NanocachedException("nanocached: no owner is reachable for this key");
     }
 
     /**
@@ -5513,9 +5247,7 @@ public final class NanocachedClient implements AutoCloseable {
          * bug outcome carries no value, so sharing one across element types is safe.
          */
         private static final LegOutcome<Object> ENDED_WITHOUT_OUTCOME =
-                LegOutcome.bug(
-                        new NanocachedException(
-                                "nanocached: hedged read leg ended without an outcome"));
+                LegOutcome.bug(new NanocachedException("nanocached: hedged read leg ended without an outcome"));
 
         @SuppressWarnings("unchecked")
         static <T> LegOutcome<T> endedWithoutOutcome() {
@@ -5540,8 +5272,7 @@ public final class NanocachedClient implements AutoCloseable {
      */
     static final class HedgeSettlement<T> {
         private final java.util.concurrent.atomic.AtomicReferenceArray<LegOutcome<T>> slots;
-        private final java.util.concurrent.Semaphore settled =
-                new java.util.concurrent.Semaphore(0);
+        private final java.util.concurrent.Semaphore settled = new java.util.concurrent.Semaphore(0);
 
         HedgeSettlement(int legs) {
             slots = new java.util.concurrent.atomic.AtomicReferenceArray<>(legs);
@@ -5593,9 +5324,8 @@ public final class NanocachedClient implements AutoCloseable {
      * so tests that shorten the timeouts shorten this.
      */
     static long hedgeSettleBoundMillis() {
-        long oneLeg =
-                2 * (Connection.requestTimeoutMillis + Identify.connectTimeoutMillis)
-                        + executorTerminationTimeoutMillis;
+        long oneLeg = 2 * (Connection.requestTimeoutMillis + Identify.connectTimeoutMillis)
+                + executorTerminationTimeoutMillis;
         return 2 * oneLeg;
     }
 
@@ -5673,16 +5403,14 @@ public final class NanocachedClient implements AutoCloseable {
                     if (index < 0) {
                         // Not resolveLosers: that joins the legs, and these
                         // are the ones that did not report.
-                        throw new NanocachedException(
-                                "nanocached: a hedged read leg did not report an outcome within "
-                                        + boundMillis
-                                        + " ms");
+                        throw new NanocachedException("nanocached: a hedged read leg did not report an outcome within "
+                                + boundMillis
+                                + " ms");
                     }
                 }
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-                throw new NanocachedException(
-                        "nanocached: interrupted while waiting for a hedged read", interrupted);
+                throw new NanocachedException("nanocached: interrupted while waiting for a hedged read", interrupted);
             }
 
             if (index < 0) {
@@ -5696,9 +5424,7 @@ public final class NanocachedClient implements AutoCloseable {
                     }
                 }
                 if (nextIndex < names.size()) {
-                    legFutures.put(
-                            nextIndex,
-                            startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
+                    legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
                     pendingCount++;
                     nextIndex++;
                 }
@@ -5739,17 +5465,14 @@ public final class NanocachedClient implements AutoCloseable {
                 // Everything started so far has failed or missed
                 // provisionally: the next owner gets its turn right away,
                 // rather than waiting out another full interval.
-                legFutures.put(
-                        nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
+                legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
                 pendingCount++;
                 nextIndex++;
             }
         }
 
         if (replicaMissed) return null;
-        throw lastError != null
-                ? lastError
-                : new NanocachedException("nanocached: no owner is reachable for this key");
+        throw lastError != null ? lastError : new NanocachedException("nanocached: no owner is reachable for this key");
     }
 
     /**
@@ -5816,8 +5539,7 @@ public final class NanocachedClient implements AutoCloseable {
                     detachedHedgeLegs.incrementAndGet();
                     // Runs exactly once, right away if the leg finished
                     // between the check and here.
-                    future.whenComplete(
-                            (ignoredResult, ignoredError) -> detachedHedgeLegs.decrementAndGet());
+                    future.whenComplete((ignoredResult, ignoredError) -> detachedHedgeLegs.decrementAndGet());
                 }
             }
             return;
@@ -5849,39 +5571,35 @@ public final class NanocachedClient implements AutoCloseable {
      */
     private <T> CompletableFuture<Void> startHedgeLeg(
             int index, String name, ConnectionOp<T> op, HedgeSettlement<T> settlement) {
-        Runnable task =
-                () -> {
-                    // Issue #1150: whatever happens, record an outcome and signal the
-                    // reader -- it waits on `settlement` once every owner is in
-                    // flight, so a leg that ended without signalling (an Error used
-                    // to) parked the caller thread forever. Issue #1265: settling
-                    // allocates nothing, and the reader's wait is bounded anyway.
-                    LegOutcome<T> outcome = null;
-                    try {
-                        T value = applyReconnecting(() -> memberConnection(name), op);
-                        outcome = LegOutcome.hit(value);
-                    } catch (NanocachedException.WrongNode error) {
-                        outcome = LegOutcome.wrongNode(error);
-                    } catch (NanocachedException error) {
-                        outcome = LegOutcome.failure(error);
-                    } catch (RuntimeException error) {
-                        outcome = LegOutcome.bug(error);
-                    } catch (Error error) {
-                        outcome = LegOutcome.fatal(error);
-                    } catch (Throwable error) {
-                        // Not reachable without a sneaky throw, but must still settle.
-                        outcome =
-                                LegOutcome.bug(
-                                        new NanocachedException(
-                                                "nanocached: hedged read leg failed unexpectedly",
-                                                error));
-                    } finally {
-                        if (outcome == null) {
-                            outcome = LegOutcome.endedWithoutOutcome();
-                        }
-                        settlement.settle(index, outcome);
-                    }
-                };
+        Runnable task = () -> {
+            // Issue #1150: whatever happens, record an outcome and signal the
+            // reader -- it waits on `settlement` once every owner is in
+            // flight, so a leg that ended without signalling (an Error used
+            // to) parked the caller thread forever. Issue #1265: settling
+            // allocates nothing, and the reader's wait is bounded anyway.
+            LegOutcome<T> outcome = null;
+            try {
+                T value = applyReconnecting(() -> memberConnection(name), op);
+                outcome = LegOutcome.hit(value);
+            } catch (NanocachedException.WrongNode error) {
+                outcome = LegOutcome.wrongNode(error);
+            } catch (NanocachedException error) {
+                outcome = LegOutcome.failure(error);
+            } catch (RuntimeException error) {
+                outcome = LegOutcome.bug(error);
+            } catch (Error error) {
+                outcome = LegOutcome.fatal(error);
+            } catch (Throwable error) {
+                // Not reachable without a sneaky throw, but must still settle.
+                outcome = LegOutcome.bug(
+                        new NanocachedException("nanocached: hedged read leg failed unexpectedly", error));
+            } finally {
+                if (outcome == null) {
+                    outcome = LegOutcome.endedWithoutOutcome();
+                }
+                settlement.settle(index, outcome);
+            }
+        };
 
         // Check closed and register under hedgedReadsLock so this can't
         // interleave with close()'s drain observing the set empty (issue
@@ -5909,15 +5627,14 @@ public final class NanocachedClient implements AutoCloseable {
             hedgedReads.add(future);
         }
         future.whenComplete((ignoredResult, ignoredError) -> hedgedReads.remove(future));
-        Runnable tracked =
-                () -> {
-                    try {
-                        task.run();
-                        future.complete(null);
-                    } catch (Throwable error) {
-                        future.completeExceptionally(error);
-                    }
-                };
+        Runnable tracked = () -> {
+            try {
+                task.run();
+                future.complete(null);
+            } catch (Throwable error) {
+                future.completeExceptionally(error);
+            }
+        };
         try {
             hedgeLegs.execute(tracked);
         } catch (RejectedExecutionException rejected) {
@@ -5993,15 +5710,7 @@ public final class NanocachedClient implements AutoCloseable {
             ConnectionOp<?> replicaOp,
             boolean primaryReplaySafe,
             boolean rejectionIsFinal) {
-        return write(
-                namespace,
-                key,
-                op,
-                backgroundSafeOp,
-                replicaOp,
-                primaryReplaySafe,
-                rejectionIsFinal,
-                false);
+        return write(namespace, key, op, backgroundSafeOp, replicaOp, primaryReplaySafe, rejectionIsFinal, false);
     }
 
     /**
@@ -6044,23 +5753,16 @@ public final class NanocachedClient implements AutoCloseable {
 
         List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
         if (!replicasAfterPrimary) {
-            replicaWrites.addAll(
-                    startReplicaWrites(
-                            names.subList(1, names.size()),
-                            op,
-                            backgroundSafeOp,
-                            replicaOp,
-                            rejectionIsFinal));
+            replicaWrites.addAll(startReplicaWrites(
+                    names.subList(1, names.size()), op, backgroundSafeOp, replicaOp, rejectionIsFinal));
         }
 
         T value = null;
         RuntimeException primaryError = null;
         try {
-            value =
-                    primaryReplaySafe
-                            ? applyReconnecting(
-                                    () -> memberConnection(names.get(0)), op, rejectionIsFinal)
-                            : applyReconnectingUnlessSent(() -> memberConnection(names.get(0)), op);
+            value = primaryReplaySafe
+                    ? applyReconnecting(() -> memberConnection(names.get(0)), op, rejectionIsFinal)
+                    : applyReconnectingUnlessSent(() -> memberConnection(names.get(0)), op);
         } catch (RuntimeException error) {
             primaryError = error;
         }
@@ -6073,8 +5775,7 @@ public final class NanocachedClient implements AutoCloseable {
             // force now, minus the node that answered.
             List<String> others = new ArrayList<>(ownerNames(namespace, key));
             others.remove(names.get(0));
-            replicaWrites.addAll(
-                    startReplicaWrites(others, op, backgroundSafeOp, replicaOp, rejectionIsFinal));
+            replicaWrites.addAll(startReplicaWrites(others, op, backgroundSafeOp, replicaOp, rejectionIsFinal));
         }
 
         // Always drain the synchronous replica legs — for close()'s
@@ -6130,8 +5831,7 @@ public final class NanocachedClient implements AutoCloseable {
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
             ConnectionOp<?> replicaOp,
             boolean rejectionIsFinal) {
-        ConnectionOp<T> backgroundOp =
-                null; // lazily built at most once; see write()'s javadoc (issue #326)
+        ConnectionOp<T> backgroundOp = null; // lazily built at most once; see write()'s javadoc (issue #326)
         List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
         for (String replica : replicas) {
 
@@ -6145,36 +5845,33 @@ public final class NanocachedClient implements AutoCloseable {
                     backgroundOp = backgroundSafeOp != null ? backgroundSafeOp.get() : op;
                 }
                 ConnectionOp<?> legOp = replicaOp != null ? replicaOp : backgroundOp;
-                Runnable replicaWrite =
-                        () -> {
-                            try {
-                                applyReconnecting(
-                                        () -> memberConnection(replica), legOp, rejectionIsFinal);
-                            } catch (NanocachedException ignored) {
-                                // Swallowed by design (client-side replication): a dead or
-                                // disagreeing
-                                // replica leaves the key under-replicated until the next
-                                // node-list refresh, never fails the write. Counted via
-                                // stats().replicaWriteFailures so operators can spot
-                                // silently degrading replication. Narrowed to the
-                                // connection layer's own failure types, covering both
-                                // the fire-and-forget and synchronous-fallback callers
-                                // of this lambda, so a programming bug doesn't get
-                                // treated the same way as a dead replica.
-                                replicaWriteFailures.incrementAndGet();
-                            }
-                        };
+                Runnable replicaWrite = () -> {
+                    try {
+                        applyReconnecting(() -> memberConnection(replica), legOp, rejectionIsFinal);
+                    } catch (NanocachedException ignored) {
+                        // Swallowed by design (client-side replication): a dead or
+                        // disagreeing
+                        // replica leaves the key under-replicated until the next
+                        // node-list refresh, never fails the write. Counted via
+                        // stats().replicaWriteFailures so operators can spot
+                        // silently degrading replication. Narrowed to the
+                        // connection layer's own failure types, covering both
+                        // the fire-and-forget and synchronous-fallback callers
+                        // of this lambda, so a programming bug doesn't get
+                        // treated the same way as a dead replica.
+                        replicaWriteFailures.incrementAndGet();
+                    }
+                };
                 try {
-                    CompletableFuture.runAsync(replicaWrite, backgroundLegs)
-                            .whenComplete((ignoredResult, error) -> {
-                                backgroundReplicaWritePermits.release();
-                                // error is non-null only for a genuine bug
-                                // that escaped replicaWrite's own catch
-                                // above — see reportBackgroundWriteBug
-                                // (audit finding, background writes
-                                // silently discarding this).
-                                reportBackgroundWriteBug(error);
-                            });
+                    CompletableFuture.runAsync(replicaWrite, backgroundLegs).whenComplete((ignoredResult, error) -> {
+                        backgroundReplicaWritePermits.release();
+                        // error is non-null only for a genuine bug
+                        // that escaped replicaWrite's own catch
+                        // above — see reportBackgroundWriteBug
+                        // (audit finding, background writes
+                        // silently discarding this).
+                        reportBackgroundWriteBug(error);
+                    });
                 } catch (RejectedExecutionException rejected) {
                     // close() shut backgroundLegs down concurrently: the
                     // permit was already acquired, but the task was never
@@ -6189,19 +5886,17 @@ public final class NanocachedClient implements AutoCloseable {
             }
 
             ConnectionOp<?> syncLegOp = replicaOp != null ? replicaOp : op;
-            Runnable replicaWrite =
-                    () -> {
-                        try {
-                            applyReconnecting(
-                                    () -> memberConnection(replica), syncLegOp, rejectionIsFinal);
-                        } catch (NanocachedException ignored) {
-                            // Swallowed by design (client-side replication) — see the
-                            // matching catch in the fire-and-forget branch above for
-                            // the full rationale; both callers of this lambda shape
-                            // share it verbatim.
-                            replicaWriteFailures.incrementAndGet();
-                        }
-                    };
+            Runnable replicaWrite = () -> {
+                try {
+                    applyReconnecting(() -> memberConnection(replica), syncLegOp, rejectionIsFinal);
+                } catch (NanocachedException ignored) {
+                    // Swallowed by design (client-side replication) — see the
+                    // matching catch in the fire-and-forget branch above for
+                    // the full rationale; both callers of this lambda shape
+                    // share it verbatim.
+                    replicaWriteFailures.incrementAndGet();
+                }
+            };
             replicaWrites.add(submitReplicaWrite(replicaWrite));
         }
         return replicaWrites;
@@ -6233,8 +5928,7 @@ public final class NanocachedClient implements AutoCloseable {
      * the only safe retry, via {@link #applyReconnectingNonIdempotent}; see its doc for why a
      * redial is safe only when the request never reached the wire.
      */
-    private Connection.IncrResult incrPrimaryThenReplicate(
-            byte[] namespace, byte[] key, long delta) {
+    private Connection.IncrResult incrPrimaryThenReplicate(byte[] namespace, byte[] key, long delta) {
         if (ring == null) {
             return applyReconnectingNonIdempotent(
                     this::singleConnection, connection -> connection.incr(namespace, key, delta));
@@ -6245,10 +5939,8 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException("nanocached: no owner is reachable for this key");
         }
 
-        Connection.IncrResult result =
-                applyReconnectingNonIdempotent(
-                        () -> memberConnection(names.get(0)),
-                        connection -> connection.incr(namespace, key, delta));
+        Connection.IncrResult result = applyReconnectingNonIdempotent(
+                () -> memberConnection(names.get(0)), connection -> connection.incr(namespace, key, delta));
         if (result == null) return null;
 
         replicateIncrResult(namespace, key, names, result);
@@ -6266,18 +5958,15 @@ public final class NanocachedClient implements AutoCloseable {
      * bug that escapes a leg is simply logged via {@link #reportBackgroundWriteBug}, exactly as a
      * {@code fireAndForgetReplicas} leg's own bug already is.
      */
-    private void replicateIncrResult(
-            byte[] namespace, byte[] key, List<String> names, Connection.IncrResult result) {
+    private void replicateIncrResult(byte[] namespace, byte[] key, List<String> names, Connection.IncrResult result) {
         byte[] valueBytes = Long.toString(result.value()).getBytes(StandardCharsets.US_ASCII);
         // Issue #1255: a background replica leg frames these after the call returned.
         byte[] ownedNamespace = ownedForBackground(namespace);
         byte[] ownedKey = ownedForBackground(key);
-        replicateResultToReplicas(
-                names,
-                connection -> {
-                    connection.set(ownedNamespace, ownedKey, valueBytes, result.ttlSeconds());
-                    return null;
-                });
+        replicateResultToReplicas(names, connection -> {
+            connection.set(ownedNamespace, ownedKey, valueBytes, result.ttlSeconds());
+            return null;
+        });
     }
 
     /**
@@ -6313,8 +6002,7 @@ public final class NanocachedClient implements AutoCloseable {
             List<String> names,
             ConnectionOp<Void> op,
             java.util.function.Supplier<ConnectionOp<Void>> backgroundSafeOp) {
-        ConnectionOp<Void> backgroundOp =
-                null; // lazily built at most once; see write()'s matching field
+        ConnectionOp<Void> backgroundOp = null; // lazily built at most once; see write()'s matching field
         List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
         for (int i = 1; i < names.size(); i++) {
             String replica = names.get(i);
@@ -6324,24 +6012,22 @@ public final class NanocachedClient implements AutoCloseable {
                     backgroundOp = backgroundSafeOp != null ? backgroundSafeOp.get() : op;
                 }
                 ConnectionOp<Void> legOp = backgroundOp;
-                Runnable replicaWrite =
-                        () -> {
-                            try {
-                                applyReconnecting(() -> memberConnection(replica), legOp);
-                            } catch (NanocachedException ignored) {
-                                // Swallowed by design, exactly like write()'s own
-                                // replica leg — see that method's matching catch for
-                                // the full rationale (audit finding covers
-                                // both identically).
-                                replicaWriteFailures.incrementAndGet();
-                            }
-                        };
+                Runnable replicaWrite = () -> {
+                    try {
+                        applyReconnecting(() -> memberConnection(replica), legOp);
+                    } catch (NanocachedException ignored) {
+                        // Swallowed by design, exactly like write()'s own
+                        // replica leg — see that method's matching catch for
+                        // the full rationale (audit finding covers
+                        // both identically).
+                        replicaWriteFailures.incrementAndGet();
+                    }
+                };
                 try {
-                    CompletableFuture.runAsync(replicaWrite, backgroundLegs)
-                            .whenComplete((ignoredResult, error) -> {
-                                backgroundReplicaWritePermits.release();
-                                reportBackgroundWriteBug(error);
-                            });
+                    CompletableFuture.runAsync(replicaWrite, backgroundLegs).whenComplete((ignoredResult, error) -> {
+                        backgroundReplicaWritePermits.release();
+                        reportBackgroundWriteBug(error);
+                    });
                 } catch (RejectedExecutionException rejected) {
                     // close() shut backgroundLegs down concurrently — see
                     // write()'s identical handling.
@@ -6351,18 +6037,17 @@ public final class NanocachedClient implements AutoCloseable {
                 continue;
             }
 
-            Runnable replicaWrite =
-                    () -> {
-                        try {
-                            applyReconnecting(() -> memberConnection(replica), op);
-                        } catch (NanocachedException ignored) {
-                            // Swallowed by design, exactly like write()'s own
-                            // replica leg — see that method's matching catch for
-                            // the full rationale (audit finding covers
-                            // both identically).
-                            replicaWriteFailures.incrementAndGet();
-                        }
-                    };
+            Runnable replicaWrite = () -> {
+                try {
+                    applyReconnecting(() -> memberConnection(replica), op);
+                } catch (NanocachedException ignored) {
+                    // Swallowed by design, exactly like write()'s own
+                    // replica leg — see that method's matching catch for
+                    // the full rationale (audit finding covers
+                    // both identically).
+                    replicaWriteFailures.incrementAndGet();
+                }
+            };
             replicaWrites.add(submitReplicaWrite(replicaWrite));
         }
 
@@ -6399,12 +6084,10 @@ public final class NanocachedClient implements AutoCloseable {
      * so the primary leg below already owns the only safe retry, via {@link
      * #applyReconnectingNonIdempotent}.
      */
-    private boolean casPrimaryThenReplicate(
-            byte[] namespace, byte[] key, byte[] value, Long ttlSeconds, String cond) {
+    private boolean casPrimaryThenReplicate(byte[] namespace, byte[] key, byte[] value, Long ttlSeconds, String cond) {
         if (ring == null) {
             return applyReconnectingNonIdempotent(
-                    this::singleConnection,
-                    connection -> connection.casSet(namespace, key, value, ttlSeconds, cond));
+                    this::singleConnection, connection -> connection.casSet(namespace, key, value, ttlSeconds, cond));
         }
 
         List<String> names = ownerNames(namespace, key);
@@ -6412,10 +6095,9 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException("nanocached: no owner is reachable for this key");
         }
 
-        boolean stored =
-                applyReconnectingNonIdempotent(
-                        () -> memberConnection(names.get(0)),
-                        connection -> connection.casSet(namespace, key, value, ttlSeconds, cond));
+        boolean stored = applyReconnectingNonIdempotent(
+                () -> memberConnection(names.get(0)),
+                connection -> connection.casSet(namespace, key, value, ttlSeconds, cond));
         if (!stored) return false;
 
         // Issue #1255: a background replica leg frames these after the call returned.
@@ -6456,8 +6138,7 @@ public final class NanocachedClient implements AutoCloseable {
     private boolean casDeletePrimaryThenReplicate(byte[] namespace, byte[] key, String cond) {
         if (ring == null) {
             return applyReconnectingNonIdempotent(
-                    this::singleConnection,
-                    connection -> connection.casDelete(namespace, key, cond));
+                    this::singleConnection, connection -> connection.casDelete(namespace, key, cond));
         }
 
         List<String> names = ownerNames(namespace, key);
@@ -6465,21 +6146,17 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException("nanocached: no owner is reachable for this key");
         }
 
-        boolean deleted =
-                applyReconnectingNonIdempotent(
-                        () -> memberConnection(names.get(0)),
-                        connection -> connection.casDelete(namespace, key, cond));
+        boolean deleted = applyReconnectingNonIdempotent(
+                () -> memberConnection(names.get(0)), connection -> connection.casDelete(namespace, key, cond));
         if (!deleted) return false;
 
         // Issue #1255: a background replica leg frames these after the call returned.
         byte[] ownedNamespace = ownedForBackground(namespace);
         byte[] ownedKey = ownedForBackground(key);
-        replicateResultToReplicas(
-                names,
-                connection -> {
-                    connection.delete(ownedNamespace, ownedKey);
-                    return null;
-                });
+        replicateResultToReplicas(names, connection -> {
+            connection.delete(ownedNamespace, ownedKey);
+            return null;
+        });
         return true;
     }
 
@@ -6546,12 +6223,10 @@ public final class NanocachedClient implements AutoCloseable {
      */
     private void fanOutClear(byte[] namespace) {
         if (ring == null) {
-            applyReconnecting(
-                    this::singleConnection,
-                    connection -> {
-                        sendClear(connection, namespace);
-                        return null;
-                    });
+            applyReconnecting(this::singleConnection, connection -> {
+                sendClear(connection, namespace);
+                return null;
+            });
             return;
         }
 
@@ -6561,8 +6236,7 @@ public final class NanocachedClient implements AutoCloseable {
         maybeRefresh(true);
         failed = clearFanOutOnce(allMemberNames(), namespace);
         if (!failed.isEmpty()) {
-            throw new NanocachedException(
-                    "nanocached: clear failed on node(s): " + String.join(", ", failed));
+            throw new NanocachedException("nanocached: clear failed on node(s): " + String.join(", ", failed));
         }
     }
 
@@ -6595,19 +6269,16 @@ public final class NanocachedClient implements AutoCloseable {
         Set<String> failed = ConcurrentHashMap.newKeySet();
         List<CompletableFuture<Void>> futures = new ArrayList<>(names.size());
         for (String name : names) {
-            futures.add(
-                    submitReplicaWrite(() -> {
-                        try {
-                            applyReconnecting(
-                                    () -> memberConnection(name),
-                                    connection -> {
-                                        sendClear(connection, namespace);
-                                        return null;
-                                    });
-                        } catch (NanocachedException ignored) {
-                            failed.add(name);
-                        }
-                    }));
+            futures.add(submitReplicaWrite(() -> {
+                try {
+                    applyReconnecting(() -> memberConnection(name), connection -> {
+                        sendClear(connection, namespace);
+                        return null;
+                    });
+                } catch (NanocachedException ignored) {
+                    failed.add(name);
+                }
+            }));
         }
 
         // See drainLegsKeepingFirstBug's own doc comment (issue #233).
@@ -6732,9 +6403,7 @@ public final class NanocachedClient implements AutoCloseable {
         for (Address address : addresses) {
             Identify.Result identified;
             try {
-                identified =
-                        Identify.connectAndIdentify(
-                                address.host(), address.port(), authSecret, tls, true);
+                identified = Identify.connectAndIdentify(address.host(), address.port(), authSecret, tls, true);
             } catch (IOException | RuntimeException error) {
                 continue;
             }
@@ -6809,8 +6478,7 @@ public final class NanocachedClient implements AutoCloseable {
             // last reconnectCooldown, whichever code path dials.
             reconnectCooldowns
                     .entrySet()
-                    .removeIf(entry ->
-                            !entry.getKey().equals(address) && now >= entry.getValue().untilNanos);
+                    .removeIf(entry -> !entry.getKey().equals(address) && now >= entry.getValue().untilNanos);
             reconnectCooldowns.put(address, new CooldownEntry(now + reconnectCooldownNanos, error));
         }
     }
@@ -6824,8 +6492,7 @@ public final class NanocachedClient implements AutoCloseable {
             // Connection-classified (issue #8): the usual cause is a
             // refresh racing this operation, which the refresh-and-retry
             // layer heals.
-            throw new NanocachedException.ConnectionLost(
-                    "nanocached: " + name + " has no open connection", null);
+            throw new NanocachedException.ConnectionLost("nanocached: " + name + " has no open connection", null);
         }
         // member.connection is null for a member listed by discovery but
         // unreachable when this client bootstrapped (issue #67) — treated
@@ -6844,8 +6511,7 @@ public final class NanocachedClient implements AutoCloseable {
                 }
                 member = current;
             }
-            if (member.connection != null && !member.connection.isClosed())
-                return member.connection;
+            if (member.connection != null && !member.connection.isClosed()) return member.connection;
             // Issue #1229: a request whose connection close() just poisoned
             // retries through here. openNodeConnection only looks at `closed`
             // after the dial and Identify, so without this check that retry
@@ -6867,9 +6533,7 @@ public final class NanocachedClient implements AutoCloseable {
                 if (members.get(name) != member) {
                     connection.close();
                     throw new NanocachedException.ConnectionLost(
-                            "nanocached: " + name + " left the cluster while reconnecting",
-                            null,
-                            true);
+                            "nanocached: " + name + " left the cluster while reconnecting", null, true);
                 }
                 member.connection = connection;
             }
@@ -6882,8 +6546,7 @@ public final class NanocachedClient implements AutoCloseable {
             return openNodeConnection(address);
         } catch (IOException error) {
             throw new NanocachedException.ConnectionLost(
-                    "nanocached: could not connect to " + address + ": " + error.getMessage(),
-                    error);
+                    "nanocached: could not connect to " + address + ": " + error.getMessage(), error);
         }
     }
 
@@ -6918,9 +6581,7 @@ public final class NanocachedClient implements AutoCloseable {
         Integer port = separator == -1 ? null : parsePort(address.substring(separator + 1));
         if (separator == -1 || port == null) {
             throw new NanocachedException.ConnectionLost(
-                    "nanocached: invalid node address from discovery server: " + address,
-                    null,
-                    true);
+                    "nanocached: invalid node address from discovery server: " + address, null, true);
         }
         String host = address.substring(0, separator);
 
@@ -6965,10 +6626,7 @@ public final class NanocachedClient implements AutoCloseable {
         trackOpenTarget(targetKey);
         try {
             return new Connection(
-                    socket,
-                    tagged,
-                    () -> untrackOpenTarget(targetKey),
-                    transientRetries::incrementAndGet);
+                    socket, tagged, () -> untrackOpenTarget(targetKey), transientRetries::incrementAndGet);
         } catch (IOException | RuntimeException error) {
             untrackOpenTarget(targetKey);
             try {
@@ -7013,8 +6671,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
         try {
             if (closed) return;
-            if (!force && System.nanoTime() - lastFetchNanos < NODE_LIST_STALE_AFTER.toNanos())
-                return;
+            if (!force && System.nanoTime() - lastFetchNanos < NODE_LIST_STALE_AFTER.toNanos()) return;
             if (force && lastFetchStartedNanos - observed >= 0) return;
             if (force && lastRefreshEnded) {
                 // Minimum interval between forced refreshes, measured from
@@ -7026,9 +6683,7 @@ public final class NanocachedClient implements AutoCloseable {
                 // failure), so its follow-up starts once the window has
                 // passed, and the callers queued behind it then find a
                 // refresh that started after their failure and share it.
-                long waitNanos =
-                        FORCED_REFRESH_MIN_INTERVAL.toNanos()
-                                - (System.nanoTime() - lastRefreshEndNanos);
+                long waitNanos = FORCED_REFRESH_MIN_INTERVAL.toNanos() - (System.nanoTime() - lastRefreshEndNanos);
                 if (waitNanos > 0) {
                     if (!waited) return;
                     try {
@@ -7115,26 +6770,25 @@ public final class NanocachedClient implements AutoCloseable {
                 }
                 return;
             }
-            members.entrySet()
-                    .removeIf(entry -> {
-                        if (!byName.containsKey(entry.getKey())) {
-                            // null for a member that was never reached (issue #67)
-                            // — nothing to close in that case.
-                            Connection stale = entry.getValue().connection;
-                            if (stale != null) stale.close();
-                            // Node names are per-process UUIDs; a departed node's
-                            // redial gate would otherwise leak forever (issue #12).
-                            redialLocks.remove(entry.getKey());
-                            // Same leak, for the same reason, on the per-address
-                            // cooldown map: a departed node's address is never
-                            // reused, so its cooldown entry (if any) would
-                            // otherwise linger forever (audit finding,
-                            // unpruned reconnectCooldowns).
-                            reconnectCooldowns.remove(entry.getValue().address);
-                            return true;
-                        }
-                        return false;
-                    });
+            members.entrySet().removeIf(entry -> {
+                if (!byName.containsKey(entry.getKey())) {
+                    // null for a member that was never reached (issue #67)
+                    // — nothing to close in that case.
+                    Connection stale = entry.getValue().connection;
+                    if (stale != null) stale.close();
+                    // Node names are per-process UUIDs; a departed node's
+                    // redial gate would otherwise leak forever (issue #12).
+                    redialLocks.remove(entry.getKey());
+                    // Same leak, for the same reason, on the per-address
+                    // cooldown map: a departed node's address is never
+                    // reused, so its cooldown entry (if any) would
+                    // otherwise linger forever (audit finding,
+                    // unpruned reconnectCooldowns).
+                    reconnectCooldowns.remove(entry.getValue().address);
+                    return true;
+                }
+                return false;
+            });
             for (int i = 0; i < toOpen.size(); i++) {
                 DiscoveredNode node = toOpen.get(i);
                 DialOutcome outcome = outcomes.get(i);
@@ -7180,9 +6834,7 @@ public final class NanocachedClient implements AutoCloseable {
         for (Address address : addresses) {
             Identify.Result identified;
             try {
-                identified =
-                        Identify.connectAndIdentify(
-                                address.host(), address.port(), authSecret, tls);
+                identified = Identify.connectAndIdentify(address.host(), address.port(), authSecret, tls);
             } catch (IOException | RuntimeException error) {
                 // Silent by design — refresh is opportunistic/best-effort
                 // and must never fail the caller's operation, consistent
@@ -7227,14 +6879,11 @@ public final class NanocachedClient implements AutoCloseable {
         // the Go SDK). pingsInFlight keeps a hung node to one pinned
         // thread: later ticks skip a connection whose last ping hasn't
         // returned. Threads are created on demand and are daemons.
-        keepAlive =
-                Executors.newScheduledThreadPool(
-                        MAX_KEEPALIVE_THREADS,
-                        runnable -> {
-                            Thread thread = new Thread(runnable, "nanocached-keepalive");
-                            thread.setDaemon(true);
-                            return thread;
-                        });
+        keepAlive = Executors.newScheduledThreadPool(MAX_KEEPALIVE_THREADS, runnable -> {
+            Thread thread = new Thread(runnable, "nanocached-keepalive");
+            thread.setDaemon(true);
+            return thread;
+        });
         Set<Connection> pingsInFlight = ConcurrentHashMap.newKeySet();
         keepAlive.scheduleAtFixedRate(
                 () -> {

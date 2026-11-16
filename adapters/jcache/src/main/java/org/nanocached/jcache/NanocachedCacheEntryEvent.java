@@ -16,12 +16,7 @@ final class NanocachedCacheEntryEvent<K, V> extends CacheEntryEvent<K, V> {
     private final boolean oldValueAvailable;
 
     NanocachedCacheEntryEvent(
-            Cache<K, V> source,
-            EventType eventType,
-            K key,
-            V value,
-            V oldValue,
-            boolean oldValueAvailable) {
+            Cache<K, V> source, EventType eventType, K key, V value, V oldValue, boolean oldValueAvailable) {
         super(source, eventType);
         this.key = key;
         this.value = value;

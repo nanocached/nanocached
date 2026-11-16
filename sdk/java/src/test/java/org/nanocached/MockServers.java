@@ -285,8 +285,7 @@ final class MockServers {
          */
         private volatile java.util.concurrent.CountDownLatch authGate;
 
-        private final java.util.concurrent.Semaphore authHeld =
-                new java.util.concurrent.Semaphore(0);
+        private final java.util.concurrent.Semaphore authHeld = new java.util.concurrent.Semaphore(0);
 
         /**
          * The TTL (whole seconds; 0 if omitted on the wire) from the most recent S request this
@@ -376,21 +375,13 @@ final class MockServers {
             return new MockNode(null, false, false, serverTls);
         }
 
-        private MockNode(
-                byte[] requiredSecret,
-                boolean supportTags,
-                boolean closeOnExtendedAuth,
-                SSLContext serverTls)
+        private MockNode(byte[] requiredSecret, boolean supportTags, boolean closeOnExtendedAuth, SSLContext serverTls)
                 throws IOException {
             this(requiredSecret, supportTags, closeOnExtendedAuth, serverTls, 0);
         }
 
         private MockNode(
-                byte[] requiredSecret,
-                boolean supportTags,
-                boolean closeOnExtendedAuth,
-                SSLContext serverTls,
-                int port)
+                byte[] requiredSecret, boolean supportTags, boolean closeOnExtendedAuth, SSLContext serverTls, int port)
                 throws IOException {
             this(requiredSecret, supportTags, closeOnExtendedAuth, serverTls, port, false);
         }
@@ -407,10 +398,9 @@ final class MockServers {
             this.supportTags = supportTags;
             this.closeOnExtendedAuth = closeOnExtendedAuth;
             this.closeOnRetryToken = closeOnRetryToken;
-            this.server =
-                    serverTls == null
-                            ? new ServerSocket(port)
-                            : serverTls.getServerSocketFactory().createServerSocket(port);
+            this.server = serverTls == null
+                    ? new ServerSocket(port)
+                    : serverTls.getServerSocketFactory().createServerSocket(port);
             Thread acceptor = new Thread(this::acceptLoop, "mock-node-accept");
             acceptor.setDaemon(true);
             acceptor.start();
@@ -781,10 +771,9 @@ final class MockServers {
                                 return;
                             }
                             byte[] secret = in.readNBytes(Integer.parseInt(parts[1]));
-                            boolean accepted =
-                                    requiredSecret == null
-                                            ? secret.length > 0
-                                            : java.util.Arrays.equals(secret, requiredSecret);
+                            boolean accepted = requiredSecret == null
+                                    ? secret.length > 0
+                                    : java.util.Arrays.equals(secret, requiredSecret);
                             java.util.concurrent.CountDownLatch gate = authGate;
                             if (gate != null) {
                                 authHeld.release();
@@ -795,14 +784,9 @@ final class MockServers {
                                     return;
                                 }
                             }
-                            tagged =
-                                    accepted
-                                            && supportTags
-                                            && parts.length > 2
-                                            && parts[2].equals("T");
-                            out.write(
-                                    (accepted ? (tagged ? "OnT\n" : "On\n") : "En\n")
-                                            .getBytes(StandardCharsets.US_ASCII));
+                            tagged = accepted && supportTags && parts.length > 2 && parts[2].equals("T");
+                            out.write((accepted ? (tagged ? "OnT\n" : "On\n") : "En\n")
+                                    .getBytes(StandardCharsets.US_ASCII));
                             out.flush();
                             if (!accepted) return;
                         }
@@ -822,9 +806,7 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -836,9 +818,7 @@ final class MockServers {
                                 // 1) — the desync a pre-tag stream
                                 // misalignment would produce.
                                 long wrongTag = Long.parseLong(parts[2]) + 1;
-                                out.write(
-                                        ("N " + wrongTag + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("N " + wrongTag + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -849,16 +829,12 @@ final class MockServers {
                             }
                             String customLength = customValueLengthField.getAndSet(null);
                             if (customLength != null) {
-                                out.write(
-                                        ("V " + customLength + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("V " + customLength + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (storedToGetReplies.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
-                                out.write(
-                                        ("S" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -875,31 +851,23 @@ final class MockServers {
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(
-                                        ("W" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 byte[] value = store.get(key);
                                 if (value == null) {
-                                    if (badTrailerReplies.getAndUpdate(n -> Math.max(0, n - 1))
-                                            > 0) {
+                                    if (badTrailerReplies.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
                                         // Two bytes, as the untagged form
                                         // always is, but the second isn't
                                         // '\n' — a desync the client must
                                         // catch rather than silently accept.
-                                        out.write(
-                                                ("N" + tagSuffix)
-                                                        .getBytes(StandardCharsets.US_ASCII));
+                                        out.write(("N" + tagSuffix).getBytes(StandardCharsets.US_ASCII));
                                         out.write('X');
                                     } else {
-                                        out.write(
-                                                ("N" + tagSuffix + "\n")
-                                                        .getBytes(StandardCharsets.US_ASCII));
+                                        out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                     }
                                 } else {
-                                    out.write(
-                                            ("V " + value.length + tagSuffix + "\n")
-                                                    .getBytes(StandardCharsets.US_ASCII));
+                                    out.write(("V " + value.length + tagSuffix + "\n")
+                                            .getBytes(StandardCharsets.US_ASCII));
                                     out.write(value);
                                 }
                             }
@@ -918,9 +886,7 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -940,15 +906,11 @@ final class MockServers {
                                 }
                             }
                             if (takeWrongNode()) {
-                                out.write(
-                                        ("W" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 store.put(key, value);
                                 namespacedPutTtl("", key, lastSetTtl);
-                                out.write(
-                                        ("S" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
@@ -959,22 +921,15 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(
-                                        ("W" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
-                                out.write(
-                                        (store.remove(key) != null
-                                                        ? "D" + tagSuffix + "\n"
-                                                        : "N" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write((store.remove(key) != null ? "D" + tagSuffix + "\n" : "N" + tagSuffix + "\n")
+                                        .getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
@@ -1005,26 +960,19 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(
-                                        ("W" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 byte[] value = namespacedGet(ns, key);
                                 if (value == null) {
-                                    out.write(
-                                            ("N" + tagSuffix + "\n")
-                                                    .getBytes(StandardCharsets.US_ASCII));
+                                    out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 } else {
-                                    out.write(
-                                            ("V " + value.length + tagSuffix + "\n")
-                                                    .getBytes(StandardCharsets.US_ASCII));
+                                    out.write(("V " + value.length + tagSuffix + "\n")
+                                            .getBytes(StandardCharsets.US_ASCII));
                                     out.write(value);
                                 }
                             }
@@ -1045,9 +993,7 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1063,15 +1009,11 @@ final class MockServers {
                                 }
                             }
                             if (takeWrongNode()) {
-                                out.write(
-                                        ("W" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
                                 namespacedPut(ns, key, value);
                                 namespacedPutTtl(ns, key, lastSetTtl);
-                                out.write(
-                                        ("S" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
@@ -1092,45 +1034,31 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(
-                                        ("W" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             byte[] existing = namespacedGet(ns, key);
                             if (existing == null) {
-                                out.write(
-                                        ("N" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             long updated;
                             try {
-                                updated =
-                                        Math.addExact(
-                                                Long.parseLong(
-                                                        new String(
-                                                                existing,
-                                                                StandardCharsets.US_ASCII)),
-                                                delta);
+                                updated = Math.addExact(
+                                        Long.parseLong(new String(existing, StandardCharsets.US_ASCII)), delta);
                             } catch (NumberFormatException | ArithmeticException notNumeric) {
-                                out.write(
-                                        ("T" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("T" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
-                            byte[] updatedValue =
-                                    Long.toString(updated).getBytes(StandardCharsets.US_ASCII);
+                            byte[] updatedValue = Long.toString(updated).getBytes(StandardCharsets.US_ASCII);
                             namespacedPut(ns, key, updatedValue);
                             if (takeDropReplyAfterIncr()) {
                                 // issue #225: applied, but the ack never
@@ -1139,9 +1067,8 @@ final class MockServers {
                             }
                             Long ttl = namespacedTtl(ns, key);
                             String ttlField = ttl == null ? "" : " " + ttl;
-                            out.write(
-                                    ("I " + updatedValue.length + ttlField + tagSuffix + "\n")
-                                            .getBytes(StandardCharsets.US_ASCII));
+                            out.write(("I " + updatedValue.length + ttlField + tagSuffix + "\n")
+                                    .getBytes(StandardCharsets.US_ASCII));
                             out.write(updatedValue);
                             out.flush();
                         }
@@ -1170,27 +1097,22 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(
-                                        ("W" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             byte[] existing = namespacedGet(ns, key);
-                            boolean matches =
-                                    switch (cond) {
-                                        case "A" -> existing == null;
-                                        case "P" -> existing != null;
-                                        default ->
-                                                existing != null && digestOf(existing).equals(cond);
-                                    };
+                            boolean matches = switch (cond) {
+                                case "A" -> existing == null;
+                                case "P" -> existing != null;
+                                default ->
+                                    existing != null && digestOf(existing).equals(cond);
+                            };
                             if (matches) {
                                 namespacedPut(ns, key, value);
                                 namespacedPutTtl(ns, key, ttlSeconds);
@@ -1200,13 +1122,9 @@ final class MockServers {
                                     // dies here.
                                     return;
                                 }
-                                out.write(
-                                        ("S" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
-                                out.write(
-                                        ("N" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
@@ -1219,29 +1137,21 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(
-                                        ("W" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             byte[] existing = namespacedGet(ns, key);
                             if (existing != null && digestOf(existing).equals(cond)) {
                                 namespacedRemove(ns, key);
-                                out.write(
-                                        ("D" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("D" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
-                                out.write(
-                                        ("N" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
@@ -1280,9 +1190,7 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1329,8 +1237,7 @@ final class MockServers {
                             }
                             int fixedFieldCount = 3 + n * 2;
                             int ttlFieldCount = parts.length - fixedFieldCount - (tagged ? 1 : 0);
-                            long ttlSeconds =
-                                    ttlFieldCount > 0 ? Long.parseLong(parts[fixedFieldCount]) : 0;
+                            long ttlSeconds = ttlFieldCount > 0 ? Long.parseLong(parts[fixedFieldCount]) : 0;
                             String[] keys = new String[n];
                             byte[][] values = new byte[n][];
                             for (int i = 0; i < n; i++) {
@@ -1347,9 +1254,7 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1385,22 +1290,17 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(
-                                        ("W" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
-                                out.write(
-                                        (namespacedRemove(ns, key) != null
-                                                        ? "D" + tagSuffix + "\n"
-                                                        : "N" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write((namespacedRemove(ns, key) != null
+                                                ? "D" + tagSuffix + "\n"
+                                                : "N" + tagSuffix + "\n")
+                                        .getBytes(StandardCharsets.US_ASCII));
                             }
                             out.flush();
                         }
@@ -1416,9 +1316,7 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1461,24 +1359,18 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             if (takeWrongNode()) {
-                                out.write(
-                                        ("W" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("W" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
                             byte[] existing = namespacedGet(ns, key);
                             if (existing == null) {
-                                out.write(
-                                        ("N" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("N" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1492,17 +1384,11 @@ final class MockServers {
                                 return; // applied, but the ack never arrives
                             }
                             if (!withValue) {
-                                out.write(
-                                        ("S" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("S" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                             } else {
-                                String ttlField =
-                                        ttlSeconds == null || ttlSeconds == 0
-                                                ? ""
-                                                : " " + ttlSeconds;
-                                out.write(
-                                        ("V " + existing.length + ttlField + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                String ttlField = ttlSeconds == null || ttlSeconds == 0 ? "" : " " + ttlSeconds;
+                                out.write(("V " + existing.length + ttlField + tagSuffix + "\n")
+                                        .getBytes(StandardCharsets.US_ASCII));
                                 out.write(existing);
                             }
                             out.flush();
@@ -1528,8 +1414,7 @@ final class MockServers {
                                 if (parts[i].equals("G")) withValue = true;
                                 else ttlSeconds = Long.parseLong(parts[i]);
                             }
-                            multiTouchFrames.add(
-                                    new MultiTouchFrame(ns, List.of(keys), ttlSeconds, withValue));
+                            multiTouchFrames.add(new MultiTouchFrame(ns, List.of(keys), ttlSeconds, withValue));
                             touchReceiptNanos.add(System.nanoTime());
                             if (rejectTouch || rejectMultiTouch) {
                                 out.write("En\n".getBytes(StandardCharsets.US_ASCII));
@@ -1545,9 +1430,7 @@ final class MockServers {
                             }
                             if (failAfter > 0) multiTouchFailAfter.decrementAndGet();
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1593,9 +1476,7 @@ final class MockServers {
                                 }
                                 while (tokens.size() < badCount) tokens.add(withValue ? "-" : "N");
                             }
-                            StringBuilder header =
-                                    new StringBuilder(withValue ? "M " : "Y ")
-                                            .append(tokens.size());
+                            StringBuilder header = new StringBuilder(withValue ? "M " : "Y ").append(tokens.size());
                             for (String token : tokens) header.append(' ').append(token);
                             header.append(tagSuffix).append('\n');
                             out.write(header.toString().getBytes(StandardCharsets.US_ASCII));
@@ -1608,9 +1489,7 @@ final class MockServers {
                                 break; // half-open: frame consumed, never answered
                             }
                             if (takeRetryable()) {
-                                out.write(
-                                        ("R" + tagSuffix + "\n")
-                                                .getBytes(StandardCharsets.US_ASCII));
+                                out.write(("R" + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
                                 out.flush();
                                 break;
                             }
@@ -1694,8 +1573,7 @@ final class MockServers {
                 else ttls.remove(key);
                 return;
             }
-            Map<String, Long> nsTtls =
-                    namespacedTtls.computeIfAbsent(ns, ignored -> new ConcurrentHashMap<>());
+            Map<String, Long> nsTtls = namespacedTtls.computeIfAbsent(ns, ignored -> new ConcurrentHashMap<>());
             if (ttlSeconds > 0) nsTtls.put(key, ttlSeconds);
             else nsTtls.remove(key);
         }
@@ -1721,8 +1599,7 @@ final class MockServers {
          */
         private static String digestOf(byte[] value) {
             try {
-                java.security.MessageDigest sha256 =
-                        java.security.MessageDigest.getInstance("SHA-256");
+                java.security.MessageDigest sha256 = java.security.MessageDigest.getInstance("SHA-256");
                 byte[] digest = sha256.digest(value);
                 StringBuilder hex = new StringBuilder(32);
                 for (int i = 0; i < 16; i++) {
@@ -1827,9 +1704,7 @@ final class MockServers {
                         // requests (L is a one-shot), but the ack must
                         // still parse.
                         boolean requestedTags = parts.length > 2 && parts[2].equals("T");
-                        out.write(
-                                (requestedTags ? "OdT\n" : "Od\n")
-                                        .getBytes(StandardCharsets.US_ASCII));
+                        out.write((requestedTags ? "OdT\n" : "Od\n").getBytes(StandardCharsets.US_ASCII));
                         out.flush();
                     } else if (parts[0].equals("L")) {
                         if (warmingUp) {
@@ -1846,9 +1721,7 @@ final class MockServers {
                         long delay = connectionCount.get() > 1 ? laterListDelayMillis : 0;
                         if (delay > 0) Thread.sleep(delay);
                         List<DiscoveredNode> snapshot = nodes;
-                        StringBuilder frame =
-                                new StringBuilder(
-                                        "N " + snapshot.size() + " " + replication + "\n");
+                        StringBuilder frame = new StringBuilder("N " + snapshot.size() + " " + replication + "\n");
                         for (DiscoveredNode node : snapshot) {
                             frame.append(node.name().length())
                                     .append(' ')
@@ -1924,8 +1797,7 @@ final class MockServers {
          * "ip:127.0.0.1"} or {@code "dns:wrong.example.test"} — this is exactly the value the JDK's
          * HTTPS endpoint-identification algorithm (issue J1) checks the connected-to host against.
          */
-        static Generated generate(Path dir, String commonName, String subjectAltName)
-                throws Exception {
+        static Generated generate(Path dir, String commonName, String subjectAltName) throws Exception {
             Path keystore = dir.resolve("node.p12");
             Path pem = dir.resolve("node.pem");
 
@@ -1977,30 +1849,21 @@ final class MockServers {
             return new Generated(serverContext, pem);
         }
 
-        private static void runKeytool(Path workingDir, String... args)
-                throws IOException, InterruptedException {
+        private static void runKeytool(Path workingDir, String... args) throws IOException, InterruptedException {
             List<String> command = new java.util.ArrayList<>();
-            command.add(
-                    System.getProperty("java.home")
-                            + File.separator
-                            + "bin"
-                            + File.separator
-                            + "keytool");
+            command.add(System.getProperty("java.home") + File.separator + "bin" + File.separator + "keytool");
             command.addAll(List.of(args));
-            Process process =
-                    new ProcessBuilder(command)
-                            .directory(workingDir.toFile())
-                            .redirectErrorStream(true)
-                            .start();
-            String output =
-                    new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            Process process = new ProcessBuilder(command)
+                    .directory(workingDir.toFile())
+                    .redirectErrorStream(true)
+                    .start();
+            String output = new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
             if (!process.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)) {
                 process.destroyForcibly();
                 throw new IOException("keytool timed out: " + command);
             }
             if (process.exitValue() != 0) {
-                throw new IOException(
-                        "keytool failed (exit " + process.exitValue() + "): " + output);
+                throw new IOException("keytool failed (exit " + process.exitValue() + "): " + output);
             }
         }
     }
@@ -2023,8 +1886,7 @@ final class MockServers {
             this(false, script);
         }
 
-        ScriptedNode(boolean acceptTags, java.util.function.Function<String, String> script)
-                throws IOException {
+        ScriptedNode(boolean acceptTags, java.util.function.Function<String, String> script) throws IOException {
             this.acceptTags = acceptTags;
             this.script = script;
             this.server = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());

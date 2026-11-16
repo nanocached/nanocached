@@ -91,7 +91,9 @@ class CachingAnnotationsIntegrationTest {
          * through the proxy. A barrier shared by two threads makes both outer loaders hold their
          * in-flight state before either nests, which is the deadlock choreography.
          */
-        @Autowired @Lazy UserService self;
+        @Autowired
+        @Lazy
+        UserService self;
 
         private volatile CyclicBarrier bothOuterLoadersStarted;
 
@@ -184,8 +186,7 @@ class CachingAnnotationsIntegrationTest {
         }
 
         @Override
-        public void handleCachePutError(
-                RuntimeException exception, Cache cache, Object key, Object value) {
+        public void handleCachePutError(RuntimeException exception, Cache cache, Object key, Object value) {
             putErrors.add(exception);
             if (!swallow) throw exception;
         }
@@ -205,7 +206,9 @@ class CachingAnnotationsIntegrationTest {
 
         @Bean
         CacheManager nanocachedCacheManager() {
-            return NanocachedCacheManager.builder(client).defaultTtl(Duration.ofMinutes(5)).build();
+            return NanocachedCacheManager.builder(client)
+                    .defaultTtl(Duration.ofMinutes(5))
+                    .build();
         }
 
         @Override
@@ -227,13 +230,8 @@ class CachingAnnotationsIntegrationTest {
     @BeforeEach
     void start() throws Exception {
         node = new MockNode();
-        client =
-                NanocachedClient.connect(
-                        new NanocachedClient.Options()
-                                .addresses(
-                                        List.of(
-                                                new NanocachedClient.Address(
-                                                        "127.0.0.1", node.port()))));
+        client = NanocachedClient.connect(new NanocachedClient.Options()
+                .addresses(List.of(new NanocachedClient.Address("127.0.0.1", node.port()))));
         CacheConfig.client = client;
         CacheConfig.errorHandler.getErrors.clear();
         CacheConfig.errorHandler.putErrors.clear();
@@ -264,9 +262,7 @@ class CachingAnnotationsIntegrationTest {
         assertEquals(
                 1,
                 node.store("users").keySet().stream()
-                        .filter(key ->
-                                new String(key.array(), StandardCharsets.UTF_8)
-                                        .equals("String:alice"))
+                        .filter(key -> new String(key.array(), StandardCharsets.UTF_8).equals("String:alice"))
                         .count());
     }
 
@@ -352,8 +348,7 @@ class CachingAnnotationsIntegrationTest {
         service.bothOuterLoadersStarted(new CyclicBarrier(2));
 
         CompletableFuture<User> first = CompletableFuture.supplyAsync(() -> service.loadSync(a, b));
-        CompletableFuture<User> second =
-                CompletableFuture.supplyAsync(() -> service.loadSync(c, d));
+        CompletableFuture<User> second = CompletableFuture.supplyAsync(() -> service.loadSync(c, d));
         assertEquals(a, first.get(8, TimeUnit.SECONDS).name());
         assertEquals(c, second.get(8, TimeUnit.SECONDS).name());
         assertEquals(4, service.dbCalls());
@@ -370,8 +365,7 @@ class CachingAnnotationsIntegrationTest {
     private static String outerKeyOnStripe(String prefix, String inner, int stripe) {
         for (int i = 0; ; i++) {
             String candidate = prefix + "-" + i;
-            if (stripeOf(new org.springframework.cache.interceptor.SimpleKey(candidate, inner))
-                    == stripe) {
+            if (stripeOf(new org.springframework.cache.interceptor.SimpleKey(candidate, inner)) == stripe) {
                 return candidate;
             }
         }
@@ -387,8 +381,7 @@ class CachingAnnotationsIntegrationTest {
         // unwraps back to the original exception for the caller.
         service.bothOuterLoadersStarted(new CyclicBarrier(1));
         String key = "self";
-        RuntimeException error =
-                assertThrows(RuntimeException.class, () -> service.loadSync(key, key));
+        RuntimeException error = assertThrows(RuntimeException.class, () -> service.loadSync(key, key));
         Throwable cause = error;
         while (cause != null
                 && !(cause.getMessage() != null && cause.getMessage().contains("re-entered"))) {
@@ -410,34 +403,28 @@ class CachingAnnotationsIntegrationTest {
         CountDownLatch firstLoaderStarted = new CountDownLatch(1);
         CountDownLatch secondCallerWaiting = new CountDownLatch(1);
         String key = "erroring";
-        CompletableFuture<Throwable> first =
-                CompletableFuture.supplyAsync(() -> {
-                    try {
-                        cache.get(
-                                key,
-                                () -> {
-                                    firstLoaderStarted.countDown();
-                                    secondCallerWaiting.await(5, TimeUnit.SECONDS);
-                                    throw new AssertionError("simulated loader failure");
-                                });
-                        return null;
-                    } catch (Throwable error) {
-                        return error;
-                    }
+        CompletableFuture<Throwable> first = CompletableFuture.supplyAsync(() -> {
+            try {
+                cache.get(key, () -> {
+                    firstLoaderStarted.countDown();
+                    secondCallerWaiting.await(5, TimeUnit.SECONDS);
+                    throw new AssertionError("simulated loader failure");
                 });
+                return null;
+            } catch (Throwable error) {
+                return error;
+            }
+        });
         assertTrue(firstLoaderStarted.await(5, TimeUnit.SECONDS));
         CompletableFuture<User> second =
-                CompletableFuture.supplyAsync(
-                        () -> cache.get(key, () -> new User(key, key.length())));
+                CompletableFuture.supplyAsync(() -> cache.get(key, () -> new User(key, key.length())));
         // The second caller is parked on the first run by now; let the
         // first loader fail.
         Thread.sleep(300);
         secondCallerWaiting.countDown();
 
         Throwable firstOutcome = first.get(8, TimeUnit.SECONDS);
-        assertTrue(
-                firstOutcome instanceof AssertionError,
-                "the first caller sees its loader's Error: " + firstOutcome);
+        assertTrue(firstOutcome instanceof AssertionError, "the first caller sees its loader's Error: " + firstOutcome);
         assertEquals(key, second.get(8, TimeUnit.SECONDS).name(), "the waiter loads on its own");
     }
 
@@ -455,13 +442,11 @@ class CachingAnnotationsIntegrationTest {
         assertEquals(1_200_000, value.length);
         assertEquals(
                 1,
-                CacheConfig.errorHandler.getErrors.size()
-                        + CacheConfig.errorHandler.putErrors.size(),
+                CacheConfig.errorHandler.getErrors.size() + CacheConfig.errorHandler.putErrors.size(),
                 "the error handler must see the failed put exactly once");
-        RuntimeException seen =
-                CacheConfig.errorHandler.getErrors.isEmpty()
-                        ? CacheConfig.errorHandler.putErrors.get(0)
-                        : CacheConfig.errorHandler.getErrors.get(0);
+        RuntimeException seen = CacheConfig.errorHandler.getErrors.isEmpty()
+                ? CacheConfig.errorHandler.putErrors.get(0)
+                : CacheConfig.errorHandler.getErrors.get(0);
         assertTrue(seen instanceof IllegalArgumentException, "unexpected error: " + seen);
     }
 
@@ -478,16 +463,12 @@ class CachingAnnotationsIntegrationTest {
         Path source = dir.resolve("app").resolve("ChildUser.java");
         Files.createDirectories(source.getParent());
         Files.writeString(
-                source,
-                "package app; public record ChildUser(String name) implements java.io.Serializable {}");
+                source, "package app; public record ChildUser(String name) implements java.io.Serializable {}");
         int compiled =
-                ToolProvider.getSystemJavaCompiler()
-                        .run(null, null, null, "-d", dir.toString(), source.toString());
+                ToolProvider.getSystemJavaCompiler().run(null, null, null, "-d", dir.toString(), source.toString());
         assertEquals(0, compiled, "javac");
-        try (URLClassLoader child =
-                new URLClassLoader(
-                        new java.net.URL[] {dir.toUri().toURL()},
-                        CachingAnnotationsIntegrationTest.class.getClassLoader())) {
+        try (URLClassLoader child = new URLClassLoader(
+                new java.net.URL[] {dir.toUri().toURL()}, CachingAnnotationsIntegrationTest.class.getClassLoader())) {
             service.childClass(child.loadClass("app.ChildUser"));
             Object first = service.findChildObject("alice");
             ClassLoader original = Thread.currentThread().getContextClassLoader();
@@ -515,14 +496,11 @@ class CachingAnnotationsIntegrationTest {
         assertEquals(2, service.dbCalls());
         assertTrue(
                 CacheConfig.errorHandler.getErrors.stream()
-                        .anyMatch(error ->
-                                error instanceof IllegalArgumentException
-                                        && error.getMessage().contains("lone surrogate")),
-                "the lookup under the malformed key must have been rejected: "
-                        + CacheConfig.errorHandler.getErrors);
+                        .anyMatch(error -> error instanceof IllegalArgumentException
+                                && error.getMessage().contains("lone surrogate")),
+                "the lookup under the malformed key must have been rejected: " + CacheConfig.errorHandler.getErrors);
         service.findUser("x?");
-        assertEquals(
-                2, service.dbCalls(), "\"x?\" must still be a hit, untouched by the rejected key");
+        assertEquals(2, service.dbCalls(), "\"x?\" must still be a hit, untouched by the rejected key");
     }
 
     @Test

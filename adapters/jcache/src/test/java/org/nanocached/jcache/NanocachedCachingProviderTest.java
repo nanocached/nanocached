@@ -57,8 +57,7 @@ class NanocachedCachingProviderTest {
         CachingProvider provider = Caching.getCachingProvider();
         assertTrue(
                 provider instanceof NanocachedCachingProvider,
-                "expected the ServiceLoader to find NanocachedCachingProvider, got "
-                        + provider.getClass());
+                "expected the ServiceLoader to find NanocachedCachingProvider, got " + provider.getClass());
     }
 
     @Test
@@ -68,10 +67,8 @@ class NanocachedCachingProviderTest {
         properties.setProperty("nanocached.addresses", "127.0.0.1:1");
         properties.setProperty("nanocached.tsl", "true");
         properties.setProperty("other.setting", "left alone");
-        CacheException error =
-                assertThrows(
-                        CacheException.class,
-                        () -> provider.getCacheManager(URI.create("test:typo"), null, properties));
+        CacheException error = assertThrows(
+                CacheException.class, () -> provider.getCacheManager(URI.create("test:typo"), null, properties));
         assertTrue(error.getMessage().contains("nanocached.tsl"), error.getMessage());
         assertFalse(error.getMessage().contains("other.setting"), error.getMessage());
     }
@@ -88,9 +85,7 @@ class NanocachedCachingProviderTest {
             Properties mistyped = propertiesFor(node);
             mistyped.setProperty("nanocached.tsl", "true");
             CacheException error =
-                    assertThrows(
-                            CacheException.class,
-                            () -> provider.getCacheManager(uri, classLoader, mistyped));
+                    assertThrows(CacheException.class, () -> provider.getCacheManager(uri, classLoader, mistyped));
             assertTrue(error.getMessage().contains("nanocached.tsl"), error.getMessage());
 
             // The existing manager is untouched and still returned for
@@ -103,12 +98,9 @@ class NanocachedCachingProviderTest {
     @Test
     void requiresAddressesInProperties() {
         CachingProvider provider = new NanocachedCachingProvider();
-        CacheException error =
-                assertThrows(
-                        CacheException.class,
-                        () ->
-                                provider.getCacheManager(
-                                        URI.create("test:no-addresses"), null, new Properties()));
+        CacheException error = assertThrows(
+                CacheException.class,
+                () -> provider.getCacheManager(URI.create("test:no-addresses"), null, new Properties()));
         assertTrue(error.getMessage().contains("nanocached.addresses"), error.getMessage());
     }
 
@@ -126,9 +118,7 @@ class NanocachedCachingProviderTest {
             properties.setProperty("nanocached.reconnect-cooldown-millis", "2000");
             properties.setProperty("nanocached.read-hedge-after-millis", "50");
 
-            CacheManager manager =
-                    provider.getCacheManager(
-                            URI.create("test:reliability-options"), null, properties);
+            CacheManager manager = provider.getCacheManager(URI.create("test:reliability-options"), null, properties);
             assertTrue(!manager.isClosed());
         }
     }
@@ -149,12 +139,8 @@ class NanocachedCachingProviderTest {
         try (CachingProvider provider = new NanocachedCachingProvider();
                 MockNode other = new MockNode()) {
             ClassLoader classLoader = getClass().getClassLoader();
-            CacheManager first =
-                    provider.getCacheManager(
-                            URI.create("test:a"), classLoader, propertiesFor(node));
-            CacheManager second =
-                    provider.getCacheManager(
-                            URI.create("test:b"), classLoader, propertiesFor(other));
+            CacheManager first = provider.getCacheManager(URI.create("test:a"), classLoader, propertiesFor(node));
+            CacheManager second = provider.getCacheManager(URI.create("test:b"), classLoader, propertiesFor(other));
             assertNotSame(first, second);
         }
     }
@@ -162,8 +148,7 @@ class NanocachedCachingProviderTest {
     @Test
     void closingTheProviderClosesEveryManagerItHandedOut() {
         CachingProvider provider = new NanocachedCachingProvider();
-        CacheManager manager =
-                provider.getCacheManager(URI.create("test:close-all"), null, propertiesFor(node));
+        CacheManager manager = provider.getCacheManager(URI.create("test:close-all"), null, propertiesFor(node));
         assertTrue(!manager.isClosed());
 
         provider.close();
@@ -185,8 +170,7 @@ class NanocachedCachingProviderTest {
     }
 
     @Test
-    void racingRequestsForTheSameKeyConvergeOnOneManagerAndCloseEveryLosingClient()
-            throws Exception {
+    void racingRequestsForTheSameKeyConvergeOnOneManagerAndCloseEveryLosingClient() throws Exception {
         // issue #192: the blocking connect must run outside
         // ConcurrentHashMap#compute — otherwise every racer would
         // effectively serialize behind that key's bucket lock. Racing
@@ -204,13 +188,11 @@ class NanocachedCachingProviderTest {
                 CountDownLatch go = new CountDownLatch(1);
                 List<Future<CacheManager>> futures = new ArrayList<>();
                 for (int i = 0; i < racers; i++) {
-                    futures.add(
-                            pool.submit(() -> {
-                                ready.countDown();
-                                go.await();
-                                return provider.getCacheManager(
-                                        uri, classLoader, propertiesFor(node));
-                            }));
+                    futures.add(pool.submit(() -> {
+                        ready.countDown();
+                        go.await();
+                        return provider.getCacheManager(uri, classLoader, propertiesFor(node));
+                    }));
                 }
                 ready.await();
                 go.countDown();
@@ -231,10 +213,7 @@ class NanocachedCachingProviderTest {
                 while (node.liveConnectionCount.get() != 1 && System.nanoTime() < deadline) {
                     Thread.sleep(10);
                 }
-                assertEquals(
-                        1,
-                        node.liveConnectionCount.get(),
-                        "every losing client must be closed, not leaked");
+                assertEquals(1, node.liveConnectionCount.get(), "every losing client must be closed, not leaked");
             } finally {
                 pool.shutdownNow();
             }
@@ -261,13 +240,11 @@ class NanocachedCachingProviderTest {
             URI uri = URI.create("test:late-forget");
             ClassLoader classLoader = getClass().getClassLoader();
             NanocachedCacheManager first =
-                    (NanocachedCacheManager)
-                            provider.getCacheManager(uri, classLoader, propertiesFor(node));
+                    (NanocachedCacheManager) provider.getCacheManager(uri, classLoader, propertiesFor(node));
             first.close();
 
             NanocachedCacheManager second =
-                    (NanocachedCacheManager)
-                            provider.getCacheManager(uri, classLoader, propertiesFor(node));
+                    (NanocachedCacheManager) provider.getCacheManager(uri, classLoader, propertiesFor(node));
             assertNotSame(first, second);
             assertTrue(!second.isClosed());
 
@@ -277,9 +254,7 @@ class NanocachedCachingProviderTest {
                     second,
                     provider.getCacheManager(uri, classLoader, propertiesFor(node)),
                     "the live manager must still be registered under the key");
-            assertTrue(
-                    !second.isClosed(),
-                    "the live manager must not have been closed by first's late forget");
+            assertTrue(!second.isClosed(), "the live manager must not have been closed by first's late forget");
         } finally {
             provider.close();
         }
@@ -288,25 +263,21 @@ class NanocachedCachingProviderTest {
     @Test
     void malformedAddressesFailWithACacheExceptionNamingTheOffendingEntry() {
         try (CachingProvider provider = new NanocachedCachingProvider()) {
-            for (String bad :
-                    new String[] {
-                        "localhost",
-                        "localhost:",
-                        ":8357",
-                        "localhost:abc",
-                        "localhost:0",
-                        "localhost:70000",
-                        "127.0.0.1:8357,localhost"
-                    }) {
+            for (String bad : new String[] {
+                "localhost",
+                "localhost:",
+                ":8357",
+                "localhost:abc",
+                "localhost:0",
+                "localhost:70000",
+                "127.0.0.1:8357,localhost"
+            }) {
                 Properties properties = new Properties();
                 properties.setProperty("nanocached.addresses", bad);
-                CacheException error =
-                        assertThrows(
-                                CacheException.class,
-                                () ->
-                                        provider.getCacheManager(
-                                                URI.create("test:bad-address"), null, properties),
-                                bad);
+                CacheException error = assertThrows(
+                        CacheException.class,
+                        () -> provider.getCacheManager(URI.create("test:bad-address"), null, properties),
+                        bad);
                 assertTrue(error.getMessage().contains("nanocached.addresses"), error.getMessage());
             }
         }
@@ -333,27 +304,16 @@ class NanocachedCachingProviderTest {
         try (CachingProvider provider = new NanocachedCachingProvider()) {
             Properties threshold = propertiesFor(node);
             threshold.setProperty("nanocached.compression-threshold", "abc");
-            CacheException error =
-                    assertThrows(
-                            CacheException.class,
-                            () ->
-                                    provider.getCacheManager(
-                                            URI.create("test:bad-threshold"), null, threshold));
-            assertTrue(
-                    error.getMessage().contains("nanocached.compression-threshold"),
-                    error.getMessage());
+            CacheException error = assertThrows(
+                    CacheException.class,
+                    () -> provider.getCacheManager(URI.create("test:bad-threshold"), null, threshold));
+            assertTrue(error.getMessage().contains("nanocached.compression-threshold"), error.getMessage());
 
             Properties hedge = propertiesFor(node);
             hedge.setProperty("nanocached.read-hedge-after-millis", "0");
-            error =
-                    assertThrows(
-                            CacheException.class,
-                            () ->
-                                    provider.getCacheManager(
-                                            URI.create("test:bad-hedge"), null, hedge));
-            assertTrue(
-                    error.getMessage().contains("nanocached.read-hedge-after-millis"),
-                    error.getMessage());
+            error = assertThrows(
+                    CacheException.class, () -> provider.getCacheManager(URI.create("test:bad-hedge"), null, hedge));
+            assertTrue(error.getMessage().contains("nanocached.read-hedge-after-millis"), error.getMessage());
         }
     }
 
@@ -364,12 +324,8 @@ class NanocachedCachingProviderTest {
         try (CachingProvider provider = new NanocachedCachingProvider()) {
             Properties properties = propertiesFor(node);
             properties.setProperty("nanocached.tls", "yes");
-            CacheException error =
-                    assertThrows(
-                            CacheException.class,
-                            () ->
-                                    provider.getCacheManager(
-                                            URI.create("test:tls-yes"), null, properties));
+            CacheException error = assertThrows(
+                    CacheException.class, () -> provider.getCacheManager(URI.create("test:tls-yes"), null, properties));
             assertTrue(error.getMessage().contains("nanocached.tls"), error.getMessage());
         }
     }
@@ -382,14 +338,11 @@ class NanocachedCachingProviderTest {
         try (CachingProvider provider = new NanocachedCachingProvider()) {
             Properties properties = propertiesFor(node);
             properties.setProperty("nanocached.reconnect-cooldown-millis", "0");
-            CacheManager manager =
-                    provider.getCacheManager(URI.create("test:zero-cooldown"), null, properties);
-            java.lang.reflect.Field clientField =
-                    NanocachedCacheManager.class.getDeclaredField("client");
+            CacheManager manager = provider.getCacheManager(URI.create("test:zero-cooldown"), null, properties);
+            java.lang.reflect.Field clientField = NanocachedCacheManager.class.getDeclaredField("client");
             clientField.setAccessible(true);
             Object client = clientField.get(manager);
-            java.lang.reflect.Field disabled =
-                    client.getClass().getDeclaredField("reconnectCooldownDisabled");
+            java.lang.reflect.Field disabled = client.getClass().getDeclaredField("reconnectCooldownDisabled");
             disabled.setAccessible(true);
             assertTrue(disabled.getBoolean(client), "a zero cooldown must disable the cooldown");
         }

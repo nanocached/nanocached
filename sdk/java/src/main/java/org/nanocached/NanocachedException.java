@@ -224,9 +224,8 @@ public class NanocachedException extends RuntimeException {
      */
     public static final class CompressionIncompatible extends NanocachedException {
         public CompressionIncompatible() {
-            super(
-                    "nanocached: incr/decr is incompatible with value compression "
-                            + "(disable compress or use a separate client without it)");
+            super("nanocached: incr/decr is incompatible with value compression "
+                    + "(disable compress or use a separate client without it)");
         }
     }
 
@@ -259,8 +258,7 @@ public class NanocachedException extends RuntimeException {
     public static final class PartialServerTooOldStrings extends ServerTooOld {
         public final java.util.Map<String, String> partialValues;
 
-        public PartialServerTooOldStrings(
-                Throwable cause, java.util.Map<String, String> partialValues) {
+        public PartialServerTooOldStrings(Throwable cause, java.util.Map<String, String> partialValues) {
             super("y", cause);
             this.partialValues = partialValues;
         }
@@ -278,13 +276,13 @@ public class NanocachedException extends RuntimeException {
         public final int[] unresolvedIndices;
 
         public PartialServerTooOldRaw(
-                Throwable cause,
-                byte[][] partialValues,
-                java.util.List<Integer> unresolvedIndices) {
+                Throwable cause, byte[][] partialValues, java.util.List<Integer> unresolvedIndices) {
             super("y", cause);
             this.partialValues = partialValues;
-            this.unresolvedIndices =
-                    unresolvedIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
+            this.unresolvedIndices = unresolvedIndices.stream()
+                    .mapToInt(Integer::intValue)
+                    .sorted()
+                    .toArray();
         }
     }
 
@@ -337,11 +335,12 @@ public class NanocachedException extends RuntimeException {
         public final byte[][] partialValues;
         public final int[] unresolvedIndices;
 
-        public PartialWrongNodeRaw(
-                byte[][] partialValues, java.util.List<Integer> unresolvedIndices) {
+        public PartialWrongNodeRaw(byte[][] partialValues, java.util.List<Integer> unresolvedIndices) {
             this.partialValues = partialValues;
-            this.unresolvedIndices =
-                    unresolvedIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
+            this.unresolvedIndices = unresolvedIndices.stream()
+                    .mapToInt(Integer::intValue)
+                    .sorted()
+                    .toArray();
         }
     }
 
@@ -363,8 +362,7 @@ public class NanocachedException extends RuntimeException {
     public static final class PartialConnectionLost extends ConnectionLost {
         public final java.util.Map<String, byte[]> partialValues;
 
-        public PartialConnectionLost(
-                String message, Throwable cause, java.util.Map<String, byte[]> partialValues) {
+        public PartialConnectionLost(String message, Throwable cause, java.util.Map<String, byte[]> partialValues) {
             super(message, cause);
             this.partialValues = partialValues;
         }
@@ -407,14 +405,13 @@ public class NanocachedException extends RuntimeException {
         public final int[] unresolvedIndices;
 
         public PartialConnectionLostRaw(
-                String message,
-                Throwable cause,
-                byte[][] partialValues,
-                java.util.List<Integer> unresolvedIndices) {
+                String message, Throwable cause, byte[][] partialValues, java.util.List<Integer> unresolvedIndices) {
             super(message, cause);
             this.partialValues = partialValues;
-            this.unresolvedIndices =
-                    unresolvedIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
+            this.unresolvedIndices = unresolvedIndices.stream()
+                    .mapToInt(Integer::intValue)
+                    .sorted()
+                    .toArray();
         }
     }
 
@@ -434,8 +431,7 @@ public class NanocachedException extends RuntimeException {
     public static final class PartialConnectionLostSet extends ConnectionLost {
         public final java.util.Set<String> succeededKeys;
 
-        public PartialConnectionLostSet(
-                String message, Throwable cause, java.util.Set<String> succeededKeys) {
+        public PartialConnectionLostSet(String message, Throwable cause, java.util.Set<String> succeededKeys) {
             super(message, cause);
             this.succeededKeys = succeededKeys;
         }
@@ -454,11 +450,12 @@ public class NanocachedException extends RuntimeException {
     public static final class PartialConnectionLostSetRaw extends ConnectionLost {
         public final int[] succeededIndices;
 
-        public PartialConnectionLostSetRaw(
-                String message, Throwable cause, java.util.List<Integer> succeededIndices) {
+        public PartialConnectionLostSetRaw(String message, Throwable cause, java.util.List<Integer> succeededIndices) {
             super(message, cause);
-            this.succeededIndices =
-                    succeededIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
+            this.succeededIndices = succeededIndices.stream()
+                    .mapToInt(Integer::intValue)
+                    .sorted()
+                    .toArray();
         }
     }
 }

@@ -52,12 +52,10 @@ class NanocachedCacheStatisticsTest {
         config.setStatisticsEnabled(true);
         cache = manager.createCache("stats", config);
         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        ObjectName objectName =
-                new ObjectName(
-                        "javax.cache:type=CacheStatistics,CacheManager="
-                                + ObjectName.quote(manager.getURI().toString())
-                                + ",Cache="
-                                + ObjectName.quote("stats"));
+        ObjectName objectName = new ObjectName("javax.cache:type=CacheStatistics,CacheManager="
+                + ObjectName.quote(manager.getURI().toString())
+                + ",Cache="
+                + ObjectName.quote("stats"));
         statistics = JMX.newMXBeanProxy(mbs, objectName, CacheStatisticsMXBean.class);
     }
 

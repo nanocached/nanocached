@@ -84,8 +84,7 @@ public final class JdkCacheValueSerializer implements CacheValueSerializer {
         this(filter, false, classLoader);
     }
 
-    private JdkCacheValueSerializer(
-            ObjectInputFilter filter, boolean useGlobalFilter, ClassLoader classLoader) {
+    private JdkCacheValueSerializer(ObjectInputFilter filter, boolean useGlobalFilter, ClassLoader classLoader) {
         this.explicitFilter = filter;
         this.useGlobalFilter = useGlobalFilter;
         this.classLoader = classLoader;
@@ -94,18 +93,16 @@ public final class JdkCacheValueSerializer implements CacheValueSerializer {
     @Override
     public byte[] serialize(Object value) {
         if (!(value instanceof Serializable)) {
-            throw new IllegalArgumentException(
-                    "nanocached-spring: value of type "
-                            + value.getClass().getName()
-                            + " is not Serializable; configure a custom CacheValueSerializer"
-                            + " or make the cached type Serializable");
+            throw new IllegalArgumentException("nanocached-spring: value of type "
+                    + value.getClass().getName()
+                    + " is not Serializable; configure a custom CacheValueSerializer"
+                    + " or make the cached type Serializable");
         }
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
             out.writeObject(value);
         } catch (IOException e) {
-            throw new IllegalStateException(
-                    "nanocached-spring: failed to serialize cache value", e);
+            throw new IllegalStateException("nanocached-spring: failed to serialize cache value", e);
         }
         return bytes.toByteArray();
     }
@@ -119,21 +116,18 @@ public final class JdkCacheValueSerializer implements CacheValueSerializer {
         if (loader == null) {
             loader = JdkCacheValueSerializer.class.getClassLoader();
         }
-        try (ObjectInputStream in =
-                new ConfigurableObjectInputStream(new ByteArrayInputStream(bytes), loader)) {
+        try (ObjectInputStream in = new ConfigurableObjectInputStream(new ByteArrayInputStream(bytes), loader)) {
             // Re-read the JVM-wide filter here rather than at construction
             // time (issue #365): setSerialFilter may run after this
             // serializer was built but before it is ever used, and a value
             // captured once would silently miss that.
-            ObjectInputFilter filter =
-                    useGlobalFilter ? ObjectInputFilter.Config.getSerialFilter() : explicitFilter;
+            ObjectInputFilter filter = useGlobalFilter ? ObjectInputFilter.Config.getSerialFilter() : explicitFilter;
             if (filter != null) {
                 in.setObjectInputFilter(filter);
             }
             return in.readObject();
         } catch (IOException | ClassNotFoundException e) {
-            throw new IllegalStateException(
-                    "nanocached-spring: failed to deserialize cache value", e);
+            throw new IllegalStateException("nanocached-spring: failed to deserialize cache value", e);
         }
     }
 }

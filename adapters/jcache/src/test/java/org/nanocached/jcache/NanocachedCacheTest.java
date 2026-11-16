@@ -182,8 +182,7 @@ class NanocachedCacheTest {
         MutableConfiguration<String, HashMap<String, String>> config = new MutableConfiguration<>();
         config.setTypes(String.class, (Class<HashMap<String, String>>) (Class<?>) HashMap.class);
         config.setExpiryPolicyFactory(EternalExpiryPolicy.factoryOf());
-        Cache<String, HashMap<String, String>> mapCache =
-                manager.createCache("map-widgets", config);
+        Cache<String, HashMap<String, String>> mapCache = manager.createCache("map-widgets", config);
 
         HashMap<String, String> stored = new HashMap<>();
         stored.put("x", "1");
@@ -209,8 +208,7 @@ class NanocachedCacheTest {
         MutableConfiguration<String, HashMap<String, String>> config = new MutableConfiguration<>();
         config.setTypes(String.class, (Class<HashMap<String, String>>) (Class<?>) HashMap.class);
         config.setExpiryPolicyFactory(EternalExpiryPolicy.factoryOf());
-        Cache<String, HashMap<String, String>> mapCache =
-                manager.createCache("map-widgets-remove", config);
+        Cache<String, HashMap<String, String>> mapCache = manager.createCache("map-widgets-remove", config);
 
         HashMap<String, String> stored = new HashMap<>();
         stored.put("x", "1");
@@ -358,8 +356,7 @@ class NanocachedCacheTest {
         MutableConfiguration<String, String> config = new MutableConfiguration<>();
         config.setTypes(String.class, String.class);
         config.setExpiryPolicyFactory(
-                AccessedExpiryPolicy.factoryOf(
-                        new Duration(java.util.concurrent.TimeUnit.SECONDS, 30)));
+                AccessedExpiryPolicy.factoryOf(new Duration(java.util.concurrent.TimeUnit.SECONDS, 30)));
         Cache<String, String> slidingCache = manager.createCache("sliding-all", config);
         slidingCache.put("a", "1");
         slidingCache.put("b", "2");
@@ -369,12 +366,16 @@ class NanocachedCacheTest {
                 .put(
                         java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")),
                         new MockNode.Entry(
-                                node.entry("sliding-all", KeyCodec.toKeyBytes("a")).value(), 5L));
+                                node.entry("sliding-all", KeyCodec.toKeyBytes("a"))
+                                        .value(),
+                                5L));
         node.store("sliding-all")
                 .put(
                         java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")),
                         new MockNode.Entry(
-                                node.entry("sliding-all", KeyCodec.toKeyBytes("b")).value(), 5L));
+                                node.entry("sliding-all", KeyCodec.toKeyBytes("b"))
+                                        .value(),
+                                5L));
         node.multiSetCount.set(0);
         node.multiGetCount.set(0);
 
@@ -383,21 +384,13 @@ class NanocachedCacheTest {
         assertEquals(2, all.size());
         assertEquals("1", all.get("a"));
         assertEquals("2", all.get("b"));
-        assertEquals(
-                1, node.multiTouchFrames.size(), "one batched touch reads and refreshes every key");
+        assertEquals(1, node.multiTouchFrames.size(), "one batched touch reads and refreshes every key");
         assertTrue(node.multiTouchFrames.get(0).contains(" 30 G"), node.multiTouchFrames.get(0));
         assertEquals(0, node.multiGetCount.get(), "no separate batched read");
         assertEquals(0, node.multiSetCount.get(), "no re-set of the values");
-        assertEquals(
-                30L,
-                storedTtlSeconds("sliding-all", "a"),
-                "a getAll must refresh the TTL via getExpiryForAccess");
-        assertEquals(
-                30L,
-                storedTtlSeconds("sliding-all", "b"),
-                "a getAll must refresh the TTL via getExpiryForAccess");
-        assertNull(
-                node.entry("sliding-all", KeyCodec.toKeyBytes("missing")), "a miss is not created");
+        assertEquals(30L, storedTtlSeconds("sliding-all", "a"), "a getAll must refresh the TTL via getExpiryForAccess");
+        assertEquals(30L, storedTtlSeconds("sliding-all", "b"), "a getAll must refresh the TTL via getExpiryForAccess");
+        assertNull(node.entry("sliding-all", KeyCodec.toKeyBytes("missing")), "a miss is not created");
     }
 
     /** creation → eternal, access → zero: a value is read once and expires on that read. */
@@ -454,12 +447,10 @@ class NanocachedCacheTest {
         node.armMultiTouchDrop(1, 1);
 
         javax.cache.CacheException error =
-                assertThrows(
-                        javax.cache.CacheException.class, () -> expiring.getAll(seed.keySet()));
+                assertThrows(javax.cache.CacheException.class, () -> expiring.getAll(seed.keySet()));
 
         assertTrue(
-                error.getCause() instanceof NanocachedException.PartialConnectionLostRaw,
-                "cause: " + error.getCause());
+                error.getCause() instanceof NanocachedException.PartialConnectionLostRaw, "cause: " + error.getCause());
         assertEquals(
                 2,
                 node.multiTouchFrames.size(),
@@ -475,12 +466,10 @@ class NanocachedCacheTest {
         // idempotent to re-send, so the adapter's one follow-up for the
         // remainder stands and the whole map comes back.
         Map<String, String> seed = seedOf(401);
-        Cache<String, String> sliding =
-                cacheOf(
-                        "sliding-drop",
-                        new AccessedExpiryPolicy(
-                                new Duration(java.util.concurrent.TimeUnit.SECONDS, 30)),
-                        seed);
+        Cache<String, String> sliding = cacheOf(
+                "sliding-drop",
+                new AccessedExpiryPolicy(new Duration(java.util.concurrent.TimeUnit.SECONDS, 30)),
+                seed);
         node.multiTouchFrames.clear();
         // Chunk 1 answered; chunk 2's two attempts (the SDK's own and its
         // reconnect-and-retry) drop; the adapter's follow-up succeeds.
@@ -489,10 +478,7 @@ class NanocachedCacheTest {
         Map<String, String> all = sliding.getAll(seed.keySet());
 
         assertEquals(seed, all);
-        assertEquals(
-                4,
-                node.multiTouchFrames.size(),
-                "chunk1 + chunk2-attempt1 + chunk2-attempt2 + adapter follow-up");
+        assertEquals(4, node.multiTouchFrames.size(), "chunk1 + chunk2-attempt1 + chunk2-attempt2 + adapter follow-up");
     }
 
     @Test
@@ -520,17 +506,15 @@ class NanocachedCacheTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingListener<String, String> listener = new RecordingListener<>(events);
         cache.registerCacheEntryListener(
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(listener), null, true, true));
+                new MutableCacheEntryListenerConfiguration<>(FactoryBuilder.factoryOf(listener), null, true, true));
         cache.put("a", "1");
         events.clear();
 
-        cache.putAll(
-                new java.util.LinkedHashMap<>(Map.of("a", "2")) {
-                    {
-                        put("b", "3");
-                    }
-                });
+        cache.putAll(new java.util.LinkedHashMap<>(Map.of("a", "2")) {
+            {
+                put("b", "3");
+            }
+        });
 
         assertEquals(List.of("UPDATED:a:2:old=1", "CREATED:b:3"), events);
     }
@@ -561,8 +545,7 @@ class NanocachedCacheTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingListener<String, String> listener = new RecordingListener<>(events);
         zeroCache.registerCacheEntryListener(
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(listener), null, true, true));
+                new MutableCacheEntryListenerConfiguration<>(FactoryBuilder.factoryOf(listener), null, true, true));
         node.multiSetCount.set(0);
 
         zeroCache.putAll(Map.of("a", "1", "b", "2"));
@@ -593,15 +576,13 @@ class NanocachedCacheTest {
         // It must now retry just the still-unresolved remainder and merge
         // the result back in.
         cache.putAll(Map.of("a", "1", "b", "2", "c", "3"));
-        node.forceWrongNodeCountsForGet.put(
-                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")), new AtomicInteger(1));
+        node.forceWrongNodeCountsForGet.put(java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")), new AtomicInteger(1));
         node.multiGetCount.set(0);
 
         Map<String, String> all = cache.getAll(Set.of("a", "b", "c", "missing"));
 
         assertEquals(Map.of("a", "1", "b", "2", "c", "3"), all);
-        assertEquals(
-                2, node.multiGetCount.get(), "the forced W costs exactly one extra retry round");
+        assertEquals(2, node.multiGetCount.get(), "the forced W costs exactly one extra retry round");
     }
 
     @Test
@@ -610,14 +591,11 @@ class NanocachedCacheTest {
         // must not retry forever — it eventually propagates, the same as
         // it would if the SDK's own single-key withWrongNodeRetry gave up.
         cache.put("a", "1");
-        node.forceWrongNodeCountsForGet.put(
-                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")), new AtomicInteger(100));
+        node.forceWrongNodeCountsForGet.put(java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")), new AtomicInteger(100));
 
         javax.cache.CacheException error =
                 assertThrows(javax.cache.CacheException.class, () -> cache.getAll(Set.of("a")));
-        assertTrue(
-                error.getCause() instanceof NanocachedException.WrongNode,
-                "cause: " + error.getCause());
+        assertTrue(error.getCause() instanceof NanocachedException.WrongNode, "cause: " + error.getCause());
     }
 
     @Test
@@ -630,18 +608,15 @@ class NanocachedCacheTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingListener<String, String> listener = new RecordingListener<>(events);
         cache.registerCacheEntryListener(
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(listener), null, true, true));
-        node.forceWrongNodeCountsForSet.put(
-                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")), new AtomicInteger(1));
+                new MutableCacheEntryListenerConfiguration<>(FactoryBuilder.factoryOf(listener), null, true, true));
+        node.forceWrongNodeCountsForSet.put(java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")), new AtomicInteger(1));
         node.multiSetCount.set(0);
 
         cache.putAll(Map.of("a", "1", "b", "2"));
 
         assertEquals("1", cache.get("a"));
         assertEquals("2", cache.get("b"));
-        assertEquals(
-                2, node.multiSetCount.get(), "the forced W costs exactly one extra retry round");
+        assertEquals(2, node.multiSetCount.get(), "the forced W costs exactly one extra retry round");
         assertEquals(2, events.size());
         assertTrue(events.contains("CREATED:a:1"));
         assertTrue(events.contains("CREATED:b:2"));
@@ -649,15 +624,11 @@ class NanocachedCacheTest {
 
     @Test
     void putAllPropagatesWrongNodeOnceItsRetryBudgetIsExhausted() {
-        node.forceWrongNodeCountsForSet.put(
-                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")), new AtomicInteger(100));
+        node.forceWrongNodeCountsForSet.put(java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")), new AtomicInteger(100));
 
         javax.cache.CacheException error =
-                assertThrows(
-                        javax.cache.CacheException.class, () -> cache.putAll(Map.of("a", "1")));
-        assertTrue(
-                error.getCause() instanceof NanocachedException.WrongNode,
-                "cause: " + error.getCause());
+                assertThrows(javax.cache.CacheException.class, () -> cache.putAll(Map.of("a", "1")));
+        assertTrue(error.getCause() instanceof NanocachedException.WrongNode, "cause: " + error.getCause());
     }
 
     // ── getAll/putAll partial-connection-loss recovery (issue #439) ───
@@ -689,10 +660,7 @@ class NanocachedCacheTest {
         Map<String, String> all = cache.getAll(seed.keySet());
 
         assertEquals(seed, all);
-        assertEquals(
-                4,
-                node.multiGetCount.get(),
-                "chunk1 + chunk2-attempt1 + chunk2-attempt2 + adapter-retry");
+        assertEquals(4, node.multiGetCount.get(), "chunk1 + chunk2-attempt1 + chunk2-attempt2 + adapter-retry");
     }
 
     @Test
@@ -713,9 +681,7 @@ class NanocachedCacheTest {
 
         javax.cache.CacheException error =
                 assertThrows(javax.cache.CacheException.class, () -> cache.getAll(seed.keySet()));
-        assertTrue(
-                error.getCause() instanceof NanocachedException.ConnectionLost,
-                "cause: " + error.getCause());
+        assertTrue(error.getCause() instanceof NanocachedException.ConnectionLost, "cause: " + error.getCause());
     }
 
     @Test
@@ -786,10 +752,7 @@ class NanocachedCacheTest {
         for (int i = 0; i < keyCount; i++) {
             assertEquals("v" + i, cache.get("k" + i), "key k" + i + " must have landed");
         }
-        assertEquals(
-                4,
-                node.multiSetCount.get(),
-                "chunk1 + chunk2-attempt1 + chunk2-attempt2 + adapter-retry");
+        assertEquals(4, node.multiSetCount.get(), "chunk1 + chunk2-attempt1 + chunk2-attempt2 + adapter-retry");
     }
 
     @Test
@@ -802,11 +765,8 @@ class NanocachedCacheTest {
         node.multiSetCount.set(0);
         node.armMultiSetDrop(1, 4);
 
-        javax.cache.CacheException error =
-                assertThrows(javax.cache.CacheException.class, () -> cache.putAll(seed));
-        assertTrue(
-                error.getCause() instanceof NanocachedException.ConnectionLost,
-                "cause: " + error.getCause());
+        javax.cache.CacheException error = assertThrows(javax.cache.CacheException.class, () -> cache.putAll(seed));
+        assertTrue(error.getCause() instanceof NanocachedException.ConnectionLost, "cause: " + error.getCause());
     }
 
     /** creation → 60 s, update → 30 s: two distinct TTLs within one putAll. */
@@ -905,19 +865,13 @@ class NanocachedCacheTest {
         } finally {
             node.deleteDelayMillis = 0;
         }
-        assertTrue(
-                NanocachedCache.REMOVE_ALL_EXECUTOR.getPoolSize() > 1,
-                "the fan-out should have spun up workers");
+        assertTrue(NanocachedCache.REMOVE_ALL_EXECUTOR.getPoolSize() > 1, "the fan-out should have spun up workers");
 
         long deadline = System.nanoTime() + 20_000_000_000L;
-        while (NanocachedCache.REMOVE_ALL_EXECUTOR.getPoolSize() > 0
-                && System.nanoTime() < deadline) {
+        while (NanocachedCache.REMOVE_ALL_EXECUTOR.getPoolSize() > 0 && System.nanoTime() < deadline) {
             Thread.sleep(50);
         }
-        assertEquals(
-                0,
-                NanocachedCache.REMOVE_ALL_EXECUTOR.getPoolSize(),
-                "idle removeAll workers should exit");
+        assertEquals(0, NanocachedCache.REMOVE_ALL_EXECUTOR.getPoolSize(), "idle removeAll workers should exit");
     }
 
     @Test
@@ -962,8 +916,7 @@ class NanocachedCacheTest {
         MutableConfiguration<String, String> config = new MutableConfiguration<>();
         config.setTypes(String.class, String.class);
         config.setExpiryPolicyFactory(
-                CreatedExpiryPolicy.factoryOf(
-                        new Duration(java.util.concurrent.TimeUnit.SECONDS, 60)));
+                CreatedExpiryPolicy.factoryOf(new Duration(java.util.concurrent.TimeUnit.SECONDS, 60)));
         Cache<String, String> ttlCache = manager.createCache("ttl-widgets", config);
 
         ttlCache.put("a", "1");
@@ -1003,8 +956,7 @@ class NanocachedCacheTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingListener<String, String> listener = new RecordingListener<>(events);
         zeroCache.registerCacheEntryListener(
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(listener), null, true, true));
+                new MutableCacheEntryListenerConfiguration<>(FactoryBuilder.factoryOf(listener), null, true, true));
 
         zeroCache.put("a", "1"); // update resolves to Duration.ZERO -> deletes
 
@@ -1036,8 +988,7 @@ class NanocachedCacheTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingListener<String, String> listener = new RecordingListener<>(events);
         zeroCache.registerCacheEntryListener(
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(listener), null, true, true));
+                new MutableCacheEntryListenerConfiguration<>(FactoryBuilder.factoryOf(listener), null, true, true));
 
         assertTrue(zeroCache.replace("a", "1")); // update resolves to Duration.ZERO -> deletes
 
@@ -1047,8 +998,7 @@ class NanocachedCacheTest {
     }
 
     @Test
-    void getAndPutOnDurationZeroKeepsRetryingTheConditionedDeleteAndFiresRemoved()
-            throws Exception {
+    void getAndPutOnDurationZeroKeepsRetryingTheConditionedDeleteAndFiresRemoved() throws Exception {
         // The update expiry resolves to Duration.ZERO, so getAndPut's
         // write is a conditioned delete. Sustained CAS mismatches used to
         // exhaust a fixed budget and fall through to an unconditional
@@ -1070,8 +1020,7 @@ class NanocachedCacheTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingListener<String, String> listener = new RecordingListener<>(events);
         zeroCache.registerCacheEntryListener(
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(listener), null, true, true));
+                new MutableCacheEntryListenerConfiguration<>(FactoryBuilder.factoryOf(listener), null, true, true));
 
         node.forceCasMismatchCount.set(50);
 
@@ -1081,9 +1030,7 @@ class NanocachedCacheTest {
         assertEquals(List.of("REMOVED:a:old=old"), events);
         assertEquals(1, statisticsMBean("zero-fallback").getCacheRemovals());
         assertEquals(0, node.deleteCount.get(), "no unconditional delete");
-        assertTrue(
-                node.casDeleteCount.get() > 50,
-                "the conditioned delete was retried past the old budget");
+        assertTrue(node.casDeleteCount.get() > 50, "the conditioned delete was retried past the old budget");
     }
 
     @Test
@@ -1091,15 +1038,12 @@ class NanocachedCacheTest {
         MutableConfiguration<String, String> config = new MutableConfiguration<>();
         config.setTypes(String.class, String.class);
         config.setExpiryPolicyFactory(
-                AccessedExpiryPolicy.factoryOf(
-                        new Duration(java.util.concurrent.TimeUnit.SECONDS, 30)));
+                AccessedExpiryPolicy.factoryOf(new Duration(java.util.concurrent.TimeUnit.SECONDS, 30)));
         Cache<String, String> slidingCache = manager.createCache("sliding-widgets", config);
 
         slidingCache.put("a", "1");
         assertEquals(
-                30L,
-                storedTtlSeconds("sliding-widgets", "a"),
-                "AccessedExpiryPolicy also sets the TTL on creation");
+                30L, storedTtlSeconds("sliding-widgets", "a"), "AccessedExpiryPolicy also sets the TTL on creation");
 
         // Simulate time having passed by rewriting the stored TTL directly,
         // bypassing the cache — then prove a plain get() resets it to the
@@ -1108,16 +1052,15 @@ class NanocachedCacheTest {
                 .put(
                         java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")),
                         new MockNode.Entry(
-                                node.entry("sliding-widgets", KeyCodec.toKeyBytes("a")).value(),
+                                node.entry("sliding-widgets", KeyCodec.toKeyBytes("a"))
+                                        .value(),
                                 5L));
         assertEquals(5L, storedTtlSeconds("sliding-widgets", "a"));
 
         slidingCache.get("a");
 
         assertEquals(
-                30L,
-                storedTtlSeconds("sliding-widgets", "a"),
-                "a get must refresh the TTL via getExpiryForAccess");
+                30L, storedTtlSeconds("sliding-widgets", "a"), "a get must refresh the TTL via getExpiryForAccess");
     }
 
     // ── access expiry through getAndTouch (issue #826) ──────────────
@@ -1175,9 +1118,7 @@ class NanocachedCacheTest {
         assertEquals("1", sliding.get("a"));
 
         assertEquals(0L, storedTtlSeconds("touch-eternal", "a"), "0 is the mock's no-TTL");
-        assertFalse(
-                node.touchFrames.get(0).contains(" 0 G"),
-                "no TTL field, not a 0 that would expire it");
+        assertFalse(node.touchFrames.get(0).contains(" 0 G"), "no TTL field, not a 0 that would expire it");
     }
 
     @Test
@@ -1212,18 +1153,12 @@ class NanocachedCacheTest {
         Cache<String, String> sliding =
                 accessCache("touch-race", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
         sliding.put("a", "old");
-        java.util.concurrent.atomic.AtomicBoolean fired =
-                new java.util.concurrent.atomic.AtomicBoolean();
-        node.beforeAccessApplies =
-                () -> {
-                    if (fired.compareAndSet(false, true)) {
-                        rawSet(
-                                "touch-race",
-                                KeyCodec.toKeyBytes("a"),
-                                ValueCodec.serialize("new"),
-                                30L);
-                    }
-                };
+        java.util.concurrent.atomic.AtomicBoolean fired = new java.util.concurrent.atomic.AtomicBoolean();
+        node.beforeAccessApplies = () -> {
+            if (fired.compareAndSet(false, true)) {
+                rawSet("touch-race", KeyCodec.toKeyBytes("a"), ValueCodec.serialize("new"), 30L);
+            }
+        };
 
         sliding.get("a");
         node.beforeAccessApplies = null;
@@ -1259,9 +1194,7 @@ class NanocachedCacheTest {
 
         assertEquals(0L, storedTtlSeconds("touch-all-eternal", "a"), "0 is the mock's no-TTL");
         assertEquals(0L, storedTtlSeconds("touch-all-eternal", "b"), "0 is the mock's no-TTL");
-        assertFalse(
-                node.multiTouchFrames.get(0).contains(" 0 G"),
-                "no TTL field, not a 0 that would expire them");
+        assertFalse(node.multiTouchFrames.get(0).contains(" 0 G"), "no TTL field, not a 0 that would expire them");
     }
 
     @Test
@@ -1282,8 +1215,7 @@ class NanocachedCacheTest {
     @Test
     void getAllUnderAnAccessPolicyCountsHitsAndMisses() throws Exception {
         Cache<String, String> sliding =
-                accessCache(
-                        "touch-all-stats", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
+                accessCache("touch-all-stats", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
         manager.enableStatistics("touch-all-stats", true);
         sliding.put("a", "1");
 
@@ -1300,22 +1232,15 @@ class NanocachedCacheTest {
         // refresh was lost. The concurrent write is injected after the node
         // has seen the batched touch and before it answers.
         Cache<String, String> sliding =
-                accessCache(
-                        "touch-all-race", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
+                accessCache("touch-all-race", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
         sliding.put("a", "old");
         sliding.put("b", "other");
-        java.util.concurrent.atomic.AtomicBoolean fired =
-                new java.util.concurrent.atomic.AtomicBoolean();
-        node.beforeAccessApplies =
-                () -> {
-                    if (fired.compareAndSet(false, true)) {
-                        rawSet(
-                                "touch-all-race",
-                                KeyCodec.toKeyBytes("a"),
-                                ValueCodec.serialize("new"),
-                                30L);
-                    }
-                };
+        java.util.concurrent.atomic.AtomicBoolean fired = new java.util.concurrent.atomic.AtomicBoolean();
+        node.beforeAccessApplies = () -> {
+            if (fired.compareAndSet(false, true)) {
+                rawSet("touch-all-race", KeyCodec.toKeyBytes("a"), ValueCodec.serialize("new"), 30L);
+            }
+        };
 
         sliding.getAll(Set.of("a", "b"));
         node.beforeAccessApplies = null;
@@ -1334,16 +1259,12 @@ class NanocachedCacheTest {
                 accessCache("touch-all-w", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
         sliding.putAll(Map.of("a", "1", "b", "2", "c", "3"));
         seedWithTtl("touch-all-w", "b", "2", 5L);
-        node.forceWrongNodeCountsForGet.put(
-                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")), new AtomicInteger(1));
+        node.forceWrongNodeCountsForGet.put(java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")), new AtomicInteger(1));
 
         Map<String, String> all = sliding.getAll(Set.of("a", "b", "c", "missing"));
 
         assertEquals(Map.of("a", "1", "b", "2", "c", "3"), all);
-        assertEquals(
-                2,
-                node.multiTouchFrames.size(),
-                "the forced W costs exactly one extra retry round");
+        assertEquals(2, node.multiTouchFrames.size(), "the forced W costs exactly one extra retry round");
         assertTrue(
                 node.multiTouchFrames.get(1).startsWith("y " + "touch-all-w".length() + " 1 "),
                 "the retry carries only the unresolved key: " + node.multiTouchFrames.get(1));
@@ -1353,17 +1274,14 @@ class NanocachedCacheTest {
     @Test
     void getAllAgainstAServerWithoutTheBatchedTouchFailsWithServerTooOld() {
         Cache<String, String> sliding =
-                accessCache(
-                        "touch-all-old", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
+                accessCache("touch-all-old", new Duration(java.util.concurrent.TimeUnit.SECONDS, 30));
         sliding.put("a", "1");
         node.rejectMultiTouch = true;
 
         javax.cache.CacheException error =
                 assertThrows(javax.cache.CacheException.class, () -> sliding.getAll(Set.of("a")));
 
-        assertTrue(
-                error.getCause() instanceof NanocachedException.ServerTooOld,
-                "cause: " + error.getCause());
+        assertTrue(error.getCause() instanceof NanocachedException.ServerTooOld, "cause: " + error.getCause());
         assertEquals("y", ((NanocachedException.ServerTooOld) error.getCause()).command());
         // A cache without an access policy never sends `y`, so it keeps working.
         cache.put("plain", "1");
@@ -1377,17 +1295,8 @@ class NanocachedCacheTest {
             java.io.InputStream in = socket.getInputStream();
             out.write("A 1\nx".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
             readLine(in); // On
-            out.write(
-                    ("s "
-                                    + ns.length
-                                    + " "
-                                    + key.length
-                                    + " "
-                                    + value.length
-                                    + " "
-                                    + ttlSeconds
-                                    + "\n")
-                            .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            out.write(("s " + ns.length + " " + key.length + " " + value.length + " " + ttlSeconds + "\n")
+                    .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
             out.write(ns);
             out.write(key);
             out.write(value);
@@ -1430,12 +1339,10 @@ class NanocachedCacheTest {
 
     private CacheStatisticsMXBean statisticsMBean(String cacheName) throws Exception {
         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
-        ObjectName objectName =
-                new ObjectName(
-                        "javax.cache:type=CacheStatistics,CacheManager="
-                                + ObjectName.quote(manager.getURI().toString())
-                                + ",Cache="
-                                + ObjectName.quote(cacheName));
+        ObjectName objectName = new ObjectName("javax.cache:type=CacheStatistics,CacheManager="
+                + ObjectName.quote(manager.getURI().toString())
+                + ",Cache="
+                + ObjectName.quote(cacheName));
         return JMX.newMXBeanProxy(mbs, objectName, CacheStatisticsMXBean.class);
     }
 
@@ -1446,8 +1353,7 @@ class NanocachedCacheTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingListener<String, String> listener = new RecordingListener<>(events);
         cache.registerCacheEntryListener(
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(listener), null, true, true));
+                new MutableCacheEntryListenerConfiguration<>(FactoryBuilder.factoryOf(listener), null, true, true));
 
         cache.put("a", "1"); // created
         cache.put("a", "2"); // updated
@@ -1465,8 +1371,7 @@ class NanocachedCacheTest {
         List<String> events = new CopyOnWriteArrayList<>();
         UnguardedListener<String, String> listener = new UnguardedListener<>(events);
         cache.registerCacheEntryListener(
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(listener), null, true, true));
+                new MutableCacheEntryListenerConfiguration<>(FactoryBuilder.factoryOf(listener), null, true, true));
 
         cache.put("a", "1"); // created: no old value
         assertTrue(cache.replace("a", "2")); // updated: old value unavailable
@@ -1481,12 +1386,8 @@ class NanocachedCacheTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingListener<String, String> listener = new RecordingListener<>(events);
         OnlyKeyAFilter<String, String> onlyA = new OnlyKeyAFilter<>();
-        cache.registerCacheEntryListener(
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(listener),
-                        FactoryBuilder.factoryOf(onlyA),
-                        true,
-                        true));
+        cache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(listener), FactoryBuilder.factoryOf(onlyA), true, true));
 
         cache.put("a", "1");
         cache.put("b", "1");
@@ -1499,8 +1400,7 @@ class NanocachedCacheTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingListener<String, String> listener = new RecordingListener<>(events);
         CacheEntryListenerConfiguration<String, String> config =
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(listener), null, true, true);
+                new MutableCacheEntryListenerConfiguration<>(FactoryBuilder.factoryOf(listener), null, true, true);
         cache.registerCacheEntryListener(config);
         cache.deregisterCacheEntryListener(config);
 
@@ -1517,25 +1417,18 @@ class NanocachedCacheTest {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingListener<String, String> listener = new RecordingListener<>(events);
         CacheEntryListenerConfiguration<String, String> config =
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(listener), null, true, true);
+                new MutableCacheEntryListenerConfiguration<>(FactoryBuilder.factoryOf(listener), null, true, true);
         cache.registerCacheEntryListener(config);
 
-        assertThrows(
-                IllegalArgumentException.class, () -> cache.registerCacheEntryListener(config));
+        assertThrows(IllegalArgumentException.class, () -> cache.registerCacheEntryListener(config));
         // An equal but distinct configuration is the same registration.
         assertThrows(
                 IllegalArgumentException.class,
-                () ->
-                        cache.registerCacheEntryListener(
-                                new MutableCacheEntryListenerConfiguration<>(
-                                        FactoryBuilder.factoryOf(listener), null, true, true)));
+                () -> cache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                        FactoryBuilder.factoryOf(listener), null, true, true)));
 
         cache.put("a", "1");
-        assertEquals(
-                List.of("CREATED:a:1"),
-                events,
-                "the rejected registrations must not deliver anything");
+        assertEquals(List.of("CREATED:a:1"), events, "the rejected registrations must not deliver anything");
 
         // After a deregister the configuration can be registered again.
         cache.deregisterCacheEntryListener(config);
@@ -1548,27 +1441,19 @@ class NanocachedCacheTest {
     @Test
     void aCacheConfiguredWithTheSameListenerConfigurationTwiceIsRejected() {
         List<String> events = new CopyOnWriteArrayList<>();
-        CacheEntryListenerConfiguration<String, String> config =
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(new RecordingListener<String, String>(events)),
-                        null,
-                        true,
-                        true);
+        CacheEntryListenerConfiguration<String, String> config = new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(new RecordingListener<String, String>(events)), null, true, true);
         // MutableConfiguration itself refuses a duplicate, so hand the manager
         // a configuration that reports one twice.
-        MutableConfiguration<String, String> duplicated =
-                new MutableConfiguration<String, String>() {
-                    @Override
-                    public Iterable<CacheEntryListenerConfiguration<String, String>>
-                            getCacheEntryListenerConfigurations() {
-                        return List.of(config, config);
-                    }
-                };
+        MutableConfiguration<String, String> duplicated = new MutableConfiguration<String, String>() {
+            @Override
+            public Iterable<CacheEntryListenerConfiguration<String, String>> getCacheEntryListenerConfigurations() {
+                return List.of(config, config);
+            }
+        };
         duplicated.setTypes(String.class, String.class);
 
-        assertThrows(
-                IllegalArgumentException.class,
-                () -> manager.createCache("duplicated", duplicated));
+        assertThrows(IllegalArgumentException.class, () -> manager.createCache("duplicated", duplicated));
         assertNull(manager.getCache("duplicated"), "a rejected cache must not be registered");
     }
 
@@ -1600,19 +1485,13 @@ class NanocachedCacheTest {
      */
     private void storeUndecodable(String cacheName, String key) {
         node.store(cacheName)
-                .put(
-                        java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes(key)),
-                        new MockNode.Entry(new byte[] {1, 2, 3}, 60L));
+                .put(java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes(key)), new MockNode.Entry(new byte[] {1, 2, 3}, 60L));
     }
 
     private List<String> listen(Cache<String, String> target) {
         List<String> events = new CopyOnWriteArrayList<>();
-        target.registerCacheEntryListener(
-                new MutableCacheEntryListenerConfiguration<>(
-                        FactoryBuilder.factoryOf(new RecordingListener<String, String>(events)),
-                        null,
-                        true,
-                        true));
+        target.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(new RecordingListener<String, String>(events)), null, true, true));
         return events;
     }
 
@@ -1663,8 +1542,7 @@ class NanocachedCacheTest {
                 Class<?> loaded = findLoadedClass(name);
                 if (loaded == null) {
                     try (java.io.InputStream in =
-                            Poison.class.getResourceAsStream(
-                                    "/" + name.replace('.', '/') + ".class")) {
+                            Poison.class.getResourceAsStream("/" + name.replace('.', '/') + ".class")) {
                         byte[] bytes = in.readAllBytes();
                         loaded = defineClass(name, bytes, 0, bytes.length);
                     } catch (java.io.IOException e) {
@@ -1690,11 +1568,8 @@ class NanocachedCacheTest {
         }
         Properties properties = new Properties();
         properties.setProperty("nanocached.addresses", node.address());
-        CacheManager poisonManager =
-                provider.getCacheManager(
-                        URI.create("test:poison"),
-                        new PoisonLoader(getClass().getClassLoader()),
-                        properties);
+        CacheManager poisonManager = provider.getCacheManager(
+                URI.create("test:poison"), new PoisonLoader(getClass().getClassLoader()), properties);
         MutableConfiguration<String, String> config = new MutableConfiguration<>();
         config.setTypes(String.class, String.class);
         config.setExpiryPolicyFactory(EternalExpiryPolicy.factoryOf());
@@ -1705,9 +1580,7 @@ class NanocachedCacheTest {
         try {
             for (String key : List.of("put", "putAll", "remove")) {
                 node.store("poison")
-                        .put(
-                                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes(key)),
-                                new MockNode.Entry(poisoned, 60L));
+                        .put(java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes(key)), new MockNode.Entry(poisoned, 60L));
             }
 
             target.put("put", "new");
@@ -1717,12 +1590,7 @@ class NanocachedCacheTest {
             assertEquals("new", target.get("put"));
             assertEquals("new", target.get("putAll"));
             assertNull(node.entry("poison", KeyCodec.toKeyBytes("remove")), "the remove landed");
-            assertEquals(
-                    List.of(
-                            "UPDATED:put:new:old=?",
-                            "UPDATED:putAll:new:old=?",
-                            "REMOVED:remove:old=?"),
-                    events);
+            assertEquals(List.of("UPDATED:put:new:old=?", "UPDATED:putAll:new:old=?", "REMOVED:remove:old=?"), events);
         } finally {
             System.clearProperty(Poison.PROPERTY);
         }
@@ -1756,12 +1624,11 @@ class NanocachedCacheTest {
             storeUndecodable(name, "a");
             List<String> events = withListener ? listen(target) : null;
 
-            target.putAll(
-                    new java.util.LinkedHashMap<>(Map.of("a", "1")) {
-                        {
-                            put("b", "2");
-                        }
-                    });
+            target.putAll(new java.util.LinkedHashMap<>(Map.of("a", "1")) {
+                {
+                    put("b", "2");
+                }
+            });
 
             assertEquals("1", target.get("a"));
             assertEquals("2", target.get("b"));
@@ -1815,8 +1682,7 @@ class NanocachedCacheTest {
         assertEquals(List.of("REMOVED:k:old=?"), events);
     }
 
-    private static final class OnlyKeyAFilter<K, V>
-            implements CacheEntryEventFilter<K, V>, java.io.Serializable {
+    private static final class OnlyKeyAFilter<K, V> implements CacheEntryEventFilter<K, V>, java.io.Serializable {
         @Override
         public boolean evaluate(CacheEntryEvent<? extends K, ? extends V> event) {
             return event.getKey().equals("a");
@@ -1847,10 +1713,8 @@ class NanocachedCacheTest {
         public void onUpdated(Iterable<CacheEntryEvent<? extends K, ? extends V>> iterable)
                 throws CacheEntryListenerException {
             for (CacheEntryEvent<? extends K, ? extends V> event : iterable) {
-                String oldValue =
-                        event.isOldValueAvailable() ? String.valueOf(event.getOldValue()) : "?";
-                events.add(
-                        "UPDATED:" + event.getKey() + ":" + event.getValue() + ":old=" + oldValue);
+                String oldValue = event.isOldValueAvailable() ? String.valueOf(event.getOldValue()) : "?";
+                events.add("UPDATED:" + event.getKey() + ":" + event.getValue() + ":old=" + oldValue);
             }
         }
 
@@ -1858,8 +1722,7 @@ class NanocachedCacheTest {
         public void onRemoved(Iterable<CacheEntryEvent<? extends K, ? extends V>> iterable)
                 throws CacheEntryListenerException {
             for (CacheEntryEvent<? extends K, ? extends V> event : iterable) {
-                String oldValue =
-                        event.isOldValueAvailable() ? String.valueOf(event.getOldValue()) : "?";
+                String oldValue = event.isOldValueAvailable() ? String.valueOf(event.getOldValue()) : "?";
                 events.add("REMOVED:" + event.getKey() + ":old=" + oldValue);
             }
         }
@@ -1881,17 +1744,9 @@ class NanocachedCacheTest {
             this.events = events;
         }
 
-        private void record(
-                String type, Iterable<CacheEntryEvent<? extends K, ? extends V>> iterable) {
+        private void record(String type, Iterable<CacheEntryEvent<? extends K, ? extends V>> iterable) {
             for (CacheEntryEvent<? extends K, ? extends V> event : iterable) {
-                events.add(
-                        type
-                                + ":"
-                                + event.getKey()
-                                + ":"
-                                + event.getValue()
-                                + ":"
-                                + event.getOldValue());
+                events.add(type + ":" + event.getKey() + ":" + event.getValue() + ":" + event.getOldValue());
             }
         }
 
@@ -1923,8 +1778,7 @@ class NanocachedCacheTest {
         assertEquals("old", cache.getAndPut("a", "new"));
         assertEquals("new", cache.get("a"));
         assertEquals(1, node.setCount.get(), "only the seeding put sent an unconditional set");
-        assertTrue(
-                node.casSetCount.get() > 30, "the compare-and-set was retried past the old budget");
+        assertTrue(node.casSetCount.get() > 30, "the compare-and-set was retried past the old budget");
     }
 
     @Test
@@ -1942,8 +1796,7 @@ class NanocachedCacheTest {
         // The deadline is reached through reflection so this test still
         // compiles against an adapter without it and then fails (rather
         // than being silently skipped by a compilation error).
-        java.lang.reflect.Field deadline =
-                NanocachedCache.class.getDeclaredField("casRetryDeadlineMillis");
+        java.lang.reflect.Field deadline = NanocachedCache.class.getDeclaredField("casRetryDeadlineMillis");
         deadline.setAccessible(true);
         long saved = deadline.getLong(null);
         deadline.setLong(null, 200);
@@ -1951,8 +1804,7 @@ class NanocachedCacheTest {
             cache.put("a", "old");
             node.forceCasMismatchCount.set(1_000_000);
             javax.cache.CacheException error =
-                    assertThrows(
-                            javax.cache.CacheException.class, () -> cache.getAndPut("a", "new"));
+                    assertThrows(javax.cache.CacheException.class, () -> cache.getAndPut("a", "new"));
             assertTrue(error.getMessage().contains("gave up"), error.getMessage());
             assertEquals(1, node.setCount.get(), "no unconditional overwrite after giving up");
             assertEquals("old", cache.get("a"), "the stored value is untouched");
@@ -1969,31 +1821,25 @@ class NanocachedCacheTest {
         // exactly once (plus the initial null), which only holds when
         // every getAndPut is atomic.
         int threads = 8, perThread = 100;
-        java.util.concurrent.ExecutorService pool =
-                java.util.concurrent.Executors.newFixedThreadPool(threads);
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threads);
         try {
             List<java.util.concurrent.Future<List<String>>> results = new java.util.ArrayList<>();
             for (int t = 0; t < threads; t++) {
                 int thread = t;
-                results.add(
-                        pool.submit(() -> {
-                            List<String> previous = new java.util.ArrayList<>();
-                            for (int i = 0; i < perThread; i++) {
-                                previous.add(cache.getAndPut("hot", "t" + thread + "-" + i));
-                            }
-                            return previous;
-                        }));
+                results.add(pool.submit(() -> {
+                    List<String> previous = new java.util.ArrayList<>();
+                    for (int i = 0; i < perThread; i++) {
+                        previous.add(cache.getAndPut("hot", "t" + thread + "-" + i));
+                    }
+                    return previous;
+                }));
             }
             List<String> all = new java.util.ArrayList<>();
-            for (java.util.concurrent.Future<List<String>> result : results)
-                all.addAll(result.get());
+            for (java.util.concurrent.Future<List<String>> result : results) all.addAll(result.get());
             long nulls = all.stream().filter(java.util.Objects::isNull).count();
             assertEquals(1, nulls, "exactly one caller saw the empty cache");
             Set<String> distinct = new java.util.HashSet<>(all);
-            assertEquals(
-                    all.size(),
-                    distinct.size(),
-                    "a previous value was returned to more than one caller");
+            assertEquals(all.size(), distinct.size(), "a previous value was returned to more than one caller");
             assertEquals(threads * perThread, all.size());
         } finally {
             pool.shutdownNow();
@@ -2017,11 +1863,10 @@ class NanocachedCacheTest {
         operations.put("putIfAbsent", () -> cache.putIfAbsent("c", "3"));
         operations.put("getAndPut", () -> cache.getAndPut("a", "4"));
         for (Map.Entry<String, Runnable> operation : operations.entrySet()) {
-            javax.cache.CacheException error =
-                    assertThrows(
-                            javax.cache.CacheException.class,
-                            operation.getValue()::run,
-                            operation.getKey() + " must throw CacheException");
+            javax.cache.CacheException error = assertThrows(
+                    javax.cache.CacheException.class,
+                    operation.getValue()::run,
+                    operation.getKey() + " must throw CacheException");
             assertTrue(
                     error.getCause() instanceof NanocachedException,
                     operation.getKey() + " cause: " + error.getCause());
@@ -2031,11 +1876,8 @@ class NanocachedCacheTest {
     @Test
     void anOversizedValueIsACacheException() {
         javax.cache.CacheException error =
-                assertThrows(
-                        javax.cache.CacheException.class,
-                        () -> cache.put("big", "x".repeat(1_200_000)));
-        assertTrue(
-                error.getCause() instanceof IllegalArgumentException, "cause: " + error.getCause());
+                assertThrows(javax.cache.CacheException.class, () -> cache.put("big", "x".repeat(1_200_000)));
+        assertTrue(error.getCause() instanceof IllegalArgumentException, "cause: " + error.getCause());
     }
 
     // ── the manager's class loader resolves value classes ───────────
@@ -2050,22 +1892,18 @@ class NanocachedCacheTest {
         java.nio.file.Path source = dir.resolve("app").resolve("JcUser.java");
         java.nio.file.Files.createDirectories(source.getParent());
         java.nio.file.Files.writeString(
-                source,
-                "package app; public record JcUser(String name) implements java.io.Serializable {}");
+                source, "package app; public record JcUser(String name) implements java.io.Serializable {}");
         assertEquals(
                 0,
                 javax.tools.ToolProvider.getSystemJavaCompiler()
                         .run(null, null, null, "-d", dir.toString(), source.toString()));
-        try (java.net.URLClassLoader child =
-                new java.net.URLClassLoader(
-                        new java.net.URL[] {dir.toUri().toURL()},
-                        NanocachedCacheTest.class.getClassLoader())) {
+        try (java.net.URLClassLoader child = new java.net.URLClassLoader(
+                new java.net.URL[] {dir.toUri().toURL()}, NanocachedCacheTest.class.getClassLoader())) {
             Class<?> type = child.loadClass("app.JcUser");
             Object user = type.getConstructor(String.class).newInstance("alice");
             Properties properties = new Properties();
             properties.setProperty("nanocached.addresses", node.address());
-            CacheManager childManager =
-                    provider.getCacheManager(URI.create("test:child-loader"), child, properties);
+            CacheManager childManager = provider.getCacheManager(URI.create("test:child-loader"), child, properties);
             MutableConfiguration<String, Object> config = new MutableConfiguration<>();
             config.setTypes(String.class, Object.class);
             config.setExpiryPolicyFactory(EternalExpiryPolicy.factoryOf());
@@ -2092,8 +1930,6 @@ class NanocachedCacheTest {
         IllegalArgumentException error =
                 assertThrows(IllegalArgumentException.class, () -> KeyCodec.toKeyBytes('\uD800'));
         assertTrue(error.getMessage().contains("lone surrogate"), error.getMessage());
-        assertEquals(
-                "Character:x",
-                new String(KeyCodec.toKeyBytes('x'), java.nio.charset.StandardCharsets.UTF_8));
+        assertEquals("Character:x", new String(KeyCodec.toKeyBytes('x'), java.nio.charset.StandardCharsets.UTF_8));
     }
 }

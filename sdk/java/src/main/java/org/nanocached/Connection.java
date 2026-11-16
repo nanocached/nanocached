@@ -119,14 +119,11 @@ final class Connection {
     private static final ScheduledThreadPoolExecutor WATCHDOG = newWatchdogPool();
 
     private static ScheduledThreadPoolExecutor newWatchdogPool() {
-        ScheduledThreadPoolExecutor pool =
-                new ScheduledThreadPoolExecutor(
-                        1,
-                        runnable -> {
-                            Thread thread = new Thread(runnable, "nanocached-request-watchdog");
-                            thread.setDaemon(true);
-                            return thread;
-                        });
+        ScheduledThreadPoolExecutor pool = new ScheduledThreadPoolExecutor(1, runnable -> {
+            Thread thread = new Thread(runnable, "nanocached-request-watchdog");
+            thread.setDaemon(true);
+            return thread;
+        });
         pool.setRemoveOnCancelPolicy(true);
         return pool;
     }
@@ -151,8 +148,7 @@ final class Connection {
      * As {@link #Connection(Socket, boolean, Runnable)}, additionally reporting every {@code R}
      * response via {@code onTransientRetry} (see that field's doc).
      */
-    Connection(Socket socket, boolean tagged, Runnable onClose, Runnable onTransientRetry)
-            throws IOException {
+    Connection(Socket socket, boolean tagged, Runnable onClose, Runnable onTransientRetry) throws IOException {
         this.socket = socket;
         this.tagged = tagged;
         this.onClose = onClose;
@@ -202,9 +198,7 @@ final class Connection {
      */
     private void schedule(long delayNanos) {
         long generation = ++deadlineGeneration;
-        deadlineTask =
-                WATCHDOG.schedule(
-                        () -> checkDeadline(generation), delayNanos, TimeUnit.NANOSECONDS);
+        deadlineTask = WATCHDOG.schedule(() -> checkDeadline(generation), delayNanos, TimeUnit.NANOSECONDS);
     }
 
     /**
@@ -260,14 +254,11 @@ final class Connection {
         // close the socket *before* trying to poison: poison() takes the
         // monitor, and a writer wedged in out.write holds it — only the
         // close itself can unblock that writer (and the blocked reader).
-        timedOutError =
-                new NanocachedException.ConnectionLost(
-                        "nanocached: no response from server within "
-                                + requestTimeoutMillis
-                                + "ms (request timed out)",
-                        null,
-                        false,
-                        true);
+        timedOutError = new NanocachedException.ConnectionLost(
+                "nanocached: no response from server within " + requestTimeoutMillis + "ms (request timed out)",
+                null,
+                false,
+                true);
         try {
             socket.close();
         } catch (IOException ignored) {
@@ -289,8 +280,7 @@ final class Connection {
     }
 
     byte[] get(byte[] key) {
-        Response response =
-                request(tag -> frame("G " + key.length + tagSuffix(tag) + "\n", key, null));
+        Response response = request(tag -> frame("G " + key.length + tagSuffix(tag) + "\n", key, null));
         return switch (response.marker) {
             case 'V' -> plainValue(response);
             case 'N' -> null;
@@ -320,12 +310,7 @@ final class Connection {
      */
     boolean touch(byte[] namespace, byte[] key, Long ttlSeconds) {
         Response response =
-                request(tag ->
-                        frame(
-                                touchHeader(namespace, key, ttlSeconds, false, tag),
-                                namespace,
-                                key,
-                                null));
+                request(tag -> frame(touchHeader(namespace, key, ttlSeconds, false, tag), namespace, key, null));
         return switch (response.marker) {
             case 'S' -> true;
             case 'N' -> false;
@@ -340,12 +325,7 @@ final class Connection {
      */
     byte[] getAndTouch(byte[] namespace, byte[] key, Long ttlSeconds) {
         Response response =
-                request(tag ->
-                        frame(
-                                touchHeader(namespace, key, ttlSeconds, true, tag),
-                                namespace,
-                                key,
-                                null));
+                request(tag -> frame(touchHeader(namespace, key, ttlSeconds, true, tag), namespace, key, null));
         return switch (response.marker) {
             case 'V' -> response.value;
             case 'N' -> null;
@@ -354,8 +334,7 @@ final class Connection {
         };
     }
 
-    private static String touchHeader(
-            byte[] namespace, byte[] key, Long ttlSeconds, boolean get, Integer tag) {
+    private static String touchHeader(byte[] namespace, byte[] key, Long ttlSeconds, boolean get, Integer tag) {
         return "t "
                 + namespace.length
                 + " "
@@ -367,28 +346,18 @@ final class Connection {
     }
 
     void set(byte[] key, byte[] value, Long ttlSeconds) {
-        Response response =
-                request(tag -> {
-                    String header =
-                            ttlSeconds == null
-                                    ? "S " + key.length + " " + value.length + tagSuffix(tag) + "\n"
-                                    : "S "
-                                            + key.length
-                                            + " "
-                                            + value.length
-                                            + " "
-                                            + ttlSeconds
-                                            + tagSuffix(tag)
-                                            + "\n";
-                    return frame(header, key, value);
-                });
+        Response response = request(tag -> {
+            String header = ttlSeconds == null
+                    ? "S " + key.length + " " + value.length + tagSuffix(tag) + "\n"
+                    : "S " + key.length + " " + value.length + " " + ttlSeconds + tagSuffix(tag) + "\n";
+            return frame(header, key, value);
+        });
         if (response.marker == 'W') throw new NanocachedException.WrongNode();
         if (response.marker != 'S') throw mismatch(response.marker);
     }
 
     boolean delete(byte[] key) {
-        Response response =
-                request(tag -> frame("D " + key.length + tagSuffix(tag) + "\n", key, null));
+        Response response = request(tag -> frame("D " + key.length + tagSuffix(tag) + "\n", key, null));
         return switch (response.marker) {
             case 'D' -> true;
             case 'N' -> false;
@@ -409,13 +378,8 @@ final class Connection {
 
     byte[] get(byte[] namespace, byte[] key) {
         if (namespace.length == 0) return get(key);
-        Response response =
-                request(tag ->
-                        frame(
-                                "g " + namespace.length + " " + key.length + tagSuffix(tag) + "\n",
-                                namespace,
-                                key,
-                                null));
+        Response response = request(
+                tag -> frame("g " + namespace.length + " " + key.length + tagSuffix(tag) + "\n", namespace, key, null));
         return switch (response.marker) {
             case 'V' -> plainValue(response);
             case 'N' -> null;
@@ -429,43 +393,29 @@ final class Connection {
             set(key, value, ttlSeconds);
             return;
         }
-        Response response =
-                request(tag -> {
-                    String header =
-                            ttlSeconds == null
-                                    ? "s "
-                                            + namespace.length
-                                            + " "
-                                            + key.length
-                                            + " "
-                                            + value.length
-                                            + tagSuffix(tag)
-                                            + "\n"
-                                    : "s "
-                                            + namespace.length
-                                            + " "
-                                            + key.length
-                                            + " "
-                                            + value.length
-                                            + " "
-                                            + ttlSeconds
-                                            + tagSuffix(tag)
-                                            + "\n";
-                    return frame(header, namespace, key, value);
-                });
+        Response response = request(tag -> {
+            String header = ttlSeconds == null
+                    ? "s " + namespace.length + " " + key.length + " " + value.length + tagSuffix(tag) + "\n"
+                    : "s "
+                            + namespace.length
+                            + " "
+                            + key.length
+                            + " "
+                            + value.length
+                            + " "
+                            + ttlSeconds
+                            + tagSuffix(tag)
+                            + "\n";
+            return frame(header, namespace, key, value);
+        });
         if (response.marker == 'W') throw new NanocachedException.WrongNode();
         if (response.marker != 'S') throw mismatch(response.marker);
     }
 
     boolean delete(byte[] namespace, byte[] key) {
         if (namespace.length == 0) return delete(key);
-        Response response =
-                request(tag ->
-                        frame(
-                                "d " + namespace.length + " " + key.length + tagSuffix(tag) + "\n",
-                                namespace,
-                                key,
-                                null));
+        Response response = request(
+                tag -> frame("d " + namespace.length + " " + key.length + tagSuffix(tag) + "\n", namespace, key, null));
         return switch (response.marker) {
             case 'D' -> true;
             case 'N' -> false;
@@ -487,9 +437,7 @@ final class Connection {
      * clears the default namespace ({@code c 0}).
      */
     void clear(byte[] namespace) {
-        Response response =
-                request(tag ->
-                        frame("c " + namespace.length + tagSuffix(tag) + "\n", namespace, null));
+        Response response = request(tag -> frame("c " + namespace.length + tagSuffix(tag) + "\n", namespace, null));
         if (response.marker != 'C') throw mismatch(response.marker);
     }
 
@@ -519,20 +467,11 @@ final class Connection {
     record IncrResult(long value, Long ttlSeconds) {}
 
     IncrResult incr(byte[] namespace, byte[] key, long delta) {
-        Response response =
-                request(tag ->
-                        frame(
-                                "i "
-                                        + namespace.length
-                                        + " "
-                                        + key.length
-                                        + " "
-                                        + delta
-                                        + tagSuffix(tag)
-                                        + "\n",
-                                namespace,
-                                key,
-                                null));
+        Response response = request(tag -> frame(
+                "i " + namespace.length + " " + key.length + " " + delta + tagSuffix(tag) + "\n",
+                namespace,
+                key,
+                null));
         return switch (response.marker) {
             case 'I' -> new IncrResult(parseCounterValue(response.value), response.ttlSeconds);
             case 'N' -> null;
@@ -566,9 +505,8 @@ final class Connection {
                 // fall through to poison below
             }
         }
-        NanocachedException error =
-                new NanocachedException.ConnectionLost(
-                        "nanocached: invalid INCR value in response (connection desynced)", null);
+        NanocachedException error = new NanocachedException.ConnectionLost(
+                "nanocached: invalid INCR value in response (connection desynced)", null);
         poison(error);
         throw error;
     }
@@ -594,34 +532,32 @@ final class Connection {
      * condition mismatch ({@code N}) — a normal outcome, not an exception.
      */
     boolean casSet(byte[] namespace, byte[] key, byte[] value, Long ttlSeconds, String cond) {
-        Response response =
-                request(tag -> {
-                    String header =
-                            ttlSeconds == null
-                                    ? "k "
-                                            + namespace.length
-                                            + " "
-                                            + key.length
-                                            + " "
-                                            + value.length
-                                            + " "
-                                            + cond
-                                            + tagSuffix(tag)
-                                            + "\n"
-                                    : "k "
-                                            + namespace.length
-                                            + " "
-                                            + key.length
-                                            + " "
-                                            + value.length
-                                            + " "
-                                            + cond
-                                            + " "
-                                            + ttlSeconds
-                                            + tagSuffix(tag)
-                                            + "\n";
-                    return frame(header, namespace, key, value);
-                });
+        Response response = request(tag -> {
+            String header = ttlSeconds == null
+                    ? "k "
+                            + namespace.length
+                            + " "
+                            + key.length
+                            + " "
+                            + value.length
+                            + " "
+                            + cond
+                            + tagSuffix(tag)
+                            + "\n"
+                    : "k "
+                            + namespace.length
+                            + " "
+                            + key.length
+                            + " "
+                            + value.length
+                            + " "
+                            + cond
+                            + " "
+                            + ttlSeconds
+                            + tagSuffix(tag)
+                            + "\n";
+            return frame(header, namespace, key, value);
+        });
         return switch (response.marker) {
             case 'S' -> true;
             case 'N' -> false;
@@ -637,20 +573,8 @@ final class Connection {
      * ({@code N}).
      */
     boolean casDelete(byte[] namespace, byte[] key, String cond) {
-        Response response =
-                request(tag ->
-                        frame(
-                                "x "
-                                        + namespace.length
-                                        + " "
-                                        + key.length
-                                        + " "
-                                        + cond
-                                        + tagSuffix(tag)
-                                        + "\n",
-                                namespace,
-                                key,
-                                null));
+        Response response = request(tag -> frame(
+                "x " + namespace.length + " " + key.length + " " + cond + tagSuffix(tag) + "\n", namespace, key, null));
         return switch (response.marker) {
             case 'D' -> true;
             case 'N' -> false;
@@ -678,12 +602,8 @@ final class Connection {
      * pipelining), not something this SDK introduces.
      */
     private NanocachedException mismatch(int marker) {
-        NanocachedException error =
-                new NanocachedException.ConnectionLost(
-                        "nanocached: response '"
-                                + (char) marker
-                                + "' does not match the request (connection desynced)",
-                        null);
+        NanocachedException error = new NanocachedException.ConnectionLost(
+                "nanocached: response '" + (char) marker + "' does not match the request (connection desynced)", null);
         poison(error);
         return error;
     }
@@ -694,16 +614,15 @@ final class Connection {
      * poisons the connection the same way.
      */
     private NanocachedException desyncedEntryCount(String op, int got, int want) {
-        NanocachedException error =
-                new NanocachedException.ConnectionLost(
-                        "nanocached: "
-                                + op
-                                + " response roster length "
-                                + got
-                                + " does not match request key count "
-                                + want
-                                + " (connection desynced)",
-                        null);
+        NanocachedException error = new NanocachedException.ConnectionLost(
+                "nanocached: "
+                        + op
+                        + " response roster length "
+                        + got
+                        + " does not match request key count "
+                        + want
+                        + " (connection desynced)",
+                null);
         poison(error);
         return error;
     }
@@ -829,8 +748,7 @@ final class Connection {
      * As for {@link #multiGet}, only a desynced roster is an error.
      */
     List<MultiEntry> multiTouch(byte[] namespace, byte[][] keys, Long ttlSeconds) {
-        Response response =
-                request(tag -> buildMultiTouchFrame(namespace, keys, ttlSeconds, false, tag));
+        Response response = request(tag -> buildMultiTouchFrame(namespace, keys, ttlSeconds, false, tag));
         if (response.marker() != 'Y') throw mismatch(response.marker());
         if (response.entries().size() != keys.length) {
             throw desyncedEntryCount("multi-touch", response.entries().size(), keys.length);
@@ -845,8 +763,7 @@ final class Connection {
      * in the roster. Unlike {@link #getAndTouch} the reply carries no per-key TTL.
      */
     List<MultiEntry> multiGetAndTouch(byte[] namespace, byte[][] keys, Long ttlSeconds) {
-        Response response =
-                request(tag -> buildMultiTouchFrame(namespace, keys, ttlSeconds, true, tag));
+        Response response = request(tag -> buildMultiTouchFrame(namespace, keys, ttlSeconds, true, tag));
         if (response.marker() != 'M') throw mismatch(response.marker());
         if (response.entries().size() != keys.length) {
             throw desyncedEntryCount("multi-get", response.entries().size(), keys.length);
@@ -895,8 +812,7 @@ final class Connection {
      * stance.
      */
     List<MultiEntry> multiSet(byte[] namespace, byte[][] keys, byte[][] values, Long ttlSeconds) {
-        Response response =
-                request(tag -> buildMultiSetFrame(namespace, keys, values, ttlSeconds, tag));
+        Response response = request(tag -> buildMultiSetFrame(namespace, keys, values, ttlSeconds, tag));
         if (response.marker() != 'O') throw mismatch(response.marker());
         if (response.entries().size() != keys.length) {
             throw desyncedEntryCount("multi-set", response.entries().size(), keys.length);
@@ -982,8 +898,7 @@ final class Connection {
 
     private static byte[] frame(String header, byte[] key, byte[] value) {
         byte[] headerBytes = header.getBytes(StandardCharsets.US_ASCII);
-        byte[] frame =
-                new byte[headerBytes.length + key.length + (value == null ? 0 : value.length)];
+        byte[] frame = new byte[headerBytes.length + key.length + (value == null ? 0 : value.length)];
         System.arraycopy(headerBytes, 0, frame, 0, headerBytes.length);
         System.arraycopy(key, 0, frame, headerBytes.length, key.length);
         if (value != null) {
@@ -1020,8 +935,7 @@ final class Connection {
      * docs/protocol.html#multi) — every other marker leaves it {@code null}, {@code value} unused
      * for those two markers instead.
      */
-    private record Response(
-            int marker, byte[] value, int tag, Long ttlSeconds, List<MultiEntry> entries) {}
+    private record Response(int marker, byte[] value, int tag, Long ttlSeconds, List<MultiEntry> entries) {}
 
     /**
      * One key's outcome inside an {@code M} (multi-get) or {@code O} (multi-set) response (issue
@@ -1098,8 +1012,7 @@ final class Connection {
             // the wire — the connection was already dead (e.g. an
             // idle-timeout FIN the reader thread already noticed), so a
             // non-idempotent caller may safely redial and resend.
-            throw new NanocachedException.ConnectionLost(
-                    "nanocached: connection is closed", null, true);
+            throw new NanocachedException.ConnectionLost("nanocached: connection is closed", null, true);
         }
 
         PreparedRequest prepared = null;
@@ -1117,8 +1030,7 @@ final class Connection {
                         // hasn't been written; only a concurrent poison() (or
                         // an 'R' retry racing a close) landed between the
                         // check above and this one.
-                        throw new NanocachedException.ConnectionLost(
-                                "nanocached: connection is closed", null, true);
+                        throw new NanocachedException.ConnectionLost("nanocached: connection is closed", null, true);
                     }
                     lastUsedNanos = System.nanoTime();
                     if (prepared == null) {
@@ -1167,14 +1079,10 @@ final class Connection {
                     // fully sent.
                     boolean timedOut = timedOutError != null;
                     boolean notSent = !timedOut;
-                    poison(
-                            new NanocachedException.ConnectionLost(
-                                    "nanocached: connection failed: " + error.getMessage(), error));
+                    poison(new NanocachedException.ConnectionLost(
+                            "nanocached: connection failed: " + error.getMessage(), error));
                     throw new NanocachedException.ConnectionLost(
-                            "nanocached: connection failed: " + error.getMessage(),
-                            error,
-                            notSent,
-                            timedOut);
+                            "nanocached: connection failed: " + error.getMessage(), error, notSent, timedOut);
                 }
             }
 
@@ -1184,8 +1092,7 @@ final class Connection {
             } catch (CompletionException wrapped) {
                 Throwable cause = wrapped.getCause();
                 if (cause instanceof NanocachedException nanocachedError) throw nanocachedError;
-                throw new NanocachedException.ConnectionLost(
-                        "nanocached: connection failed", cause);
+                throw new NanocachedException.ConnectionLost("nanocached: connection failed", cause);
             }
 
             if (response.marker != 'R') return response;
@@ -1213,8 +1120,7 @@ final class Connection {
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw new NanocachedException(
-                    "nanocached: interrupted while waiting to retry a transient (R) failure",
-                    interrupted);
+                    "nanocached: interrupted while waiting to retry a transient (R) failure", interrupted);
         }
     }
 
@@ -1291,9 +1197,7 @@ final class Connection {
         try {
             dispatchResponses();
         } catch (RuntimeException error) {
-            poison(
-                    new NanocachedException.ConnectionLost(
-                            "nanocached: connection failed: " + error, error));
+            poison(new NanocachedException.ConnectionLost("nanocached: connection failed: " + error, error));
         }
     }
 
@@ -1303,9 +1207,8 @@ final class Connection {
             try {
                 response = readResponse();
             } catch (IOException error) {
-                poison(
-                        new NanocachedException.ConnectionLost(
-                                "nanocached: connection failed: " + error.getMessage(), error));
+                poison(new NanocachedException.ConnectionLost(
+                        "nanocached: connection failed: " + error.getMessage(), error));
                 return;
             } catch (NanocachedException.ServerRejected rejected) {
                 // Issue #1875: a node's `En` answers the oldest request
@@ -1321,9 +1224,8 @@ final class Connection {
                 synchronized (this) {
                     oldest = pending.pollFirst();
                 }
-                poison(
-                        new NanocachedException.ConnectionLost(
-                                "nanocached: connection closed by the server", null, true));
+                poison(new NanocachedException.ConnectionLost(
+                        "nanocached: connection closed by the server", null, true));
                 if (oldest != null) oldest.future().completeExceptionally(rejected);
                 return;
             } catch (NanocachedException error) {
@@ -1354,19 +1256,16 @@ final class Connection {
             // the connection; it isn't an answer to anything we sent
             // (mirrors the TypeScript SDK's Connection.onData).
             if (response.marker == 'B' && wasEmpty) {
-                poison(
-                        new NanocachedException.ConnectionLost(
-                                "nanocached: server rejected the connection (connection limit reached)",
-                                null));
+                poison(new NanocachedException.ConnectionLost(
+                        "nanocached: server rejected the connection (connection limit reached)", null));
                 return;
             }
             if (waiter == null) {
-                poison(
-                        new NanocachedException.ConnectionLost(
-                                "nanocached: unsolicited response '"
-                                        + (char) response.marker
-                                        + "' from server (connection desynced)",
-                                null));
+                poison(new NanocachedException.ConnectionLost(
+                        "nanocached: unsolicited response '"
+                                + (char) response.marker
+                                + "' from server (connection desynced)",
+                        null));
                 return;
             }
 
@@ -1376,14 +1275,13 @@ final class Connection {
             // the caller-side kind check (mismatch()), catching it here
             // stops the misdelivery instead of merely noticing it later.
             if (tagged && response.tag != waiter.tag()) {
-                NanocachedException error =
-                        new NanocachedException.ConnectionLost(
-                                "nanocached: response tag "
-                                        + response.tag
-                                        + " does not answer request tag "
-                                        + waiter.tag()
-                                        + " (connection desynced)",
-                                null);
+                NanocachedException error = new NanocachedException.ConnectionLost(
+                        "nanocached: response tag "
+                                + response.tag
+                                + " does not answer request tag "
+                                + waiter.tag()
+                                + " (connection desynced)",
+                        null);
                 poison(error);
                 // The polled waiter is no longer in `pending`, so poison()
                 // won't reach it — complete it here; the rest drain there.
@@ -1403,23 +1301,19 @@ final class Connection {
      * read, so the loop's cost is already O(count), and count is already bounded by the header
      * line's own length (capped like every other header, see readLine).
      */
-    private Response readAckRoster(
-            int marker, String what, java.util.function.Function<String, MultiEntry> entryOf)
+    private Response readAckRoster(int marker, String what, java.util.function.Function<String, MultiEntry> entryOf)
             throws IOException {
         String[] fields = readLine().split(" ");
         if (fields.length < 1) {
-            throw new NanocachedException.ConnectionLost(
-                    "nanocached: invalid " + what + " header in response", null);
+            throw new NanocachedException.ConnectionLost("nanocached: invalid " + what + " header in response", null);
         }
         int count = parseNonNegativeInt(fields[0]);
         if (count < 0) {
-            throw new NanocachedException.ConnectionLost(
-                    "nanocached: invalid " + what + " count in response", null);
+            throw new NanocachedException.ConnectionLost("nanocached: invalid " + what + " count in response", null);
         }
         int wantFields = 1 + count + (tagged ? 1 : 0);
         if (fields.length != wantFields) {
-            throw new NanocachedException.ConnectionLost(
-                    "nanocached: invalid " + what + " header in response", null);
+            throw new NanocachedException.ConnectionLost("nanocached: invalid " + what + " header in response", null);
         }
         List<MultiEntry> entries = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
@@ -1445,8 +1339,7 @@ final class Connection {
                 String[] fields = readLine().split(" ");
                 int valueFields = tagged ? 2 : 1;
                 if (fields.length != valueFields && fields.length != valueFields + 1) {
-                    throw new NanocachedException.ConnectionLost(
-                            "nanocached: invalid value header in response", null);
+                    throw new NanocachedException.ConnectionLost("nanocached: invalid value header in response", null);
                 }
                 // A non-numeric (issue #462: including a leading '+'),
                 // negative, or absurd length is protocol garbage: the
@@ -1455,15 +1348,13 @@ final class Connection {
                 // redial/retry layer handles it (issue #8).
                 int length = parseNonNegativeInt(fields[0]);
                 if (length < 0 || length > MAX_VALUE_LENGTH) {
-                    throw new NanocachedException.ConnectionLost(
-                            "nanocached: invalid value length in response", null);
+                    throw new NanocachedException.ConnectionLost("nanocached: invalid value length in response", null);
                 }
                 Long valueTtl = null;
                 if (fields.length == valueFields + 1) {
                     long parsedTtl = parseNonNegativeLong(fields[1]);
                     if (parsedTtl < 0) {
-                        throw new NanocachedException.ConnectionLost(
-                                "nanocached: invalid ttl in response", null);
+                        throw new NanocachedException.ConnectionLost("nanocached: invalid ttl in response", null);
                     }
                     valueTtl = parsedTtl;
                 }
@@ -1487,8 +1378,7 @@ final class Connection {
                 }
                 int length = parseNonNegativeInt(fields[0]);
                 if (length < 0 || length > MAX_VALUE_LENGTH) {
-                    throw new NanocachedException.ConnectionLost(
-                            "nanocached: invalid value length in response", null);
+                    throw new NanocachedException.ConnectionLost("nanocached: invalid value length in response", null);
                 }
                 Long ttlSeconds = null;
                 if (fields.length == fieldsWithTtl) {
@@ -1497,8 +1387,7 @@ final class Connection {
                     // (issue #462) via parseNonNegativeLong instead.
                     long parsedTtl = parseNonNegativeLong(fields[1]);
                     if (parsedTtl < 0) {
-                        throw new NanocachedException.ConnectionLost(
-                                "nanocached: invalid ttl in response", null);
+                        throw new NanocachedException.ConnectionLost("nanocached: invalid ttl in response", null);
                     }
                     ttlSeconds = parsedTtl;
                 }
@@ -1560,15 +1449,12 @@ final class Connection {
                             int length = parseNonNegativeInt(token);
                             if (length < 0 || length > MAX_VALUE_LENGTH) {
                                 throw new NanocachedException.ConnectionLost(
-                                        "nanocached: invalid multi-get result length in response",
-                                        null);
+                                        "nanocached: invalid multi-get result length in response", null);
                             }
                             totalBytes += length;
                             if (totalBytes > maxMultiGetResponseBytes) {
                                 throw new NanocachedException.ConnectionLost(
-                                        "nanocached: multi-get response exceeds "
-                                                + maxMultiGetResponseBytes
-                                                + " bytes",
+                                        "nanocached: multi-get response exceeds " + maxMultiGetResponseBytes + " bytes",
                                         null);
                             }
                             entries.add(MultiEntry.ofHit(readExactly(length)));
@@ -1595,15 +1481,11 @@ final class Connection {
             // many single-character tokens can fit on it in the first
             // place.
             case 'O' -> {
-                return readAckRoster(
-                        marker,
-                        "multi-set",
-                        token ->
-                                switch (token) {
-                                    case "S" -> MultiEntry.ofStored();
-                                    case "W" -> MultiEntry.ofWrongNode();
-                                    default -> null;
-                                });
+                return readAckRoster(marker, "multi-set", token -> switch (token) {
+                    case "S" -> MultiEntry.ofStored();
+                    case "W" -> MultiEntry.ofWrongNode();
+                    default -> null;
+                });
             }
             // 'Y' is batched touch's (issue #871, docs/protocol.html "y —
             // batched touch") reply: `Y <n> <result-1> ... <result-n>[
@@ -1611,16 +1493,12 @@ final class Connection {
             // entry, a clean miss) or "W" (wrong node). A `y ... G` is
             // answered with `M` instead, as `m` is.
             case 'Y' -> {
-                return readAckRoster(
-                        marker,
-                        "multi-touch",
-                        token ->
-                                switch (token) {
-                                    case "S" -> MultiEntry.ofStored();
-                                    case "N" -> MultiEntry.ofMiss();
-                                    case "W" -> MultiEntry.ofWrongNode();
-                                    default -> null;
-                                });
+                return readAckRoster(marker, "multi-touch", token -> switch (token) {
+                    case "S" -> MultiEntry.ofStored();
+                    case "N" -> MultiEntry.ofMiss();
+                    case "W" -> MultiEntry.ofWrongNode();
+                    default -> null;
+                });
             }
             // `En\n`: the node rejects the request and is closing the
             // connection. Told apart from other unexpected bytes so a touch
@@ -1648,12 +1526,11 @@ final class Connection {
                 if (rest.equals("n") || rest.startsWith("n ")) {
                     throw new NanocachedException.ServerRejected();
                 }
-                throw new NanocachedException.ConnectionLost(
-                        "nanocached: unexpected response from server: E", null);
+                throw new NanocachedException.ConnectionLost("nanocached: unexpected response from server: E", null);
             }
             default ->
-                    throw new NanocachedException.ConnectionLost(
-                            "nanocached: unexpected response from server: " + (char) marker, null);
+                throw new NanocachedException.ConnectionLost(
+                        "nanocached: unexpected response from server: " + (char) marker, null);
         }
     }
 
@@ -1693,8 +1570,7 @@ final class Connection {
         int value = readByte();
         if (value != '\n') {
             throw new NanocachedException.ConnectionLost(
-                    "nanocached: unexpected byte after response marker (connection desynced)",
-                    null);
+                    "nanocached: unexpected byte after response marker (connection desynced)", null);
         }
     }
 
@@ -1707,8 +1583,7 @@ final class Connection {
         ByteArrayOutputStream line = new ByteArrayOutputStream();
         for (int b = readByte(); b != '\n'; b = readByte()) {
             if (line.size() >= MAX_HEADER_LINE_LENGTH) {
-                throw new NanocachedException.ConnectionLost(
-                        "nanocached: response header line too long", null);
+                throw new NanocachedException.ConnectionLost("nanocached: response header line too long", null);
             }
             line.write(b);
         }

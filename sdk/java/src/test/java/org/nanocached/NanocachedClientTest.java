@@ -46,12 +46,10 @@ class NanocachedClientTest {
     private static final List<String> NAMES =
             List.of("5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47");
 
-    private static void waitFor(java.util.function.BooleanSupplier condition, String what)
-            throws InterruptedException {
+    private static void waitFor(java.util.function.BooleanSupplier condition, String what) throws InterruptedException {
         long deadline = System.nanoTime() + 5_000_000_000L;
         while (!condition.getAsBoolean()) {
-            if (System.nanoTime() > deadline)
-                throw new AssertionError("timed out waiting for " + what);
+            if (System.nanoTime() > deadline) throw new AssertionError("timed out waiting for " + what);
             Thread.sleep(5);
         }
     }
@@ -61,13 +59,13 @@ class NanocachedClientTest {
      * reconnectCooldownSkipsARedialToAKnownDeadAddress for why the first call after a node closes
      * is not asserted on directly), returning that failure.
      */
-    private static NanocachedException.ConnectionLost firstConnectionFailure(
-            NanocachedClient client) throws InterruptedException {
+    private static NanocachedException.ConnectionLost firstConnectionFailure(NanocachedClient client)
+            throws InterruptedException {
         return firstConnectionFailure(client, -1);
     }
 
-    private static NanocachedException.ConnectionLost firstConnectionFailure(
-            NanocachedClient client, int port) throws InterruptedException {
+    private static NanocachedException.ConnectionLost firstConnectionFailure(NanocachedClient client, int port)
+            throws InterruptedException {
         long deadline = System.nanoTime() + 5_000_000_000L;
         Object lastResult = null;
         while (true) {
@@ -77,13 +75,12 @@ class NanocachedClientTest {
                 return failure;
             }
             if (System.nanoTime() > deadline) {
-                throw new AssertionError(
-                        "timed out waiting for a get to fail against the closed node on port "
-                                + port
-                                + "; last get returned "
-                                + lastResult
-                                + "; stats="
-                                + client.stats());
+                throw new AssertionError("timed out waiting for a get to fail against the closed node on port "
+                        + port
+                        + "; last get returned "
+                        + lastResult
+                        + "; stats="
+                        + client.stats());
             }
             Thread.sleep(5);
         }
@@ -168,11 +165,8 @@ class NanocachedClientTest {
                 assertThrows(IllegalArgumentException.class, () -> client.set("k", "v", -1L));
                 assertThrows(
                         IllegalArgumentException.class,
-                        () ->
-                                client.set(
-                                        "k".getBytes(StandardCharsets.UTF_8),
-                                        "v".getBytes(StandardCharsets.UTF_8),
-                                        -1L));
+                        () -> client.set(
+                                "k".getBytes(StandardCharsets.UTF_8), "v".getBytes(StandardCharsets.UTF_8), -1L));
                 // The rejected set must not have poisoned the connection.
                 assertEquals(Optional.of("v"), client.get("k"));
             }
@@ -208,10 +202,8 @@ class NanocachedClientTest {
                     NanocachedClient.connect(single("127.0.0.1", node.port()).compress(true))) {
                 client.set("a", "12345678");
                 client.set("b", "12345678");
-                NanocachedException.DecompressionFailed error =
-                        assertThrows(
-                                NanocachedException.DecompressionFailed.class,
-                                () -> client.getMany(List.of("a", "b")));
+                NanocachedException.DecompressionFailed error = assertThrows(
+                        NanocachedException.DecompressionFailed.class, () -> client.getMany(List.of("a", "b")));
                 assertTrue(error.getMessage().contains("across the batch"));
                 // A single-key read is untouched by the batch bound.
                 assertEquals("12345678", client.get("a").orElseThrow());
@@ -235,9 +227,7 @@ class NanocachedClientTest {
             try (NanocachedClient client =
                     NanocachedClient.connect(single("127.0.0.1", node.port()).compress(true))) {
                 client.set("a", "12");
-                assertThrows(
-                        NanocachedException.DecompressionFailed.class,
-                        () -> client.getMany(List.of("a")));
+                assertThrows(NanocachedException.DecompressionFailed.class, () -> client.getMany(List.of("a")));
             }
         } finally {
             Compression.maxMultiGetDecompressedBytes = saved;
@@ -292,9 +282,7 @@ class NanocachedClientTest {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.setMany(Map.of("a", "1", "b", "2", "c", "3"));
-                assertEquals(
-                        Map.of("a", "1", "b", "2", "c", "3"),
-                        client.getMany(List.of("a", "b", "c")));
+                assertEquals(Map.of("a", "1", "b", "2", "c", "3"), client.getMany(List.of("a", "b", "c")));
                 assertEquals(1, node.multiSetCount.get());
             }
         }
@@ -306,14 +294,10 @@ class NanocachedClientTest {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.setMany(Map.of("k", "v"), 0);
                 assertEquals(Optional.of("v"), client.get("k"));
+                assertThrows(IllegalArgumentException.class, () -> client.setMany(Map.of("k", "v"), -1L));
                 assertThrows(
                         IllegalArgumentException.class,
-                        () -> client.setMany(Map.of("k", "v"), -1L));
-                assertThrows(
-                        IllegalArgumentException.class,
-                        () ->
-                                client.setManyBytes(
-                                        Map.of("k", "v".getBytes(StandardCharsets.UTF_8)), -1L));
+                        () -> client.setManyBytes(Map.of("k", "v".getBytes(StandardCharsets.UTF_8)), -1L));
             }
         }
     }
@@ -352,9 +336,7 @@ class NanocachedClientTest {
                 ns.set("k", "v");
                 java.util.Arrays.fill(buf, (byte) 'x');
                 assertEquals(Optional.of("v"), ns.get("k"));
-                assertArrayEquals(
-                        "tenant-a".getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                        ns.namespace());
+                assertArrayEquals("tenant-a".getBytes(java.nio.charset.StandardCharsets.UTF_8), ns.namespace());
             }
         }
     }
@@ -364,13 +346,9 @@ class NanocachedClientTest {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 node.answerWrongNodeOnce();
-                assertThrows(
-                        NanocachedException.PartialWrongNode.class,
-                        () -> client.getManyBytes(List.of("a", "b")));
+                assertThrows(NanocachedException.PartialWrongNode.class, () -> client.getManyBytes(List.of("a", "b")));
                 node.answerWrongNodeOnce();
-                assertThrows(
-                        NanocachedException.WrongNode.class,
-                        () -> client.setMany(Map.of("a", "1")));
+                assertThrows(NanocachedException.WrongNode.class, () -> client.setMany(Map.of("a", "1")));
             }
         }
     }
@@ -386,10 +364,7 @@ class NanocachedClientTest {
                 client.set(opaque, "one".getBytes(StandardCharsets.UTF_8));
                 client.set(magic, "two".getBytes(StandardCharsets.UTF_8));
                 byte[][] values =
-                        client.getManyBytes(
-                                new byte[][] {
-                                    opaque, "missing".getBytes(StandardCharsets.UTF_8), magic
-                                });
+                        client.getManyBytes(new byte[][] {opaque, "missing".getBytes(StandardCharsets.UTF_8), magic});
                 assertEquals(3, values.length);
                 assertArrayEquals("one".getBytes(StandardCharsets.UTF_8), values[0]);
                 assertNull(values[1]);
@@ -417,11 +392,8 @@ class NanocachedClientTest {
     void positionalBulkOpsValidateTheirArguments() throws Exception {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
-                assertThrows(
-                        IllegalArgumentException.class, () -> client.getManyBytes(new byte[0][]));
-                assertThrows(
-                        IllegalArgumentException.class,
-                        () -> client.setManyBytes(new byte[0][], new byte[0][]));
+                assertThrows(IllegalArgumentException.class, () -> client.getManyBytes(new byte[0][]));
+                assertThrows(IllegalArgumentException.class, () -> client.setManyBytes(new byte[0][], new byte[0][]));
                 assertThrows(
                         IllegalArgumentException.class,
                         () -> client.setManyBytes(new byte[][] {{1}, {2}}, new byte[][] {{1}}));
@@ -451,10 +423,9 @@ class NanocachedClientTest {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 node.answerWrongNodeOnce();
-                NanocachedException.PartialWrongNodeRaw failure =
-                        assertThrows(
-                                NanocachedException.PartialWrongNodeRaw.class,
-                                () -> client.getManyBytes(new byte[][] {{1}, {2}}));
+                NanocachedException.PartialWrongNodeRaw failure = assertThrows(
+                        NanocachedException.PartialWrongNodeRaw.class,
+                        () -> client.getManyBytes(new byte[][] {{1}, {2}}));
                 assertEquals(2, failure.partialValues.length);
                 assertTrue(failure.unresolvedIndices.length > 0);
             }
@@ -492,8 +463,7 @@ class NanocachedClientTest {
                 for (int bodyBytes : node.multiSetFrameBodyBytes) {
                     assertTrue(
                             bodyBytes < 1024 * 1024,
-                            "each `o` sub-frame's body must stay under the server's 1 MiB frame cap, got "
-                                    + bodyBytes);
+                            "each `o` sub-frame's body must stay under the server's 1 MiB frame cap, got " + bodyBytes);
                 }
 
                 for (int i = 0; i < pairCount; i++) {
@@ -532,8 +502,7 @@ class NanocachedClientTest {
                 for (int bodyBytes : node.multiGetFrameBodyBytes) {
                     assertTrue(
                             bodyBytes < 1024 * 1024,
-                            "each `m` sub-frame's body must stay under the server's 1 MiB frame cap, got "
-                                    + bodyBytes);
+                            "each `m` sub-frame's body must stay under the server's 1 MiB frame cap, got " + bodyBytes);
                 }
             }
         }
@@ -561,10 +530,8 @@ class NanocachedClientTest {
                 client.set(keys[0], firstValue);
 
                 node.closeAfterNextMultiGet();
-                NanocachedException.PartialConnectionLostRaw failure =
-                        assertThrows(
-                                NanocachedException.PartialConnectionLostRaw.class,
-                                () -> client.getManyBytes(keys));
+                NanocachedException.PartialConnectionLostRaw failure = assertThrows(
+                        NanocachedException.PartialConnectionLostRaw.class, () -> client.getManyBytes(keys));
 
                 assertEquals(
                         1,
@@ -582,8 +549,7 @@ class NanocachedClientTest {
     }
 
     @Test
-    void getManyBytesStringKeyedChunkedConnectionFailureCarriesFirstChunksValues()
-            throws Exception {
+    void getManyBytesStringKeyedChunkedConnectionFailureCarriesFirstChunksValues() throws Exception {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 int keyCount = 401;
@@ -593,13 +559,9 @@ class NanocachedClientTest {
 
                 node.closeAfterNextMultiGet();
                 NanocachedException.PartialConnectionLost failure =
-                        assertThrows(
-                                NanocachedException.PartialConnectionLost.class,
-                                () -> client.getManyBytes(keys));
+                        assertThrows(NanocachedException.PartialConnectionLost.class, () -> client.getManyBytes(keys));
 
-                assertEquals(
-                        "first-chunk-value",
-                        new String(failure.partialValues.get("k0"), StandardCharsets.UTF_8));
+                assertEquals("first-chunk-value", new String(failure.partialValues.get("k0"), StandardCharsets.UTF_8));
                 assertEquals(
                         1,
                         failure.partialValues.size(),
@@ -619,10 +581,8 @@ class NanocachedClientTest {
                 client.set("k0", "first-chunk-value");
 
                 node.closeAfterNextMultiGet();
-                NanocachedException.PartialConnectionLostStrings failure =
-                        assertThrows(
-                                NanocachedException.PartialConnectionLostStrings.class,
-                                () -> client.getMany(keys));
+                NanocachedException.PartialConnectionLostStrings failure = assertThrows(
+                        NanocachedException.PartialConnectionLostStrings.class, () -> client.getMany(keys));
 
                 assertEquals(Map.of("k0", "first-chunk-value"), failure.partialValues);
             }
@@ -640,15 +600,11 @@ class NanocachedClientTest {
                 List<String> keys = new ArrayList<>();
                 for (int i = 0; i < 401; i++) keys.add("k" + i);
                 client.set("k0", "first-chunk-value");
-                client.set(
-                        "k1".getBytes(StandardCharsets.UTF_8),
-                        new byte[] {(byte) 0xFF, (byte) 0xFE, (byte) 0x80});
+                client.set("k1".getBytes(StandardCharsets.UTF_8), new byte[] {(byte) 0xFF, (byte) 0xFE, (byte) 0x80});
 
                 node.closeAfterNextMultiGet();
-                NanocachedException.PartialConnectionLostStrings failure =
-                        assertThrows(
-                                NanocachedException.PartialConnectionLostStrings.class,
-                                () -> client.getMany(keys));
+                NanocachedException.PartialConnectionLostStrings failure = assertThrows(
+                        NanocachedException.PartialConnectionLostStrings.class, () -> client.getMany(keys));
 
                 assertEquals(
                         Map.of("k0", "first-chunk-value"),
@@ -671,10 +627,8 @@ class NanocachedClientTest {
                 }
 
                 node.closeAfterNextMultiSet();
-                NanocachedException.PartialConnectionLostSetRaw failure =
-                        assertThrows(
-                                NanocachedException.PartialConnectionLostSetRaw.class,
-                                () -> client.setManyBytes(keys, values));
+                NanocachedException.PartialConnectionLostSetRaw failure = assertThrows(
+                        NanocachedException.PartialConnectionLostSetRaw.class, () -> client.setManyBytes(keys, values));
 
                 assertEquals(
                         1,
@@ -693,8 +647,7 @@ class NanocachedClientTest {
     }
 
     @Test
-    void setManyBytesMapKeyedChunkedConnectionFailureCarriesFirstChunksSucceededKeys()
-            throws Exception {
+    void setManyBytesMapKeyedChunkedConnectionFailureCarriesFirstChunksSucceededKeys() throws Exception {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 int pairCount = 401;
@@ -704,10 +657,8 @@ class NanocachedClientTest {
                 }
 
                 node.closeAfterNextMultiSet();
-                NanocachedException.PartialConnectionLostSet failure =
-                        assertThrows(
-                                NanocachedException.PartialConnectionLostSet.class,
-                                () -> client.setManyBytes(values));
+                NanocachedException.PartialConnectionLostSet failure = assertThrows(
+                        NanocachedException.PartialConnectionLostSet.class, () -> client.setManyBytes(values));
 
                 assertEquals(400, failure.succeededKeys.size());
                 assertTrue(failure.succeededKeys.contains("k0"));
@@ -732,18 +683,13 @@ class NanocachedClientTest {
                 node.close();
                 firstConnectionFailure(client, port); // establishes the node is reliably down
 
-                NanocachedException.ConnectionLost getFailure =
-                        assertThrows(
-                                NanocachedException.ConnectionLost.class,
-                                () -> client.getManyBytes(new byte[][] {{1}, {2}}));
+                NanocachedException.ConnectionLost getFailure = assertThrows(
+                        NanocachedException.ConnectionLost.class, () -> client.getManyBytes(new byte[][] {{1}, {2}}));
                 assertSame(NanocachedException.ConnectionLost.class, getFailure.getClass());
 
-                NanocachedException.ConnectionLost setFailure =
-                        assertThrows(
-                                NanocachedException.ConnectionLost.class,
-                                () ->
-                                        client.setManyBytes(
-                                                new byte[][] {{1}, {2}}, new byte[][] {{9}, {9}}));
+                NanocachedException.ConnectionLost setFailure = assertThrows(
+                        NanocachedException.ConnectionLost.class,
+                        () -> client.setManyBytes(new byte[][] {{1}, {2}}, new byte[][] {{9}, {9}}));
                 assertSame(NanocachedException.ConnectionLost.class, setFailure.getClass());
             }
         }
@@ -759,7 +705,8 @@ class NanocachedClientTest {
         // confirmed stored — overcounting replicaWriteFailures for keys
         // that in fact landed just fine.
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 HashRing ring = new HashRing(NAMES);
                 // 5 keys that all route primary to NAMES.get(0), so
                 // NAMES.get(1) is a pure-replica leg for the whole batch:
@@ -791,10 +738,7 @@ class NanocachedClientTest {
                 client.setManyBytes(values);
                 long delta = client.stats().replicaWriteFailures() - before;
 
-                assertTrue(
-                        delta > 0,
-                        "the failed chunk's own replica-held keys must still be counted, got "
-                                + delta);
+                assertTrue(delta > 0, "the failed chunk's own replica-held keys must still be counted, got " + delta);
                 assertTrue(
                         delta < keys.size(),
                         "only the failed chunk's own keys should count as new failures — got "
@@ -838,9 +782,7 @@ class NanocachedClientTest {
                 client.set("counter", "10");
                 assertEquals(java.util.OptionalLong.of(15), client.incr("counter", 5));
                 assertEquals(java.util.OptionalLong.of(12), client.incr("counter", -3));
-                assertEquals(
-                        java.util.OptionalLong.of(13),
-                        client.incr("counter")); // defaults to delta 1
+                assertEquals(java.util.OptionalLong.of(13), client.incr("counter")); // defaults to delta 1
                 assertEquals(Optional.of("13"), client.get("counter"));
             }
         }
@@ -852,14 +794,10 @@ class NanocachedClientTest {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("counter", "20");
                 assertEquals(java.util.OptionalLong.of(15), client.decr("counter", 5));
-                assertEquals(
-                        java.util.OptionalLong.of(14),
-                        client.decr("counter")); // defaults to amount 1
+                assertEquals(java.util.OptionalLong.of(14), client.decr("counter")); // defaults to amount 1
                 assertEquals(Optional.of("14"), client.get("counter"));
 
-                assertThrows(
-                        IllegalArgumentException.class,
-                        () -> client.decr("counter", Long.MIN_VALUE));
+                assertThrows(IllegalArgumentException.class, () -> client.decr("counter", Long.MIN_VALUE));
             }
         }
     }
@@ -898,12 +836,8 @@ class NanocachedClientTest {
             try (NanocachedClient client =
                     NanocachedClient.connect(single("127.0.0.1", node.port()).compress(true))) {
                 int connectionsAfterConnect = node.connectionCount.get();
-                assertThrows(
-                        NanocachedException.CompressionIncompatible.class,
-                        () -> client.incr("counter", 1));
-                assertThrows(
-                        NanocachedException.CompressionIncompatible.class,
-                        () -> client.decr("counter", 1));
+                assertThrows(NanocachedException.CompressionIncompatible.class, () -> client.incr("counter", 1));
+                assertThrows(NanocachedException.CompressionIncompatible.class, () -> client.decr("counter", 1));
                 assertThrows(
                         NanocachedException.CompressionIncompatible.class,
                         () -> client.namespace("tenant-a").incr("counter"));
@@ -951,8 +885,7 @@ class NanocachedClientTest {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("counter", "10");
                 node.dropReplyAfterNextIncr();
-                assertThrows(
-                        NanocachedException.ConnectionLost.class, () -> client.incr("counter", 5));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.incr("counter", 5));
                 assertEquals(Optional.of("15"), client.get("counter"));
             }
         }
@@ -970,9 +903,7 @@ class NanocachedClientTest {
                 client.getAndTouch("k", 45);
                 client.getAndTouch("k", NanocachedClient.REMOVE_TTL);
                 client.namespace("tenant").touch("k", 7);
-                assertEquals(
-                        List.of("t 0 1 30", "t 0 1", "t 0 1 45 G", "t 0 1 G", "t 6 1 7"),
-                        node.touchFrames);
+                assertEquals(List.of("t 0 1 30", "t 0 1", "t 0 1 45 G", "t 0 1 G", "t 6 1 7"), node.touchFrames);
             }
         }
     }
@@ -1010,7 +941,8 @@ class NanocachedClientTest {
                 assertEquals(Long.valueOf(30), node.ttls.get("k"));
                 assertArrayEquals(
                         "value".getBytes(StandardCharsets.UTF_8),
-                        client.getAndTouchBytes("k", NanocachedClient.REMOVE_TTL).orElseThrow());
+                        client.getAndTouchBytes("k", NanocachedClient.REMOVE_TTL)
+                                .orElseThrow());
                 assertNull(node.ttls.get("k"));
 
                 assertEquals(Optional.empty(), client.getAndTouch("missing", 30));
@@ -1035,10 +967,7 @@ class NanocachedClientTest {
                 assertFalse(tenant.touch("only-default", 5));
 
                 assertEquals(Long.valueOf(7), node.namespacedTtls.get("tenant").get("k"));
-                assertEquals(
-                        Long.valueOf(100),
-                        node.ttls.get("k"),
-                        "the default keyspace was not touched");
+                assertEquals(Long.valueOf(100), node.ttls.get("k"), "the default keyspace was not touched");
             }
         }
     }
@@ -1061,8 +990,7 @@ class NanocachedClientTest {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("k", "v");
                 assertThrows(IllegalArgumentException.class, () -> client.touch("k", -2));
-                assertThrows(
-                        IllegalArgumentException.class, () -> client.touch("k", Long.MIN_VALUE));
+                assertThrows(IllegalArgumentException.class, () -> client.touch("k", Long.MIN_VALUE));
                 assertThrows(IllegalArgumentException.class, () -> client.getAndTouch("k", -2));
                 assertTrue(node.touchFrames.isEmpty());
             }
@@ -1090,8 +1018,7 @@ class NanocachedClientTest {
                 client.set("k", "v");
                 node.rejectTouchLikeAnOldServer();
                 assertThrows(NanocachedException.ServerTooOld.class, () -> client.touch("k", 30));
-                assertThrows(
-                        NanocachedException.ServerTooOld.class, () -> client.getAndTouch("k", 30));
+                assertThrows(NanocachedException.ServerTooOld.class, () -> client.getAndTouch("k", 30));
                 assertEquals(Optional.of("v"), client.get("k"));
             }
         }
@@ -1110,8 +1037,7 @@ class NanocachedClientTest {
 
                 client.set("counter", "10");
                 node.dropReplyAfterNextIncr();
-                assertThrows(
-                        NanocachedException.ConnectionLost.class, () -> client.incr("counter", 5));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.incr("counter", 5));
             }
         }
     }
@@ -1122,10 +1048,10 @@ class NanocachedClientTest {
     @Test
     void anExpiringTouchWhoseReplyWasLostIsNotResent() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-key";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
 
                 client.set(key, "payload", 100);
@@ -1139,20 +1065,16 @@ class NanocachedClientTest {
     @Test
     void anExpiringGetAndTouchWhoseReplyWasLostIsNotResent() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-key";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
 
                 client.set(key, "payload", 100);
                 primary.dropReplyAfterNextTouch();
-                assertThrows(
-                        NanocachedException.ConnectionLost.class, () -> client.getAndTouch(key, 0));
-                assertEquals(
-                        1,
-                        primary.touchFrames.size(),
-                        "the applied get-and-touch was not sent again");
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.getAndTouch(key, 0));
+                assertEquals(1, primary.touchFrames.size(), "the applied get-and-touch was not sent again");
             }
         }
     }
@@ -1163,8 +1085,7 @@ class NanocachedClientTest {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("k", "payload", 100);
                 node.dropReplyAfterNextTouch();
-                assertThrows(
-                        NanocachedException.ConnectionLost.class, () -> client.getAndTouch("k", 0));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.getAndTouch("k", 0));
                 assertEquals(1, node.touchFrames.size());
             }
         }
@@ -1173,17 +1094,16 @@ class NanocachedClientTest {
     @Test
     void anExpiringTouchStillRetriesARequestThatWasNeverSent() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-key";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
 
                 client.set(key, "payload", 100);
                 primary.answerWrongNodeOnce();
                 assertEquals(Optional.of("payload"), client.getAndTouch(key, 0));
-                assertEquals(
-                        2, primary.touchFrames.size(), "the W answer was followed by one resend");
+                assertEquals(2, primary.touchFrames.size(), "the W answer was followed by one resend");
 
                 client.set(key, "payload", 100);
                 primary.answerWrongNodeOnce();
@@ -1212,11 +1132,11 @@ class NanocachedClientTest {
     @Test
     void touchGoesToEveryOwner() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-key";
                 client.set(key, "v", 100);
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
 
                 assertTrue(client.touch(key, 30));
@@ -1233,11 +1153,11 @@ class NanocachedClientTest {
     @Test
     void getAndTouchSendsGToThePrimaryOnlyAndThePlainTouchToReplicas() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-key";
                 client.set(key, "v", 100);
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
                 MockNode replica = cluster.nodes().get(owners.get(1));
                 String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
@@ -1254,23 +1174,19 @@ class NanocachedClientTest {
     @Test
     void getAndTouchDoesNotFallBackToAReplicaOnAPrimaryMiss() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-key";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
                 MockNode replica = cluster.nodes().get(owners.get(1));
                 // Only the replica holds the value.
-                replica.store.put(
-                        MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8)), new byte[] {'v'});
+                replica.store.put(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8)), new byte[] {'v'});
 
                 assertEquals(Optional.empty(), client.getAndTouch(key, 30));
 
                 assertEquals(List.of("t 0 10 30 G"), primary.touchFrames);
-                assertEquals(
-                        List.of("t 0 10 30"),
-                        replica.touchFrames,
-                        "the replica is never asked for the value");
+                assertEquals(List.of("t 0 10 30"), replica.touchFrames, "the replica is never asked for the value");
             }
         }
     }
@@ -1278,18 +1194,17 @@ class NanocachedClientTest {
     @Test
     void touchRecoversFromAWrongNodeAnswer() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-key";
                 client.set(key, "v", 100);
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
                 primary.answerWrongNodeOnce();
 
                 assertTrue(client.touch(key, 30));
                 assertEquals(Optional.of("v"), client.getAndTouch(key, 31));
-                assertTrue(
-                        primary.touchFrames.size() >= 2, "the touch was re-sent after the refresh");
+                assertTrue(primary.touchFrames.size() >= 2, "the touch was re-sent after the refresh");
             }
         }
     }
@@ -1297,11 +1212,11 @@ class NanocachedClientTest {
     @Test
     void aReplicaThatPredatesTouchDoesNotFailThePrimarysAnswer() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-key";
                 client.set(key, "v", 100);
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
                 MockNode replica = cluster.nodes().get(owners.get(1));
                 replica.rejectTouchLikeAnOldServer();
@@ -1321,11 +1236,11 @@ class NanocachedClientTest {
         // gives up at once, as the primary leg does, instead of paying a
         // second dial for the same answer on every touch.
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-key";
                 client.set(key, "v", 100);
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode replica = cluster.nodes().get(owners.get(1));
                 replica.rejectTouchLikeAnOldServer();
 
@@ -1344,8 +1259,7 @@ class NanocachedClientTest {
         List<String> keys = new ArrayList<>();
         for (int i = 0; keys.size() < count; i++) {
             String key = "batch-" + i;
-            if (ring.owners(key.getBytes(StandardCharsets.UTF_8), 2).get(0).equals(name))
-                keys.add(key);
+            if (ring.owners(key.getBytes(StandardCharsets.UTF_8), 2).get(0).equals(name)) keys.add(key);
         }
         return keys;
     }
@@ -1423,9 +1337,7 @@ class NanocachedClientTest {
                 client.set("a", "one", 100);
                 client.set("b", "two", 100);
 
-                assertEquals(
-                        Map.of("a", "one", "b", "two"),
-                        client.getManyAndTouch(List.of("a", "missing", "b"), 30));
+                assertEquals(Map.of("a", "one", "b", "two"), client.getManyAndTouch(List.of("a", "missing", "b"), 30));
                 assertEquals(Long.valueOf(30), node.ttls.get("a"));
                 assertFalse(node.store.containsKey("missing"));
 
@@ -1434,8 +1346,7 @@ class NanocachedClientTest {
                 assertArrayEquals("one".getBytes(StandardCharsets.UTF_8), raw.get("a"));
                 assertEquals(Long.valueOf(40), node.ttls.get("a"));
 
-                byte[][] positional =
-                        client.getManyAndTouchBytes(utf8Keys("b", "missing", "a"), 50);
+                byte[][] positional = client.getManyAndTouchBytes(utf8Keys("b", "missing", "a"), 50);
                 assertArrayEquals("two".getBytes(StandardCharsets.UTF_8), positional[0]);
                 assertNull(positional[1]);
                 assertArrayEquals("one".getBytes(StandardCharsets.UTF_8), positional[2]);
@@ -1453,25 +1364,17 @@ class NanocachedClientTest {
                 client.set("a", "one", 100);
                 client.set("b", "two", 100);
 
-                assertEquals(
-                        Map.of("a", true, "b", true), client.touchMany(List.of("a", "b", "a"), 30));
-                byte[][] values =
-                        client.getManyAndTouchBytes(
-                                utf8Keys("a", "b", "a", "missing", "missing"), 30);
+                assertEquals(Map.of("a", true, "b", true), client.touchMany(List.of("a", "b", "a"), 30));
+                byte[][] values = client.getManyAndTouchBytes(utf8Keys("a", "b", "a", "missing", "missing"), 30);
                 assertArrayEquals("one".getBytes(StandardCharsets.UTF_8), values[0]);
                 assertArrayEquals("two".getBytes(StandardCharsets.UTF_8), values[1]);
                 assertArrayEquals("one".getBytes(StandardCharsets.UTF_8), values[2]);
                 assertNull(values[3]);
                 assertNull(values[4]);
-                assertArrayEquals(
-                        new boolean[] {true, true, true},
-                        client.touchMany(utf8Keys("a", "b", "a"), 30));
+                assertArrayEquals(new boolean[] {true, true, true}, client.touchMany(utf8Keys("a", "b", "a"), 30));
 
                 for (MockNode.MultiTouchFrame frame : node.multiTouchFrames) {
-                    assertEquals(
-                            frame.get() ? 3 : 2,
-                            frame.keys().size(),
-                            "duplicates are sent once: " + frame);
+                    assertEquals(frame.get() ? 3 : 2, frame.keys().size(), "duplicates are sent once: " + frame);
                 }
             }
         }
@@ -1486,24 +1389,17 @@ class NanocachedClientTest {
                 client.set("k", "in-default", 100);
 
                 assertEquals(
-                        Map.of("k", true, "only-default", false),
-                        tenant.touchMany(List.of("k", "only-default"), 5));
-                assertEquals(
-                        Map.of("k", "in-tenant"),
-                        tenant.getManyAndTouch(List.of("k", "only-default"), 6));
+                        Map.of("k", true, "only-default", false), tenant.touchMany(List.of("k", "only-default"), 5));
+                assertEquals(Map.of("k", "in-tenant"), tenant.getManyAndTouch(List.of("k", "only-default"), 6));
                 assertArrayEquals(
                         "in-tenant".getBytes(StandardCharsets.UTF_8),
                         tenant.getManyAndTouchBytes(List.of("k"), 7).get("k"));
                 assertArrayEquals(new boolean[] {true}, tenant.touchMany(utf8Keys("k"), 8));
                 assertArrayEquals(
-                        "in-tenant".getBytes(StandardCharsets.UTF_8),
-                        tenant.getManyAndTouchBytes(utf8Keys("k"), 9)[0]);
+                        "in-tenant".getBytes(StandardCharsets.UTF_8), tenant.getManyAndTouchBytes(utf8Keys("k"), 9)[0]);
 
                 assertEquals(Long.valueOf(9), node.namespacedTtls.get("tenant").get("k"));
-                assertEquals(
-                        Long.valueOf(100),
-                        node.ttls.get("k"),
-                        "the default keyspace was not touched");
+                assertEquals(Long.valueOf(100), node.ttls.get("k"), "the default keyspace was not touched");
             }
         }
     }
@@ -1526,17 +1422,11 @@ class NanocachedClientTest {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 List<String> keys = List.of("k");
                 assertThrows(IllegalArgumentException.class, () -> client.touchMany(keys, -2));
-                assertThrows(
-                        IllegalArgumentException.class, () -> client.getManyAndTouch(keys, -2));
-                assertThrows(
-                        IllegalArgumentException.class,
-                        () -> client.getManyAndTouchBytes(utf8Keys("k"), -2));
+                assertThrows(IllegalArgumentException.class, () -> client.getManyAndTouch(keys, -2));
+                assertThrows(IllegalArgumentException.class, () -> client.getManyAndTouchBytes(utf8Keys("k"), -2));
                 assertThrows(IllegalArgumentException.class, () -> client.touchMany(List.of(), 30));
-                assertThrows(
-                        IllegalArgumentException.class,
-                        () -> client.getManyAndTouch(List.of(), 30));
-                assertThrows(
-                        IllegalArgumentException.class, () -> client.touchMany(new byte[0][], 30));
+                assertThrows(IllegalArgumentException.class, () -> client.getManyAndTouch(List.of(), 30));
+                assertThrows(IllegalArgumentException.class, () -> client.touchMany(new byte[0][], 30));
                 assertTrue(node.multiTouchFrames.isEmpty());
             }
         }
@@ -1558,14 +1448,17 @@ class NanocachedClientTest {
                 assertFalse(touched.get("k1"));
                 assertEquals(
                         List.of(400, 1),
-                        node.multiTouchFrames.stream().map(frame -> frame.keys().size()).toList());
+                        node.multiTouchFrames.stream()
+                                .map(frame -> frame.keys().size())
+                                .toList());
 
                 node.multiTouchFrames.clear();
-                assertEquals(
-                        Map.of("k0", "first", "k400", "last"), client.getManyAndTouch(keys, 30));
+                assertEquals(Map.of("k0", "first", "k400", "last"), client.getManyAndTouch(keys, 30));
                 assertEquals(
                         List.of(400, 1),
-                        node.multiTouchFrames.stream().map(frame -> frame.keys().size()).toList());
+                        node.multiTouchFrames.stream()
+                                .map(frame -> frame.keys().size())
+                                .toList());
             }
         }
     }
@@ -1575,9 +1468,7 @@ class NanocachedClientTest {
         try (MockNode node = MockNode.withTagSupport()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("k", "v", 100);
-                assertEquals(
-                        Map.of("k", true, "missing", false),
-                        client.touchMany(List.of("k", "missing"), 30));
+                assertEquals(Map.of("k", true, "missing", false), client.touchMany(List.of("k", "missing"), 30));
                 assertEquals(Map.of("k", "v"), client.getManyAndTouch(List.of("k", "missing"), 40));
                 assertEquals(Long.valueOf(40), node.ttls.get("k"));
                 assertEquals(2, node.multiTouchFrames.size());
@@ -1594,10 +1485,8 @@ class NanocachedClientTest {
                     if (predatesTouchToo) node.rejectTouchLikeAnOldServer();
                     else node.rejectMultiTouchLikeAnOldServer();
 
-                    NanocachedException.ServerTooOld failure =
-                            assertThrows(
-                                    NanocachedException.ServerTooOld.class,
-                                    () -> client.touchMany(List.of("k"), 30));
+                    NanocachedException.ServerTooOld failure = assertThrows(
+                            NanocachedException.ServerTooOld.class, () -> client.touchMany(List.of("k"), 30));
                     assertEquals("y", failure.command());
                     assertEquals(
                             "y",
@@ -1612,9 +1501,7 @@ class NanocachedClientTest {
                     } else {
                         assertEquals(
                                 "t",
-                                assertThrows(
-                                                NanocachedException.ServerTooOld.class,
-                                                () -> client.touch("k", 30))
+                                assertThrows(NanocachedException.ServerTooOld.class, () -> client.touch("k", 30))
                                         .command());
                     }
                 }
@@ -1627,16 +1514,14 @@ class NanocachedClientTest {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 byte[][] keys = new byte[401][];
-                for (int i = 0; i < keys.length; i++)
-                    keys[i] = ("k" + i).getBytes(StandardCharsets.UTF_8);
+                for (int i = 0; i < keys.length; i++) keys[i] = ("k" + i).getBytes(StandardCharsets.UTF_8);
                 byte[] first = "first-chunk-value".getBytes(StandardCharsets.UTF_8);
                 client.set(keys[0], first);
 
                 node.failMultiTouchAfter(1);
-                NanocachedException.PartialConnectionLostRaw failure =
-                        assertThrows(
-                                NanocachedException.PartialConnectionLostRaw.class,
-                                () -> client.getManyAndTouchBytes(keys, 30));
+                NanocachedException.PartialConnectionLostRaw failure = assertThrows(
+                        NanocachedException.PartialConnectionLostRaw.class,
+                        () -> client.getManyAndTouchBytes(keys, 30));
                 assertEquals(keys.length, failure.partialValues.length);
                 assertArrayEquals(first, failure.partialValues[0]);
                 assertArrayEquals(new int[] {400}, failure.unresolvedIndices);
@@ -1644,9 +1529,7 @@ class NanocachedClientTest {
                 // touchMany carries no partial result: the whole batch is idempotent, send it
                 // again.
                 NanocachedException.ConnectionLost bare =
-                        assertThrows(
-                                NanocachedException.ConnectionLost.class,
-                                () -> client.touchMany(keys, 30));
+                        assertThrows(NanocachedException.ConnectionLost.class, () -> client.touchMany(keys, 30));
                 assertFalse(bare instanceof NanocachedException.PartialConnectionLostRaw);
             }
         }
@@ -1660,24 +1543,21 @@ class NanocachedClientTest {
         // returned must reach the caller. `R` means chunk 2 was not
         // applied, so its key is not reported as possibly applied either.
         AtomicInteger frameCount = new AtomicInteger();
-        try (ScriptedNode proxy =
-                new ScriptedNode(header -> {
-                    int count = Integer.parseInt(header.split(" ")[2]);
-                    if (frameCount.getAndIncrement() > 0) return "R\n";
-                    StringBuilder reply = new StringBuilder("M " + count);
-                    for (int i = 0; i < count; i++) reply.append(" 1");
-                    reply.append('\n');
-                    for (int i = 0; i < count; i++) reply.append('x');
-                    return reply.toString();
-                })) {
+        try (ScriptedNode proxy = new ScriptedNode(header -> {
+            int count = Integer.parseInt(header.split(" ")[2]);
+            if (frameCount.getAndIncrement() > 0) return "R\n";
+            StringBuilder reply = new StringBuilder("M " + count);
+            for (int i = 0; i < count; i++) reply.append(" 1");
+            reply.append('\n');
+            for (int i = 0; i < count; i++) reply.append('x');
+            return reply.toString();
+        })) {
             try (NanocachedClient client = connect("127.0.0.1", proxy.port())) {
                 List<String> keys = new ArrayList<>();
                 for (int i = 0; i < 401; i++) keys.add("k" + i);
 
-                NanocachedException.PartialConnectionLostStrings failure =
-                        assertThrows(
-                                NanocachedException.PartialConnectionLostStrings.class,
-                                () -> client.getManyAndTouch(keys, 0));
+                NanocachedException.PartialConnectionLostStrings failure = assertThrows(
+                        NanocachedException.PartialConnectionLostStrings.class, () -> client.getManyAndTouch(keys, 0));
                 assertEquals(400, failure.partialValues.size());
                 assertEquals("x", failure.partialValues.get("k0"));
                 assertTrue(failure.getCause() instanceof NanocachedException.RetryableError);
@@ -1692,11 +1572,8 @@ class NanocachedClientTest {
         try (ScriptedNode proxy = new ScriptedNode(header -> "R\n")) {
             try (NanocachedClient client = connect("127.0.0.1", proxy.port())) {
                 assertThrows(
-                        NanocachedException.RetryableError.class,
-                        () -> client.getManyAndTouch(List.of("a", "b"), 0));
-                assertThrows(
-                        NanocachedException.RetryableError.class,
-                        () -> client.touchMany(List.of("a", "b"), 0));
+                        NanocachedException.RetryableError.class, () -> client.getManyAndTouch(List.of("a", "b"), 0));
+                assertThrows(NanocachedException.RetryableError.class, () -> client.touchMany(List.of("a", "b"), 0));
             }
         }
     }
@@ -1705,18 +1582,16 @@ class NanocachedClientTest {
      * Runs each of the four touch calls with ttl 0 against a node that answers {@code reply} to
      * every frame, and returns what each threw.
      */
-    private static List<Throwable> expiringTouchesAnsweredWith(String reply, boolean tagged)
-            throws Exception {
+    private static List<Throwable> expiringTouchesAnsweredWith(String reply, boolean tagged) throws Exception {
         List<Throwable> thrown = new ArrayList<>();
-        java.util.function.Consumer<Runnable> record =
-                call -> {
-                    try {
-                        call.run();
-                        thrown.add(null);
-                    } catch (Throwable error) {
-                        thrown.add(error);
-                    }
-                };
+        java.util.function.Consumer<Runnable> record = call -> {
+            try {
+                call.run();
+                thrown.add(null);
+            } catch (Throwable error) {
+                thrown.add(error);
+            }
+        };
         // One node per call, so each call's frame count stands alone.
         for (int which = 0; which < 4; which++) {
             try (ScriptedNode node = new ScriptedNode(tagged, header -> reply)) {
@@ -1731,8 +1606,7 @@ class NanocachedClientTest {
                         }
                     });
                 }
-                assertEquals(
-                        1, node.frames.get(), "call " + which + " must send exactly one frame");
+                assertEquals(1, node.frames.get(), "call " + which + " must send exactly one frame");
             }
         }
         return thrown;
@@ -1785,34 +1659,30 @@ class NanocachedClientTest {
         // redialed, not reported as an unknown outcome.
         java.util.concurrent.CountDownLatch touchSent = new java.util.concurrent.CountDownLatch(1);
         AtomicInteger incrFrames = new AtomicInteger();
-        try (ScriptedNode node =
-                new ScriptedNode(header -> {
-                    if (header.startsWith("y ")) {
-                        touchSent.countDown();
-                        return ""; // held until the incr is pipelined behind it
-                    }
-                    if (header.startsWith("i ")) {
-                        // The first incr arrives behind the held `y`: refuse the `y`.
-                        return incrFrames.getAndIncrement() == 0 ? "En\n" : "I 1\n6";
-                    }
-                    return null;
-                })) {
+        try (ScriptedNode node = new ScriptedNode(header -> {
+            if (header.startsWith("y ")) {
+                touchSent.countDown();
+                return ""; // held until the incr is pipelined behind it
+            }
+            if (header.startsWith("i ")) {
+                // The first incr arrives behind the held `y`: refuse the `y`.
+                return incrFrames.getAndIncrement() == 0 ? "En\n" : "I 1\n6";
+            }
+            return null;
+        })) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
-                CompletableFuture<Throwable> touch =
-                        CompletableFuture.supplyAsync(() -> {
-                            try {
-                                client.touchMany(List.of("a", "b"), 30);
-                                return null;
-                            } catch (Throwable error) {
-                                return error;
-                            }
-                        });
+                CompletableFuture<Throwable> touch = CompletableFuture.supplyAsync(() -> {
+                    try {
+                        client.touchMany(List.of("a", "b"), 30);
+                        return null;
+                    } catch (Throwable error) {
+                        return error;
+                    }
+                });
                 assertTrue(touchSent.await(5, java.util.concurrent.TimeUnit.SECONDS));
                 assertEquals(java.util.OptionalLong.of(6), client.incr("n", 1));
                 Throwable touchError = touch.get(5, java.util.concurrent.TimeUnit.SECONDS);
-                assertTrue(
-                        touchError instanceof NanocachedException.ServerTooOld,
-                        String.valueOf(touchError));
+                assertTrue(touchError instanceof NanocachedException.ServerTooOld, String.valueOf(touchError));
                 assertEquals(2, incrFrames.get());
             }
         }
@@ -1824,14 +1694,12 @@ class NanocachedClientTest {
      * Drops {@code node} from the discovery server's list, so the client's next refresh no longer
      * has it, and waits for its sockets to be gone.
      */
-    private static void removeFromDiscovery(Cluster cluster, String name, MockNode node)
-            throws Exception {
+    private static void removeFromDiscovery(Cluster cluster, String name, MockNode node) throws Exception {
         node.close();
         Thread.sleep(100);
-        cluster.discovery().nodes =
-                cluster.discovery().nodes.stream()
-                        .filter(discovered -> !discovered.name().equals(name))
-                        .toList();
+        cluster.discovery().nodes = cluster.discovery().nodes.stream()
+                .filter(discovered -> !discovered.name().equals(name))
+                .toList();
     }
 
     private static String touchFrame(String key, String tail) {
@@ -1839,11 +1707,11 @@ class NanocachedClientTest {
     }
 
     @Test
-    void anExpiringTouchRerouteFromADeadPrimaryFindsTheValueBecauseNoReplicaWasTouchedFirst()
-            throws Exception {
+    void anExpiringTouchRerouteFromADeadPrimaryFindsTheValueBecauseNoReplicaWasTouchedFirst() throws Exception {
         for (boolean get : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
                     String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
                     client.set(key, "v", 100);
                     MockNode survivor = cluster.nodes().get(NAMES.get(1));
@@ -1868,25 +1736,23 @@ class NanocachedClientTest {
     void anExpiringTouchOfAPrimaryThatStaysUnreachableTouchesNoReplica() throws Exception {
         for (boolean get : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
                     String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
                     client.set(key, "v", 100);
                     MockNode replica = cluster.nodes().get(NAMES.get(1));
                     cluster.nodes().get(NAMES.get(0)).close();
                     Thread.sleep(100);
 
-                    assertThrows(
-                            NanocachedException.ConnectionLost.class,
-                            () -> {
-                                if (get) client.getAndTouch(key, 0);
-                                else client.touch(key, 0);
-                            });
+                    assertThrows(NanocachedException.ConnectionLost.class, () -> {
+                        if (get) client.getAndTouch(key, 0);
+                        else client.touch(key, 0);
+                    });
                     assertEquals(List.of(), replica.touchFrames, "the replica was not touched");
                     assertEquals(
                             "v",
                             new String(
-                                    replica.store.get(
-                                            MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))),
+                                    replica.store.get(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))),
                                     StandardCharsets.UTF_8));
                 }
             }
@@ -1894,11 +1760,11 @@ class NanocachedClientTest {
     }
 
     @Test
-    void anExpiringTouchAnsweredWrongNodeTouchesTheReplicaOnlyWithTheFinalAnswer()
-            throws Exception {
+    void anExpiringTouchAnsweredWrongNodeTouchesTheReplicaOnlyWithTheFinalAnswer() throws Exception {
         for (boolean get : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
                     String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
                     client.set(key, "v", 100);
                     MockNode primary = cluster.nodes().get(NAMES.get(0));
@@ -1923,7 +1789,8 @@ class NanocachedClientTest {
     @Test
     void anExpiringTouchWhoseReplyWasLostTouchedNoReplica() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
                 client.set(key, "v", 100);
                 MockNode primary = cluster.nodes().get(NAMES.get(0));
@@ -1941,7 +1808,8 @@ class NanocachedClientTest {
     void anExpiringTouchIsSentToTheReplicaOnlyAfterThePrimaryAnswered() throws Exception {
         for (boolean get : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
                     String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
                     client.set(key, "v", 100);
                     MockNode primary = cluster.nodes().get(NAMES.get(0));
@@ -1953,17 +1821,10 @@ class NanocachedClientTest {
                     } else {
                         assertTrue(client.touch(key, 0));
                     }
-                    long gapMillis =
-                            (replica.touchReceiptNanos.get(0) - primary.touchReceiptNanos.get(0))
-                                    / 1_000_000;
-                    assertTrue(
-                            gapMillis >= 350,
-                            "the replica's frame came " + gapMillis + " ms after the primary's");
+                    long gapMillis = (replica.touchReceiptNanos.get(0) - primary.touchReceiptNanos.get(0)) / 1_000_000;
+                    assertTrue(gapMillis >= 350, "the replica's frame came " + gapMillis + " ms after the primary's");
                     assertEquals(List.of(touchFrame(key, "0")), replica.touchFrames);
-                    assertEquals(
-                            null,
-                            replica.store.get(
-                                    MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
+                    assertEquals(null, replica.store.get(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
                 }
             }
         }
@@ -1973,11 +1834,11 @@ class NanocachedClientTest {
     // that is then rerouted would make the call answer false.
 
     @Test
-    void aDeleteRerouteFromADeadPrimaryFindsTheKeyBecauseNoReplicaWasDeletedFirst()
-            throws Exception {
+    void aDeleteRerouteFromADeadPrimaryFindsTheKeyBecauseNoReplicaWasDeletedFirst() throws Exception {
         for (boolean namespaced : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
                     NanocachedClient.Namespace ns = client.namespace("tenant");
                     String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
                     if (namespaced) ns.set(key, "v");
@@ -1996,7 +1857,8 @@ class NanocachedClientTest {
     void aDeleteAnsweredWrongNodeDeletesTheReplicaOnlyWithTheFinalAnswer() throws Exception {
         for (boolean namespaced : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
                     NanocachedClient.Namespace ns = client.namespace("tenant");
                     String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
                     if (namespaced) ns.set(key, "v");
@@ -2008,9 +1870,7 @@ class NanocachedClientTest {
                     assertTrue(namespaced ? ns.delete(key) : client.delete(key));
                     assertEquals(2, primary.deleteFrames.get(), "W, then the retried delete");
                     assertEquals(
-                            1,
-                            replica.deleteFrames.get(),
-                            "one delete, sent after the primary's definitive answer");
+                            1, replica.deleteFrames.get(), "one delete, sent after the primary's definitive answer");
                 }
             }
         }
@@ -2020,7 +1880,8 @@ class NanocachedClientTest {
     void aTouchThatDoesNotExpireStillGoesToEveryOwnerAtOnce() throws Exception {
         for (long ttl : new long[] {30, NanocachedClient.REMOVE_TTL}) {
             try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
                     String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
                     client.set(key, "v", 100);
                     MockNode primary = cluster.nodes().get(NAMES.get(0));
@@ -2028,12 +1889,8 @@ class NanocachedClientTest {
                     primary.delayTouchRepliesBy(400);
 
                     assertTrue(client.touch(key, ttl));
-                    long gapMillis =
-                            (replica.touchReceiptNanos.get(0) - primary.touchReceiptNanos.get(0))
-                                    / 1_000_000;
-                    assertTrue(
-                            Math.abs(gapMillis) < 300,
-                            "concurrent legs, " + gapMillis + " ms apart");
+                    long gapMillis = (replica.touchReceiptNanos.get(0) - primary.touchReceiptNanos.get(0)) / 1_000_000;
+                    assertTrue(Math.abs(gapMillis) < 300, "concurrent legs, " + gapMillis + " ms apart");
                 }
             }
         }
@@ -2043,7 +1900,8 @@ class NanocachedClientTest {
     void anExpiringBatchTouchSendsThePrimariesFirstAndOneFanOutAfterThem() throws Exception {
         for (boolean get : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
                     MockNode nodeA = cluster.nodes().get(NAMES.get(0));
                     MockNode nodeB = cluster.nodes().get(NAMES.get(1));
                     List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
@@ -2075,12 +1933,8 @@ class NanocachedClientTest {
                     assertEquals(keysA, nodeB.multiTouchFrames.get(1).keys());
                     assertFalse(nodeB.multiTouchFrames.get(1).get());
                     // Nothing went to a replica until the primaries had answered (300 ms).
-                    long firstReplicaFrame =
-                            Math.min(
-                                    nodeA.touchReceiptNanos.get(1), nodeB.touchReceiptNanos.get(1));
-                    long lastPrimaryFrame =
-                            Math.max(
-                                    nodeA.touchReceiptNanos.get(0), nodeB.touchReceiptNanos.get(0));
+                    long firstReplicaFrame = Math.min(nodeA.touchReceiptNanos.get(1), nodeB.touchReceiptNanos.get(1));
+                    long lastPrimaryFrame = Math.max(nodeA.touchReceiptNanos.get(0), nodeB.touchReceiptNanos.get(0));
                     assertTrue(
                             (firstReplicaFrame - lastPrimaryFrame) / 1_000_000 >= 250,
                             "replica legs followed the primaries by "
@@ -2092,11 +1946,11 @@ class NanocachedClientTest {
     }
 
     @Test
-    void anExpiringBatchTouchRerouteFromADeadPrimaryFindsTheValuesBecauseNoReplicaWasTouchedFirst()
-            throws Exception {
+    void anExpiringBatchTouchRerouteFromADeadPrimaryFindsTheValuesBecauseNoReplicaWasTouchedFirst() throws Exception {
         for (boolean get : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
                     MockNode survivor = cluster.nodes().get(NAMES.get(1));
                     List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 2);
                     List<String> keysB = keysWhosePrimaryIs(NAMES.get(1), 2);
@@ -2110,9 +1964,7 @@ class NanocachedClientTest {
                         assertEquals(values, client.getManyAndTouch(all, 0));
                     } else {
                         Map<String, Boolean> touched = client.touchMany(all, 0);
-                        assertTrue(
-                                touched.values().stream().allMatch(Boolean::booleanValue),
-                                touched.toString());
+                        assertTrue(touched.values().stream().allMatch(Boolean::booleanValue), touched.toString());
                     }
                     // The first pass sent the survivor only the keys it is primary
                     // for; the dead primary's keys came in the second pass.
@@ -2128,7 +1980,8 @@ class NanocachedClientTest {
     void anExpiringBatchTouchOfPrimariesThatStayUnreachableTouchesNoReplica() throws Exception {
         for (boolean get : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
                     MockNode replica = cluster.nodes().get(NAMES.get(1));
                     List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
                     Map<String, String> values = new java.util.LinkedHashMap<>();
@@ -2137,16 +1990,11 @@ class NanocachedClientTest {
                     cluster.nodes().get(NAMES.get(0)).close();
                     Thread.sleep(100);
 
-                    assertThrows(
-                            NanocachedException.ConnectionLost.class,
-                            () -> {
-                                if (get) client.getManyAndTouch(keysA, 0);
-                                else client.touchMany(keysA, 0);
-                            });
-                    assertEquals(
-                            List.of(),
-                            replica.multiTouchFrames,
-                            "no primary answered, so no replica leg");
+                    assertThrows(NanocachedException.ConnectionLost.class, () -> {
+                        if (get) client.getManyAndTouch(keysA, 0);
+                        else client.touchMany(keysA, 0);
+                    });
+                    assertEquals(List.of(), replica.multiTouchFrames, "no primary answered, so no replica leg");
                     assertEquals(keysA.size(), replica.store.size());
                 }
             }
@@ -2157,7 +2005,8 @@ class NanocachedClientTest {
     void anExpiringBatchTouchWhosePrimaryReplyWasLostTouchedNoReplica() throws Exception {
         for (boolean get : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
                     MockNode nodeA = cluster.nodes().get(NAMES.get(0));
                     MockNode replica = cluster.nodes().get(NAMES.get(1));
                     List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
@@ -2166,16 +2015,11 @@ class NanocachedClientTest {
                     client.setMany(values);
                     nodeA.dropReplyAfterNextTouch();
 
-                    assertThrows(
-                            NanocachedException.ConnectionLost.class,
-                            () -> {
-                                if (get) client.getManyAndTouch(keysA, 0);
-                                else client.touchMany(keysA, 0);
-                            });
-                    assertEquals(
-                            1,
-                            nodeA.multiTouchFrames.size(),
-                            "the applied frame was not sent again");
+                    assertThrows(NanocachedException.ConnectionLost.class, () -> {
+                        if (get) client.getManyAndTouch(keysA, 0);
+                        else client.touchMany(keysA, 0);
+                    });
+                    assertEquals(1, nodeA.multiTouchFrames.size(), "the applied frame was not sent again");
                     assertEquals(List.of(), replica.multiTouchFrames, "the primary never answered");
                 }
             }
@@ -2183,10 +2027,10 @@ class NanocachedClientTest {
     }
 
     @Test
-    void anExpiringBatchTouchAnsweredWrongNodeTouchesTheReplicaOnlyWithTheFinalAnswer()
-            throws Exception {
+    void anExpiringBatchTouchAnsweredWrongNodeTouchesTheReplicaOnlyWithTheFinalAnswer() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 MockNode nodeA = cluster.nodes().get(NAMES.get(0));
                 MockNode replica = cluster.nodes().get(NAMES.get(1));
                 List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
@@ -2210,20 +2054,14 @@ class NanocachedClientTest {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("k", "v", 100);
                 node.answerWrongNodeOnce();
-                assertThrows(
-                        NanocachedException.WrongNode.class,
-                        () -> client.touchMany(List.of("k"), 30));
+                assertThrows(NanocachedException.WrongNode.class, () -> client.touchMany(List.of("k"), 30));
 
                 node.answerWrongNodeOnce();
-                NanocachedException.PartialWrongNodeStrings failure =
-                        assertThrows(
-                                NanocachedException.PartialWrongNodeStrings.class,
-                                () -> client.getManyAndTouch(List.of("k"), 30));
+                NanocachedException.PartialWrongNodeStrings failure = assertThrows(
+                        NanocachedException.PartialWrongNodeStrings.class,
+                        () -> client.getManyAndTouch(List.of("k"), 30));
                 assertTrue(failure.partialValues.isEmpty());
-                assertEquals(
-                        Long.valueOf(100),
-                        node.ttls.get("k"),
-                        "a wrong-node answer touches nothing");
+                assertEquals(Long.valueOf(100), node.ttls.get("k"), "a wrong-node answer touches nothing");
             }
         }
     }
@@ -2246,8 +2084,7 @@ class NanocachedClientTest {
 
                 node.multiTouchFrames.clear();
                 node.answerMultiTouchWithEntryCountOnce(2);
-                assertEquals(
-                        Map.of("a", "1", "b", "2", "c", "3"), client.getManyAndTouch(keys, 31));
+                assertEquals(Map.of("a", "1", "b", "2", "c", "3"), client.getManyAndTouch(keys, 31));
                 assertEquals(2, node.multiTouchFrames.size());
             }
         }
@@ -2256,7 +2093,8 @@ class NanocachedClientTest {
     @Test
     void batchTouchGoesToEveryOwnerAndGoesToThePrimaryInTheGetForm() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 MockNode nodeA = cluster.nodes().get(NAMES.get(0));
                 MockNode nodeB = cluster.nodes().get(NAMES.get(1));
                 List<String> primaryA = keysWhosePrimaryIs(NAMES.get(0), 3);
@@ -2306,21 +2144,18 @@ class NanocachedClientTest {
     @Test
     void getManyAndTouchDoesNotFallBackToAReplicaOnAPrimaryMiss() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 MockNode primary = cluster.nodes().get(NAMES.get(0));
                 MockNode replica = cluster.nodes().get(NAMES.get(1));
                 String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
                 // Only the replica holds the value.
-                replica.store.put(
-                        MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8)), new byte[] {'v'});
+                replica.store.put(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8)), new byte[] {'v'});
 
                 assertEquals(Map.of(), client.getManyAndTouch(List.of(key), 30));
 
                 assertEquals(1, framesWithGet(primary, true).size());
-                assertEquals(
-                        0,
-                        framesWithGet(replica, true).size(),
-                        "the replica is never asked for the value");
+                assertEquals(0, framesWithGet(replica, true).size(), "the replica is never asked for the value");
                 assertEquals(1, framesWithGet(replica, false).size());
             }
         }
@@ -2329,12 +2164,10 @@ class NanocachedClientTest {
     @Test
     void batchTouchRecoversFromAWrongNodeAnswer() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 MockNode nodeA = cluster.nodes().get(NAMES.get(0));
-                List<String> all =
-                        concat(
-                                keysWhosePrimaryIs(NAMES.get(0), 3),
-                                keysWhosePrimaryIs(NAMES.get(1), 3));
+                List<String> all = concat(keysWhosePrimaryIs(NAMES.get(0), 3), keysWhosePrimaryIs(NAMES.get(1), 3));
                 Map<String, String> values = new java.util.LinkedHashMap<>();
                 for (String key : all) values.put(key, "value of " + key);
                 client.setMany(values);
@@ -2343,10 +2176,7 @@ class NanocachedClientTest {
                 Map<String, Boolean> touched = client.touchMany(all, 30);
                 assertEquals(6, touched.size());
                 assertTrue(touched.values().stream().allMatch(t -> t));
-                assertEquals(
-                        2,
-                        nodeA.multiTouchFrames.size(),
-                        "the keys A answered W for were sent again");
+                assertEquals(2, nodeA.multiTouchFrames.size(), "the keys A answered W for were sent again");
 
                 nodeA.answerWrongNodeOnce();
                 assertEquals(values, client.getManyAndTouch(all, 31));
@@ -2357,7 +2187,8 @@ class NanocachedClientTest {
     @Test
     void batchTouchStillWrongNodeAfterTheRetryThrowsWhatDidResolve() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 MockNode nodeA = cluster.nodes().get(NAMES.get(0));
                 List<String> primaryA = keysWhosePrimaryIs(NAMES.get(0), 3);
                 List<String> primaryB = keysWhosePrimaryIs(NAMES.get(1), 3);
@@ -2368,15 +2199,11 @@ class NanocachedClientTest {
 
                 for (int i = 0; i < 8; i++) nodeA.answerWrongNodeOnce();
                 NanocachedException.WrongNode failure =
-                        assertThrows(
-                                NanocachedException.WrongNode.class,
-                                () -> client.touchMany(all, 30));
+                        assertThrows(NanocachedException.WrongNode.class, () -> client.touchMany(all, 30));
                 assertFalse(failure instanceof NanocachedException.PartialWrongNodeStrings);
 
-                NanocachedException.PartialWrongNodeStrings partial =
-                        assertThrows(
-                                NanocachedException.PartialWrongNodeStrings.class,
-                                () -> client.getManyAndTouch(all, 31));
+                NanocachedException.PartialWrongNodeStrings partial = assertThrows(
+                        NanocachedException.PartialWrongNodeStrings.class, () -> client.getManyAndTouch(all, 31));
                 Map<String, String> resolved = new java.util.LinkedHashMap<>();
                 for (String key : primaryB) resolved.put(key, values.get(key));
                 assertEquals(resolved, partial.partialValues);
@@ -2388,7 +2215,8 @@ class NanocachedClientTest {
     void getManyAndGetManyAndTouchKeepWrongNodeWhenAResolvedValueIsNotUtf8() throws Exception {
         for (boolean touch : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
                     MockNode nodeA = cluster.nodes().get(NAMES.get(0));
                     List<String> primaryA = keysWhosePrimaryIs(NAMES.get(0), 3);
                     List<String> primaryB = keysWhosePrimaryIs(NAMES.get(1), 3);
@@ -2397,21 +2225,16 @@ class NanocachedClientTest {
                     for (String key : all) values.put(key, "value of " + key);
                     client.setMany(values);
                     String binary = primaryB.get(0);
-                    client.set(
-                            binary.getBytes(StandardCharsets.UTF_8),
-                            new byte[] {(byte) 0xFF, (byte) 0xFE});
+                    client.set(binary.getBytes(StandardCharsets.UTF_8), new byte[] {(byte) 0xFF, (byte) 0xFE});
 
                     for (int i = 0; i < 8; i++) nodeA.answerWrongNodeOnce();
                     NanocachedException.PartialWrongNodeStrings partial =
-                            assertThrows(
-                                    NanocachedException.PartialWrongNodeStrings.class,
-                                    () -> {
-                                        if (touch) client.getManyAndTouch(all, 31);
-                                        else client.getMany(all);
-                                    });
+                            assertThrows(NanocachedException.PartialWrongNodeStrings.class, () -> {
+                                if (touch) client.getManyAndTouch(all, 31);
+                                else client.getMany(all);
+                            });
                     Map<String, String> resolved = new java.util.LinkedHashMap<>();
-                    for (String key : primaryB)
-                        if (!key.equals(binary)) resolved.put(key, values.get(key));
+                    for (String key : primaryB) if (!key.equals(binary)) resolved.put(key, values.get(key));
                     assertEquals(
                             resolved,
                             partial.partialValues,
@@ -2424,7 +2247,8 @@ class NanocachedClientTest {
     @Test
     void aBatchTouchWhoseReplyWasLostIsSentAgain() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 MockNode nodeA = cluster.nodes().get(NAMES.get(0));
                 List<String> keys = keysWhosePrimaryIs(NAMES.get(0), 3);
                 Map<String, String> values = new java.util.LinkedHashMap<>();
@@ -2442,7 +2266,8 @@ class NanocachedClientTest {
     @Test
     void anExpiringBatchTouchWhoseReplyWasLostIsNotResent() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 MockNode nodeA = cluster.nodes().get(NAMES.get(0));
                 List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
                 List<String> keysB = keysWhosePrimaryIs(NAMES.get(1), 3);
@@ -2452,10 +2277,8 @@ class NanocachedClientTest {
                 client.setMany(values);
 
                 nodeA.dropReplyAfterNextTouch();
-                assertThrows(
-                        NanocachedException.ConnectionLost.class, () -> client.touchMany(all, 0));
-                assertEquals(
-                        1, nodeA.multiTouchFrames.size(), "the applied frame was not sent again");
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.touchMany(all, 0));
+                assertEquals(1, nodeA.multiTouchFrames.size(), "the applied frame was not sent again");
             }
         }
     }
@@ -2463,7 +2286,8 @@ class NanocachedClientTest {
     @Test
     void anExpiringGetManyAndTouchWhoseReplyWasLostIsNotResent() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 MockNode nodeA = cluster.nodes().get(NAMES.get(0));
                 List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
                 List<String> keysB = keysWhosePrimaryIs(NAMES.get(1), 3);
@@ -2473,15 +2297,12 @@ class NanocachedClientTest {
                 client.setMany(values);
 
                 nodeA.dropReplyAfterNextTouch();
-                NanocachedException.PartialConnectionLostStrings partial =
-                        assertThrows(
-                                NanocachedException.PartialConnectionLostStrings.class,
-                                () -> client.getManyAndTouch(all, 0));
+                NanocachedException.PartialConnectionLostStrings partial = assertThrows(
+                        NanocachedException.PartialConnectionLostStrings.class, () -> client.getManyAndTouch(all, 0));
                 Map<String, String> resolved = new java.util.LinkedHashMap<>();
                 for (String key : keysB) resolved.put(key, values.get(key));
                 assertEquals(resolved, partial.partialValues, "the other primary's hits are kept");
-                assertEquals(
-                        1, nodeA.multiTouchFrames.size(), "the applied frame was not sent again");
+                assertEquals(1, nodeA.multiTouchFrames.size(), "the applied frame was not sent again");
             }
         }
     }
@@ -2489,12 +2310,10 @@ class NanocachedClientTest {
     @Test
     void anExpiringBatchTouchStillRetriesKeysThatWereNeverSent() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 MockNode nodeA = cluster.nodes().get(NAMES.get(0));
-                List<String> all =
-                        concat(
-                                keysWhosePrimaryIs(NAMES.get(0), 3),
-                                keysWhosePrimaryIs(NAMES.get(1), 3));
+                List<String> all = concat(keysWhosePrimaryIs(NAMES.get(0), 3), keysWhosePrimaryIs(NAMES.get(1), 3));
                 Map<String, String> values = new java.util.LinkedHashMap<>();
                 for (String key : all) values.put(key, "value of " + key);
                 client.setMany(values);
@@ -2503,10 +2322,7 @@ class NanocachedClientTest {
                 Map<String, Boolean> touched = client.touchMany(all, 0);
                 assertEquals(6, touched.size());
                 assertTrue(touched.values().stream().allMatch(t -> t));
-                assertEquals(
-                        2,
-                        nodeA.multiTouchFrames.size(),
-                        "the keys A answered W for were sent again");
+                assertEquals(2, nodeA.multiTouchFrames.size(), "the keys A answered W for were sent again");
 
                 client.setMany(values);
                 nodeA.answerWrongNodeOnce();
@@ -2516,10 +2332,10 @@ class NanocachedClientTest {
     }
 
     @Test
-    void aReplicaThatPredatesBatchTouchIsCountedPerKeyAndDoesNotFailThePrimarysAnswer()
-            throws Exception {
+    void aReplicaThatPredatesBatchTouchIsCountedPerKeyAndDoesNotFailThePrimarysAnswer() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 MockNode primary = cluster.nodes().get(NAMES.get(0));
                 MockNode replica = cluster.nodes().get(NAMES.get(1));
                 List<String> keys = keysWhosePrimaryIs(NAMES.get(0), 3);
@@ -2543,7 +2359,8 @@ class NanocachedClientTest {
     @Test
     void aPrimaryThatPredatesBatchTouchIsServerTooOldNotAConnectionFailure() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 List<String> keys = keysWhosePrimaryIs(NAMES.get(0), 2);
                 Map<String, String> values = new java.util.LinkedHashMap<>();
                 for (String key : keys) values.put(key, "value of " + key);
@@ -2552,15 +2369,11 @@ class NanocachedClientTest {
 
                 assertEquals(
                         "y",
-                        assertThrows(
-                                        NanocachedException.ServerTooOld.class,
-                                        () -> client.touchMany(keys, 30))
+                        assertThrows(NanocachedException.ServerTooOld.class, () -> client.touchMany(keys, 30))
                                 .command());
                 assertEquals(
                         "y",
-                        assertThrows(
-                                        NanocachedException.ServerTooOld.class,
-                                        () -> client.getManyAndTouch(keys, 30))
+                        assertThrows(NanocachedException.ServerTooOld.class, () -> client.getManyAndTouch(keys, 30))
                                 .command());
             }
         }
@@ -2571,7 +2384,8 @@ class NanocachedClientTest {
         // getManyAndTouch(ttl=0) consumes the values the other primaries
         // return, so an `En` from one primary must not throw them away.
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 List<String> oldKeys = keysWhosePrimaryIs(NAMES.get(0), 2);
                 List<String> newKeys = keysWhosePrimaryIs(NAMES.get(1), 2);
                 List<String> all = new java.util.ArrayList<>(oldKeys);
@@ -2583,20 +2397,16 @@ class NanocachedClientTest {
                 client.setMany(values);
                 cluster.nodes().get(NAMES.get(0)).rejectMultiTouchLikeAnOldServer();
 
-                NanocachedException.PartialServerTooOldStrings strings =
-                        assertThrows(
-                                NanocachedException.PartialServerTooOldStrings.class,
-                                () -> client.getManyAndTouch(all, 0));
+                NanocachedException.PartialServerTooOldStrings strings = assertThrows(
+                        NanocachedException.PartialServerTooOldStrings.class, () -> client.getManyAndTouch(all, 0));
                 assertEquals("y", strings.command());
                 assertEquals(expected, strings.partialValues);
                 // The ttl=0 call above consumed them: this is the loss.
                 assertTrue(client.getMany(newKeys).isEmpty());
                 client.setMany(values);
 
-                NanocachedException.PartialServerTooOld bytes =
-                        assertThrows(
-                                NanocachedException.PartialServerTooOld.class,
-                                () -> client.getManyAndTouchBytes(all, 30));
+                NanocachedException.PartialServerTooOld bytes = assertThrows(
+                        NanocachedException.PartialServerTooOld.class, () -> client.getManyAndTouchBytes(all, 30));
                 assertEquals(expected.keySet(), bytes.partialValues.keySet());
                 for (String key : newKeys) {
                     assertArrayEquals(
@@ -2609,10 +2419,9 @@ class NanocachedClientTest {
                 for (int i = 0; i < all.size(); i++)
                     positional[i] = all.get(i).getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 positional[all.size()] = positional[0];
-                NanocachedException.PartialServerTooOldRaw raw =
-                        assertThrows(
-                                NanocachedException.PartialServerTooOldRaw.class,
-                                () -> client.getManyAndTouchBytes(positional, 30));
+                NanocachedException.PartialServerTooOldRaw raw = assertThrows(
+                        NanocachedException.PartialServerTooOldRaw.class,
+                        () -> client.getManyAndTouchBytes(positional, 30));
                 assertArrayEquals(new int[] {0, 1, all.size()}, raw.unresolvedIndices);
                 assertNull(raw.partialValues[0]);
                 assertTrue(raw.partialValues[2] != null);
@@ -2621,15 +2430,11 @@ class NanocachedClientTest {
                 // where nothing resolved elsewhere throws the bare error.
                 assertEquals(
                         NanocachedException.ServerTooOld.class,
-                        assertThrows(
-                                        NanocachedException.ServerTooOld.class,
-                                        () -> client.touchMany(all, 30))
+                        assertThrows(NanocachedException.ServerTooOld.class, () -> client.touchMany(all, 30))
                                 .getClass());
                 assertEquals(
                         NanocachedException.ServerTooOld.class,
-                        assertThrows(
-                                        NanocachedException.ServerTooOld.class,
-                                        () -> client.getManyAndTouch(oldKeys, 30))
+                        assertThrows(NanocachedException.ServerTooOld.class, () -> client.getManyAndTouch(oldKeys, 30))
                                 .getClass());
             }
         }
@@ -2638,7 +2443,8 @@ class NanocachedClientTest {
     @Test
     void aPrimaryThatAnswersEnToBatchTouchIsNotRedialledOrAskedAgain() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 List<String> keys = keysWhosePrimaryIs(NAMES.get(0), 3);
                 Map<String, String> values = new java.util.LinkedHashMap<>();
                 for (String key : keys) values.put(key, "value of " + key);
@@ -2650,16 +2456,12 @@ class NanocachedClientTest {
                 // call sends one frame, with no resend and no second pass.
                 assertEquals(
                         "y",
-                        assertThrows(
-                                        NanocachedException.ServerTooOld.class,
-                                        () -> client.touchMany(keys, 30))
+                        assertThrows(NanocachedException.ServerTooOld.class, () -> client.touchMany(keys, 30))
                                 .command());
                 assertEquals(1, old.multiTouchFrames.size());
                 assertEquals(
                         "y",
-                        assertThrows(
-                                        NanocachedException.ServerTooOld.class,
-                                        () -> client.getManyAndTouch(keys, 30))
+                        assertThrows(NanocachedException.ServerTooOld.class, () -> client.getManyAndTouch(keys, 30))
                                 .command());
                 assertEquals(2, old.multiTouchFrames.size());
             }
@@ -2669,7 +2471,8 @@ class NanocachedClientTest {
     @Test
     void aPrimaryThatAnswersEnToTouchIsNotRedialledOrAskedAgain() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
                 client.set(key, "v", 100);
                 MockNode old = cluster.nodes().get(NAMES.get(0));
@@ -2679,8 +2482,7 @@ class NanocachedClientTest {
                 // after a redial and none after a refresh.
                 assertThrows(NanocachedException.ServerTooOld.class, () -> client.touch(key, 30));
                 assertEquals(1, old.touchFrames.size());
-                assertThrows(
-                        NanocachedException.ServerTooOld.class, () -> client.getAndTouch(key, 30));
+                assertThrows(NanocachedException.ServerTooOld.class, () -> client.getAndTouch(key, 30));
                 assertEquals(2, old.touchFrames.size());
                 assertThrows(NanocachedException.ServerTooOld.class, () -> client.touch(key, 0));
                 assertEquals(3, old.touchFrames.size());
@@ -2691,7 +2493,8 @@ class NanocachedClientTest {
     @Test
     void aReplicaThatAnswersEnToBatchTouchDoesNotFailTheCall() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 List<String> keys = keysWhosePrimaryIs(NAMES.get(0), 3);
                 Map<String, String> values = new java.util.LinkedHashMap<>();
                 for (String key : keys) values.put(key, "value of " + key);
@@ -2710,7 +2513,8 @@ class NanocachedClientTest {
     @Test
     void batchTouchReportsAnUnreachablePrimaryAsAConnectionFailureNotWrongNode() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String dead = NAMES.get(0);
                 List<String> deadKeys = keysWhosePrimaryIs(dead, 3);
                 List<String> liveKeys = keysWhosePrimaryIs(NAMES.get(1), 3);
@@ -2722,15 +2526,11 @@ class NanocachedClientTest {
                 Thread.sleep(50); // let the FIN land
 
                 NanocachedException touchFailure =
-                        assertThrows(
-                                NanocachedException.ConnectionLost.class,
-                                () -> client.touchMany(all, 30));
+                        assertThrows(NanocachedException.ConnectionLost.class, () -> client.touchMany(all, 30));
                 assertFalse(touchFailure instanceof NanocachedException.WrongNode);
 
-                NanocachedException.PartialConnectionLostStrings failure =
-                        assertThrows(
-                                NanocachedException.PartialConnectionLostStrings.class,
-                                () -> client.getManyAndTouch(all, 30));
+                NanocachedException.PartialConnectionLostStrings failure = assertThrows(
+                        NanocachedException.PartialConnectionLostStrings.class, () -> client.getManyAndTouch(all, 30));
                 Map<String, String> live = new java.util.LinkedHashMap<>();
                 for (String key : liveKeys) live.put(key, values.get(key));
                 assertEquals(live, failure.partialValues);
@@ -2744,7 +2544,8 @@ class NanocachedClientTest {
     @Test
     void batchTouchGoesToTheOwnersOfANamespacedKey() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 NanocachedClient.Namespace tenant = client.namespace("tenant");
                 List<String> keys = List.of("a", "b", "c", "d", "e", "f");
                 Map<String, String> values = new java.util.LinkedHashMap<>();
@@ -2758,7 +2559,9 @@ class NanocachedClientTest {
                         assertEquals("tenant", frame.namespace());
                     }
                     for (String key : keys) {
-                        assertEquals(Long.valueOf(31), node.namespacedTtls.get("tenant").get(key));
+                        assertEquals(
+                                Long.valueOf(31),
+                                node.namespacedTtls.get("tenant").get(key));
                     }
                 }
             }
@@ -2768,7 +2571,8 @@ class NanocachedClientTest {
     @Test
     void batchTouchReachesAFireAndForgetReplicaInTheBackground() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connectFireAndForget(cluster.discovery().port())) {
                 MockNode replica = cluster.nodes().get(NAMES.get(1));
                 List<String> keys = keysWhosePrimaryIs(NAMES.get(0), 3);
                 Map<String, String> values = new java.util.LinkedHashMap<>();
@@ -2777,23 +2581,15 @@ class NanocachedClientTest {
                 // The replica's copy of the set is a background write too: a touch that reaches the
                 // replica first finds nothing to touch, and the set then lands without a TTL.
                 waitFor(
-                        () ->
-                                keys.stream()
-                                        .allMatch(key ->
-                                                replica.store.containsKey(
-                                                        MockNode.keyOf(
-                                                                key.getBytes(
-                                                                        StandardCharsets.UTF_8)))),
+                        () -> keys.stream()
+                                .allMatch(key -> replica.store.containsKey(
+                                        MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8)))),
                         "the background set to land on the replica");
 
                 assertTrue(client.touchMany(keys, 30).values().stream().allMatch(t -> t));
-                waitFor(
-                        () -> !replica.multiTouchFrames.isEmpty(),
-                        "the background touch to reach the replica");
+                waitFor(() -> !replica.multiTouchFrames.isEmpty(), "the background touch to reach the replica");
                 for (String key : keys) {
-                    waitFor(
-                            () -> Long.valueOf(30).equals(replica.ttls.get(key)),
-                            "the replica's TTL");
+                    waitFor(() -> Long.valueOf(30).equals(replica.ttls.get(key)), "the replica's TTL");
                 }
             }
         }
@@ -2810,8 +2606,7 @@ class NanocachedClientTest {
     void contentDigestMatchesThePinnedCrossLanguageVector() {
         assertEquals(
                 "36287141940ca57acbd7695ccdde9d43",
-                NanocachedClient.contentDigest(
-                        "nanocached-cas-vector".getBytes(StandardCharsets.UTF_8)));
+                NanocachedClient.contentDigest("nanocached-cas-vector".getBytes(StandardCharsets.UTF_8)));
     }
 
     @Test
@@ -2854,9 +2649,7 @@ class NanocachedClientTest {
                 client.set("k", "v1");
                 NanocachedClient.CasEntry entry = client.getWithToken("k").orElseThrow();
                 assertEquals("v1", new String(entry.value(), StandardCharsets.UTF_8));
-                assertEquals(
-                        NanocachedClient.contentDigest("v1".getBytes(StandardCharsets.UTF_8)),
-                        entry.token());
+                assertEquals(NanocachedClient.contentDigest("v1".getBytes(StandardCharsets.UTF_8)), entry.token());
 
                 // A stale token (from before someone else's concurrent
                 // write) is rejected.
@@ -2881,14 +2674,10 @@ class NanocachedClientTest {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("k", "v");
-                assertThrows(
-                        IllegalArgumentException.class,
-                        () -> client.replace("k", "not-a-digest", "v2"));
+                assertThrows(IllegalArgumentException.class, () -> client.replace("k", "not-a-digest", "v2"));
                 assertThrows(IllegalArgumentException.class, () -> client.replace("k", "A", "v2"));
-                assertThrows(
-                        IllegalArgumentException.class, () -> client.deleteIfMatches("k", "P"));
-                assertThrows(
-                        IllegalArgumentException.class, () -> client.deleteIfMatches("k", null));
+                assertThrows(IllegalArgumentException.class, () -> client.deleteIfMatches("k", "P"));
+                assertThrows(IllegalArgumentException.class, () -> client.deleteIfMatches("k", null));
                 // Rejected client-side: the value must be untouched.
                 assertEquals(Optional.of("v"), client.get("k"));
             }
@@ -2900,8 +2689,7 @@ class NanocachedClientTest {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("k", "v");
-                String staleToken =
-                        NanocachedClient.contentDigest("wrong".getBytes(StandardCharsets.UTF_8));
+                String staleToken = NanocachedClient.contentDigest("wrong".getBytes(StandardCharsets.UTF_8));
                 assertFalse(client.deleteIfMatches("k", staleToken));
                 assertEquals(Optional.of("v"), client.get("k"));
 
@@ -2931,15 +2719,10 @@ class NanocachedClientTest {
                 assertTrue(client.putIfAbsent("k", "v", 60));
                 assertEquals(Long.valueOf(60), node.ttls.get("k"));
 
-                assertThrows(
-                        IllegalArgumentException.class, () -> client.putIfAbsent("k2", "v", -1L));
-                assertThrows(
-                        IllegalArgumentException.class,
-                        () -> client.replaceIfPresent("k", "v2", -1L));
+                assertThrows(IllegalArgumentException.class, () -> client.putIfAbsent("k2", "v", -1L));
+                assertThrows(IllegalArgumentException.class, () -> client.replaceIfPresent("k", "v2", -1L));
                 String token = client.getWithToken("k").orElseThrow().token();
-                assertThrows(
-                        IllegalArgumentException.class,
-                        () -> client.replace("k", token, "v3", -1L));
+                assertThrows(IllegalArgumentException.class, () -> client.replace("k", token, "v3", -1L));
             }
         }
     }
@@ -2959,9 +2742,8 @@ class NanocachedClientTest {
                 assertEquals(Optional.of("default-value"), client.get("k"));
                 assertEquals(Optional.of("tenant-value-2"), tenant.get("k"));
 
-                assertTrue(
-                        tenant.deleteIfMatches(
-                                "k", tenant.getWithToken("k").orElseThrow().token()));
+                assertTrue(tenant.deleteIfMatches(
+                        "k", tenant.getWithToken("k").orElseThrow().token()));
                 assertEquals(Optional.empty(), tenant.get("k"));
                 assertEquals(Optional.of("default-value"), client.get("k"));
             }
@@ -3001,9 +2783,7 @@ class NanocachedClientTest {
                 client.set("k", "v1");
                 String token = client.getWithToken("k").orElseThrow().token();
                 node.dropReplyAfterNextCasSet();
-                assertThrows(
-                        NanocachedException.ConnectionLost.class,
-                        () -> client.replace("k", token, "v2"));
+                assertThrows(NanocachedException.ConnectionLost.class, () -> client.replace("k", token, "v2"));
                 assertEquals(Optional.of("v2"), client.get("k"));
             }
         }
@@ -3018,11 +2798,8 @@ class NanocachedClientTest {
         // same call also returns, or a subsequent k/x conditioned on this
         // token would never match what the server actually stores.
         try (MockNode node = new MockNode()) {
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            single("127.0.0.1", node.port())
-                                    .compress(true)
-                                    .compressionThreshold(4))) {
+            try (NanocachedClient client = NanocachedClient.connect(
+                    single("127.0.0.1", node.port()).compress(true).compressionThreshold(4))) {
                 String value = "x".repeat(1000);
                 client.set("k", value);
 
@@ -3032,18 +2809,15 @@ class NanocachedClientTest {
                 NanocachedClient.CasEntry entry = client.getWithToken("k").orElseThrow();
                 assertEquals(value, new String(entry.value(), StandardCharsets.UTF_8));
                 assertEquals(NanocachedClient.contentDigest(rawWireBytes), entry.token());
-                assertNotEquals(
-                        NanocachedClient.contentDigest(value.getBytes(StandardCharsets.UTF_8)),
-                        entry.token());
+                assertNotEquals(NanocachedClient.contentDigest(value.getBytes(StandardCharsets.UTF_8)), entry.token());
 
                 // The token from getWithToken must actually work against
                 // the real server-side condition check.
                 String replacement = "y".repeat(1000);
-                assertTrue(
-                        client.replace(
-                                "k".getBytes(StandardCharsets.UTF_8),
-                                entry.token(),
-                                replacement.getBytes(StandardCharsets.UTF_8)));
+                assertTrue(client.replace(
+                        "k".getBytes(StandardCharsets.UTF_8),
+                        entry.token(),
+                        replacement.getBytes(StandardCharsets.UTF_8)));
                 assertEquals(Optional.of(replacement), client.get("k"));
                 // The replacement value must itself go through the same
                 // compression pipeline set() uses, so a later get (from
@@ -3104,8 +2878,7 @@ class NanocachedClientTest {
                 // over the limit must be rejected too.
                 byte[] smallKey = "k".getBytes(StandardCharsets.UTF_8);
                 byte[] oversizeValue = new byte[1024 * 1024];
-                assertThrows(
-                        IllegalArgumentException.class, () -> client.set(smallKey, oversizeValue));
+                assertThrows(IllegalArgumentException.class, () -> client.set(smallKey, oversizeValue));
 
                 // None of the above should have opened another connection.
                 assertEquals(connectionsBeforeRejections, node.connectionCount.get());
@@ -3131,17 +2904,14 @@ class NanocachedClientTest {
         // connect (and a smaller huge cooldown wrapped nanoTime() + nanos).
         Duration huge = Duration.ofSeconds(Long.MAX_VALUE);
         assertThrows(
-                IllegalArgumentException.class,
-                () -> NanocachedClient.builder().reconnectCooldown(huge));
+                IllegalArgumentException.class, () -> NanocachedClient.builder().reconnectCooldown(huge));
         assertThrows(
-                IllegalArgumentException.class,
-                () -> NanocachedClient.builder().readHedgeAfter(huge));
+                IllegalArgumentException.class, () -> NanocachedClient.builder().readHedgeAfter(huge));
         assertThrows(
                 IllegalArgumentException.class,
                 () -> NanocachedClient.builder().reconnectCooldown(Duration.ofDays(366)));
         assertThrows(
-                IllegalArgumentException.class,
-                () -> NanocachedClient.builder().readHedgeAfter(Duration.ofDays(366)));
+                IllegalArgumentException.class, () -> NanocachedClient.builder().readHedgeAfter(Duration.ofDays(366)));
         // The bound is generous: a day-scale value is still accepted.
         NanocachedClient.builder().reconnectCooldown(Duration.ofDays(365));
         NanocachedClient.builder().readHedgeAfter(Duration.ofDays(365));
@@ -3150,8 +2920,7 @@ class NanocachedClientTest {
     @Test
     void reconnectCooldownStillRejectsNullOrNegative() {
         assertThrows(
-                IllegalArgumentException.class,
-                () -> NanocachedClient.builder().reconnectCooldown(null));
+                IllegalArgumentException.class, () -> NanocachedClient.builder().reconnectCooldown(null));
         assertThrows(
                 IllegalArgumentException.class,
                 () -> NanocachedClient.builder().reconnectCooldown(Duration.ofMillis(-1)));
@@ -3195,26 +2964,21 @@ class NanocachedClientTest {
     void authenticates() throws Exception {
         try (MockNode node = new MockNode("s3cret".getBytes(StandardCharsets.UTF_8))) {
             try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            single("127.0.0.1", node.port()).authSecret("s3cret"))) {
+                    NanocachedClient.connect(single("127.0.0.1", node.port()).authSecret("s3cret"))) {
                 client.set("k", "v");
                 assertEquals(Optional.of("v"), client.get("k"));
             }
 
             // Both shapes are matchable as AuthenticationFailed (issue
             // #47 item 5), not just by message.
-            NanocachedException missing =
-                    assertThrows(
-                            NanocachedException.AuthenticationFailed.class,
-                            () -> connect("127.0.0.1", node.port()));
+            NanocachedException missing = assertThrows(
+                    NanocachedException.AuthenticationFailed.class, () -> connect("127.0.0.1", node.port()));
             assertTrue(missing.getMessage().contains("requires authentication"));
 
-            NanocachedException wrong =
-                    assertThrows(
-                            NanocachedException.AuthenticationFailed.class,
-                            () ->
-                                    NanocachedClient.connect(
-                                            single("127.0.0.1", node.port()).authSecret("wrong")));
+            NanocachedException wrong = assertThrows(
+                    NanocachedException.AuthenticationFailed.class,
+                    () -> NanocachedClient.connect(
+                            single("127.0.0.1", node.port()).authSecret("wrong")));
             assertTrue(wrong.getMessage().contains("authentication failed"));
         }
     }
@@ -3279,9 +3043,7 @@ class NanocachedClientTest {
                 NanocachedClient[] second = new NanocachedClient[1];
                 String output = captureStderr(() -> second[0] = connect("127.0.0.1", node.port()));
                 try {
-                    assertTrue(
-                            output.contains("was close() forgotten?"),
-                            "unexpected stderr: " + output);
+                    assertTrue(output.contains("was close() forgotten?"), "unexpected stderr: " + output);
                 } finally {
                     second[0].close();
                 }
@@ -3308,11 +3070,8 @@ class NanocachedClientTest {
     @Test
     void compressesAtOrAboveTheThresholdAndDecompressesBack() throws Exception {
         try (MockNode node = new MockNode()) {
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            single("127.0.0.1", node.port())
-                                    .compress(true)
-                                    .compressionThreshold(64))) {
+            try (NanocachedClient client = NanocachedClient.connect(
+                    single("127.0.0.1", node.port()).compress(true).compressionThreshold(64))) {
                 String value = "x".repeat(1000);
                 client.set("k", value);
 
@@ -3322,7 +3081,8 @@ class NanocachedClientTest {
 
                 assertEquals(Optional.of(value), client.get("k"));
                 assertArrayEquals(
-                        value.getBytes(StandardCharsets.UTF_8), client.getBytes("k").orElseThrow());
+                        value.getBytes(StandardCharsets.UTF_8),
+                        client.getBytes("k").orElseThrow());
             }
         }
     }
@@ -3336,14 +3096,10 @@ class NanocachedClientTest {
         // check). Rejected at connect() time, before any socket is
         // touched, exactly like the empty-addresses-list check.
         try (MockNode node = new MockNode()) {
-            IllegalArgumentException error =
-                    assertThrows(
-                            IllegalArgumentException.class,
-                            () ->
-                                    NanocachedClient.connect(
-                                            single("127.0.0.1", node.port())
-                                                    .compress(true)
-                                                    .compressionThreshold(-1)));
+            IllegalArgumentException error = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> NanocachedClient.connect(
+                            single("127.0.0.1", node.port()).compress(true).compressionThreshold(-1)));
             assertTrue(error.getMessage().contains("compressionThreshold"), error.getMessage());
         }
     }
@@ -3351,11 +3107,8 @@ class NanocachedClientTest {
     @Test
     void belowThresholdValueIsPrefixedButNotCompressed() throws Exception {
         try (MockNode node = new MockNode()) {
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            single("127.0.0.1", node.port())
-                                    .compress(true)
-                                    .compressionThreshold(256))) {
+            try (NanocachedClient client = NanocachedClient.connect(
+                    single("127.0.0.1", node.port()).compress(true).compressionThreshold(256))) {
                 client.set("k", "short");
                 byte[] expected = new byte[6];
                 expected[0] = 0x00;
@@ -3369,11 +3122,8 @@ class NanocachedClientTest {
     @Test
     void incompressibleDataPassesThroughUnbloated() throws Exception {
         try (MockNode node = new MockNode()) {
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            single("127.0.0.1", node.port())
-                                    .compress(true)
-                                    .compressionThreshold(16))) {
+            try (NanocachedClient client = NanocachedClient.connect(
+                    single("127.0.0.1", node.port()).compress(true).compressionThreshold(16))) {
                 byte[] value = new byte[512];
                 new java.security.SecureRandom().nextBytes(value);
                 client.set("k".getBytes(StandardCharsets.UTF_8), value);
@@ -3398,8 +3148,7 @@ class NanocachedClientTest {
 
             try (NanocachedClient reader =
                     NanocachedClient.connect(single("127.0.0.1", node.port()).compress(true))) {
-                assertThrows(
-                        NanocachedException.DecompressionFailed.class, () -> reader.getBytes("k"));
+                assertThrows(NanocachedException.DecompressionFailed.class, () -> reader.getBytes("k"));
             }
         }
     }
@@ -3480,8 +3229,7 @@ class NanocachedClientTest {
             // Timing: a wide cooldown window and fast-rejection bound keep this
             // from flaking on loaded CI runners.
             try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            single("127.0.0.1", port).reconnectCooldown(Duration.ofMillis(1000)))) {
+                    NanocachedClient.connect(single("127.0.0.1", port).reconnectCooldown(Duration.ofMillis(1000)))) {
                 client.set("k", "v");
                 node.close();
 
@@ -3499,8 +3247,7 @@ class NanocachedClientTest {
                 // poll stays as a belt-and-braces guard, since all the
                 // cooldown assertions below need is that the failure
                 // shows up promptly.
-                NanocachedException.ConnectionLost firstError =
-                        firstConnectionFailure(client, port);
+                NanocachedException.ConnectionLost firstError = firstConnectionFailure(client, port);
 
                 // A listener now sits on the same port and answers
                 // immediately with bytes the identify handshake rejects
@@ -3510,32 +3257,24 @@ class NanocachedClientTest {
                 // fails after exactly one connection, letting
                 // `connections` below tell "cooldown skipped the dial"
                 // apart from "cooldown let it through" unambiguously.
-                java.util.concurrent.atomic.AtomicInteger connections =
-                        new java.util.concurrent.atomic.AtomicInteger();
-                java.util.Set<java.net.Socket> acceptedSockets =
-                        java.util.concurrent.ConcurrentHashMap.newKeySet();
+                java.util.concurrent.atomic.AtomicInteger connections = new java.util.concurrent.atomic.AtomicInteger();
+                java.util.Set<java.net.Socket> acceptedSockets = java.util.concurrent.ConcurrentHashMap.newKeySet();
                 try (java.net.ServerSocket garbage = new java.net.ServerSocket(port)) {
-                    Thread acceptor =
-                            new Thread(
-                                    () -> {
-                                        while (!garbage.isClosed()) {
-                                            try {
-                                                java.net.Socket socket = garbage.accept();
-                                                connections.incrementAndGet();
-                                                acceptedSockets.add(socket);
-                                                socket.getOutputStream()
-                                                        .write(
-                                                                "XXX"
-                                                                        .getBytes(
-                                                                                StandardCharsets
-                                                                                        .US_ASCII));
-                                                socket.getOutputStream().flush();
-                                            } catch (java.io.IOException stop) {
-                                                return;
-                                            }
-                                        }
-                                    },
-                                    "garbage-accept");
+                    Thread acceptor = new Thread(
+                            () -> {
+                                while (!garbage.isClosed()) {
+                                    try {
+                                        java.net.Socket socket = garbage.accept();
+                                        connections.incrementAndGet();
+                                        acceptedSockets.add(socket);
+                                        socket.getOutputStream().write("XXX".getBytes(StandardCharsets.US_ASCII));
+                                        socket.getOutputStream().flush();
+                                    } catch (java.io.IOException stop) {
+                                        return;
+                                    }
+                                }
+                            },
+                            "garbage-accept");
                     acceptor.setDaemon(true);
                     acceptor.start();
 
@@ -3544,30 +3283,18 @@ class NanocachedClientTest {
                     // near-instantly, without dialing the listener at all.
                     long started = System.nanoTime();
                     NanocachedException.ConnectionLost secondError =
-                            assertThrows(
-                                    NanocachedException.ConnectionLost.class,
-                                    () -> client.get("k"));
+                            assertThrows(NanocachedException.ConnectionLost.class, () -> client.get("k"));
                     long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
-                    assertTrue(
-                            elapsedMillis < 500,
-                            "expected a cooldown-fast rejection, took " + elapsedMillis + "ms");
+                    assertTrue(elapsedMillis < 500, "expected a cooldown-fast rejection, took " + elapsedMillis + "ms");
                     assertEquals(0, connections.get(), "the cooldown did not prevent a redial");
-                    assertTrue(
-                            firstError == secondError,
-                            "expected the exact same cached exception, not a fresh one");
+                    assertTrue(firstError == secondError, "expected the exact same cached exception, not a fresh one");
 
                     // Once the cooldown window has passed, the address is
                     // dialed again, this time reaching the listener.
                     Thread.sleep(1200);
-                    NanocachedException thirdError =
-                            assertThrows(NanocachedException.class, () -> client.get("k"));
-                    assertTrue(
-                            thirdError.getMessage().contains("unexpected response to A"),
-                            thirdError.getMessage());
-                    assertEquals(
-                            1,
-                            connections.get(),
-                            "the address was never redialed after the cooldown elapsed");
+                    NanocachedException thirdError = assertThrows(NanocachedException.class, () -> client.get("k"));
+                    assertTrue(thirdError.getMessage().contains("unexpected response to A"), thirdError.getMessage());
+                    assertEquals(1, connections.get(), "the address was never redialed after the cooldown elapsed");
 
                     for (java.net.Socket socket : acceptedSockets) socket.close();
                 }
@@ -3589,29 +3316,26 @@ class NanocachedClientTest {
         try (MockNode node = new MockNode()) {
             int port = node.port();
             try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            single("127.0.0.1", port).reconnectCooldown(Duration.ZERO))) {
+                    NanocachedClient.connect(single("127.0.0.1", port).reconnectCooldown(Duration.ZERO))) {
                 client.set("k", "v");
                 node.close();
                 firstConnectionFailure(client, port);
 
-                java.util.concurrent.atomic.AtomicInteger connections =
-                        new java.util.concurrent.atomic.AtomicInteger();
+                java.util.concurrent.atomic.AtomicInteger connections = new java.util.concurrent.atomic.AtomicInteger();
                 try (java.net.ServerSocket garbage = new java.net.ServerSocket(port)) {
-                    Thread acceptor =
-                            new Thread(
-                                    () -> {
-                                        while (!garbage.isClosed()) {
-                                            try {
-                                                java.net.Socket socket = garbage.accept();
-                                                connections.incrementAndGet();
-                                                socket.close();
-                                            } catch (java.io.IOException stop) {
-                                                return;
-                                            }
-                                        }
-                                    },
-                                    "garbage-accept-zero-cooldown");
+                    Thread acceptor = new Thread(
+                            () -> {
+                                while (!garbage.isClosed()) {
+                                    try {
+                                        java.net.Socket socket = garbage.accept();
+                                        connections.incrementAndGet();
+                                        socket.close();
+                                    } catch (java.io.IOException stop) {
+                                        return;
+                                    }
+                                }
+                            },
+                            "garbage-accept-zero-cooldown");
                     acceptor.setDaemon(true);
                     acceptor.start();
 
@@ -3620,9 +3344,7 @@ class NanocachedClientTest {
                     // cached failure without a redial at all.
                     assertThrows(NanocachedException.ConnectionLost.class, () -> client.get("k"));
                     assertEquals(
-                            0,
-                            connections.get(),
-                            "Duration.ZERO must select the default cooldown, not disable it");
+                            0, connections.get(), "Duration.ZERO must select the default cooldown, not disable it");
                 }
             }
         }
@@ -3638,8 +3360,7 @@ class NanocachedClientTest {
         try (MockNode node = new MockNode()) {
             int port = node.port();
             try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            single("127.0.0.1", port).disableReconnectCooldown())) {
+                    NanocachedClient.connect(single("127.0.0.1", port).disableReconnectCooldown())) {
                 client.set("k", "v");
                 node.close();
                 // Timing: the closed node's FIN may not have reached the
@@ -3651,40 +3372,30 @@ class NanocachedClientTest {
                 // very first call.
                 firstConnectionFailure(client, port);
 
-                java.util.Set<java.net.Socket> acceptedSockets =
-                        java.util.concurrent.ConcurrentHashMap.newKeySet();
-                java.util.concurrent.atomic.AtomicInteger connections =
-                        new java.util.concurrent.atomic.AtomicInteger();
+                java.util.Set<java.net.Socket> acceptedSockets = java.util.concurrent.ConcurrentHashMap.newKeySet();
+                java.util.concurrent.atomic.AtomicInteger connections = new java.util.concurrent.atomic.AtomicInteger();
                 try (java.net.ServerSocket garbage = new java.net.ServerSocket(port)) {
-                    Thread acceptor =
-                            new Thread(
-                                    () -> {
-                                        while (!garbage.isClosed()) {
-                                            try {
-                                                java.net.Socket socket = garbage.accept();
-                                                connections.incrementAndGet();
-                                                acceptedSockets.add(socket);
-                                                socket.getOutputStream()
-                                                        .write(
-                                                                "XXX"
-                                                                        .getBytes(
-                                                                                StandardCharsets
-                                                                                        .US_ASCII));
-                                                socket.getOutputStream().flush();
-                                            } catch (java.io.IOException stop) {
-                                                return;
-                                            }
-                                        }
-                                    },
-                                    "garbage-accept-disabled-cooldown");
+                    Thread acceptor = new Thread(
+                            () -> {
+                                while (!garbage.isClosed()) {
+                                    try {
+                                        java.net.Socket socket = garbage.accept();
+                                        connections.incrementAndGet();
+                                        acceptedSockets.add(socket);
+                                        socket.getOutputStream().write("XXX".getBytes(StandardCharsets.US_ASCII));
+                                        socket.getOutputStream().flush();
+                                    } catch (java.io.IOException stop) {
+                                        return;
+                                    }
+                                }
+                            },
+                            "garbage-accept-disabled-cooldown");
                     acceptor.setDaemon(true);
                     acceptor.start();
 
                     assertThrows(NanocachedException.class, () -> client.get("k"));
                     assertThrows(NanocachedException.class, () -> client.get("k"));
-                    waitFor(
-                            () -> connections.get() >= 2,
-                            "every call to redial instead of reusing a cached failure");
+                    waitFor(() -> connections.get() >= 2, "every call to redial instead of reusing a cached failure");
 
                     for (java.net.Socket socket : acceptedSockets) socket.close();
                 }
@@ -3723,9 +3434,7 @@ class NanocachedClientTest {
                 // for more than half an interval but less than a full one.
                 client.set("k", "v");
                 long deadline =
-                        System.nanoTime()
-                                + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
-                                        interval * 3 / 2);
+                        System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(interval * 3 / 2);
                 while (node.getCount.get() < 2) {
                     assertTrue(System.nanoTime() < deadline, "no keep-alive ping at the next tick");
                     Thread.sleep(5);
@@ -3755,15 +3464,11 @@ class NanocachedClientTest {
                 // layer does not redial and resend after one (the peer is
                 // reachable and simply not answering), so this settles
                 // after one window.
-                NanocachedException error =
-                        assertThrows(NanocachedException.class, () -> client.get("k"));
+                NanocachedException error = assertThrows(NanocachedException.class, () -> client.get("k"));
                 assertTrue(
-                        error.getMessage().contains("request timed out"),
-                        "unexpected failure: " + error.getMessage());
+                        error.getMessage().contains("request timed out"), "unexpected failure: " + error.getMessage());
                 long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
-                assertTrue(
-                        elapsedMillis < 2_000,
-                        "get() took " + elapsedMillis + "ms, want well under 2s");
+                assertTrue(elapsedMillis < 2_000, "get() took " + elapsedMillis + "ms, want well under 2s");
             }
         } finally {
             Connection.requestTimeoutMillis = defaultTimeout;
@@ -3785,36 +3490,32 @@ class NanocachedClientTest {
                 // New requests keep arriving well inside every deadline
                 // window (once the connection is poisoned they just fail
                 // fast).
-                Thread ticker =
-                        new Thread(
-                                () -> {
+                Thread ticker = new Thread(
+                        () -> {
+                            try {
+                                while (!Thread.interrupted()) {
+                                    Thread.sleep(50);
                                     try {
-                                        while (!Thread.interrupted()) {
-                                            Thread.sleep(50);
-                                            try {
-                                                client.get("more");
-                                            } catch (RuntimeException ignored) {
-                                                // Expected once the connection is poisoned.
-                                            }
-                                        }
-                                    } catch (InterruptedException done) {
-                                        // Test finished.
+                                        client.get("more");
+                                    } catch (RuntimeException ignored) {
+                                        // Expected once the connection is poisoned.
                                     }
-                                },
-                                "test-steady-traffic");
+                                }
+                            } catch (InterruptedException done) {
+                                // Test finished.
+                            }
+                        },
+                        "test-steady-traffic");
                 ticker.setDaemon(true);
                 ticker.start();
                 try {
                     long started = System.nanoTime();
-                    NanocachedException error =
-                            assertThrows(NanocachedException.class, () -> client.get("k"));
+                    NanocachedException error = assertThrows(NanocachedException.class, () -> client.get("k"));
                     assertTrue(
                             error.getMessage().contains("request timed out"),
                             "unexpected failure: " + error.getMessage());
                     long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
-                    assertTrue(
-                            elapsedMillis < 2_000,
-                            "get() took " + elapsedMillis + "ms, want well under 2s");
+                    assertTrue(elapsedMillis < 2_000, "get() took " + elapsedMillis + "ms, want well under 2s");
                 } finally {
                     ticker.interrupt();
                     ticker.join(5_000);
@@ -3836,8 +3537,7 @@ class NanocachedClientTest {
         try (java.net.Socket socket = new java.net.Socket()) {
             try (MockNode node = new MockNode()) {
                 socket.connect(new java.net.InetSocketAddress("127.0.0.1", node.port()));
-                java.util.concurrent.atomic.AtomicInteger closedCount =
-                        new java.util.concurrent.atomic.AtomicInteger();
+                java.util.concurrent.atomic.AtomicInteger closedCount = new java.util.concurrent.atomic.AtomicInteger();
                 Connection connection = new Connection(socket, false, closedCount::incrementAndGet);
 
                 ExecutorService pool = Executors.newFixedThreadPool(8);
@@ -3870,27 +3570,23 @@ class NanocachedClientTest {
         try (MockNode node = new MockNode()) {
             NanocachedClient client = connect("127.0.0.1", node.port());
             try {
-                java.lang.reflect.Field targetKeyField =
-                        NanocachedClient.class.getDeclaredField("targetKey");
+                java.lang.reflect.Field targetKeyField = NanocachedClient.class.getDeclaredField("targetKey");
                 targetKeyField.setAccessible(true);
                 String targetKey = (String) targetKeyField.get(client);
 
-                java.lang.reflect.Field openTargetsField =
-                        NanocachedClient.class.getDeclaredField("OPEN_TARGETS");
+                java.lang.reflect.Field openTargetsField = NanocachedClient.class.getDeclaredField("OPEN_TARGETS");
                 openTargetsField.setAccessible(true);
                 @SuppressWarnings("unchecked")
                 java.util.concurrent.ConcurrentHashMap<String, Integer> openTargets =
-                        (java.util.concurrent.ConcurrentHashMap<String, Integer>)
-                                openTargetsField.get(null);
+                        (java.util.concurrent.ConcurrentHashMap<String, Integer>) openTargetsField.get(null);
                 int before = openTargets.getOrDefault(targetKey, 0);
 
                 // Never connected: getInputStream()/getOutputStream() (and
                 // thus Connection's constructor) throw IOException on it.
                 java.net.Socket neverConnected = new java.net.Socket();
 
-                java.lang.reflect.Method newTrackedConnection =
-                        NanocachedClient.class.getDeclaredMethod(
-                                "newTrackedConnection", java.net.Socket.class, boolean.class);
+                java.lang.reflect.Method newTrackedConnection = NanocachedClient.class.getDeclaredMethod(
+                        "newTrackedConnection", java.net.Socket.class, boolean.class);
                 newTrackedConnection.setAccessible(true);
                 assertThrows(
                         java.lang.reflect.InvocationTargetException.class,
@@ -3901,8 +3597,7 @@ class NanocachedClientTest {
                         openTargets.getOrDefault(targetKey, 0),
                         "the open-target counter must not leak when the Connection constructor fails");
                 assertTrue(
-                        neverConnected.isClosed(),
-                        "the socket must be closed when the Connection constructor fails");
+                        neverConnected.isClosed(), "the socket must be closed when the Connection constructor fails");
             } finally {
                 client.close();
             }
@@ -3913,10 +3608,8 @@ class NanocachedClientTest {
 
     @Test
     void rejectsAMissingTarget() {
-        IllegalArgumentException error =
-                assertThrows(
-                        IllegalArgumentException.class,
-                        () -> NanocachedClient.connect(NanocachedClient.builder()));
+        IllegalArgumentException error = assertThrows(
+                IllegalArgumentException.class, () -> NanocachedClient.connect(NanocachedClient.builder()));
         assertTrue(error.getMessage().contains("non-empty addresses list"));
     }
 
@@ -3924,16 +3617,10 @@ class NanocachedClientTest {
     void failsOverToTheSecondAddress() throws Exception {
         try (MockNode node = new MockNode();
                 MockDiscovery discovery =
-                        new MockDiscovery(
-                                List.of(new DiscoveredNode(NAMES.get(0), node.address())), 1)) {
+                        new MockDiscovery(List.of(new DiscoveredNode(NAMES.get(0), node.address())), 1)) {
             int dead = MockServers.unusedPort();
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            NanocachedClient.builder()
-                                    .addresses(
-                                            List.of(
-                                                    new Address("127.0.0.1", dead),
-                                                    new Address("127.0.0.1", discovery.port()))))) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(new Address("127.0.0.1", dead), new Address("127.0.0.1", discovery.port()))))) {
                 client.set("k", "v");
                 assertEquals(Optional.of("v"), client.get("k"));
             }
@@ -3950,31 +3637,25 @@ class NanocachedClientTest {
         // which would trigger a second, equally doomed untagged dial.
         try (MockNode node = new MockNode();
                 MockDiscovery discovery =
-                        new MockDiscovery(
-                                List.of(new DiscoveredNode(NAMES.get(0), node.address())), 1);
+                        new MockDiscovery(List.of(new DiscoveredNode(NAMES.get(0), node.address())), 1);
                 java.net.ServerSocket silent = new java.net.ServerSocket(0)) {
-            List<java.net.Socket> acceptedSockets =
-                    java.util.Collections.synchronizedList(new ArrayList<>());
-            Thread acceptor =
-                    new Thread(
-                            () -> {
-                                try {
-                                    while (true) acceptedSockets.add(silent.accept());
-                                } catch (java.io.IOException ignored) {
-                                    // Server socket closed.
-                                }
-                            },
-                            "test-silent-accept");
+            List<java.net.Socket> acceptedSockets = java.util.Collections.synchronizedList(new ArrayList<>());
+            Thread acceptor = new Thread(
+                    () -> {
+                        try {
+                            while (true) acceptedSockets.add(silent.accept());
+                        } catch (java.io.IOException ignored) {
+                            // Server socket closed.
+                        }
+                    },
+                    "test-silent-accept");
             acceptor.setDaemon(true);
             acceptor.start();
 
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            NanocachedClient.builder()
-                                    .addresses(
-                                            List.of(
-                                                    new Address("127.0.0.1", silent.getLocalPort()),
-                                                    new Address("127.0.0.1", discovery.port()))))) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(
+                            new Address("127.0.0.1", silent.getLocalPort()),
+                            new Address("127.0.0.1", discovery.port()))))) {
                 client.set("k", "v");
                 assertEquals(Optional.of("v"), client.get("k"));
             }
@@ -3992,19 +3673,13 @@ class NanocachedClientTest {
     void skipsAWarmingUpAddress() throws Exception {
         try (MockNode node = new MockNode();
                 MockDiscovery warming =
-                        new MockDiscovery(
-                                List.of(new DiscoveredNode(NAMES.get(0), node.address())), 1);
+                        new MockDiscovery(List.of(new DiscoveredNode(NAMES.get(0), node.address())), 1);
                 MockDiscovery healthy =
-                        new MockDiscovery(
-                                List.of(new DiscoveredNode(NAMES.get(0), node.address())), 1)) {
+                        new MockDiscovery(List.of(new DiscoveredNode(NAMES.get(0), node.address())), 1)) {
             warming.warmingUp = true;
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            NanocachedClient.builder()
-                                    .addresses(
-                                            List.of(
-                                                    new Address("127.0.0.1", warming.port()),
-                                                    new Address("127.0.0.1", healthy.port()))))) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(
+                            new Address("127.0.0.1", warming.port()), new Address("127.0.0.1", healthy.port()))))) {
                 client.set("k", "v");
                 assertEquals(Optional.of("v"), client.get("k"));
             }
@@ -4019,14 +3694,9 @@ class NanocachedClientTest {
             second.warmingUp = true;
             assertThrows(
                     NanocachedException.DiscoveryBusy.class,
-                    () ->
-                            NanocachedClient.connect(
-                                    NanocachedClient.builder()
-                                            .addresses(
-                                                    List.of(
-                                                            new Address("127.0.0.1", first.port()),
-                                                            new Address(
-                                                                    "127.0.0.1", second.port())))));
+                    () -> NanocachedClient.connect(NanocachedClient.builder()
+                            .addresses(List.of(
+                                    new Address("127.0.0.1", first.port()), new Address("127.0.0.1", second.port())))));
         }
     }
 
@@ -4041,9 +3711,7 @@ class NanocachedClientTest {
         try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
             discovery.rawListResponse = "N 2000000001 3\n";
             NanocachedException error =
-                    assertThrows(
-                            NanocachedException.class,
-                            () -> connect("127.0.0.1", discovery.port()));
+                    assertThrows(NanocachedException.class, () -> connect("127.0.0.1", discovery.port()));
             assertTrue(error.getMessage().contains("node count"), error.getMessage());
         }
     }
@@ -4059,9 +3727,7 @@ class NanocachedClientTest {
             int hugeNameLength = 20 * 1024 * 1024; // > 16 MiB alone
             discovery.rawListResponse = "N 1 1\n" + hugeNameLength + " 0\n";
             NanocachedException error =
-                    assertThrows(
-                            NanocachedException.class,
-                            () -> connect("127.0.0.1", discovery.port()));
+                    assertThrows(NanocachedException.class, () -> connect("127.0.0.1", discovery.port()));
             assertTrue(error.getMessage().contains("exceeds"), error.getMessage());
         }
     }
@@ -4075,8 +3741,7 @@ class NanocachedClientTest {
     }
 
     @Test
-    void rejectsAMalformedNodeEntryLengthHeaderInsteadOfLeakingANumberFormatException()
-            throws Exception {
+    void rejectsAMalformedNodeEntryLengthHeaderInsteadOfLeakingANumberFormatException() throws Exception {
         try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
             discovery.rawListResponse = "N 1 1\nx y\n";
             assertThrows(NanocachedException.class, () -> connect("127.0.0.1", discovery.port()));
@@ -4088,12 +3753,9 @@ class NanocachedClientTest {
         // Regression: NanocachedClient.openNodeConnection used to call
         // Integer.parseInt directly on a discovered node's port.
         try (MockDiscovery discovery =
-                new MockDiscovery(
-                        List.of(new DiscoveredNode(NAMES.get(0), "127.0.0.1:notaport")), 1)) {
+                new MockDiscovery(List.of(new DiscoveredNode(NAMES.get(0), "127.0.0.1:notaport")), 1)) {
             NanocachedException error =
-                    assertThrows(
-                            NanocachedException.class,
-                            () -> connect("127.0.0.1", discovery.port()));
+                    assertThrows(NanocachedException.class, () -> connect("127.0.0.1", discovery.port()));
             assertTrue(error.getMessage().contains("invalid node address"), error.getMessage());
         }
     }
@@ -4105,21 +3767,16 @@ class NanocachedClientTest {
         try (MockDiscovery discovery =
                 new MockDiscovery(List.of(new DiscoveredNode(NAMES.get(0), "no-port-here")), 1)) {
             NanocachedException error =
-                    assertThrows(
-                            NanocachedException.class,
-                            () -> connect("127.0.0.1", discovery.port()));
+                    assertThrows(NanocachedException.class, () -> connect("127.0.0.1", discovery.port()));
             assertEquals(NanocachedException.class, error.getClass());
             assertTrue(error.getMessage().contains("invalid node address"), error.getMessage());
         }
         try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
-            discovery.nodes =
-                    List.of(new DiscoveredNode(NAMES.get(0), "127.0.0.1:" + discovery.port()));
+            discovery.nodes = List.of(new DiscoveredNode(NAMES.get(0), "127.0.0.1:" + discovery.port()));
             // Listed nodes that are all non-nodes: nothing is reachable, so the
             // connect still fails with the configuration error it always did.
             NanocachedException error =
-                    assertThrows(
-                            NanocachedException.class,
-                            () -> connect("127.0.0.1", discovery.port()));
+                    assertThrows(NanocachedException.class, () -> connect("127.0.0.1", discovery.port()));
             assertEquals(NanocachedException.class, error.getClass());
             assertTrue(error.getMessage().contains("non-node address"), error.getMessage());
         }
@@ -4134,21 +3791,17 @@ class NanocachedClientTest {
         try (Cluster cluster = startCluster(2)) {
             MockNode live = cluster.nodes().get(NAMES.get(0));
             String notACacheNode = "127.0.0.1:" + cluster.discovery().port();
-            cluster.discovery().nodes =
-                    List.of(
-                            new DiscoveredNode(NAMES.get(0), live.address()),
-                            new DiscoveredNode(NAMES.get(1), notACacheNode));
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            cluster.discovery().nodes = List.of(
+                    new DiscoveredNode(NAMES.get(0), live.address()), new DiscoveredNode(NAMES.get(1), notACacheNode));
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 assertNull(memberConnectionOf(client, NAMES.get(1)));
                 assertTrue(memberConnectionOf(client, NAMES.get(0)) != null);
 
-                Field cooldownsField =
-                        NanocachedClient.class.getDeclaredField("reconnectCooldowns");
+                Field cooldownsField = NanocachedClient.class.getDeclaredField("reconnectCooldowns");
                 cooldownsField.setAccessible(true);
                 Map<?, ?> cooldowns = (Map<?, ?>) cooldownsField.get(client);
-                assertTrue(
-                        cooldowns.containsKey(notACacheNode),
-                        "the non-node address has its cooldown armed");
+                assertTrue(cooldowns.containsKey(notACacheNode), "the non-node address has its cooldown armed");
 
                 // A read of a key owned by the non-node fails over to the
                 // live replica; a write to it reports the lost connection.
@@ -4158,29 +3811,21 @@ class NanocachedClientTest {
                         "replica copy".getBytes(StandardCharsets.UTF_8));
                 assertEquals(Optional.of("replica copy"), client.get(key));
                 NanocachedException.ConnectionLost lost =
-                        assertThrows(
-                                NanocachedException.ConnectionLost.class,
-                                () -> client.set(key, "v"));
-                assertTrue(
-                        lost.getMessage().contains("does not identify as a cache node"),
-                        lost.getMessage());
+                        assertThrows(NanocachedException.ConnectionLost.class, () -> client.set(key, "v"));
+                assertTrue(lost.getMessage().contains("does not identify as a cache node"), lost.getMessage());
 
                 // Inside the cooldown the dead member reports the not-sent
                 // lost connection the redial path uses.
-                Method memberConnection =
-                        NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
+                Method memberConnection = NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
                 memberConnection.setAccessible(true);
-                java.lang.reflect.InvocationTargetException failure =
-                        assertThrows(
-                                java.lang.reflect.InvocationTargetException.class,
-                                () -> memberConnection.invoke(client, NAMES.get(1)));
+                java.lang.reflect.InvocationTargetException failure = assertThrows(
+                        java.lang.reflect.InvocationTargetException.class,
+                        () -> memberConnection.invoke(client, NAMES.get(1)));
                 assertTrue(
                         failure.getCause() instanceof NanocachedException.ConnectionLost,
                         failure.getCause().toString());
                 assertTrue(
-                        failure.getCause()
-                                .getMessage()
-                                .contains("does not identify as a cache node"),
+                        failure.getCause().getMessage().contains("does not identify as a cache node"),
                         failure.getCause().getMessage());
             }
         }
@@ -4197,10 +3842,8 @@ class NanocachedClientTest {
         // the same connection-lost exception type.
         try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
             discovery.rawListResponse = "N " + "9".repeat(8192); // never terminates
-            NanocachedException.ConnectionLost error =
-                    assertThrows(
-                            NanocachedException.ConnectionLost.class,
-                            () -> connect("127.0.0.1", discovery.port()));
+            NanocachedException.ConnectionLost error = assertThrows(
+                    NanocachedException.ConnectionLost.class, () -> connect("127.0.0.1", discovery.port()));
             assertTrue(error.getMessage().contains("header line too long"), error.getMessage());
         }
     }
@@ -4227,47 +3870,37 @@ class NanocachedClientTest {
             for (int i = 0; i < nodeCount; i++) {
                 java.net.ServerSocket silent = new java.net.ServerSocket(0);
                 silentServers.add(silent);
-                Thread acceptor =
-                        new Thread(
-                                () -> {
-                                    try {
-                                        while (true) silent.accept();
-                                    } catch (java.io.IOException ignored) {
-                                        // Server socket closed.
-                                    }
-                                },
-                                "test-silent-accept-" + i);
+                Thread acceptor = new Thread(
+                        () -> {
+                            try {
+                                while (true) silent.accept();
+                            } catch (java.io.IOException ignored) {
+                                // Server socket closed.
+                            }
+                        },
+                        "test-silent-accept-" + i);
                 acceptor.setDaemon(true);
                 acceptor.start();
-                nodes.add(
-                        new DiscoveredNode(
-                                NAMES.get(0) + "-" + i, "127.0.0.1:" + silent.getLocalPort()));
+                nodes.add(new DiscoveredNode(NAMES.get(0) + "-" + i, "127.0.0.1:" + silent.getLocalPort()));
             }
 
             try (MockDiscovery discovery = new MockDiscovery(nodes, 1)) {
-                java.util.concurrent.atomic.AtomicInteger maxObserved =
-                        new java.util.concurrent.atomic.AtomicInteger();
-                Thread sampler =
-                        new Thread(
-                                () -> {
-                                    while (!Thread.currentThread().isInterrupted()) {
-                                        long alive =
-                                                Thread.getAllStackTraces().keySet().stream()
-                                                        .filter(t ->
-                                                                t.getName()
-                                                                        .equals(
-                                                                                "nanocached-bootstrap-dial"))
-                                                        .count();
-                                        maxObserved.updateAndGet(
-                                                current -> (int) Math.max(current, alive));
-                                        try {
-                                            Thread.sleep(2);
-                                        } catch (InterruptedException interrupted) {
-                                            return;
-                                        }
-                                    }
-                                },
-                                "test-thread-sampler");
+                java.util.concurrent.atomic.AtomicInteger maxObserved = new java.util.concurrent.atomic.AtomicInteger();
+                Thread sampler = new Thread(
+                        () -> {
+                            while (!Thread.currentThread().isInterrupted()) {
+                                long alive = Thread.getAllStackTraces().keySet().stream()
+                                        .filter(t -> t.getName().equals("nanocached-bootstrap-dial"))
+                                        .count();
+                                maxObserved.updateAndGet(current -> (int) Math.max(current, alive));
+                                try {
+                                    Thread.sleep(2);
+                                } catch (InterruptedException interrupted) {
+                                    return;
+                                }
+                            }
+                        },
+                        "test-thread-sampler");
                 sampler.setDaemon(true);
                 sampler.start();
                 try {
@@ -4275,8 +3908,7 @@ class NanocachedClientTest {
                     // of them — it's expected to fail once every dial
                     // has timed out; that failure isn't what's under
                     // test here, only how many dialer threads it took.
-                    assertThrows(
-                            RuntimeException.class, () -> connect("127.0.0.1", discovery.port()));
+                    assertThrows(RuntimeException.class, () -> connect("127.0.0.1", discovery.port()));
                 } finally {
                     sampler.interrupt();
                     sampler.join();
@@ -4285,8 +3917,7 @@ class NanocachedClientTest {
                 assertTrue(maxObserved.get() > 0, "test never observed a dialer thread running");
                 assertTrue(
                         maxObserved.get() <= 16,
-                        "bootstrap dialer pool must never exceed its cap, observed "
-                                + maxObserved.get());
+                        "bootstrap dialer pool must never exceed its cap, observed " + maxObserved.get());
             }
         } finally {
             for (java.net.ServerSocket silent : silentServers) silent.close();
@@ -4295,8 +3926,7 @@ class NanocachedClientTest {
 
     // ── クラスタと複製 ────────────────────────────────────────────
 
-    private record Cluster(Map<String, MockNode> nodes, MockDiscovery discovery)
-            implements AutoCloseable {
+    private record Cluster(Map<String, MockNode> nodes, MockDiscovery discovery) implements AutoCloseable {
         @Override
         public void close() throws Exception {
             discovery.close();
@@ -4308,26 +3938,28 @@ class NanocachedClientTest {
         MockNode nodeA = new MockNode();
         MockNode nodeB = new MockNode();
         Map<String, MockNode> nodes = Map.of(NAMES.get(0), nodeA, NAMES.get(1), nodeB);
-        MockDiscovery discovery =
-                new MockDiscovery(
-                        List.of(
-                                new DiscoveredNode(NAMES.get(0), nodeA.address()),
-                                new DiscoveredNode(NAMES.get(1), nodeB.address())),
-                        replication);
+        MockDiscovery discovery = new MockDiscovery(
+                List.of(
+                        new DiscoveredNode(NAMES.get(0), nodeA.address()),
+                        new DiscoveredNode(NAMES.get(1), nodeB.address())),
+                replication);
         return new Cluster(nodes, discovery);
     }
 
     @Test
     void routesAndReadsItsOwnWrites() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 for (int i = 0; i < 50; i++) {
                     client.set("key-" + i, "value of key-" + i);
                 }
                 for (int i = 0; i < 50; i++) {
                     assertEquals(Optional.of("value of key-" + i), client.get("key-" + i));
                 }
-                int total = cluster.nodes().values().stream().mapToInt(n -> n.store.size()).sum();
+                int total = cluster.nodes().values().stream()
+                        .mapToInt(n -> n.store.size())
+                        .sum();
                 assertEquals(50, total);
                 assertTrue(cluster.nodes().values().stream().allMatch(n -> !n.store.isEmpty()));
             }
@@ -4337,14 +3969,11 @@ class NanocachedClientTest {
     @Test
     void wrongNodeTriggersRefreshAndOneRetry() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "some-key";
                 client.set(key, "v");
-                MockNode owner =
-                        cluster.nodes()
-                                .get(
-                                        new HashRing(NAMES)
-                                                .route(key.getBytes(StandardCharsets.UTF_8)));
+                MockNode owner = cluster.nodes().get(new HashRing(NAMES).route(key.getBytes(StandardCharsets.UTF_8)));
 
                 owner.answerWrongNodeOnce();
                 assertEquals(Optional.of("v"), client.get(key));
@@ -4359,7 +3988,8 @@ class NanocachedClientTest {
     @Test
     void fansWritesOutToEveryOwner() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 assertEquals(2, client.replication());
                 for (int i = 0; i < 20; i++) {
                     client.set("key-" + i, "v");
@@ -4377,11 +4007,13 @@ class NanocachedClientTest {
     @Test
     void readsFailOverWhenThePrimaryDies() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "survives";
                 client.set(key, "still here");
-                String primary =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2).get(0);
+                String primary = new HashRing(NAMES)
+                        .owners(key.getBytes(StandardCharsets.UTF_8), 2)
+                        .get(0);
                 cluster.nodes().get(primary).close();
                 Thread.sleep(50);
                 assertEquals(Optional.of("still here"), client.get(key));
@@ -4398,7 +4030,8 @@ class NanocachedClientTest {
         // fallen over to it. Discovery is left as it is — the client's
         // ring still names the dead node as primary.
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 Map<String, String> values = new java.util.LinkedHashMap<>();
                 for (int i = 0; i < 24; i++) values.put("key-" + i, "value-" + i);
                 client.setMany(values);
@@ -4406,10 +4039,9 @@ class NanocachedClientTest {
                 HashRing ring = new HashRing(NAMES);
                 assertTrue(
                         values.keySet().stream()
-                                .anyMatch(key ->
-                                        ring.owners(key.getBytes(StandardCharsets.UTF_8), 2)
-                                                .get(0)
-                                                .equals(dead)),
+                                .anyMatch(key -> ring.owners(key.getBytes(StandardCharsets.UTF_8), 2)
+                                        .get(0)
+                                        .equals(dead)),
                         "the key set must give the dead node some primaries");
                 cluster.nodes().get(dead).close();
                 Thread.sleep(50); // let the FIN land
@@ -4425,7 +4057,8 @@ class NanocachedClientTest {
         // so the failure must not be the wrong-node one; the keys the live
         // node owns are still returned, attached to the exception.
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 Map<String, String> values = new java.util.LinkedHashMap<>();
                 for (int i = 0; i < 24; i++) values.put("key-" + i, "value-" + i);
                 client.setMany(values);
@@ -4440,20 +4073,15 @@ class NanocachedClientTest {
                         liveValues.put(entry.getKey(), entry.getValue());
                     }
                 }
-                assertTrue(
-                        !liveValues.isEmpty() && liveValues.size() < values.size(),
-                        "both nodes must own some keys");
+                assertTrue(!liveValues.isEmpty() && liveValues.size() < values.size(), "both nodes must own some keys");
                 cluster.nodes().get(dead).close();
                 Thread.sleep(50); // let the FIN land
 
-                NanocachedException failure =
-                        assertThrows(
-                                NanocachedException.PartialConnectionLostStrings.class,
-                                () -> client.getMany(new ArrayList<>(values.keySet())));
+                NanocachedException failure = assertThrows(
+                        NanocachedException.PartialConnectionLostStrings.class,
+                        () -> client.getMany(new ArrayList<>(values.keySet())));
                 assertFalse(failure instanceof NanocachedException.WrongNode);
-                assertEquals(
-                        liveValues,
-                        ((NanocachedException.PartialConnectionLostStrings) failure).partialValues);
+                assertEquals(liveValues, ((NanocachedException.PartialConnectionLostStrings) failure).partialValues);
                 assertTrue(
                         failure.getCause() instanceof NanocachedException.ConnectionLost,
                         "cause = " + failure.getCause());
@@ -4464,18 +4092,17 @@ class NanocachedClientTest {
     @Test
     void aDeadReplicaDoesNotFailWrites() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "written-anyway";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 cluster.nodes().get(owners.get(1)).close();
                 Thread.sleep(50);
                 client.set(key, "v");
-                assertTrue(
-                        cluster.nodes()
-                                .get(owners.get(0))
-                                .store
-                                .containsKey(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
+                assertTrue(cluster.nodes()
+                        .get(owners.get(0))
+                        .store
+                        .containsKey(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
                 assertEquals(Optional.of("v"), client.get(key));
             }
         }
@@ -4484,21 +4111,18 @@ class NanocachedClientTest {
     @Test
     void writesRouteAroundADeadPrimaryOnceDiscoveryDropsIt() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "written-after-primary-death";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
 
                 // The primary dies AND discovery has already noticed: the
                 // first write attempt fails on the dead primary, forcing a
                 // refresh that re-ranks onto the survivor, and the retry
                 // succeeds.
                 cluster.nodes().get(owners.get(0)).close();
-                cluster.discovery().nodes =
-                        List.of(
-                                new DiscoveredNode(
-                                        owners.get(1),
-                                        cluster.nodes().get(owners.get(1)).address()));
+                cluster.discovery().nodes = List.of(new DiscoveredNode(
+                        owners.get(1), cluster.nodes().get(owners.get(1)).address()));
                 Thread.sleep(50);
 
                 client.set(key, "v");
@@ -4513,18 +4137,15 @@ class NanocachedClientTest {
     @Test
     void incrRoutesAroundADeadPrimaryOnceDiscoveryDropsIt() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "counter-after-primary-death";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 client.set(key, "10"); // replicated to the survivor too
 
                 cluster.nodes().get(owners.get(0)).close();
-                cluster.discovery().nodes =
-                        List.of(
-                                new DiscoveredNode(
-                                        owners.get(1),
-                                        cluster.nodes().get(owners.get(1)).address()));
+                cluster.discovery().nodes = List.of(new DiscoveredNode(
+                        owners.get(1), cluster.nodes().get(owners.get(1)).address()));
                 Thread.sleep(50);
 
                 assertEquals(java.util.OptionalLong.of(15), client.incr(key, 5));
@@ -4536,18 +4157,15 @@ class NanocachedClientTest {
     @Test
     void casRoutesAroundADeadPrimaryOnceDiscoveryDropsIt() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "cas-after-primary-death";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 client.set(key, "old"); // replicated to the survivor too
 
                 cluster.nodes().get(owners.get(0)).close();
-                cluster.discovery().nodes =
-                        List.of(
-                                new DiscoveredNode(
-                                        owners.get(1),
-                                        cluster.nodes().get(owners.get(1)).address()));
+                cluster.discovery().nodes = List.of(new DiscoveredNode(
+                        owners.get(1), cluster.nodes().get(owners.get(1)).address()));
                 Thread.sleep(50);
 
                 assertTrue(client.replaceIfPresent(key, "new"));
@@ -4560,7 +4178,8 @@ class NanocachedClientTest {
     @Test
     void fansDeletesOutToEveryOwner() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "gone-everywhere";
                 client.set(key, "v");
                 assertTrue(client.delete(key));
@@ -4588,13 +4207,12 @@ class NanocachedClientTest {
         // once.
         try (MockNode nodeA = new MockNode();
                 MockNode nodeB = new MockNode()) {
-            try (MockDiscovery discovery =
-                    new MockDiscovery(
-                            List.of(
-                                    new DiscoveredNode(NAMES.get(0), nodeA.address()),
-                                    new DiscoveredNode(NAMES.get(0), nodeA.address()),
-                                    new DiscoveredNode(NAMES.get(1), nodeB.address())),
-                            2)) {
+            try (MockDiscovery discovery = new MockDiscovery(
+                    List.of(
+                            new DiscoveredNode(NAMES.get(0), nodeA.address()),
+                            new DiscoveredNode(NAMES.get(0), nodeA.address()),
+                            new DiscoveredNode(NAMES.get(1), nodeB.address())),
+                    2)) {
                 try (NanocachedClient client = connect("127.0.0.1", discovery.port())) {
                     Field membersField = NanocachedClient.class.getDeclaredField("members");
                     membersField.setAccessible(true);
@@ -4606,12 +4224,8 @@ class NanocachedClientTest {
                     ringField.setAccessible(true);
                     HashRing ring = (HashRing) ringField.get(client);
                     for (int replicas = 1; replicas <= 2; replicas++) {
-                        List<String> owners =
-                                ring.owners("some-key".getBytes(StandardCharsets.UTF_8), replicas);
-                        assertEquals(
-                                owners.size(),
-                                new java.util.HashSet<>(owners).size(),
-                                owners.toString());
+                        List<String> owners = ring.owners("some-key".getBytes(StandardCharsets.UTF_8), replicas);
+                        assertEquals(owners.size(), new java.util.HashSet<>(owners).size(), owners.toString());
                         assertTrue(owners.size() <= 2);
                     }
                 }
@@ -4626,20 +4240,19 @@ class NanocachedClientTest {
         // a member's live connection with a second, redundant dial of
         // the same node.
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String name = NAMES.get(0);
                 Connection before = memberConnectionOf(client, name);
 
                 MockNode node = cluster.nodes().get(name);
-                cluster.discovery().nodes =
-                        List.of(
-                                new DiscoveredNode(name, node.address()),
-                                new DiscoveredNode(name, node.address()),
-                                new DiscoveredNode(
-                                        NAMES.get(1), cluster.nodes().get(NAMES.get(1)).address()));
+                cluster.discovery().nodes = List.of(
+                        new DiscoveredNode(name, node.address()),
+                        new DiscoveredNode(name, node.address()),
+                        new DiscoveredNode(
+                                NAMES.get(1), cluster.nodes().get(NAMES.get(1)).address()));
 
-                Method refreshNodeList =
-                        NanocachedClient.class.getDeclaredMethod("refreshNodeList");
+                Method refreshNodeList = NanocachedClient.class.getDeclaredMethod("refreshNodeList");
                 refreshNodeList.setAccessible(true);
                 refreshNodeList.invoke(client);
 
@@ -4657,7 +4270,8 @@ class NanocachedClientTest {
     @Test
     void batchedGetSetRouteAcrossOwnersAndReassembleInCallerOrder() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 List<String> keys = new ArrayList<>();
                 Map<String, String> values = new java.util.LinkedHashMap<>();
                 for (int i = 0; i < 20; i++) {
@@ -4669,8 +4283,9 @@ class NanocachedClientTest {
                 // Every key routed to exactly one owner: both nodes together
                 // received every `o`/`m` sub-frame, and each key landed on
                 // exactly the node HashRing itself would route it to.
-                int totalStored =
-                        cluster.nodes().values().stream().mapToInt(n -> n.store.size()).sum();
+                int totalStored = cluster.nodes().values().stream()
+                        .mapToInt(n -> n.store.size())
+                        .sum();
                 assertEquals(20, totalStored);
                 assertTrue(
                         cluster.nodes().values().stream().allMatch(n -> !n.store.isEmpty()),
@@ -4682,7 +4297,8 @@ class NanocachedClientTest {
     @Test
     void batchedWritesFanOutToEveryOwnerWhenReplicated() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 Map<String, String> values = new java.util.LinkedHashMap<>();
                 for (int i = 0; i < 10; i++) values.put("key-" + i, "v");
                 client.setMany(values);
@@ -4702,18 +4318,17 @@ class NanocachedClientTest {
     @Test
     void aDeadReplicaDoesNotFailABatchedWrite() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "written-anyway";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 cluster.nodes().get(owners.get(1)).close();
                 Thread.sleep(50);
                 client.setMany(Map.of(key, "v"));
-                assertTrue(
-                        cluster.nodes()
-                                .get(owners.get(0))
-                                .store
-                                .containsKey(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
+                assertTrue(cluster.nodes()
+                        .get(owners.get(0))
+                        .store
+                        .containsKey(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
                 assertEquals(Map.of(key, "v"), client.getMany(List.of(key)));
             }
         }
@@ -4722,24 +4337,19 @@ class NanocachedClientTest {
     @Test
     void batchedGetWrongNodeTriggersRefreshAndOneRetry() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "some-key";
                 client.setMany(Map.of(key, "v"));
-                MockNode owner =
-                        cluster.nodes()
-                                .get(
-                                        new HashRing(NAMES)
-                                                .route(key.getBytes(StandardCharsets.UTF_8)));
+                MockNode owner = cluster.nodes().get(new HashRing(NAMES).route(key.getBytes(StandardCharsets.UTF_8)));
 
                 owner.answerWrongNodeOnce();
                 assertEquals(Map.of(key, "v"), client.getMany(List.of(key)));
 
                 owner.answerWrongNodeOnce();
                 owner.answerWrongNodeOnce();
-                NanocachedException.PartialWrongNode failure =
-                        assertThrows(
-                                NanocachedException.PartialWrongNode.class,
-                                () -> client.getManyBytes(List.of(key)));
+                NanocachedException.PartialWrongNode failure = assertThrows(
+                        NanocachedException.PartialWrongNode.class, () -> client.getManyBytes(List.of(key)));
                 assertTrue(failure.partialValues.isEmpty());
             }
         }
@@ -4748,13 +4358,10 @@ class NanocachedClientTest {
     @Test
     void batchedSetWrongNodeTriggersRefreshAndOneRetry() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "some-key";
-                MockNode owner =
-                        cluster.nodes()
-                                .get(
-                                        new HashRing(NAMES)
-                                                .route(key.getBytes(StandardCharsets.UTF_8)));
+                MockNode owner = cluster.nodes().get(new HashRing(NAMES).route(key.getBytes(StandardCharsets.UTF_8)));
 
                 owner.answerWrongNodeOnce();
                 client.setMany(Map.of(key, "v"));
@@ -4762,16 +4369,13 @@ class NanocachedClientTest {
 
                 owner.answerWrongNodeOnce();
                 owner.answerWrongNodeOnce();
-                assertThrows(
-                        NanocachedException.WrongNode.class,
-                        () -> client.setMany(Map.of(key, "v2")));
+                assertThrows(NanocachedException.WrongNode.class, () -> client.setMany(Map.of(key, "v2")));
             }
         }
     }
 
     @Test
-    void multiGetDrainsEveryLegAndDoesNotCountASecondLegsDecompressionFailureAsABackgroundBug()
-            throws Exception {
+    void multiGetDrainsEveryLegAndDoesNotCountASecondLegsDecompressionFailureAsABackgroundBug() throws Exception {
         // Regression for issue #230: multiGetPass used to rethrow on the
         // first failing leg's join() without draining the remaining
         // legs, so a second, independent leg's bug would vanish silently
@@ -4796,13 +4400,11 @@ class NanocachedClientTest {
             String keyOnNodeB = null;
             for (int i = 0; i < 1000 && (keyOnNodeA == null || keyOnNodeB == null); i++) {
                 String candidate = "gk-" + i;
-                String owner =
-                        new HashRing(NAMES).route(candidate.getBytes(StandardCharsets.UTF_8));
+                String owner = new HashRing(NAMES).route(candidate.getBytes(StandardCharsets.UTF_8));
                 if (owner.equals(NAMES.get(0)) && keyOnNodeA == null) keyOnNodeA = candidate;
                 if (owner.equals(NAMES.get(1)) && keyOnNodeB == null) keyOnNodeB = candidate;
             }
-            assertTrue(
-                    keyOnNodeA != null && keyOnNodeB != null, "need one key routing to each node");
+            assertTrue(keyOnNodeA != null && keyOnNodeB != null, "need one key routing to each node");
             String finalKeyOnNodeA = keyOnNodeA;
             String finalKeyOnNodeB = keyOnNodeB;
 
@@ -4816,15 +4418,10 @@ class NanocachedClientTest {
                     .store
                     .put(MockNode.keyOf(keyOnNodeB.getBytes(StandardCharsets.UTF_8)), corrupt);
 
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            NanocachedClient.builder()
-                                    .addresses(
-                                            List.of(
-                                                    new Address(
-                                                            "127.0.0.1",
-                                                            cluster.discovery().port())))
-                                    .compress(true))) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(
+                            List.of(new Address("127.0.0.1", cluster.discovery().port())))
+                    .compress(true))) {
                 long before = client.stats().backgroundWriteBugs();
                 assertThrows(
                         NanocachedException.DecompressionFailed.class,
@@ -4855,24 +4452,21 @@ class NanocachedClientTest {
         // uncaught bug isn't reproducible by feeding a real server bad
         // data the way issue #230's own regression test could for GET.
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 RuntimeException first = new IllegalStateException("first leg's bug");
                 RuntimeException second = new IllegalStateException("second leg's bug");
                 RuntimeException third = new IllegalStateException("third leg's bug");
-                List<CompletableFuture<Void>> legs =
-                        List.of(
-                                CompletableFuture.completedFuture(null),
-                                CompletableFuture.failedFuture(first),
-                                CompletableFuture.failedFuture(second),
-                                CompletableFuture.failedFuture(third));
+                List<CompletableFuture<Void>> legs = List.of(
+                        CompletableFuture.completedFuture(null),
+                        CompletableFuture.failedFuture(first),
+                        CompletableFuture.failedFuture(second),
+                        CompletableFuture.failedFuture(third));
 
                 long before = client.stats().backgroundWriteBugs();
                 RuntimeException returned = client.drainLegsKeepingFirstBug(legs);
 
-                assertSame(
-                        first,
-                        returned,
-                        "the first leg's bug must be the one returned to the caller");
+                assertSame(first, returned, "the first leg's bug must be the one returned to the caller");
                 assertEquals(
                         before + 2,
                         client.stats().backgroundWriteBugs(),
@@ -4882,8 +4476,7 @@ class NanocachedClientTest {
     }
 
     @Test
-    void drainLegsKeepingFirstBugDoesNotCountAFurtherDecompressionFailedAsABackgroundBug()
-            throws Exception {
+    void drainLegsKeepingFirstBugDoesNotCountAFurtherDecompressionFailedAsABackgroundBug() throws Exception {
         // Regression for issue #413(b): runMultiGetLeg deliberately lets a
         // DecompressionFailed from decompressForBatch escape uncaught
         // (per that method's own doc comment — a decompression failure
@@ -4899,28 +4492,21 @@ class NanocachedClientTest {
         // counted via backgroundWriteBugs — that counter is documented to
         // "never increment for a legitimate reason".
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
-                RuntimeException first =
-                        new NanocachedException.DecompressionFailed(
-                                "first leg's decompression bug");
-                RuntimeException second =
-                        new NanocachedException.DecompressionFailed(
-                                "second leg's decompression bug");
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
+                RuntimeException first = new NanocachedException.DecompressionFailed("first leg's decompression bug");
+                RuntimeException second = new NanocachedException.DecompressionFailed("second leg's decompression bug");
                 RuntimeException third = new IllegalStateException("third leg's genuine bug");
-                List<CompletableFuture<Void>> legs =
-                        List.of(
-                                CompletableFuture.completedFuture(null),
-                                CompletableFuture.failedFuture(first),
-                                CompletableFuture.failedFuture(second),
-                                CompletableFuture.failedFuture(third));
+                List<CompletableFuture<Void>> legs = List.of(
+                        CompletableFuture.completedFuture(null),
+                        CompletableFuture.failedFuture(first),
+                        CompletableFuture.failedFuture(second),
+                        CompletableFuture.failedFuture(third));
 
                 long before = client.stats().backgroundWriteBugs();
                 RuntimeException returned = client.drainLegsKeepingFirstBug(legs);
 
-                assertSame(
-                        first,
-                        returned,
-                        "the first leg's bug must be the one returned to the caller");
+                assertSame(first, returned, "the first leg's bug must be the one returned to the caller");
                 assertEquals(
                         before + 1,
                         client.stats().backgroundWriteBugs(),
@@ -4939,7 +4525,8 @@ class NanocachedClientTest {
         // Setting `closed` directly (reflection) reproduces the state such a
         // retry sees, as in aHedgeLegRacingCloseIsRefusedNotRegistered.
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 client.set("k", "v");
 
                 Field closedField = NanocachedClient.class.getDeclaredField("closed");
@@ -4956,16 +4543,13 @@ class NanocachedClientTest {
                 MockNode node = cluster.nodes().get(name);
                 int connectionsBefore = node.connectionCount.get();
 
-                Method memberConnection =
-                        NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
+                Method memberConnection = NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
                 memberConnection.setAccessible(true);
 
                 closedField.setBoolean(client, true);
                 try {
                     InvocationTargetException thrown =
-                            assertThrows(
-                                    InvocationTargetException.class,
-                                    () -> memberConnection.invoke(client, name));
+                            assertThrows(InvocationTargetException.class, () -> memberConnection.invoke(client, name));
                     assertTrue(
                             thrown.getCause() instanceof NanocachedException.AlreadyClosed,
                             "expected AlreadyClosed, got " + thrown.getCause());
@@ -4995,17 +4579,15 @@ class NanocachedClientTest {
         // readHedged (issue #1150), the Error must now reach the caller as
         // itself -- and only after the remaining legs were drained.
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 AssertionError injected = new AssertionError("a leg's Error");
                 RuntimeException later = new IllegalStateException("a later leg's bug");
                 List<CompletableFuture<Void>> legs =
-                        List.of(
-                                CompletableFuture.failedFuture(injected),
-                                CompletableFuture.failedFuture(later));
+                        List.of(CompletableFuture.failedFuture(injected), CompletableFuture.failedFuture(later));
 
                 long before = client.stats().backgroundWriteBugs();
-                Throwable thrown =
-                        assertThrows(Throwable.class, () -> client.drainLegsKeepingFirstBug(legs));
+                Throwable thrown = assertThrows(Throwable.class, () -> client.drainLegsKeepingFirstBug(legs));
 
                 assertSame(injected, thrown, "the leg's Error must reach the caller as itself");
                 assertEquals(
@@ -5026,27 +4608,24 @@ class NanocachedClientTest {
     @Test
     void incrSendsIOnlyToThePrimaryAndReplicatesTheResultAsSet() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-counter";
                 client.set(key, "10"); // fans out to both owners, seeding them identically
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
                 MockNode replica = cluster.nodes().get(owners.get(1));
                 String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
 
                 assertEquals(java.util.OptionalLong.of(15), client.incr(key, 5));
 
-                assertEquals(
-                        1, primary.incrCount.get(), "primary must receive exactly one `i` frame");
-                assertEquals(
-                        0, replica.incrCount.get(), "a replica must never receive an `i` frame");
+                assertEquals(1, primary.incrCount.get(), "primary must receive exactly one `i` frame");
+                assertEquals(0, replica.incrCount.get(), "a replica must never receive an `i` frame");
                 assertEquals(
                         "15",
                         new String(replica.store.get(storedKey), StandardCharsets.UTF_8),
                         "the replica must hold the primary's literal resulting value");
-                assertEquals(
-                        "15", new String(primary.store.get(storedKey), StandardCharsets.UTF_8));
+                assertEquals("15", new String(primary.store.get(storedKey), StandardCharsets.UTF_8));
             }
         }
     }
@@ -5054,20 +4633,21 @@ class NanocachedClientTest {
     @Test
     void incrDoesNotTouchReplicasOnAMissOrNonNumericValue() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String missing = "never-set";
-                List<String> missingOwners =
-                        new HashRing(NAMES).owners(missing.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> missingOwners = new HashRing(NAMES).owners(missing.getBytes(StandardCharsets.UTF_8), 2);
                 assertEquals(java.util.OptionalLong.empty(), client.incr(missing, 1));
                 // Only the primary is ever asked; a miss touches no replica.
-                assertEquals(1, cluster.nodes().get(missingOwners.get(0)).incrCount.get());
-                assertEquals(0, cluster.nodes().get(missingOwners.get(1)).incrCount.get());
+                assertEquals(
+                        1, cluster.nodes().get(missingOwners.get(0)).incrCount.get());
+                assertEquals(
+                        0, cluster.nodes().get(missingOwners.get(1)).incrCount.get());
                 assertEquals(0, cluster.nodes().get(missingOwners.get(1)).store.size());
 
                 String word = "not-a-number";
                 client.set(word, "hello");
-                List<String> wordOwners =
-                        new HashRing(NAMES).owners(word.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> wordOwners = new HashRing(NAMES).owners(word.getBytes(StandardCharsets.UTF_8), 2);
                 // Owners are just a permutation of this 2-node cluster's
                 // two names, so the "word" primary may be the same
                 // physical node as the "missing" case's above — compare
@@ -5089,8 +4669,7 @@ class NanocachedClientTest {
     }
 
     @Test
-    void incrAppliedButAcknowledgementLostIsNeverReplayedByTheOuterWrongNodeRetry()
-            throws Exception {
+    void incrAppliedButAcknowledgementLostIsNeverReplayedByTheOuterWrongNodeRetry() throws Exception {
         // issue #225: applyReconnectingNonIdempotent's own redial-and-
         // retry isn't the only layer that could double-apply INCR — the
         // outer withWrongNodeRetry (which refreshes the ring and re-runs
@@ -5102,11 +4681,11 @@ class NanocachedClientTest {
         // specifically targeting that outer layer rather than the inner
         // one.
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-counter";
                 client.set(key, "10");
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
                 String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
 
@@ -5121,8 +4700,7 @@ class NanocachedClientTest {
                         1,
                         primary.incrCount.get(),
                         "the primary must receive exactly one `i` frame, not a replayed one");
-                assertEquals(
-                        "15", new String(primary.store.get(storedKey), StandardCharsets.UTF_8));
+                assertEquals("15", new String(primary.store.get(storedKey), StandardCharsets.UTF_8));
             }
         }
     }
@@ -5130,19 +4708,18 @@ class NanocachedClientTest {
     @Test
     void incrReplicatesTheEntrysLiveTtlToTheReplica() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "counter-with-ttl";
                 client.set(key, "10", 60);
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
                 MockNode replica = cluster.nodes().get(owners.get(1));
                 String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
 
                 assertEquals(java.util.OptionalLong.of(11), client.incr(key, 1));
 
-                assertEquals(
-                        "11", new String(replica.store.get(storedKey), StandardCharsets.UTF_8));
+                assertEquals("11", new String(replica.store.get(storedKey), StandardCharsets.UTF_8));
                 assertEquals(
                         Long.valueOf(60),
                         replica.ttls.get(storedKey),
@@ -5162,26 +4739,23 @@ class NanocachedClientTest {
     @Test
     void casSendsKOnlyToThePrimaryAndReplicatesTheResultAsSet() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-cas-key";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
                 MockNode replica = cluster.nodes().get(owners.get(1));
                 String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
 
                 assertTrue(client.putIfAbsent(key, "v1"));
 
-                assertEquals(
-                        1, primary.casSetCount.get(), "primary must receive exactly one `k` frame");
-                assertEquals(
-                        0, replica.casSetCount.get(), "a replica must never receive a `k` frame");
+                assertEquals(1, primary.casSetCount.get(), "primary must receive exactly one `k` frame");
+                assertEquals(0, replica.casSetCount.get(), "a replica must never receive a `k` frame");
                 assertEquals(
                         "v1",
                         new String(replica.store.get(storedKey), StandardCharsets.UTF_8),
                         "the replica must hold the primary's literal resulting value");
-                assertEquals(
-                        "v1", new String(primary.store.get(storedKey), StandardCharsets.UTF_8));
+                assertEquals("v1", new String(primary.store.get(storedKey), StandardCharsets.UTF_8));
 
                 // A mismatch (key already present) never touches any
                 // replica, and the primary's own casSetCount still moves —
@@ -5189,8 +4763,7 @@ class NanocachedClientTest {
                 assertFalse(client.putIfAbsent(key, "v2"));
                 assertEquals(2, primary.casSetCount.get());
                 assertEquals(0, replica.casSetCount.get());
-                assertEquals(
-                        "v1", new String(replica.store.get(storedKey), StandardCharsets.UTF_8));
+                assertEquals("v1", new String(replica.store.get(storedKey), StandardCharsets.UTF_8));
             }
         }
     }
@@ -5198,10 +4771,10 @@ class NanocachedClientTest {
     @Test
     void casReplicatesTheLiteralTtlNeverRecomputingIt() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "cas-with-ttl";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
                 MockNode replica = cluster.nodes().get(owners.get(1));
                 String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
@@ -5220,11 +4793,11 @@ class NanocachedClientTest {
     @Test
     void deleteIfMatchesSendsXOnlyToThePrimaryAndReplicatesTheResultAsDelete() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "shared-cas-delete-key";
                 client.set(key, "v1"); // fans out to both owners, seeding them identically
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
                 MockNode replica = cluster.nodes().get(owners.get(1));
                 String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
@@ -5232,14 +4805,8 @@ class NanocachedClientTest {
 
                 assertTrue(client.deleteIfMatches(key, token));
 
-                assertEquals(
-                        1,
-                        primary.casDeleteCount.get(),
-                        "primary must receive exactly one `x` frame");
-                assertEquals(
-                        0,
-                        replica.casDeleteCount.get(),
-                        "a replica must never receive an `x` frame");
+                assertEquals(1, primary.casDeleteCount.get(), "primary must receive exactly one `x` frame");
+                assertEquals(0, replica.casDeleteCount.get(), "a replica must never receive an `x` frame");
                 assertFalse(primary.store.containsKey(storedKey));
                 assertFalse(
                         replica.store.containsKey(storedKey),
@@ -5251,16 +4818,15 @@ class NanocachedClientTest {
     @Test
     void casDoesNotTouchReplicasOnAMismatch() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "cas-mismatch-key";
                 client.set(key, "v1");
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 MockNode primary = cluster.nodes().get(owners.get(0));
                 MockNode replica = cluster.nodes().get(owners.get(1));
                 String storedKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
-                String staleToken =
-                        NanocachedClient.contentDigest("stale".getBytes(StandardCharsets.UTF_8));
+                String staleToken = NanocachedClient.contentDigest("stale".getBytes(StandardCharsets.UTF_8));
 
                 assertFalse(client.deleteIfMatches(key, staleToken));
 
@@ -5275,10 +4841,9 @@ class NanocachedClientTest {
     // ── fire-and-forget レプリカ書き込み (fire-and-forget replica writes) ──────────
 
     private static NanocachedClient connectFireAndForget(int port) {
-        return NanocachedClient.connect(
-                NanocachedClient.builder()
-                        .addresses(List.of(new Address("127.0.0.1", port)))
-                        .fireAndForgetReplicas(true));
+        return NanocachedClient.connect(NanocachedClient.builder()
+                .addresses(List.of(new Address("127.0.0.1", port)))
+                .fireAndForgetReplicas(true));
     }
 
     // A "did it wait for the mock's delay" assertion can't compare the
@@ -5301,8 +4866,8 @@ class NanocachedClientTest {
      * is still queued -- not yet having read any of its arguments -- when {@code afterCall}
      * overwrites the caller's arrays; then lets the leg run and waits until it has finished.
      */
-    private static void runWithBackgroundLegHeld(
-            NanocachedClient client, Runnable call, Runnable afterCall) throws Exception {
+    private static void runWithBackgroundLegHeld(NanocachedClient client, Runnable call, Runnable afterCall)
+            throws Exception {
         Field backgroundLegsField = NanocachedClient.class.getDeclaredField("backgroundLegs");
         backgroundLegsField.setAccessible(true);
         ExecutorService backgroundLegs = (ExecutorService) backgroundLegsField.get(client);
@@ -5323,11 +4888,9 @@ class NanocachedClientTest {
             release.countDown();
         }
         // The permit is released only after the leg has finished.
-        Field permitsField =
-                NanocachedClient.class.getDeclaredField("backgroundReplicaWritePermits");
+        Field permitsField = NanocachedClient.class.getDeclaredField("backgroundReplicaWritePermits");
         permitsField.setAccessible(true);
-        java.util.concurrent.Semaphore permits =
-                (java.util.concurrent.Semaphore) permitsField.get(client);
+        java.util.concurrent.Semaphore permits = (java.util.concurrent.Semaphore) permitsField.get(client);
         waitFor(() -> permits.availablePermits() == 1, "the background replica leg to finish");
     }
 
@@ -5348,14 +4911,12 @@ class NanocachedClientTest {
             String replica = new HashRing(NAMES).owners(namespace, key, 2).get(1);
             seedNamespaced(cluster, "tenant", "k", "v");
 
-            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
-                runWithBackgroundLegHeld(
-                        client,
-                        () -> client.delete(namespace, key),
-                        () -> {
-                            Arrays.fill(key, (byte) 'X');
-                            Arrays.fill(namespace, (byte) 'Y');
-                        });
+            try (NanocachedClient client =
+                    connectFireAndForget(cluster.discovery().port())) {
+                runWithBackgroundLegHeld(client, () -> client.delete(namespace, key), () -> {
+                    Arrays.fill(key, (byte) 'X');
+                    Arrays.fill(namespace, (byte) 'Y');
+                });
                 MockNode node = cluster.nodes().get(replica);
                 assertFalse(
                         node.namespacedStores.get("tenant").containsKey("k"),
@@ -5373,20 +4934,16 @@ class NanocachedClientTest {
             String replica = new HashRing(NAMES).owners(namespace, key, 2).get(1);
             seedNamespaced(cluster, "tenant", "k", "v");
 
-            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
-                runWithBackgroundLegHeld(
-                        client,
-                        () -> client.touch(namespace, key, 77),
-                        () -> {
-                            Arrays.fill(key, (byte) 'X');
-                            Arrays.fill(namespace, (byte) 'Y');
-                        });
+            try (NanocachedClient client =
+                    connectFireAndForget(cluster.discovery().port())) {
+                runWithBackgroundLegHeld(client, () -> client.touch(namespace, key, 77), () -> {
+                    Arrays.fill(key, (byte) 'X');
+                    Arrays.fill(namespace, (byte) 'Y');
+                });
                 MockNode node = cluster.nodes().get(replica);
                 Map<String, Long> ttls = node.namespacedTtls.get("tenant");
                 assertEquals(
-                        77L,
-                        ttls == null ? null : ttls.get("k"),
-                        "the replica must have touched the original key");
+                        77L, ttls == null ? null : ttls.get("k"), "the replica must have touched the original key");
             }
         }
     }
@@ -5400,13 +4957,11 @@ class NanocachedClientTest {
             String replica = new HashRing(NAMES).owners(namespace, key, 2).get(1);
             seedNamespaced(cluster, "tenant", "k", "5");
 
-            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connectFireAndForget(cluster.discovery().port())) {
                 runWithBackgroundLegHeld(
                         client,
-                        () ->
-                                assertEquals(
-                                        java.util.OptionalLong.of(6),
-                                        client.incr(namespace, key, 1)),
+                        () -> assertEquals(java.util.OptionalLong.of(6), client.incr(namespace, key, 1)),
                         () -> {
                             Arrays.fill(key, (byte) 'X');
                             Arrays.fill(namespace, (byte) 'Y');
@@ -5429,20 +4984,16 @@ class NanocachedClientTest {
             String replica = new HashRing(NAMES).owners(namespace, key, 2).get(1);
             seedNamespaced(cluster, "tenant", "k", "v");
 
-            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
-                runWithBackgroundLegHeld(
-                        client,
-                        () -> client.touchMany(namespace, new byte[][] {key}, 77),
-                        () -> {
-                            Arrays.fill(key, (byte) 'X');
-                            Arrays.fill(namespace, (byte) 'Y');
-                        });
+            try (NanocachedClient client =
+                    connectFireAndForget(cluster.discovery().port())) {
+                runWithBackgroundLegHeld(client, () -> client.touchMany(namespace, new byte[][] {key}, 77), () -> {
+                    Arrays.fill(key, (byte) 'X');
+                    Arrays.fill(namespace, (byte) 'Y');
+                });
                 MockNode node = cluster.nodes().get(replica);
                 Map<String, Long> ttls = node.namespacedTtls.get("tenant");
                 assertEquals(
-                        77L,
-                        ttls == null ? null : ttls.get("k"),
-                        "the replica must have touched the original key");
+                        77L, ttls == null ? null : ttls.get("k"), "the replica must have touched the original key");
             }
         }
     }
@@ -5450,11 +5001,13 @@ class NanocachedClientTest {
     @Test
     void byDefaultAWriteStillWaitsForTheReplicaLeg() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            String replica =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            String replica = new HashRing(NAMES)
+                    .owners("k".getBytes(StandardCharsets.UTF_8), 2)
+                    .get(1);
             cluster.nodes().get(replica).delaySets(80);
 
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 long start = System.nanoTime();
                 client.set("k", "v");
                 long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
@@ -5468,19 +5021,19 @@ class NanocachedClientTest {
     @Test
     void fireAndForgetReplicasReturnsAsSoonAsThePrimaryAcks() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            String replica =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            String replica = new HashRing(NAMES)
+                    .owners("k".getBytes(StandardCharsets.UTF_8), 2)
+                    .get(1);
             cluster.nodes().get(replica).delaySets(200);
 
-            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connectFireAndForget(cluster.discovery().port())) {
                 long start = System.nanoTime();
                 client.set("k", "v");
                 long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
                 assertTrue(
                         elapsedMillis < 200,
-                        "set() should not have waited for the replica, took "
-                                + elapsedMillis
-                                + "ms");
+                        "set() should not have waited for the replica, took " + elapsedMillis + "ms");
 
                 String stored = MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8));
                 waitFor(
@@ -5491,8 +5044,7 @@ class NanocachedClientTest {
     }
 
     @Test
-    void fireAndForgetReplicasStillReturnImmediatelyWhenTheSharedLegPoolIsSaturated()
-            throws Exception {
+    void fireAndForgetReplicasStillReturnImmediatelyWhenTheSharedLegPoolIsSaturated() throws Exception {
         // Regression for issue #500: #486 bounded the shared leg pool's
         // queue and made its overflow policy "the submitter runs the task
         // itself". That pool also carried the fire-and-forget legs, so a
@@ -5508,13 +5060,14 @@ class NanocachedClientTest {
         NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
 
         try (Cluster cluster = startCluster(2)) {
-            String replica =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            String replica = new HashRing(NAMES)
+                    .owners("k".getBytes(StandardCharsets.UTF_8), 2)
+                    .get(1);
             cluster.nodes().get(replica).delaySets(300);
 
-            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
-                Field replicaWritersField =
-                        NanocachedClient.class.getDeclaredField("replicaWriters");
+            try (NanocachedClient client =
+                    connectFireAndForget(cluster.discovery().port())) {
+                Field replicaWritersField = NanocachedClient.class.getDeclaredField("replicaWriters");
                 replicaWritersField.setAccessible(true);
                 ExecutorService replicaWriters = (ExecutorService) replicaWritersField.get(client);
 
@@ -5523,10 +5076,8 @@ class NanocachedClientTest {
                 // more submit would run on this thread (the overflow policy) —
                 // exactly what the fire-and-forget leg must no longer risk.
                 int threads = 17;
-                java.util.concurrent.CountDownLatch release =
-                        new java.util.concurrent.CountDownLatch(1);
-                java.util.concurrent.CountDownLatch occupied =
-                        new java.util.concurrent.CountDownLatch(threads);
+                java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.CountDownLatch occupied = new java.util.concurrent.CountDownLatch(threads);
                 for (int i = 0; i < 2 * threads; i++) {
                     replicaWriters.submit(() -> {
                         occupied.countDown();
@@ -5582,21 +5133,20 @@ class NanocachedClientTest {
         NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
 
         try (Cluster cluster = startCluster(2)) {
-            String replica =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            String replica = new HashRing(NAMES)
+                    .owners("k".getBytes(StandardCharsets.UTF_8), 2)
+                    .get(1);
 
-            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
-                Field backgroundLegsField =
-                        NanocachedClient.class.getDeclaredField("backgroundLegs");
+            try (NanocachedClient client =
+                    connectFireAndForget(cluster.discovery().port())) {
+                Field backgroundLegsField = NanocachedClient.class.getDeclaredField("backgroundLegs");
                 backgroundLegsField.setAccessible(true);
                 ExecutorService backgroundLegs = (ExecutorService) backgroundLegsField.get(client);
 
                 // maxInFlightBackgroundReplicaWrites (1) threads.
                 int poolSize = 1;
-                java.util.concurrent.CountDownLatch release =
-                        new java.util.concurrent.CountDownLatch(1);
-                java.util.concurrent.CountDownLatch occupied =
-                        new java.util.concurrent.CountDownLatch(poolSize);
+                java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.CountDownLatch occupied = new java.util.concurrent.CountDownLatch(poolSize);
                 for (int i = 0; i < poolSize; i++) {
                     backgroundLegs.submit(() -> {
                         occupied.countDown();
@@ -5612,8 +5162,7 @@ class NanocachedClientTest {
                 client.set("k".getBytes(StandardCharsets.UTF_8), value);
                 // The real replica leg is now queued behind the poolSize
                 // blocking tasks above — it cannot have read `value` yet.
-                Arrays.fill(
-                        value, (byte) 'X'); // mutate the caller's array in place, as a buffer-reuse
+                Arrays.fill(value, (byte) 'X'); // mutate the caller's array in place, as a buffer-reuse
                 // caller would
 
                 release.countDown(); // let every dummy task finish, then the real leg runs
@@ -5633,8 +5182,7 @@ class NanocachedClientTest {
     // Occupies the (single) background-leg thread so a fire-and-forget leg
     // stays queued, not yet having read its arguments, until the returned
     // latch is released.
-    private static java.util.concurrent.CountDownLatch blockBackgroundLegs(NanocachedClient client)
-            throws Exception {
+    private static java.util.concurrent.CountDownLatch blockBackgroundLegs(NanocachedClient client) throws Exception {
         Field backgroundLegsField = NanocachedClient.class.getDeclaredField("backgroundLegs");
         backgroundLegsField.setAccessible(true);
         ExecutorService backgroundLegs = (ExecutorService) backgroundLegsField.get(client);
@@ -5663,7 +5211,8 @@ class NanocachedClientTest {
             byte[] key = "k".getBytes(StandardCharsets.UTF_8);
             String replica = new HashRing(NAMES).owners(namespace, key, 2).get(1);
 
-            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connectFireAndForget(cluster.discovery().port())) {
                 java.util.concurrent.CountDownLatch release = blockBackgroundLegs(client);
                 try {
                     client.set(namespace, key, "v".getBytes(StandardCharsets.UTF_8), 0L);
@@ -5674,9 +5223,7 @@ class NanocachedClientTest {
                 }
 
                 MockNode node = cluster.nodes().get(replica);
-                waitFor(
-                        () -> !node.namespacedStores.isEmpty(),
-                        "the background write to land on the replica");
+                waitFor(() -> !node.namespacedStores.isEmpty(), "the background write to land on the replica");
                 Map<String, byte[]> stored = node.namespacedStores.get("tenant");
                 assertTrue(
                         stored != null && stored.containsKey("k"),
@@ -5696,14 +5243,12 @@ class NanocachedClientTest {
             byte[] key = "k".getBytes(StandardCharsets.UTF_8);
             String replica = new HashRing(NAMES).owners(namespace, key, 2).get(1);
 
-            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connectFireAndForget(cluster.discovery().port())) {
                 java.util.concurrent.CountDownLatch release = blockBackgroundLegs(client);
                 try {
                     client.setManyBytes(
-                            namespace,
-                            new byte[][] {key},
-                            new byte[][] {"v".getBytes(StandardCharsets.UTF_8)},
-                            0L);
+                            namespace, new byte[][] {key}, new byte[][] {"v".getBytes(StandardCharsets.UTF_8)}, 0L);
                     Arrays.fill(key, (byte) 'X');
                     Arrays.fill(namespace, (byte) 'Y');
                 } finally {
@@ -5711,9 +5256,7 @@ class NanocachedClientTest {
                 }
 
                 MockNode node = cluster.nodes().get(replica);
-                waitFor(
-                        () -> !node.namespacedStores.isEmpty(),
-                        "the background write to land on the replica");
+                waitFor(() -> !node.namespacedStores.isEmpty(), "the background write to land on the replica");
                 Map<String, byte[]> stored = node.namespacedStores.get("tenant");
                 assertTrue(
                         stored != null && stored.containsKey("k"),
@@ -5729,21 +5272,22 @@ class NanocachedClientTest {
         NanocachedClient.maxInFlightBackgroundReplicaWrites = 2;
 
         try (Cluster cluster = startCluster(2)) {
-            String replica =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            String replica = new HashRing(NAMES)
+                    .owners("k".getBytes(StandardCharsets.UTF_8), 2)
+                    .get(1);
             cluster.nodes().get(replica).delaySets(150);
 
-            try (NanocachedClient client = connectFireAndForget(cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connectFireAndForget(cluster.discovery().port())) {
                 long[] elapsedMillis = new long[3];
                 Thread[] threads = new Thread[3];
                 for (int i = 0; i < threads.length; i++) {
                     int index = i;
-                    threads[i] =
-                            new Thread(() -> {
-                                long start = System.nanoTime();
-                                client.set("k", "v");
-                                elapsedMillis[index] = (System.nanoTime() - start) / 1_000_000;
-                            });
+                    threads[i] = new Thread(() -> {
+                        long start = System.nanoTime();
+                        client.set("k", "v");
+                        elapsedMillis[index] = (System.nanoTime() - start) / 1_000_000;
+                    });
                     threads[i].start();
                 }
                 for (Thread thread : threads) thread.join();
@@ -5754,9 +5298,7 @@ class NanocachedClientTest {
                     if (ms >= 150 - TIMING_TOLERANCE_MILLIS) anySlow = true;
                     else anyFast = true;
                 }
-                assertTrue(
-                        anySlow,
-                        "expected at least one call to fall back to synchronous past the cap");
+                assertTrue(anySlow, "expected at least one call to fall back to synchronous past the cap");
                 assertTrue(anyFast, "expected at least one call to return fast (below the cap)");
             }
         }
@@ -5765,8 +5307,9 @@ class NanocachedClientTest {
     @Test
     void closeDrainsInFlightBackgroundReplicaWrites() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            String replica =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            String replica = new HashRing(NAMES)
+                    .owners("k".getBytes(StandardCharsets.UTF_8), 2)
+                    .get(1);
             cluster.nodes().get(replica).delaySets(80);
 
             NanocachedClient client = connectFireAndForget(cluster.discovery().port());
@@ -5799,11 +5342,13 @@ class NanocachedClientTest {
         // requestTimeout + this margin, comfortably above it.
         NanocachedClient.executorTerminationTimeoutMillis = 200;
         try (Cluster cluster = startCluster(2)) {
-            String replica =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(1);
+            String replica = new HashRing(NAMES)
+                    .owners("k".getBytes(StandardCharsets.UTF_8), 2)
+                    .get(1);
             cluster.nodes().get(replica).delaySets(800);
 
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 Thread writer = new Thread(() -> client.set("k", "v"));
                 writer.start();
                 // Let the synchronous leg get in flight on replicaWriters
@@ -5846,26 +5391,24 @@ class NanocachedClientTest {
             int threadCount = 8;
             Thread[] threads = new Thread[threadCount];
             List<Throwable> unexpected = java.util.Collections.synchronizedList(new ArrayList<>());
-            java.util.concurrent.atomic.AtomicBoolean stop =
-                    new java.util.concurrent.atomic.AtomicBoolean();
+            java.util.concurrent.atomic.AtomicBoolean stop = new java.util.concurrent.atomic.AtomicBoolean();
             for (int i = 0; i < threadCount; i++) {
                 int index = i;
-                threads[i] =
-                        new Thread(
-                                () -> {
-                                    while (!stop.get()) {
-                                        try {
-                                            client.set("k" + index, "v");
-                                        } catch (NanocachedException expected) {
-                                            // AlreadyClosed/ConnectionLost once close() wins —
-                                            // fine.
-                                        } catch (Throwable other) {
-                                            unexpected.add(other);
-                                            return;
-                                        }
-                                    }
-                                },
-                                "test-racing-writer-" + i);
+                threads[i] = new Thread(
+                        () -> {
+                            while (!stop.get()) {
+                                try {
+                                    client.set("k" + index, "v");
+                                } catch (NanocachedException expected) {
+                                    // AlreadyClosed/ConnectionLost once close() wins —
+                                    // fine.
+                                } catch (Throwable other) {
+                                    unexpected.add(other);
+                                    return;
+                                }
+                            }
+                        },
+                        "test-racing-writer-" + i);
                 threads[i].start();
             }
 
@@ -5879,8 +5422,7 @@ class NanocachedClientTest {
     }
 
     @Test
-    void multiGetFallsBackToInlineExecutionWhenReplicaWritersIsShutDownWithoutClosingTheClient()
-            throws Exception {
+    void multiGetFallsBackToInlineExecutionWhenReplicaWritersIsShutDownWithoutClosingTheClient() throws Exception {
         // Regression for issue #277: multiGetPass used to submit each
         // owner-group leg straight to replicaWriters via a raw
         // CompletableFuture.supplyAsync, bypassing submitReplicaWrite —
@@ -5898,7 +5440,8 @@ class NanocachedClientTest {
         // instead run the leg synchronously on this thread and return the
         // normal result.
         try (Cluster cluster = startCluster(2);
-                NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+                NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
             client.set("k", "v");
 
             Field replicaWritersField = NanocachedClient.class.getDeclaredField("replicaWriters");
@@ -5923,8 +5466,7 @@ class NanocachedClientTest {
         // get() below finds the value only on the replica, so every call
         // triggers a repair write-back racing close().
         try (Cluster cluster = startCluster(2)) {
-            List<String> owners =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
             cluster.nodes()
                     .get(owners.get(1))
                     .store
@@ -5937,25 +5479,23 @@ class NanocachedClientTest {
             int threadCount = 8;
             Thread[] threads = new Thread[threadCount];
             List<Throwable> unexpected = java.util.Collections.synchronizedList(new ArrayList<>());
-            java.util.concurrent.atomic.AtomicBoolean stop =
-                    new java.util.concurrent.atomic.AtomicBoolean();
+            java.util.concurrent.atomic.AtomicBoolean stop = new java.util.concurrent.atomic.AtomicBoolean();
             for (int i = 0; i < threadCount; i++) {
-                threads[i] =
-                        new Thread(
-                                () -> {
-                                    while (!stop.get()) {
-                                        try {
-                                            client.getBytes("k");
-                                        } catch (NanocachedException expected) {
-                                            // AlreadyClosed/ConnectionLost once close() wins —
-                                            // fine.
-                                        } catch (Throwable other) {
-                                            unexpected.add(other);
-                                            return;
-                                        }
-                                    }
-                                },
-                                "test-racing-reader-" + i);
+                threads[i] = new Thread(
+                        () -> {
+                            while (!stop.get()) {
+                                try {
+                                    client.getBytes("k");
+                                } catch (NanocachedException expected) {
+                                    // AlreadyClosed/ConnectionLost once close() wins —
+                                    // fine.
+                                } catch (Throwable other) {
+                                    unexpected.add(other);
+                                    return;
+                                }
+                            }
+                        },
+                        "test-racing-reader-" + i);
                 threads[i].start();
             }
 
@@ -6003,29 +5543,24 @@ class NanocachedClientTest {
         try (Cluster cluster = startCluster(1)) {
             NanocachedClient client = connect("127.0.0.1", cluster.discovery().port());
             try {
-                java.lang.reflect.Field replicaWritersField =
-                        NanocachedClient.class.getDeclaredField("replicaWriters");
+                java.lang.reflect.Field replicaWritersField = NanocachedClient.class.getDeclaredField("replicaWriters");
                 replicaWritersField.setAccessible(true);
                 ExecutorService replicaWriters = (ExecutorService) replicaWritersField.get(client);
                 assertFalse(replicaWriters.isShutdown());
 
-                java.lang.reflect.Field keepAliveField =
-                        NanocachedClient.class.getDeclaredField("keepAlive");
+                java.lang.reflect.Field keepAliveField = NanocachedClient.class.getDeclaredField("keepAlive");
                 keepAliveField.setAccessible(true);
                 ExecutorService keepAlive = (ExecutorService) keepAliveField.get(client);
                 assertFalse(keepAlive.isShutdown());
 
-                java.lang.reflect.Method teardown =
-                        NanocachedClient.class.getDeclaredMethod("teardown");
+                java.lang.reflect.Method teardown = NanocachedClient.class.getDeclaredMethod("teardown");
                 teardown.setAccessible(true);
                 teardown.invoke(client);
 
                 assertTrue(
                         replicaWriters.isShutdown(),
                         "teardown() must shut down replicaWriters too, not just the connections");
-                assertTrue(
-                        keepAlive.isShutdown(),
-                        "teardown() must shut down keepAlive too, not just the connections");
+                assertTrue(keepAlive.isShutdown(), "teardown() must shut down keepAlive too, not just the connections");
             } finally {
                 client.close();
             }
@@ -6035,17 +5570,15 @@ class NanocachedClientTest {
     // ── read repair (read repair) ────────────────────────────
 
     private static NanocachedClient connectWithReadRepair(int port) {
-        return NanocachedClient.connect(
-                NanocachedClient.builder()
-                        .addresses(List.of(new Address("127.0.0.1", port)))
-                        .readRepair(true));
+        return NanocachedClient.connect(NanocachedClient.builder()
+                .addresses(List.of(new Address("127.0.0.1", port)))
+                .readRepair(true));
     }
 
     @Test
     void byDefaultACleanMissOnThePrimaryIsNotRepaired() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            List<String> owners =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
             cluster.nodes()
                     .get(owners.get(1))
                     .store
@@ -6053,13 +5586,13 @@ class NanocachedClientTest {
                             MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8)),
                             "from-replica".getBytes(StandardCharsets.UTF_8));
 
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 assertEquals(Optional.empty(), client.getBytes("k"));
-                assertFalse(
-                        cluster.nodes()
-                                .get(owners.get(0))
-                                .store
-                                .containsKey(MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8))));
+                assertFalse(cluster.nodes()
+                        .get(owners.get(0))
+                        .store
+                        .containsKey(MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8))));
             }
         }
     }
@@ -6067,8 +5600,7 @@ class NanocachedClientTest {
     @Test
     void findsAValueOnAReplicaAndRepairsThePrimary() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            List<String> owners =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
             cluster.nodes()
                     .get(owners.get(1))
                     .store
@@ -6076,7 +5608,8 @@ class NanocachedClientTest {
                             MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8)),
                             "from-replica".getBytes(StandardCharsets.UTF_8));
 
-            try (NanocachedClient client = connectWithReadRepair(cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connectWithReadRepair(cluster.discovery().port())) {
                 assertArrayEquals(
                         "from-replica".getBytes(StandardCharsets.UTF_8),
                         client.getBytes("k").orElseThrow());
@@ -6105,8 +5638,7 @@ class NanocachedClientTest {
     }
 
     @Test
-    void theReadRepairWriteBackDoesNotAliasTheCallersKeyNamespaceOrReturnedValue()
-            throws Exception {
+    void theReadRepairWriteBackDoesNotAliasTheCallersKeyNamespaceOrReturnedValue() throws Exception {
         // Issue #1288: read repair is always asynchronous, and the repair
         // write used the caller's own namespace/key arrays and the very
         // byte[] returned to the caller. A caller that reuses its key
@@ -6123,7 +5655,8 @@ class NanocachedClientTest {
                     .computeIfAbsent("tenant", n -> new java.util.concurrent.ConcurrentHashMap<>())
                     .put("k", "from-replica".getBytes(StandardCharsets.UTF_8));
 
-            try (NanocachedClient client = connectWithReadRepair(cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connectWithReadRepair(cluster.discovery().port())) {
                 java.util.concurrent.CountDownLatch release = blockBackgroundLegs(client);
                 try {
                     byte[] value = client.getBytes(namespace, key).orElseThrow();
@@ -6153,7 +5686,8 @@ class NanocachedClientTest {
     @Test
     void staysACleanMissWhenNoOwnerHasTheValue() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connectWithReadRepair(cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connectWithReadRepair(cluster.discovery().port())) {
                 assertEquals(Optional.empty(), client.getBytes("nowhere"));
             }
         }
@@ -6167,17 +5701,15 @@ class NanocachedClientTest {
     private static final long HEDGE_TIMING_TOLERANCE_MILLIS = 30;
 
     private static NanocachedClient connectWithReadHedgeAfter(int port, long hedgeAfterMillis) {
-        return NanocachedClient.connect(
-                NanocachedClient.builder()
-                        .addresses(List.of(new Address("127.0.0.1", port)))
-                        .readHedgeAfter(Duration.ofMillis(hedgeAfterMillis)));
+        return NanocachedClient.connect(NanocachedClient.builder()
+                .addresses(List.of(new Address("127.0.0.1", port)))
+                .readHedgeAfter(Duration.ofMillis(hedgeAfterMillis)));
     }
 
     @Test
     void readHedgeAfterRejectsANonPositiveDuration() {
         assertThrows(
-                IllegalArgumentException.class,
-                () -> NanocachedClient.builder().readHedgeAfter(Duration.ZERO));
+                IllegalArgumentException.class, () -> NanocachedClient.builder().readHedgeAfter(Duration.ZERO));
         assertThrows(
                 IllegalArgumentException.class,
                 () -> NanocachedClient.builder().readHedgeAfter(Duration.ofMillis(-100)));
@@ -6186,8 +5718,7 @@ class NanocachedClientTest {
     @Test
     void aHitFromTheReplicaWinsOverASlowPrimary() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            List<String> owners =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
             String primary = owners.get(0);
             String replica = owners.get(1);
 
@@ -6206,13 +5737,8 @@ class NanocachedClientTest {
                         "expected the replica's fast answer to win, took " + elapsedMillis + "ms");
                 assertTrue(
                         elapsedMillis >= 50 - HEDGE_TIMING_TOLERANCE_MILLIS,
-                        "expected to wait out the hedge interval first, took "
-                                + elapsedMillis
-                                + "ms");
-                assertEquals(
-                        1,
-                        cluster.nodes().get(replica).getCount.get(),
-                        "the replica should have been hedged to");
+                        "expected to wait out the hedge interval first, took " + elapsedMillis + "ms");
+                assertEquals(1, cluster.nodes().get(replica).getCount.get(), "the replica should have been hedged to");
 
                 // The slow primary's leg was left to finish, not
                 // cancelled, and close() (the try-with-resources below)
@@ -6228,8 +5754,7 @@ class NanocachedClientTest {
     @Test
     void aFastPrimaryIsNeverHedged() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            List<String> owners =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
             String replica = owners.get(1);
 
             try (NanocachedClient client =
@@ -6248,18 +5773,14 @@ class NanocachedClientTest {
         // Hedging must never turn a hit into a miss: the replica lacks the
         // copy and answers first, but the primary's answer is what counts.
         try (Cluster cluster = startCluster(2)) {
-            List<String> owners =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
             String primary = owners.get(0);
             String replica = owners.get(1);
 
             try (NanocachedClient client =
                     connectWithReadHedgeAfter(cluster.discovery().port(), 50)) {
                 client.set("k", "v");
-                cluster.nodes()
-                        .get(replica)
-                        .store
-                        .remove(MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8)));
+                cluster.nodes().get(replica).store.remove(MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8)));
                 cluster.nodes().get(primary).delayGets(200);
 
                 long start = System.nanoTime();
@@ -6282,12 +5803,12 @@ class NanocachedClientTest {
     @Test
     void offByDefaultASlowPrimaryBoundsTheRead() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            List<String> owners =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
             String primary = owners.get(0);
             String replica = owners.get(1);
 
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 client.set("k", "v");
                 cluster.nodes().get(primary).delayGets(200);
 
@@ -6298,9 +5819,7 @@ class NanocachedClientTest {
                 assertEquals(Optional.of("v"), value);
                 assertTrue(
                         elapsedMillis >= 200 - HEDGE_TIMING_TOLERANCE_MILLIS,
-                        "expected the slow primary to bound the read, took "
-                                + elapsedMillis
-                                + "ms");
+                        "expected the slow primary to bound the read, took " + elapsedMillis + "ms");
                 assertEquals(0, cluster.nodes().get(replica).getCount.get());
             }
         }
@@ -6309,11 +5828,11 @@ class NanocachedClientTest {
     @Test
     void aDeadPrimaryFailsOverImmediately() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            List<String> owners =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
             String primary = owners.get(0);
 
-            NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 500);
+            NanocachedClient client =
+                    connectWithReadHedgeAfter(cluster.discovery().port(), 500);
             try {
                 client.set("k", "v");
                 cluster.nodes().get(primary).close();
@@ -6365,42 +5884,35 @@ class NanocachedClientTest {
         // aHedgeLegRacingCloseIsRefusedNotRegistered the path is driven
         // reflectively.
         try (Cluster cluster = startCluster(2)) {
-            NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50);
+            NanocachedClient client =
+                    connectWithReadHedgeAfter(cluster.discovery().port(), 50);
             try {
                 client.set("k", "v");
 
-                Class<?> opInterface =
-                        Class.forName("org.nanocached.NanocachedClient$ConnectionOp");
+                Class<?> opInterface = Class.forName("org.nanocached.NanocachedClient$ConnectionOp");
                 AssertionError injected = new AssertionError("injected hedge-leg error");
-                Object op =
-                        Proxy.newProxyInstance(
-                                opInterface.getClassLoader(),
-                                new Class<?>[] {opInterface},
-                                (proxy, method, args) -> {
-                                    throw injected;
-                                });
-                Method readHedged =
-                        NanocachedClient.class.getDeclaredMethod(
-                                "readHedged", opInterface, List.class);
+                Object op = Proxy.newProxyInstance(
+                        opInterface.getClassLoader(), new Class<?>[] {opInterface}, (proxy, method, args) -> {
+                            throw injected;
+                        });
+                Method readHedged = NanocachedClient.class.getDeclaredMethod("readHedged", opInterface, List.class);
                 readHedged.setAccessible(true);
 
                 // Run on a separate daemon thread so a regression shows up as a
                 // bounded assertion failure instead of a hung test run.
                 java.util.concurrent.atomic.AtomicReference<Throwable> thrown =
                         new java.util.concurrent.atomic.AtomicReference<>();
-                Thread caller =
-                        new Thread(
-                                () -> {
-                                    try {
-                                        readHedged.invoke(
-                                                client, op, List.of(NAMES.get(0), NAMES.get(1)));
-                                    } catch (InvocationTargetException e) {
-                                        thrown.set(e.getCause());
-                                    } catch (Throwable e) {
-                                        thrown.set(e);
-                                    }
-                                },
-                                "hedge-error-caller");
+                Thread caller = new Thread(
+                        () -> {
+                            try {
+                                readHedged.invoke(client, op, List.of(NAMES.get(0), NAMES.get(1)));
+                            } catch (InvocationTargetException e) {
+                                thrown.set(e.getCause());
+                            } catch (Throwable e) {
+                                thrown.set(e);
+                            }
+                        },
+                        "hedge-error-caller");
                 caller.setDaemon(true);
                 caller.start();
                 caller.join(5_000);
@@ -6410,8 +5922,7 @@ class NanocachedClientTest {
                     caller.join(2_000);
                 }
                 assertFalse(parked, "readHedged must not park forever after a leg threw an Error");
-                assertSame(
-                        injected, thrown.get(), "the leg's Error must reach the caller unchanged");
+                assertSame(injected, thrown.get(), "the leg's Error must reach the caller unchanged");
             } finally {
                 // close() must still complete: the failed legs were drained.
                 Thread closer = new Thread(client::close, "hedge-error-closer");
@@ -6425,8 +5936,7 @@ class NanocachedClientTest {
     }
 
     @Test
-    void aHedgeLegThatNeverSettlesFailsTheReadWithinABoundInsteadOfParkingTheCaller()
-            throws Exception {
+    void aHedgeLegThatNeverSettlesFailsTheReadWithinABoundInsteadOfParkingTheCaller() throws Exception {
         // Issue #1265: whatever stops a hedge leg from reporting (an
         // OutOfMemoryError while it settles, a bug nobody has thought of),
         // readHedged used to park in completions.take() with no timeout. The
@@ -6439,42 +5949,35 @@ class NanocachedClientTest {
         long terminationMargin = NanocachedClient.executorTerminationTimeoutMillis;
         java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
         try (Cluster cluster = startCluster(2)) {
-            NanocachedClient client = connectWithReadHedgeAfter(cluster.discovery().port(), 50);
+            NanocachedClient client =
+                    connectWithReadHedgeAfter(cluster.discovery().port(), 50);
             try {
                 Connection.requestTimeoutMillis = 200;
                 Identify.connectTimeoutMillis = 200;
                 NanocachedClient.executorTerminationTimeoutMillis = 100;
 
-                Class<?> opInterface =
-                        Class.forName("org.nanocached.NanocachedClient$ConnectionOp");
-                Object op =
-                        Proxy.newProxyInstance(
-                                opInterface.getClassLoader(),
-                                new Class<?>[] {opInterface},
-                                (proxy, method, args) -> {
-                                    release.await();
-                                    return null;
-                                });
-                Method readHedged =
-                        NanocachedClient.class.getDeclaredMethod(
-                                "readHedged", opInterface, List.class);
+                Class<?> opInterface = Class.forName("org.nanocached.NanocachedClient$ConnectionOp");
+                Object op = Proxy.newProxyInstance(
+                        opInterface.getClassLoader(), new Class<?>[] {opInterface}, (proxy, method, args) -> {
+                            release.await();
+                            return null;
+                        });
+                Method readHedged = NanocachedClient.class.getDeclaredMethod("readHedged", opInterface, List.class);
                 readHedged.setAccessible(true);
 
                 java.util.concurrent.atomic.AtomicReference<Throwable> thrown =
                         new java.util.concurrent.atomic.AtomicReference<>();
-                Thread caller =
-                        new Thread(
-                                () -> {
-                                    try {
-                                        readHedged.invoke(
-                                                client, op, List.of(NAMES.get(0), NAMES.get(1)));
-                                    } catch (InvocationTargetException e) {
-                                        thrown.set(e.getCause());
-                                    } catch (Throwable e) {
-                                        thrown.set(e);
-                                    }
-                                },
-                                "hedge-unsettled-caller");
+                Thread caller = new Thread(
+                        () -> {
+                            try {
+                                readHedged.invoke(client, op, List.of(NAMES.get(0), NAMES.get(1)));
+                            } catch (InvocationTargetException e) {
+                                thrown.set(e.getCause());
+                            } catch (Throwable e) {
+                                thrown.set(e);
+                            }
+                        },
+                        "hedge-unsettled-caller");
                 caller.setDaemon(true);
                 long start = System.nanoTime();
                 caller.start();
@@ -6485,17 +5988,14 @@ class NanocachedClientTest {
                     caller.interrupt();
                     caller.join(2_000);
                 }
-                assertFalse(
-                        parked, "readHedged must fail within its bound when no leg ever reports");
+                assertFalse(parked, "readHedged must fail within its bound when no leg ever reports");
                 assertTrue(thrown.get() instanceof NanocachedException, "got " + thrown.get());
                 assertTrue(
                         thrown.get().getMessage().contains("did not report"),
                         thrown.get().getMessage());
                 assertTrue(
                         elapsedMillis >= 1_000,
-                        "the bound must not cut a slow read short, failed after "
-                                + elapsedMillis
-                                + "ms");
+                        "the bound must not cut a slow read short, failed after " + elapsedMillis + "ms");
             } finally {
                 Connection.requestTimeoutMillis = requestTimeout;
                 Identify.connectTimeoutMillis = connectTimeout;
@@ -6527,12 +6027,9 @@ class NanocachedClientTest {
         // settles -- with the old shape (a ConcurrentHashMap put plus a
         // LinkedBlockingQueue add) as a control that the measurement can see
         // allocation at all.
-        java.lang.management.ThreadMXBean bean =
-                java.lang.management.ManagementFactory.getThreadMXBean();
-        org.junit.jupiter.api.Assumptions.assumeTrue(
-                bean instanceof com.sun.management.ThreadMXBean
-                        && ((com.sun.management.ThreadMXBean) bean)
-                                .isThreadAllocatedMemorySupported());
+        java.lang.management.ThreadMXBean bean = java.lang.management.ManagementFactory.getThreadMXBean();
+        org.junit.jupiter.api.Assumptions.assumeTrue(bean instanceof com.sun.management.ThreadMXBean
+                && ((com.sun.management.ThreadMXBean) bean).isThreadAllocatedMemorySupported());
         com.sun.management.ThreadMXBean sun = (com.sun.management.ThreadMXBean) bean;
         long self = Thread.currentThread().getId();
         int rounds = 20_000;
@@ -6540,8 +6037,7 @@ class NanocachedClientTest {
 
         java.util.concurrent.ConcurrentHashMap<Integer, Object> oldResults =
                 new java.util.concurrent.ConcurrentHashMap<>();
-        java.util.concurrent.LinkedBlockingQueue<Integer> oldQueue =
-                new java.util.concurrent.LinkedBlockingQueue<>();
+        java.util.concurrent.LinkedBlockingQueue<Integer> oldQueue = new java.util.concurrent.LinkedBlockingQueue<>();
         for (int i = 0; i < rounds; i++) { // warm up
             oldResults.put(i % 2, outcome);
             oldQueue.add(i % 2);
@@ -6554,14 +6050,10 @@ class NanocachedClientTest {
             oldQueue.poll();
         }
         long controlBytes = sun.getThreadAllocatedBytes(self) - before;
-        assertTrue(
-                controlBytes > 100_000,
-                "control should allocate, measured " + controlBytes + " bytes");
+        assertTrue(controlBytes > 100_000, "control should allocate, measured " + controlBytes + " bytes");
 
-        NanocachedClient.HedgeSettlement<Object> settlement =
-                new NanocachedClient.HedgeSettlement<>(2);
-        NanocachedClient.LegOutcome<Object> ended =
-                NanocachedClient.LegOutcome.endedWithoutOutcome();
+        NanocachedClient.HedgeSettlement<Object> settlement = new NanocachedClient.HedgeSettlement<>(2);
+        NanocachedClient.LegOutcome<Object> ended = NanocachedClient.LegOutcome.endedWithoutOutcome();
         for (int i = 0; i < rounds; i++) { // warm up
             settlement.settle(i % 2, ended);
         }
@@ -6572,12 +6064,7 @@ class NanocachedClientTest {
         long settleBytes = sun.getThreadAllocatedBytes(self) - before;
         assertTrue(
                 settleBytes < controlBytes / 20,
-                "settle allocated "
-                        + settleBytes
-                        + " bytes over "
-                        + rounds
-                        + " calls, control "
-                        + controlBytes);
+                "settle allocated " + settleBytes + " bytes over " + rounds + " calls, control " + controlBytes);
     }
 
     @Test
@@ -6600,34 +6087,23 @@ class NanocachedClientTest {
                 Field hedgedReadsField = NanocachedClient.class.getDeclaredField("hedgedReads");
                 hedgedReadsField.setAccessible(true);
 
-                Class<?> opInterface =
-                        Class.forName("org.nanocached.NanocachedClient$ConnectionOp");
-                Object op =
-                        Proxy.newProxyInstance(
-                                opInterface.getClassLoader(),
-                                new Class<?>[] {opInterface},
-                                (proxy, method, args) -> {
-                                    throw new AssertionError(
-                                            "the leg must never be dialed after close() began");
-                                });
-                Method readHedged =
-                        NanocachedClient.class.getDeclaredMethod(
-                                "readHedged", opInterface, List.class);
+                Class<?> opInterface = Class.forName("org.nanocached.NanocachedClient$ConnectionOp");
+                Object op = Proxy.newProxyInstance(
+                        opInterface.getClassLoader(), new Class<?>[] {opInterface}, (proxy, method, args) -> {
+                            throw new AssertionError("the leg must never be dialed after close() began");
+                        });
+                Method readHedged = NanocachedClient.class.getDeclaredMethod("readHedged", opInterface, List.class);
                 readHedged.setAccessible(true);
 
                 closedField.setBoolean(client, true);
                 try {
-                    InvocationTargetException thrown =
-                            assertThrows(
-                                    InvocationTargetException.class,
-                                    () -> readHedged.invoke(client, op, List.of("a", "b")));
+                    InvocationTargetException thrown = assertThrows(
+                            InvocationTargetException.class, () -> readHedged.invoke(client, op, List.of("a", "b")));
                     assertTrue(
                             thrown.getCause() instanceof NanocachedException.AlreadyClosed,
                             "expected AlreadyClosed, got " + thrown.getCause());
                     Set<?> hedgedReads = (Set<?>) hedgedReadsField.get(client);
-                    assertTrue(
-                            hedgedReads.isEmpty(),
-                            "no hedge leg may be registered after close() began");
+                    assertTrue(hedgedReads.isEmpty(), "no hedge leg may be registered after close() began");
                 } finally {
                     // Restore so close() runs its real teardown.
                     closedField.setBoolean(client, false);
@@ -6652,8 +6128,7 @@ class NanocachedClientTest {
         NanocachedClient.maxInFlightHedgeLoserLegs = 0;
 
         try (Cluster cluster = startCluster(2)) {
-            List<String> owners =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
             String primary = owners.get(0);
             String replica = owners.get(1);
 
@@ -6667,10 +6142,7 @@ class NanocachedClientTest {
                 long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
 
                 assertEquals(Optional.of("v"), value);
-                assertEquals(
-                        1,
-                        cluster.nodes().get(replica).getCount.get(),
-                        "the replica should have been hedged to");
+                assertEquals(1, cluster.nodes().get(replica).getCount.get(), "the replica should have been hedged to");
                 assertTrue(
                         elapsedMillis >= 300 - HEDGE_TIMING_TOLERANCE_MILLIS,
                         "expected get() to wait for the slow primary's loser leg past the cap, took "
@@ -6682,8 +6154,7 @@ class NanocachedClientTest {
                 hedgedReadsField.setAccessible(true);
                 Set<?> hedgedReads = (Set<?>) hedgedReadsField.get(client);
                 assertTrue(
-                        hedgedReads.isEmpty(),
-                        "the awaited loser must already be gone, not left for close() to drain");
+                        hedgedReads.isEmpty(), "the awaited loser must already be gone, not left for close() to drain");
             }
         }
     }
@@ -6728,12 +6199,12 @@ class NanocachedClientTest {
     private long fourthReadMillis(int threshold, int[] lateLegsOut) throws Exception {
         NanocachedClient.hedgeSuspectLateLegs = threshold;
         try (Cluster cluster = startCluster(2)) {
-            String primary =
-                    new HashRing(NAMES).owners("late-0".getBytes(StandardCharsets.UTF_8), 2).get(0);
+            String primary = new HashRing(NAMES)
+                    .owners("late-0".getBytes(StandardCharsets.UTF_8), 2)
+                    .get(0);
             List<String> keys = keysWithPrimary(primary, 4);
             try (NanocachedClient client =
-                    connectWithReadHedgeAfter(
-                            cluster.discovery().port(), LATE_HEDGE_AFTER_MILLIS)) {
+                    connectWithReadHedgeAfter(cluster.discovery().port(), LATE_HEDGE_AFTER_MILLIS)) {
                 for (String key : keys) {
                     client.set(key, "v");
                 }
@@ -6755,9 +6226,7 @@ class NanocachedClientTest {
         assertEquals(3, late[0]);
         assertTrue(
                 elapsedMillis < LATE_HEDGE_AFTER_MILLIS - HEDGE_TIMING_TOLERANCE_MILLIS,
-                "expected the replica's answer without the hedge interval, took "
-                        + elapsedMillis
-                        + "ms");
+                "expected the replica's answer without the hedge interval, took " + elapsedMillis + "ms");
     }
 
     @Test
@@ -6777,8 +6246,9 @@ class NanocachedClientTest {
     void aMissStillWaitsForTheDemotedPrimary() throws Exception {
         NanocachedClient.hedgeSuspectLateLegs = 2;
         try (Cluster cluster = startCluster(2)) {
-            String primary =
-                    new HashRing(NAMES).owners("late-0".getBytes(StandardCharsets.UTF_8), 2).get(0);
+            String primary = new HashRing(NAMES)
+                    .owners("late-0".getBytes(StandardCharsets.UTF_8), 2)
+                    .get(0);
             String replica = primary.equals(NAMES.get(0)) ? NAMES.get(1) : NAMES.get(0);
             List<String> keys = keysWithPrimary(primary, 3);
             try (NanocachedClient client =
@@ -6809,7 +6279,8 @@ class NanocachedClientTest {
     void demotingKeepsTheOrderWhenNoOwnerOrEveryOwnerIsSilent() throws Exception {
         NanocachedClient.hedgeSuspectLateLegs = 2;
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 List<String> names = List.of("a", "b", "c");
                 assertSame(names, client.demoteSilentOwners(names), "nobody is late");
 
@@ -6843,8 +6314,7 @@ class NanocachedClientTest {
         // waited for the slow primary.
         NanocachedClient.maxInFlightHedgeLoserLegs = 3;
         try (Cluster cluster = startCluster(2)) {
-            List<String> owners =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
             String primary = owners.get(0);
             String replica = owners.get(1);
             try (NanocachedClient client =
@@ -6856,12 +6326,11 @@ class NanocachedClientTest {
                 try {
                     List<Future<Long>> reads = new ArrayList<>();
                     for (int i = 0; i < 3; i++) {
-                        reads.add(
-                                pool.submit(() -> {
-                                    long start = System.nanoTime();
-                                    assertEquals(Optional.of("v"), client.get("k"));
-                                    return (System.nanoTime() - start) / 1_000_000;
-                                }));
+                        reads.add(pool.submit(() -> {
+                            long start = System.nanoTime();
+                            assertEquals(Optional.of("v"), client.get("k"));
+                            return (System.nanoTime() - start) / 1_000_000;
+                        }));
                     }
                     for (Future<Long> read : reads) {
                         long elapsedMillis = read.get();
@@ -6875,19 +6344,13 @@ class NanocachedClientTest {
                     pool.shutdownNow();
                 }
                 assertEquals(3, cluster.nodes().get(replica).getCount.get());
-                assertEquals(
-                        3,
-                        client.detachedHedgeLegs.get(),
-                        "the three primary legs were left running");
+                assertEquals(3, client.detachedHedgeLegs.get(), "the three primary legs were left running");
 
                 long deadline = System.nanoTime() + 5_000_000_000L;
                 while (client.detachedHedgeLegs.get() > 0 && System.nanoTime() < deadline) {
                     Thread.sleep(10);
                 }
-                assertEquals(
-                        0,
-                        client.detachedHedgeLegs.get(),
-                        "the detached legs release their counts");
+                assertEquals(0, client.detachedHedgeLegs.get(), "the detached legs release their counts");
             }
         }
     }
@@ -6900,8 +6363,7 @@ class NanocachedClientTest {
         // replication 2 the replica could never be demoted through the
         // keys it is second for.
         try (Cluster cluster = startCluster(2)) {
-            List<String> owners =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
             String primary = owners.get(0);
             String replica = owners.get(1);
             try (NanocachedClient client =
@@ -6927,9 +6389,7 @@ class NanocachedClientTest {
                 while (!client.lateHedgeLegs.isEmpty() && System.nanoTime() < deadline) {
                     Thread.sleep(10);
                 }
-                assertTrue(
-                        client.lateHedgeLegs.isEmpty(),
-                        "both legs release their counts: " + client.lateHedgeLegs);
+                assertTrue(client.lateHedgeLegs.isEmpty(), "both legs release their counts: " + client.lateHedgeLegs);
             }
         }
     }
@@ -6946,8 +6406,7 @@ class NanocachedClientTest {
                 Field hedgeLegsField = NanocachedClient.class.getDeclaredField("hedgeLegs");
                 hedgeLegsField.setAccessible(true);
                 ExecutorService hedgeLegs = (ExecutorService) hedgeLegsField.get(client);
-                Field replicaWritersField =
-                        NanocachedClient.class.getDeclaredField("replicaWriters");
+                Field replicaWritersField = NanocachedClient.class.getDeclaredField("replicaWriters");
                 replicaWritersField.setAccessible(true);
                 assertNotSame(replicaWritersField.get(client), hedgeLegs);
                 assertEquals(
@@ -6978,8 +6437,7 @@ class NanocachedClientTest {
                 }
                 assertTrue(
                         client.lateHedgeLegs.isEmpty(),
-                        "reads that are in flight but not late count for nothing: "
-                                + client.lateHedgeLegs);
+                        "reads that are in flight but not late count for nothing: " + client.lateHedgeLegs);
             }
         }
     }
@@ -6988,8 +6446,9 @@ class NanocachedClientTest {
     void lateLegsAreNoLongerCountedOnceTheyHaveFinished() throws Exception {
         NanocachedClient.hedgeSuspectLateLegs = 3;
         try (Cluster cluster = startCluster(2)) {
-            String primary =
-                    new HashRing(NAMES).owners("late-0".getBytes(StandardCharsets.UTF_8), 2).get(0);
+            String primary = new HashRing(NAMES)
+                    .owners("late-0".getBytes(StandardCharsets.UTF_8), 2)
+                    .get(0);
             List<String> keys = keysWithPrimary(primary, 3);
             try (NanocachedClient client =
                     connectWithReadHedgeAfter(cluster.discovery().port(), 50)) {
@@ -7009,10 +6468,10 @@ class NanocachedClientTest {
     @Test
     void aDeadReplicaIncrementsReplicaWriteFailuresStat() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "counted-replica-failure";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 cluster.nodes().get(owners.get(1)).close();
                 Thread.sleep(50);
 
@@ -7024,27 +6483,20 @@ class NanocachedClientTest {
     }
 
     @Test
-    void anUnreachableAddressDuringRefreshDoesNotCountWhileAnotherAddressAnswers()
-            throws Exception {
+    void anUnreachableAddressDuringRefreshDoesNotCountWhileAnotherAddressAnswers() throws Exception {
         try (Cluster cluster = startCluster(1)) {
             int dead = MockServers.unusedPort();
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            NanocachedClient.builder()
-                                    .addresses(
-                                            List.of(
-                                                    new Address("127.0.0.1", dead),
-                                                    new Address(
-                                                            "127.0.0.1",
-                                                            cluster.discovery().port()))))) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(
+                            new Address("127.0.0.1", dead),
+                            new Address("127.0.0.1", cluster.discovery().port()))))) {
                 assertEquals(0, client.stats().refreshFailures());
 
                 // Force a refresh directly rather than waiting out
                 // NODE_LIST_STALE_AFTER — the dead first address is still
                 // walked (and still fails) on every refresh, exactly as it
                 // was on connect().
-                java.lang.reflect.Method refreshNodeList =
-                        NanocachedClient.class.getDeclaredMethod("refreshNodeList");
+                java.lang.reflect.Method refreshNodeList = NanocachedClient.class.getDeclaredMethod("refreshNodeList");
                 refreshNodeList.setAccessible(true);
                 refreshNodeList.invoke(client);
 
@@ -7060,7 +6512,8 @@ class NanocachedClientTest {
         // needs for routing — so one unresponsive new node stalled all
         // traffic for the whole dial. Dials now happen outside the lock.
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 client.set("k", "v");
 
                 // A "new" node that accepts the TCP connection but never
@@ -7071,8 +6524,7 @@ class NanocachedClientTest {
                     // The dial may connect more than once (the echoed response tags
                     // legacy fallback redials after the first connection
                     // dies), so accept in a loop and track every socket.
-                    List<java.net.Socket> acceptedSockets =
-                            java.util.Collections.synchronizedList(new ArrayList<>());
+                    List<java.net.Socket> acceptedSockets = java.util.Collections.synchronizedList(new ArrayList<>());
                     // Issue #130: once the test starts tearing down, a
                     // connection accept() hands back *after* the close loop
                     // below ran would otherwise stay open until the SDK's
@@ -7080,63 +6532,56 @@ class NanocachedClientTest {
                     // acceptor closes whatever it accepts itself.
                     java.util.concurrent.atomic.AtomicBoolean tearingDown =
                             new java.util.concurrent.atomic.AtomicBoolean(false);
-                    Thread acceptor =
-                            new Thread(
-                                    () -> {
-                                        try {
-                                            while (true) {
-                                                java.net.Socket accepted = silent.accept();
-                                                if (tearingDown.get()) {
-                                                    accepted.close();
-                                                    continue;
-                                                }
-                                                acceptedSockets.add(accepted);
-                                            }
-                                        } catch (java.io.IOException ignored) {
-                                            // Server socket closed.
+                    Thread acceptor = new Thread(
+                            () -> {
+                                try {
+                                    while (true) {
+                                        java.net.Socket accepted = silent.accept();
+                                        if (tearingDown.get()) {
+                                            accepted.close();
+                                            continue;
                                         }
-                                    },
-                                    "test-silent-accept");
+                                        acceptedSockets.add(accepted);
+                                    }
+                                } catch (java.io.IOException ignored) {
+                                    // Server socket closed.
+                                }
+                            },
+                            "test-silent-accept");
                     acceptor.setDaemon(true);
                     acceptor.start();
 
                     List<DiscoveredNode> extended = new ArrayList<>(cluster.discovery().nodes);
-                    extended.add(
-                            new DiscoveredNode(
-                                    "11111111-2222-3333-4444-555555555555",
-                                    "127.0.0.1:" + silent.getLocalPort()));
+                    extended.add(new DiscoveredNode(
+                            "11111111-2222-3333-4444-555555555555", "127.0.0.1:" + silent.getLocalPort()));
                     cluster.discovery().nodes = extended;
 
                     java.lang.reflect.Method refreshNodeList =
                             NanocachedClient.class.getDeclaredMethod("refreshNodeList");
                     refreshNodeList.setAccessible(true);
-                    Thread refresher =
-                            new Thread(
-                                    () -> {
-                                        try {
-                                            refreshNodeList.invoke(client);
-                                        } catch (ReflectiveOperationException ignored) {
-                                            // The dial's IOException is swallowed by
-                                            // refreshNodeList itself; anything else fails
-                                            // the elapsed-time assertion below anyway.
-                                        }
-                                    },
-                                    "test-refresher");
+                    Thread refresher = new Thread(
+                            () -> {
+                                try {
+                                    refreshNodeList.invoke(client);
+                                } catch (ReflectiveOperationException ignored) {
+                                    // The dial's IOException is swallowed by
+                                    // refreshNodeList itself; anything else fails
+                                    // the elapsed-time assertion below anyway.
+                                }
+                            },
+                            "test-refresher");
                     refresher.setDaemon(true);
                     refresher.start();
 
                     // Only once the refresher is provably parked in the
                     // dial does the timing assertion mean anything.
-                    waitFor(
-                            () -> !acceptedSockets.isEmpty(),
-                            "the refresh to reach the silent node");
+                    waitFor(() -> !acceptedSockets.isEmpty(), "the refresh to reach the silent node");
 
                     long started = System.nanoTime();
                     assertEquals(Optional.of("v"), client.get("k"));
                     long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
                     assertTrue(
-                            elapsedMillis < 2_000,
-                            "get() stalled " + elapsedMillis + "ms behind the refresh's dial");
+                            elapsedMillis < 2_000, "get() stalled " + elapsedMillis + "ms behind the refresh's dial");
 
                     // Unblock the refresher so it finishes inside this
                     // test: stop further redials first, then kill the
@@ -7163,8 +6608,7 @@ class NanocachedClientTest {
     @Test
     void aFailedRepairWriteIncrementsReadRepairFailuresStat() throws Exception {
         try (Cluster cluster = startCluster(2)) {
-            List<String> owners =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
             MockNode primary = cluster.nodes().get(owners.get(0));
             cluster.nodes()
                     .get(owners.get(1))
@@ -7181,7 +6625,8 @@ class NanocachedClientTest {
             // CI runners.
             primary.failSets();
 
-            try (NanocachedClient client = connectWithReadRepair(cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connectWithReadRepair(cluster.discovery().port())) {
                 assertArrayEquals(
                         "from-replica".getBytes(StandardCharsets.UTF_8),
                         client.getBytes("k").orElseThrow());
@@ -7213,8 +6658,7 @@ class NanocachedClientTest {
         // parameter — EMPTY_NAMESPACE (via the empty byte[] literal below)
         // exercises exactly the un-namespaced path these tests target.
         java.lang.reflect.Method write =
-                NanocachedClient.class.getDeclaredMethod(
-                        "write", byte[].class, byte[].class, connectionOpClass());
+                NanocachedClient.class.getDeclaredMethod("write", byte[].class, byte[].class, connectionOpClass());
         write.setAccessible(true);
         return write;
     }
@@ -7234,21 +6678,21 @@ class NanocachedClientTest {
         // below for when it does propagate). Mirrors the TypeScript SDK's
         // writeToOwners / the Python SDK's _write().
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 byte[] key = "primary-ok-replica-bug".getBytes(StandardCharsets.UTF_8);
                 byte[] value = "v".getBytes(StandardCharsets.UTF_8);
-                Object op =
-                        java.lang.reflect.Proxy.newProxyInstance(
-                                connectionOpClass().getClassLoader(),
-                                new Class<?>[] {connectionOpClass()},
-                                (proxy, method, methodArgs) -> {
-                                    if (onReplicaWriterThread()) {
-                                        throw new ClassCastException("injected programming bug");
-                                    }
-                                    Connection connection = (Connection) methodArgs[0];
-                                    connection.set(key, value, null);
-                                    return null;
-                                });
+                Object op = java.lang.reflect.Proxy.newProxyInstance(
+                        connectionOpClass().getClassLoader(),
+                        new Class<?>[] {connectionOpClass()},
+                        (proxy, method, methodArgs) -> {
+                            if (onReplicaWriterThread()) {
+                                throw new ClassCastException("injected programming bug");
+                            }
+                            Connection connection = (Connection) methodArgs[0];
+                            connection.set(key, value, null);
+                            return null;
+                        });
 
                 long before = client.stats().backgroundWriteBugs();
                 writeMethod().invoke(client, new byte[0], key, op); // must not throw
@@ -7268,28 +6712,25 @@ class NanocachedClientTest {
         // (RuntimeException), never wrapped in a CompletionException, the
         // one thing every exception this SDK throws must not be.
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 byte[] key = "primary-fails-replica-bug".getBytes(StandardCharsets.UTF_8);
-                Object op =
-                        java.lang.reflect.Proxy.newProxyInstance(
-                                connectionOpClass().getClassLoader(),
-                                new Class<?>[] {connectionOpClass()},
-                                (proxy, method, methodArgs) -> {
-                                    if (onReplicaWriterThread()) {
-                                        throw new ClassCastException("injected programming bug");
-                                    }
-                                    throw new NanocachedException.ConnectionLost(
-                                            "nanocached: simulated primary failure", null);
-                                });
+                Object op = java.lang.reflect.Proxy.newProxyInstance(
+                        connectionOpClass().getClassLoader(),
+                        new Class<?>[] {connectionOpClass()},
+                        (proxy, method, methodArgs) -> {
+                            if (onReplicaWriterThread()) {
+                                throw new ClassCastException("injected programming bug");
+                            }
+                            throw new NanocachedException.ConnectionLost("nanocached: simulated primary failure", null);
+                        });
 
-                java.lang.reflect.InvocationTargetException thrown =
-                        assertThrows(
-                                java.lang.reflect.InvocationTargetException.class,
-                                () -> writeMethod().invoke(client, new byte[0], key, op));
+                java.lang.reflect.InvocationTargetException thrown = assertThrows(
+                        java.lang.reflect.InvocationTargetException.class,
+                        () -> writeMethod().invoke(client, new byte[0], key, op));
                 assertTrue(
                         thrown.getCause() instanceof ClassCastException,
-                        "expected the raw replica-leg bug to propagate directly, got: "
-                                + thrown.getCause());
+                        "expected the raw replica-leg bug to propagate directly, got: " + thrown.getCause());
             }
         }
     }
@@ -7302,10 +6743,10 @@ class NanocachedClientTest {
         // replicaWriteFailures) and never reaches the join-loop's bug
         // handling at all.
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "primary-fails-replica-dead";
-                List<String> owners =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
+                List<String> owners = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 2);
                 cluster.nodes().get(owners.get(0)).close();
                 cluster.nodes().get(owners.get(1)).close();
                 Thread.sleep(50);
@@ -7321,8 +6762,7 @@ class NanocachedClientTest {
     // requests already do, failing only when no listed node is reachable
     // at all. Mirrors the Python SDK's TolerantBootstrapTests.
 
-    private record TolerantCluster(Map<String, MockNode> liveNodes, MockDiscovery discovery)
-            implements AutoCloseable {
+    private record TolerantCluster(Map<String, MockNode> liveNodes, MockDiscovery discovery) implements AutoCloseable {
         @Override
         public void close() throws Exception {
             discovery.close();
@@ -7335,8 +6775,7 @@ class NanocachedClientTest {
      * deadNames} is listed with an address nobody listens on, and every other name gets a real
      * {@link MockNode}.
      */
-    private static TolerantCluster startClusterWithDeadNodes(List<String> deadNames)
-            throws Exception {
+    private static TolerantCluster startClusterWithDeadNodes(List<String> deadNames) throws Exception {
         // unusedPort() frees the port the instant it returns it, and on
         // Linux that port can be handed straight back out to the very
         // next bind — so it must be the last socket operation here,
@@ -7354,8 +6793,7 @@ class NanocachedClientTest {
         List<DiscoveredNode> entries = new ArrayList<>();
         for (String name : NAMES) {
             MockNode node = liveNodes.get(name);
-            String address =
-                    node == null ? "127.0.0.1:" + MockServers.unusedPort() : node.address();
+            String address = node == null ? "127.0.0.1:" + MockServers.unusedPort() : node.address();
             entries.add(new DiscoveredNode(name, address));
         }
         discovery.nodes = entries;
@@ -7388,8 +6826,7 @@ class NanocachedClientTest {
         return member;
     }
 
-    private static Connection memberConnectionOf(NanocachedClient client, String name)
-            throws Exception {
+    private static Connection memberConnectionOf(NanocachedClient client, String name) throws Exception {
         java.lang.reflect.Field connectionField =
                 memberOf(client, name).getClass().getDeclaredField("connection");
         connectionField.setAccessible(true);
@@ -7408,19 +6845,14 @@ class NanocachedClientTest {
         String dead = NAMES.get(0);
         String live = NAMES.get(1);
         try (TolerantCluster cluster = startClusterWithDeadNodes(List.of(dead))) {
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            NanocachedClient.builder()
-                                    .addresses(
-                                            List.of(
-                                                    new Address(
-                                                            "127.0.0.1",
-                                                            cluster.discovery().port())))
-                                    // Wide on purpose (see
-                                    // reconnectCooldownSkipsARedialToAKnownDeadAddress):
-                                    // this test's writes/reads must land well inside the
-                                    // window the bootstrap dial failure armed, not race it.
-                                    .reconnectCooldown(Duration.ofSeconds(5)))) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(
+                            List.of(new Address("127.0.0.1", cluster.discovery().port())))
+                    // Wide on purpose (see
+                    // reconnectCooldownSkipsARedialToAKnownDeadAddress):
+                    // this test's writes/reads must land well inside the
+                    // window the bootstrap dial failure armed, not race it.
+                    .reconnectCooldown(Duration.ofSeconds(5)))) {
                 assertEquals(2, client.replication());
                 assertTrue(
                         memberConnectionOf(client, dead) == null,
@@ -7448,9 +6880,7 @@ class NanocachedClientTest {
                 long started = System.nanoTime();
                 assertEquals(Optional.of("replica copy"), client.get(other));
                 long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
-                assertTrue(
-                        elapsedMillis < 2000,
-                        "expected a cooldown-fast failover, took " + elapsedMillis + "ms");
+                assertTrue(elapsedMillis < 2000, "expected a cooldown-fast failover, took " + elapsedMillis + "ms");
             }
         }
     }
@@ -7468,18 +6898,12 @@ class NanocachedClientTest {
     void anUnreachableNodeIsRedialedOnceTheCooldownHasPassed() throws Exception {
         String dead = NAMES.get(0);
         try (TolerantCluster cluster = startClusterWithDeadNodes(List.of(dead))) {
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            NanocachedClient.builder()
-                                    .addresses(
-                                            List.of(
-                                                    new Address(
-                                                            "127.0.0.1",
-                                                            cluster.discovery().port())))
-                                    .reconnectCooldown(Duration.ofMillis(300)))) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(
+                            List.of(new Address("127.0.0.1", cluster.discovery().port())))
+                    .reconnectCooldown(Duration.ofMillis(300)))) {
                 String deadAddress = memberAddressOf(client, dead);
-                int port =
-                        Integer.parseInt(deadAddress.substring(deadAddress.lastIndexOf(':') + 1));
+                int port = Integer.parseInt(deadAddress.substring(deadAddress.lastIndexOf(':') + 1));
 
                 // Bring the "dead" node up on the exact address discovery
                 // already listed, then outlast the cooldown.
@@ -7488,9 +6912,7 @@ class NanocachedClientTest {
 
                     String key = keyWithPrimary(dead);
                     client.set(key, "v");
-                    assertTrue(
-                            revived.store.containsKey(
-                                    MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
+                    assertTrue(revived.store.containsKey(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
                     assertTrue(memberConnectionOf(client, dead) != null);
                 }
             }
@@ -7503,42 +6925,37 @@ class NanocachedClientTest {
     // close-before-reply door-slam is.
     @Test
     void connectReportsANodeAtItsConnectionLimitAsBusyOnTheFirstDial() throws Exception {
-        java.util.concurrent.atomic.AtomicInteger dials =
-                new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger dials = new java.util.concurrent.atomic.AtomicInteger();
         try (java.net.ServerSocket server = new java.net.ServerSocket(0)) {
-            Thread accepting =
-                    new Thread(
-                            () -> {
-                                while (true) {
-                                    try (java.net.Socket accepted = server.accept()) {
-                                        dials.incrementAndGet();
-                                        accepted.getOutputStream()
-                                                .write("B\n".getBytes(StandardCharsets.US_ASCII));
-                                        accepted.getOutputStream().flush();
-                                        // Wait (bounded) for the client to hang up before closing:
-                                        // a close
-                                        // with the client's identify frame still unread is a reset
-                                        // on Linux,
-                                        // and a reset discards the B it is queued behind.
-                                        accepted.setSoTimeout(2000);
-                                        byte[] sink = new byte[256];
-                                        try {
-                                            while (accepted.getInputStream().read(sink) >= 0) {}
-                                        } catch (java.net.SocketTimeoutException ignored) {
-                                        }
-                                    } catch (java.io.IOException closed) {
-                                        return;
-                                    }
+            Thread accepting = new Thread(
+                    () -> {
+                        while (true) {
+                            try (java.net.Socket accepted = server.accept()) {
+                                dials.incrementAndGet();
+                                accepted.getOutputStream().write("B\n".getBytes(StandardCharsets.US_ASCII));
+                                accepted.getOutputStream().flush();
+                                // Wait (bounded) for the client to hang up before closing:
+                                // a close
+                                // with the client's identify frame still unread is a reset
+                                // on Linux,
+                                // and a reset discards the B it is queued behind.
+                                accepted.setSoTimeout(2000);
+                                byte[] sink = new byte[256];
+                                try {
+                                    while (accepted.getInputStream().read(sink) >= 0) {}
+                                } catch (java.net.SocketTimeoutException ignored) {
                                 }
-                            },
-                            "busy-node");
+                            } catch (java.io.IOException closed) {
+                                return;
+                            }
+                        }
+                    },
+                    "busy-node");
             accepting.setDaemon(true);
             accepting.start();
 
-            NanocachedException.ConnectionLost error =
-                    assertThrows(
-                            NanocachedException.ConnectionLost.class,
-                            () -> connect("127.0.0.1", server.getLocalPort()));
+            NanocachedException.ConnectionLost error = assertThrows(
+                    NanocachedException.ConnectionLost.class, () -> connect("127.0.0.1", server.getLocalPort()));
             assertTrue(error.getMessage().contains("connection limit"), error.getMessage());
             assertEquals(1, dials.get(), "a busy reply is not a legacy door-slam to retry");
         }
@@ -7556,8 +6973,7 @@ class NanocachedClientTest {
         ExecutorService callers = Executors.newFixedThreadPool(count);
         try (java.net.ServerSocket server = new java.net.ServerSocket(0)) {
             for (int i = 0; i < count; i++) {
-                java.net.Socket clientSocket =
-                        new java.net.Socket("127.0.0.1", server.getLocalPort());
+                java.net.Socket clientSocket = new java.net.Socket("127.0.0.1", server.getLocalPort());
                 serverSides.add(server.accept());
                 connections.add(new Connection(clientSocket, false, () -> {}));
             }
@@ -7565,28 +6981,20 @@ class NanocachedClientTest {
             // armed, so the watchdog is at its busiest.
             List<Future<byte[]>> inFlight = new ArrayList<>();
             for (Connection connection : connections) {
-                inFlight.add(
-                        callers.submit(() -> connection.get("k".getBytes(StandardCharsets.UTF_8))));
+                inFlight.add(callers.submit(() -> connection.get("k".getBytes(StandardCharsets.UTF_8))));
             }
             for (java.net.Socket serverSide : serverSides) {
                 byte[] frame = "G 1\nk".getBytes(StandardCharsets.US_ASCII);
                 assertArrayEquals(frame, serverSide.getInputStream().readNBytes(frame.length));
             }
 
-            java.util.Map<String, Long> threads =
-                    Thread.getAllStackTraces().keySet().stream()
-                            .map(Thread::getName)
-                            .filter(name -> name.startsWith("nanocached-"))
-                            .collect(
-                                    java.util.stream.Collectors.groupingBy(
-                                            name -> name, java.util.stream.Collectors.counting()));
-            assertEquals(
-                    Long.valueOf(count),
-                    threads.get("nanocached-connection-reader"),
-                    threads.toString());
-            assertTrue(
-                    threads.getOrDefault("nanocached-request-watchdog", 0L) <= 1,
-                    threads.toString());
+            java.util.Map<String, Long> threads = Thread.getAllStackTraces().keySet().stream()
+                    .map(Thread::getName)
+                    .filter(name -> name.startsWith("nanocached-"))
+                    .collect(java.util.stream.Collectors.groupingBy(
+                            name -> name, java.util.stream.Collectors.counting()));
+            assertEquals(Long.valueOf(count), threads.get("nanocached-connection-reader"), threads.toString());
+            assertTrue(threads.getOrDefault("nanocached-request-watchdog", 0L) <= 1, threads.toString());
 
             for (Connection connection : connections) connection.close();
             for (Future<byte[]> call : inFlight) {
@@ -7606,8 +7014,7 @@ class NanocachedClientTest {
     @Test
     void incrRequestFrameBytesAndUntaggedResponseDecoding() throws Exception {
         try (java.net.ServerSocket server = new java.net.ServerSocket(0);
-                java.net.Socket clientSocket =
-                        new java.net.Socket("127.0.0.1", server.getLocalPort());
+                java.net.Socket clientSocket = new java.net.Socket("127.0.0.1", server.getLocalPort());
                 java.net.Socket serverSocket = server.accept()) {
             Connection connection = new Connection(clientSocket, false, () -> {});
             try {
@@ -7617,12 +7024,8 @@ class NanocachedClientTest {
                 try {
                     // Namespaced, negative delta: `i <ns-len> <key-len>
                     // <delta>\n<namespace><key>` — the exact wire bytes.
-                    Future<Connection.IncrResult> withTtl =
-                            pool.submit(() ->
-                                    connection.incr(
-                                            "ns".getBytes(StandardCharsets.UTF_8),
-                                            "key".getBytes(StandardCharsets.UTF_8),
-                                            -42));
+                    Future<Connection.IncrResult> withTtl = pool.submit(() -> connection.incr(
+                            "ns".getBytes(StandardCharsets.UTF_8), "key".getBytes(StandardCharsets.UTF_8), -42));
                     byte[] expectedFrame = "i 2 3 -42\nnskey".getBytes(StandardCharsets.US_ASCII);
                     assertArrayEquals(expectedFrame, serverIn.readNBytes(expectedFrame.length));
                     serverOut.write("I 2 100\n".getBytes(StandardCharsets.US_ASCII));
@@ -7637,9 +7040,7 @@ class NanocachedClientTest {
                     byte[] frameNoTtl = "i 0 1 1\nk".getBytes(StandardCharsets.US_ASCII);
 
                     Future<Connection.IncrResult> noTtl =
-                            pool.submit(() ->
-                                    connection.incr(
-                                            new byte[0], "k".getBytes(StandardCharsets.UTF_8), 1));
+                            pool.submit(() -> connection.incr(new byte[0], "k".getBytes(StandardCharsets.UTF_8), 1));
                     assertArrayEquals(frameNoTtl, serverIn.readNBytes(frameNoTtl.length));
                     serverOut.write("I 1\n".getBytes(StandardCharsets.US_ASCII));
                     serverOut.write("9".getBytes(StandardCharsets.US_ASCII));
@@ -7650,39 +7051,33 @@ class NanocachedClientTest {
 
                     // Miss.
                     Future<Connection.IncrResult> missing =
-                            pool.submit(() ->
-                                    connection.incr(
-                                            new byte[0], "k".getBytes(StandardCharsets.UTF_8), 1));
+                            pool.submit(() -> connection.incr(new byte[0], "k".getBytes(StandardCharsets.UTF_8), 1));
                     assertArrayEquals(frameNoTtl, serverIn.readNBytes(frameNoTtl.length));
                     serverOut.write("N\n".getBytes(StandardCharsets.US_ASCII));
                     serverOut.flush();
                     assertNull(missing.get());
 
                     // Non-numeric stored value / overflow.
-                    Future<Object> notNumeric =
-                            pool.submit(() -> {
-                                try {
-                                    return connection.incr(
-                                            new byte[0], "k".getBytes(StandardCharsets.UTF_8), 1);
-                                } catch (NanocachedException.NotNumeric caught) {
-                                    return caught;
-                                }
-                            });
+                    Future<Object> notNumeric = pool.submit(() -> {
+                        try {
+                            return connection.incr(new byte[0], "k".getBytes(StandardCharsets.UTF_8), 1);
+                        } catch (NanocachedException.NotNumeric caught) {
+                            return caught;
+                        }
+                    });
                     assertArrayEquals(frameNoTtl, serverIn.readNBytes(frameNoTtl.length));
                     serverOut.write("T\n".getBytes(StandardCharsets.US_ASCII));
                     serverOut.flush();
                     assertTrue(notNumeric.get() instanceof NanocachedException.NotNumeric);
 
                     // Stale routing.
-                    Future<Object> wrongNode =
-                            pool.submit(() -> {
-                                try {
-                                    return connection.incr(
-                                            new byte[0], "k".getBytes(StandardCharsets.UTF_8), 1);
-                                } catch (NanocachedException.WrongNode caught) {
-                                    return caught;
-                                }
-                            });
+                    Future<Object> wrongNode = pool.submit(() -> {
+                        try {
+                            return connection.incr(new byte[0], "k".getBytes(StandardCharsets.UTF_8), 1);
+                        } catch (NanocachedException.WrongNode caught) {
+                            return caught;
+                        }
+                    });
                     assertArrayEquals(frameNoTtl, serverIn.readNBytes(frameNoTtl.length));
                     serverOut.write("W\n".getBytes(StandardCharsets.US_ASCII));
                     serverOut.flush();
@@ -7760,13 +7155,11 @@ class NanocachedClientTest {
     @Test
     void parseCounterValueAcceptsALeadingMinusButRejectsEverythingElseNonDigit() throws Exception {
         try (java.net.ServerSocket server = new java.net.ServerSocket(0);
-                java.net.Socket clientSocket =
-                        new java.net.Socket("127.0.0.1", server.getLocalPort());
+                java.net.Socket clientSocket = new java.net.Socket("127.0.0.1", server.getLocalPort());
                 java.net.Socket serverSocket = server.accept()) {
             Connection connection = new Connection(clientSocket, false, () -> {});
             try {
-                Method parseCounterValue =
-                        Connection.class.getDeclaredMethod("parseCounterValue", byte[].class);
+                Method parseCounterValue = Connection.class.getDeclaredMethod("parseCounterValue", byte[].class);
                 parseCounterValue.setAccessible(true);
 
                 Map<String, Long> accepted = new java.util.LinkedHashMap<>();
@@ -7785,11 +7178,10 @@ class NanocachedClientTest {
                 List<String> rejected = List.of("+5", " 5", "5 ", "1_000", "1e2", "");
                 for (String testCase : rejected) {
                     byte[] body = testCase.getBytes(StandardCharsets.US_ASCII);
-                    InvocationTargetException thrown =
-                            assertThrows(
-                                    InvocationTargetException.class,
-                                    () -> parseCounterValue.invoke(connection, (Object) body),
-                                    "parseCounterValue(\"" + testCase + "\") should reject");
+                    InvocationTargetException thrown = assertThrows(
+                            InvocationTargetException.class,
+                            () -> parseCounterValue.invoke(connection, (Object) body),
+                            "parseCounterValue(\"" + testCase + "\") should reject");
                     assertTrue(
                             thrown.getCause() instanceof NanocachedException.ConnectionLost,
                             "expected ConnectionLost, got " + thrown.getCause());
@@ -7804,46 +7196,31 @@ class NanocachedClientTest {
     void incrRoundTripsOnATaggedConnectionWithAndWithoutTtl() throws Exception {
         try (MockNode node = MockNode.withTagSupport()) {
             Identify.NodeTarget target =
-                    (Identify.NodeTarget)
-                            Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
             assertTrue(target.tagged());
             Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
             try {
                 // Missing key.
-                assertNull(
-                        connection.incr(
-                                new byte[0], "counter".getBytes(StandardCharsets.UTF_8), 5));
+                assertNull(connection.incr(new byte[0], "counter".getBytes(StandardCharsets.UTF_8), 5));
 
                 // Hit, no TTL.
-                connection.set(
-                        "counter".getBytes(StandardCharsets.UTF_8),
-                        "10".getBytes(StandardCharsets.UTF_8),
-                        null);
+                connection.set("counter".getBytes(StandardCharsets.UTF_8), "10".getBytes(StandardCharsets.UTF_8), null);
                 Connection.IncrResult result =
                         connection.incr(new byte[0], "counter".getBytes(StandardCharsets.UTF_8), 5);
                 assertEquals(15L, result.value());
                 assertNull(result.ttlSeconds());
 
                 // Hit, with a TTL.
-                connection.set(
-                        "timed".getBytes(StandardCharsets.UTF_8),
-                        "100".getBytes(StandardCharsets.UTF_8),
-                        30L);
-                Connection.IncrResult timed =
-                        connection.incr(new byte[0], "timed".getBytes(StandardCharsets.UTF_8), 1);
+                connection.set("timed".getBytes(StandardCharsets.UTF_8), "100".getBytes(StandardCharsets.UTF_8), 30L);
+                Connection.IncrResult timed = connection.incr(new byte[0], "timed".getBytes(StandardCharsets.UTF_8), 1);
                 assertEquals(101L, timed.value());
                 assertEquals(Long.valueOf(30), timed.ttlSeconds());
 
                 // Non-numeric.
-                connection.set(
-                        "word".getBytes(StandardCharsets.UTF_8),
-                        "hi".getBytes(StandardCharsets.UTF_8),
-                        null);
+                connection.set("word".getBytes(StandardCharsets.UTF_8), "hi".getBytes(StandardCharsets.UTF_8), null);
                 assertThrows(
                         NanocachedException.NotNumeric.class,
-                        () ->
-                                connection.incr(
-                                        new byte[0], "word".getBytes(StandardCharsets.UTF_8), 1));
+                        () -> connection.incr(new byte[0], "word".getBytes(StandardCharsets.UTF_8), 1));
             } finally {
                 connection.close();
             }
@@ -7858,8 +7235,7 @@ class NanocachedClientTest {
     @Test
     void casRequestFrameBytesAndUntaggedResponseDecoding() throws Exception {
         try (java.net.ServerSocket server = new java.net.ServerSocket(0);
-                java.net.Socket clientSocket =
-                        new java.net.Socket("127.0.0.1", server.getLocalPort());
+                java.net.Socket clientSocket = new java.net.Socket("127.0.0.1", server.getLocalPort());
                 java.net.Socket serverSocket = server.accept()) {
             Connection connection = new Connection(clientSocket, false, () -> {});
             try {
@@ -7870,16 +7246,13 @@ class NanocachedClientTest {
                     // `k <ns-len> <key-len> <value-len> <cond> [<ttl>]\n
                     // <namespace><key><value>` — cond A, namespaced, with a
                     // ttl: the exact wire bytes.
-                    Future<Boolean> absent =
-                            pool.submit(() ->
-                                    connection.casSet(
-                                            "ns".getBytes(StandardCharsets.UTF_8),
-                                            "key".getBytes(StandardCharsets.UTF_8),
-                                            "val".getBytes(StandardCharsets.UTF_8),
-                                            60L,
-                                            "A"));
-                    byte[] absentFrame =
-                            "k 2 3 3 A 60\nnskeyval".getBytes(StandardCharsets.US_ASCII);
+                    Future<Boolean> absent = pool.submit(() -> connection.casSet(
+                            "ns".getBytes(StandardCharsets.UTF_8),
+                            "key".getBytes(StandardCharsets.UTF_8),
+                            "val".getBytes(StandardCharsets.UTF_8),
+                            60L,
+                            "A"));
+                    byte[] absentFrame = "k 2 3 3 A 60\nnskeyval".getBytes(StandardCharsets.US_ASCII);
                     assertArrayEquals(absentFrame, serverIn.readNBytes(absentFrame.length));
                     serverOut.write("S\n".getBytes(StandardCharsets.US_ASCII));
                     serverOut.flush();
@@ -7887,14 +7260,12 @@ class NanocachedClientTest {
 
                     // cond P, default namespace (namespace-length 0, still
                     // always sent), no ttl; mismatch (N).
-                    Future<Boolean> present =
-                            pool.submit(() ->
-                                    connection.casSet(
-                                            new byte[0],
-                                            "k".getBytes(StandardCharsets.UTF_8),
-                                            "v".getBytes(StandardCharsets.UTF_8),
-                                            null,
-                                            "P"));
+                    Future<Boolean> present = pool.submit(() -> connection.casSet(
+                            new byte[0],
+                            "k".getBytes(StandardCharsets.UTF_8),
+                            "v".getBytes(StandardCharsets.UTF_8),
+                            null,
+                            "P"));
                     byte[] presentFrame = "k 0 1 1 P\nkv".getBytes(StandardCharsets.US_ASCII);
                     assertArrayEquals(presentFrame, serverIn.readNBytes(presentFrame.length));
                     serverOut.write("N\n".getBytes(StandardCharsets.US_ASCII));
@@ -7904,35 +7275,31 @@ class NanocachedClientTest {
                     // cond is a 32-character digest, not length-prefixed —
                     // its own shape identifies it, exactly like A/P.
                     String digest = "d41d8cd98f00b204e9800998ecf8427e";
-                    Future<Boolean> digestMatch =
-                            pool.submit(() ->
-                                    connection.casSet(
-                                            new byte[0],
-                                            "k".getBytes(StandardCharsets.UTF_8),
-                                            "v2".getBytes(StandardCharsets.UTF_8),
-                                            null,
-                                            digest));
-                    byte[] digestFrame =
-                            ("k 0 1 2 " + digest + "\nkv2").getBytes(StandardCharsets.US_ASCII);
+                    Future<Boolean> digestMatch = pool.submit(() -> connection.casSet(
+                            new byte[0],
+                            "k".getBytes(StandardCharsets.UTF_8),
+                            "v2".getBytes(StandardCharsets.UTF_8),
+                            null,
+                            digest));
+                    byte[] digestFrame = ("k 0 1 2 " + digest + "\nkv2").getBytes(StandardCharsets.US_ASCII);
                     assertArrayEquals(digestFrame, serverIn.readNBytes(digestFrame.length));
                     serverOut.write("S\n".getBytes(StandardCharsets.US_ASCII));
                     serverOut.flush();
                     assertTrue(digestMatch.get());
 
                     // Stale routing.
-                    Future<Object> wrongNode =
-                            pool.submit(() -> {
-                                try {
-                                    return connection.casSet(
-                                            new byte[0],
-                                            "k".getBytes(StandardCharsets.UTF_8),
-                                            "v".getBytes(StandardCharsets.UTF_8),
-                                            null,
-                                            "A");
-                                } catch (NanocachedException.WrongNode caught) {
-                                    return caught;
-                                }
-                            });
+                    Future<Object> wrongNode = pool.submit(() -> {
+                        try {
+                            return connection.casSet(
+                                    new byte[0],
+                                    "k".getBytes(StandardCharsets.UTF_8),
+                                    "v".getBytes(StandardCharsets.UTF_8),
+                                    null,
+                                    "A");
+                        } catch (NanocachedException.WrongNode caught) {
+                            return caught;
+                        }
+                    });
                     byte[] wrongNodeFrame = "k 0 1 1 A\nkv".getBytes(StandardCharsets.US_ASCII);
                     assertArrayEquals(wrongNodeFrame, serverIn.readNBytes(wrongNodeFrame.length));
                     serverOut.write("W\n".getBytes(StandardCharsets.US_ASCII));
@@ -7941,14 +7308,9 @@ class NanocachedClientTest {
 
                     // `x <ns-len> <key-len> <cond>\n<namespace><key>` —
                     // cond is always a digest here.
-                    Future<Boolean> deleted =
-                            pool.submit(() ->
-                                    connection.casDelete(
-                                            new byte[0],
-                                            "k".getBytes(StandardCharsets.UTF_8),
-                                            digest));
-                    byte[] deleteFrame =
-                            ("x 0 1 " + digest + "\nk").getBytes(StandardCharsets.US_ASCII);
+                    Future<Boolean> deleted = pool.submit(
+                            () -> connection.casDelete(new byte[0], "k".getBytes(StandardCharsets.UTF_8), digest));
+                    byte[] deleteFrame = ("x 0 1 " + digest + "\nk").getBytes(StandardCharsets.US_ASCII);
                     assertArrayEquals(deleteFrame, serverIn.readNBytes(deleteFrame.length));
                     serverOut.write("D\n".getBytes(StandardCharsets.US_ASCII));
                     serverOut.flush();
@@ -7956,12 +7318,8 @@ class NanocachedClientTest {
 
                     // Mismatch or missing key: N, exactly like a plain D's
                     // own miss.
-                    Future<Boolean> notDeleted =
-                            pool.submit(() ->
-                                    connection.casDelete(
-                                            new byte[0],
-                                            "k".getBytes(StandardCharsets.UTF_8),
-                                            digest));
+                    Future<Boolean> notDeleted = pool.submit(
+                            () -> connection.casDelete(new byte[0], "k".getBytes(StandardCharsets.UTF_8), digest));
                     assertArrayEquals(deleteFrame, serverIn.readNBytes(deleteFrame.length));
                     serverOut.write("N\n".getBytes(StandardCharsets.US_ASCII));
                     serverOut.flush();
@@ -7979,61 +7337,33 @@ class NanocachedClientTest {
     void casRoundTripsOnATaggedConnectionForEveryConditionKind() throws Exception {
         try (MockNode node = MockNode.withTagSupport()) {
             Identify.NodeTarget target =
-                    (Identify.NodeTarget)
-                            Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
             assertTrue(target.tagged());
             Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
             try {
                 byte[] key = "k".getBytes(StandardCharsets.UTF_8);
 
                 // A: absent succeeds, then mismatches once present.
-                assertTrue(
-                        connection.casSet(
-                                new byte[0],
-                                key,
-                                "v1".getBytes(StandardCharsets.UTF_8),
-                                null,
-                                "A"));
-                assertFalse(
-                        connection.casSet(
-                                new byte[0],
-                                key,
-                                "v2".getBytes(StandardCharsets.UTF_8),
-                                null,
-                                "A"));
+                assertTrue(connection.casSet(new byte[0], key, "v1".getBytes(StandardCharsets.UTF_8), null, "A"));
+                assertFalse(connection.casSet(new byte[0], key, "v2".getBytes(StandardCharsets.UTF_8), null, "A"));
 
                 // P: present succeeds, carrying a ttl through untouched.
-                assertTrue(
-                        connection.casSet(
-                                new byte[0], key, "v3".getBytes(StandardCharsets.UTF_8), 30L, "P"));
+                assertTrue(connection.casSet(new byte[0], key, "v3".getBytes(StandardCharsets.UTF_8), 30L, "P"));
 
                 // Digest: matches the real current content (cross-checked
                 // against this SDK's own independent digest implementation
                 // via the mock's own — see MockNode.digestOf).
-                String currentDigest =
-                        NanocachedClient.contentDigest(connection.get(new byte[0], key));
-                assertTrue(
-                        connection.casSet(
-                                new byte[0],
-                                key,
-                                "v4".getBytes(StandardCharsets.UTF_8),
-                                null,
-                                currentDigest));
-                assertArrayEquals(
-                        "v4".getBytes(StandardCharsets.UTF_8), connection.get(new byte[0], key));
+                String currentDigest = NanocachedClient.contentDigest(connection.get(new byte[0], key));
+                assertTrue(connection.casSet(
+                        new byte[0], key, "v4".getBytes(StandardCharsets.UTF_8), null, currentDigest));
+                assertArrayEquals("v4".getBytes(StandardCharsets.UTF_8), connection.get(new byte[0], key));
 
                 // The same (now stale) digest mismatches.
-                assertFalse(
-                        connection.casSet(
-                                new byte[0],
-                                key,
-                                "v5".getBytes(StandardCharsets.UTF_8),
-                                null,
-                                currentDigest));
+                assertFalse(connection.casSet(
+                        new byte[0], key, "v5".getBytes(StandardCharsets.UTF_8), null, currentDigest));
 
                 // x: digest-conditioned delete.
-                String latestDigest =
-                        NanocachedClient.contentDigest(connection.get(new byte[0], key));
+                String latestDigest = NanocachedClient.contentDigest(connection.get(new byte[0], key));
                 assertTrue(connection.casDelete(new byte[0], key, latestDigest));
                 assertNull(connection.get(new byte[0], key));
 
@@ -8062,8 +7392,7 @@ class NanocachedClientTest {
         long defaultBound = Connection.maxMultiGetResponseBytes;
         Connection.maxMultiGetResponseBytes = 3;
         try (java.net.ServerSocket server = new java.net.ServerSocket(0);
-                java.net.Socket clientSocket =
-                        new java.net.Socket("127.0.0.1", server.getLocalPort());
+                java.net.Socket clientSocket = new java.net.Socket("127.0.0.1", server.getLocalPort());
                 java.net.Socket serverSocket = server.accept()) {
             Connection connection = new Connection(clientSocket, false, () -> {});
             try {
@@ -8071,9 +7400,7 @@ class NanocachedClientTest {
                 java.io.OutputStream serverOut = serverSocket.getOutputStream();
                 ExecutorService pool = Executors.newSingleThreadExecutor();
                 try {
-                    byte[][] keys = {
-                        "a".getBytes(StandardCharsets.UTF_8), "b".getBytes(StandardCharsets.UTF_8)
-                    };
+                    byte[][] keys = {"a".getBytes(StandardCharsets.UTF_8), "b".getBytes(StandardCharsets.UTF_8)};
                     Future<List<Connection.MultiEntry>> future =
                             pool.submit(() -> connection.multiGet(new byte[0], keys));
 
@@ -8089,17 +7416,14 @@ class NanocachedClientTest {
                     serverOut.write("xy".getBytes(StandardCharsets.US_ASCII));
                     serverOut.flush();
 
-                    ExecutionException wrapped =
-                            assertThrows(ExecutionException.class, future::get);
+                    ExecutionException wrapped = assertThrows(ExecutionException.class, future::get);
                     assertTrue(
                             wrapped.getCause() instanceof NanocachedException.ConnectionLost,
                             String.valueOf(wrapped.getCause()));
                     assertTrue(
                             wrapped.getCause().getMessage().contains("exceeds"),
                             wrapped.getCause().getMessage());
-                    assertTrue(
-                            connection.isClosed(),
-                            "an oversized multi-get reply must poison the connection");
+                    assertTrue(connection.isClosed(), "an oversized multi-get reply must poison the connection");
                 } finally {
                     pool.shutdown();
                 }
@@ -8127,9 +7451,7 @@ class NanocachedClientTest {
                     List<Future<?>> sets = new ArrayList<>();
                     for (int i = 0; i < n; i++) {
                         int index = i;
-                        sets.add(
-                                pool.submit(
-                                        () -> client.set("key-" + index, "value-" + index, index)));
+                        sets.add(pool.submit(() -> client.set("key-" + index, "value-" + index, index)));
                     }
                     for (Future<?> future : sets) future.get();
 
@@ -8165,34 +7487,24 @@ class NanocachedClientTest {
         // healed retry) so the raw per-call outcome is observable.
         try (MockNode node = MockNode.withTagSupport()) {
             Identify.NodeTarget target =
-                    (Identify.NodeTarget)
-                            Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
             assertTrue(target.tagged());
             Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
             try {
-                connection.set(
-                        "k".getBytes(StandardCharsets.UTF_8),
-                        "v".getBytes(StandardCharsets.UTF_8),
-                        null);
+                connection.set("k".getBytes(StandardCharsets.UTF_8), "v".getBytes(StandardCharsets.UTF_8), null);
 
                 node.swallowGetOnce();
                 ExecutorService pool = Executors.newFixedThreadPool(2);
                 try {
-                    Future<byte[]> first =
-                            pool.submit(() -> connection.get("a".getBytes(StandardCharsets.UTF_8)));
-                    waitFor(
-                            () -> node.getCount.get() >= 1,
-                            "the swallowed GET to reach the server");
-                    Future<byte[]> second =
-                            pool.submit(() -> connection.get("k".getBytes(StandardCharsets.UTF_8)));
+                    Future<byte[]> first = pool.submit(() -> connection.get("a".getBytes(StandardCharsets.UTF_8)));
+                    waitFor(() -> node.getCount.get() >= 1, "the swallowed GET to reach the server");
+                    Future<byte[]> second = pool.submit(() -> connection.get("k".getBytes(StandardCharsets.UTF_8)));
 
-                    ExecutionException firstError =
-                            assertThrows(ExecutionException.class, first::get);
+                    ExecutionException firstError = assertThrows(ExecutionException.class, first::get);
                     assertTrue(
                             firstError.getCause().getMessage().contains("desynced"),
                             firstError.getCause().getMessage());
-                    ExecutionException secondError =
-                            assertThrows(ExecutionException.class, second::get);
+                    ExecutionException secondError = assertThrows(ExecutionException.class, second::get);
                     assertTrue(
                             secondError.getCause().getMessage().contains("desynced"),
                             secondError.getCause().getMessage());
@@ -8221,15 +7533,12 @@ class NanocachedClientTest {
         // otherwise mask this.
         try (MockNode node = MockNode.withTagSupport()) {
             Identify.NodeTarget target =
-                    (Identify.NodeTarget)
-                            Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
             Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
             try {
                 node.answerWrongTagOnce();
-                NanocachedException error =
-                        assertThrows(
-                                NanocachedException.class,
-                                () -> connection.get("k".getBytes(StandardCharsets.UTF_8)));
+                NanocachedException error = assertThrows(
+                        NanocachedException.class, () -> connection.get("k".getBytes(StandardCharsets.UTF_8)));
                 assertTrue(error.getMessage().contains("desynced"), error.getMessage());
                 assertTrue(connection.isClosed());
             } finally {
@@ -8247,15 +7556,12 @@ class NanocachedClientTest {
         // request timeout.
         try (MockNode node = new MockNode()) {
             Identify.NodeTarget target =
-                    (Identify.NodeTarget)
-                            Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
             Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
             try {
                 node.answerRunawayHeaderOnce();
-                NanocachedException error =
-                        assertThrows(
-                                NanocachedException.class,
-                                () -> connection.get("k".getBytes(StandardCharsets.UTF_8)));
+                NanocachedException error = assertThrows(
+                        NanocachedException.class, () -> connection.get("k".getBytes(StandardCharsets.UTF_8)));
                 assertTrue(error.getMessage().contains("too long"), error.getMessage());
                 assertTrue(connection.isClosed());
             } finally {
@@ -8273,15 +7579,12 @@ class NanocachedClientTest {
         // the connection.
         try (MockNode node = new MockNode()) {
             Identify.NodeTarget target =
-                    (Identify.NodeTarget)
-                            Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
             Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
             try {
                 node.answerBadTrailerOnce();
-                NanocachedException error =
-                        assertThrows(
-                                NanocachedException.class,
-                                () -> connection.get("missing".getBytes(StandardCharsets.UTF_8)));
+                NanocachedException error = assertThrows(
+                        NanocachedException.class, () -> connection.get("missing".getBytes(StandardCharsets.UTF_8)));
                 assertTrue(error.getMessage().contains("desynced"), error.getMessage());
                 assertTrue(connection.isClosed());
             } finally {
@@ -8343,8 +7646,7 @@ class NanocachedClientTest {
             // The stuck connection did negotiate tags — confirmed with a
             // second, independent probe against the same mock.
             Identify.NodeTarget target =
-                    (Identify.NodeTarget)
-                            Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
             assertTrue(target.tagged());
             target.socket().close();
         }
@@ -8362,15 +7664,13 @@ class NanocachedClientTest {
 
                 assertEquals(1, client.stats().transientRetries());
                 assertEquals(1, node.connectionCount.get(), "no new connection was dialed");
-                assertEquals(
-                        2, node.getCount.get(), "the R'd attempt plus the retry that succeeded");
+                assertEquals(2, node.getCount.get(), "the R'd attempt plus the retry that succeeded");
             }
         }
     }
 
     @Test
-    void threeTransientRResponsesExhaustTheRetryBudgetButLeaveTheConnectionUsable()
-            throws Exception {
+    void threeTransientRResponsesExhaustTheRetryBudgetButLeaveTheConnectionUsable() throws Exception {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("k", "v");
@@ -8383,13 +7683,10 @@ class NanocachedClientTest {
                 // 100ms before the second.
                 assertTrue(
                         elapsedMillis >= 150,
-                        "expected at least the 50ms+100ms retry backoff, took "
-                                + elapsedMillis
-                                + "ms");
+                        "expected at least the 50ms+100ms retry backoff, took " + elapsedMillis + "ms");
 
                 assertEquals(3, client.stats().transientRetries());
-                assertEquals(
-                        1, node.connectionCount.get(), "still the same connection — no redial");
+                assertEquals(1, node.connectionCount.get(), "still the same connection — no redial");
 
                 // The SAME connection still serves a following op.
                 assertEquals(Optional.of("v"), client.get("k"));
@@ -8437,8 +7734,7 @@ class NanocachedClientTest {
                 MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
             discovery.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
 
-            try (NanocachedClient client =
-                    NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+            try (NanocachedClient client = NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
                 client.set("k", "v");
 
                 proxy.answerRetryableFor(1);
@@ -8467,14 +7763,10 @@ class NanocachedClientTest {
         // identity it was issued to.
         Tls.Generated cert = Tls.generate(tempDir, "wrong-host", "dns:wrong.example.test");
         try (MockNode node = MockNode.withTls(cert.serverContext())) {
-            NanocachedException error =
-                    assertThrows(
-                            NanocachedException.class,
-                            () ->
-                                    NanocachedClient.connect(
-                                            single("127.0.0.1", node.port())
-                                                    .tls(true)
-                                                    .ca(cert.pemCert())));
+            NanocachedException error = assertThrows(
+                    NanocachedException.class,
+                    () -> NanocachedClient.connect(
+                            single("127.0.0.1", node.port()).tls(true).ca(cert.pemCert())));
             // Surfaces as an ordinary connection failure — never a silent
             // fallback to an unverified connection.
             assertTrue(error instanceof NanocachedException.ConnectionLost, error.toString());
@@ -8488,9 +7780,8 @@ class NanocachedClientTest {
         // iPAddress SAN entries (RFC 2818), so the cert must carry one.
         Tls.Generated cert = Tls.generate(tempDir, "127.0.0.1", "ip:127.0.0.1");
         try (MockNode node = MockNode.withTls(cert.serverContext())) {
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            single("127.0.0.1", node.port()).tls(true).ca(cert.pemCert()))) {
+            try (NanocachedClient client = NanocachedClient.connect(
+                    single("127.0.0.1", node.port()).tls(true).ca(cert.pemCert()))) {
                 client.set("k", "v");
                 assertEquals(Optional.of("v"), client.get("k"));
             }
@@ -8552,8 +7843,7 @@ class NanocachedClientTest {
                 assertArrayEquals(new byte[0], root.namespace());
 
                 root.set("k", "v");
-                assertEquals(
-                        Optional.of("v"), client.get("k")); // same keyspace as the client itself
+                assertEquals(Optional.of("v"), client.get("k")); // same keyspace as the client itself
                 assertEquals(Optional.of("v"), root.get("k"));
                 assertTrue(root.delete("k"));
                 assertEquals(Optional.empty(), client.get("k"));
@@ -8604,7 +7894,8 @@ class NanocachedClientTest {
     @Test
     void wrongNodeOnANamespacedKeyTriggersRefreshAndRoutesByNamespaceAndKey() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = "key-0";
                 byte[] namespace = "ns".getBytes(StandardCharsets.UTF_8);
                 NanocachedClient.Namespace ns = client.namespace(namespace);
@@ -8614,11 +7905,8 @@ class NanocachedClientTest {
                 // owner and its namespaced owner are different nodes in
                 // this 2-node ring, so the test fails if namespace were
                 // silently dropped from routing.
-                List<String> plainOwner =
-                        new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 1);
-                List<String> nsOwner =
-                        new HashRing(NAMES)
-                                .owners(namespace, key.getBytes(StandardCharsets.UTF_8), 1);
+                List<String> plainOwner = new HashRing(NAMES).owners(key.getBytes(StandardCharsets.UTF_8), 1);
+                List<String> nsOwner = new HashRing(NAMES).owners(namespace, key.getBytes(StandardCharsets.UTF_8), 1);
                 assertNotEquals(plainOwner, nsOwner);
 
                 ns.set(key, "v");
@@ -8643,8 +7931,7 @@ class NanocachedClientTest {
         // proven, not just the higher-level round trip.
         try (MockNode node = MockNode.withTagSupport()) {
             Identify.NodeTarget target =
-                    (Identify.NodeTarget)
-                            Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
             assertTrue(target.tagged());
             Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
             try {
@@ -8680,8 +7967,7 @@ class NanocachedClientTest {
         // `C` response parses correctly.
         try (MockNode node = MockNode.withTagSupport()) {
             Identify.NodeTarget target =
-                    (Identify.NodeTarget)
-                            Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
+                    (Identify.NodeTarget) Identify.connectAndIdentify("127.0.0.1", node.port(), null, null);
             assertTrue(target.tagged());
             Connection connection = new Connection(target.socket(), target.tagged(), () -> {});
             try {
@@ -8720,11 +8006,8 @@ class NanocachedClientTest {
                 ns1.clear();
 
                 assertEquals(Optional.empty(), ns1.get("k"));
-                assertEquals(
-                        Optional.of("ns2-value"), ns2.get("k")); // a different namespace survives
-                assertEquals(
-                        Optional.of("default-value"),
-                        client.get("default-key")); // the default survives
+                assertEquals(Optional.of("ns2-value"), ns2.get("k")); // a different namespace survives
+                assertEquals(Optional.of("default-value"), client.get("default-key")); // the default survives
             }
         }
     }
@@ -8740,8 +8023,7 @@ class NanocachedClientTest {
                 client.namespace("").clear(); // `c 0` — the default namespace only, not `F`
 
                 assertEquals(Optional.empty(), client.get("default-key"));
-                assertEquals(
-                        Optional.of("ns-value"), ns.get("k")); // untouched — this is not clearAll()
+                assertEquals(Optional.of("ns-value"), ns.get("k")); // untouched — this is not clearAll()
             }
         }
     }
@@ -8779,7 +8061,8 @@ class NanocachedClientTest {
     @Test
     void clearAllFansOutToEveryNodeInTheCluster() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 for (int i = 0; i < 20; i++) {
                     client.set("key-" + i, "v"); // scattered across both nodes by HRW
                 }
@@ -8788,8 +8071,7 @@ class NanocachedClientTest {
                 client.clearAll();
 
                 for (MockNode node : cluster.nodes().values()) {
-                    assertEquals(
-                            1, node.clearAllCount.get(), "every node must receive the F frame");
+                    assertEquals(1, node.clearAllCount.get(), "every node must receive the F frame");
                     assertTrue(node.store.isEmpty());
                 }
             }
@@ -8799,7 +8081,8 @@ class NanocachedClientTest {
     @Test
     void namespaceClearFansOutToEveryNodeInTheCluster() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 NanocachedClient.Namespace ns = client.namespace("tenant");
                 for (int i = 0; i < 20; i++) {
                     ns.set("key-" + i, "v"); // scattered across both nodes by HRW
@@ -8818,7 +8101,8 @@ class NanocachedClientTest {
     @Test
     void clearAllRetriesOnceAfterANodeFailsThenSucceedsOnTheRefreshedList() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 MockNode owner = cluster.nodes().get(NAMES.get(0));
                 MockNode survivor = cluster.nodes().get(NAMES.get(1));
                 // Two credits: applyReconnecting's own single redial-retry
@@ -8849,13 +8133,13 @@ class NanocachedClientTest {
     @Test
     void clearAllRaisesNamingTheNodeWhenItIsStillDownAfterTheRetry() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String deadName = NAMES.get(0);
                 cluster.nodes().get(deadName).close();
                 Thread.sleep(50);
 
-                NanocachedException error =
-                        assertThrows(NanocachedException.class, client::clearAll);
+                NanocachedException error = assertThrows(NanocachedException.class, client::clearAll);
                 assertTrue(
                         error.getMessage().contains(deadName),
                         "error should name the failing node: " + error.getMessage());
@@ -8876,14 +8160,12 @@ class NanocachedClientTest {
         try (MockNode proxy = new MockNode();
                 MockNode node = new MockNode();
                 MockDiscovery discovery =
-                        new MockDiscovery(
-                                List.of(new DiscoveredNode(NAMES.get(0), node.address())), 1)) {
+                        new MockDiscovery(List.of(new DiscoveredNode(NAMES.get(0), node.address())), 1)) {
             // A cluster node is registered too, so "never dials a node"
             // below is an actual assertion, not vacuously true.
             discovery.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
 
-            try (NanocachedClient client =
-                    NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+            try (NanocachedClient client = NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
                 client.set("k", "v");
                 assertEquals(Optional.of("v"), client.get("k"));
                 assertTrue(client.delete("k"));
@@ -8897,10 +8179,7 @@ class NanocachedClientTest {
                 assertEquals(Optional.empty(), ns.get("k2"));
 
                 assertTrue(proxy.connectionCount.get() >= 1);
-                assertEquals(
-                        0,
-                        node.connectionCount.get(),
-                        "viaProxy must never open a connection to a cluster node");
+                assertEquals(0, node.connectionCount.get(), "viaProxy must never open a connection to a cluster node");
             }
         }
     }
@@ -8914,24 +8193,17 @@ class NanocachedClientTest {
         try (MockNode proxyA = new MockNode();
                 MockNode proxyB = new MockNode();
                 MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
-            discovery.proxies =
-                    List.of(
-                            new DiscoveredNode("proxy-a", proxyA.address()),
-                            new DiscoveredNode("proxy-b", proxyB.address()));
+            discovery.proxies = List.of(
+                    new DiscoveredNode("proxy-a", proxyA.address()), new DiscoveredNode("proxy-b", proxyB.address()));
 
             for (int i = 0; i < 40; i++) {
-                try (NanocachedClient client =
-                        NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+                try (NanocachedClient client = NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
                     client.set("k", "v");
                 }
             }
 
-            assertTrue(
-                    proxyA.connectionCount.get() > 0,
-                    "proxy-a was never picked across 40 connects");
-            assertTrue(
-                    proxyB.connectionCount.get() > 0,
-                    "proxy-b was never picked across 40 connects");
+            assertTrue(proxyA.connectionCount.get() > 0, "proxy-a was never picked across 40 connects");
+            assertTrue(proxyB.connectionCount.get() > 0, "proxy-b was never picked across 40 connects");
         }
     }
 
@@ -8944,13 +8216,11 @@ class NanocachedClientTest {
             // the roster, so the dead entry is picked first about half the
             // time — the outcome (landing on the live one) must hold
             // either way.
-            discovery.proxies =
-                    List.of(
-                            new DiscoveredNode("proxy-dead", "127.0.0.1:" + deadPort),
-                            new DiscoveredNode("proxy-live", live.address()));
+            discovery.proxies = List.of(
+                    new DiscoveredNode("proxy-dead", "127.0.0.1:" + deadPort),
+                    new DiscoveredNode("proxy-live", live.address()));
 
-            try (NanocachedClient client =
-                    NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+            try (NanocachedClient client = NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
                 client.set("k", "v");
                 assertEquals(Optional.of("v"), client.get("k"));
                 assertEquals(1, live.connectionCount.get());
@@ -8968,14 +8238,10 @@ class NanocachedClientTest {
             warming.warmingUp = true;
             healthy.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
 
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            NanocachedClient.builder()
-                                    .addresses(
-                                            List.of(
-                                                    new Address("127.0.0.1", warming.port()),
-                                                    new Address("127.0.0.1", healthy.port())))
-                                    .viaProxy(true))) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(
+                            List.of(new Address("127.0.0.1", warming.port()), new Address("127.0.0.1", healthy.port())))
+                    .viaProxy(true))) {
                 client.set("k", "v");
                 assertEquals(Optional.of("v"), client.get("k"));
             }
@@ -8985,10 +8251,8 @@ class NanocachedClientTest {
     @Test
     void viaProxyRaisesAClearErrorWhenNoProxiesAreRegistered() throws Exception {
         try (MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
-            NanocachedException error =
-                    assertThrows(
-                            NanocachedException.class,
-                            () -> NanocachedClient.connect(viaProxyOptions(discovery.port())));
+            NanocachedException error = assertThrows(
+                    NanocachedException.class, () -> NanocachedClient.connect(viaProxyOptions(discovery.port())));
             assertTrue(error.getMessage().contains("no proxies registered"), error.getMessage());
         }
     }
@@ -8996,10 +8260,8 @@ class NanocachedClientTest {
     @Test
     void viaProxyPointedAtANodeAddressFailsFastNamingTheAddress() throws Exception {
         try (MockNode node = new MockNode()) {
-            NanocachedException error =
-                    assertThrows(
-                            NanocachedException.class,
-                            () -> NanocachedClient.connect(viaProxyOptions(node.port())));
+            NanocachedException error = assertThrows(
+                    NanocachedException.class, () -> NanocachedClient.connect(viaProxyOptions(node.port())));
             assertTrue(
                     error.getMessage().contains("viaProxy")
                             && error.getMessage().contains("cache node"),
@@ -9013,13 +8275,10 @@ class NanocachedClientTest {
         try (MockNode proxyA = new MockNode();
                 MockNode proxyB = new MockNode();
                 MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
-            discovery.proxies =
-                    List.of(
-                            new DiscoveredNode("proxy-a", proxyA.address()),
-                            new DiscoveredNode("proxy-b", proxyB.address()));
+            discovery.proxies = List.of(
+                    new DiscoveredNode("proxy-a", proxyA.address()), new DiscoveredNode("proxy-b", proxyB.address()));
 
-            try (NanocachedClient client =
-                    NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+            try (NanocachedClient client = NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
                 client.set("k", "v");
 
                 MockNode connected = proxyA.connectionCount.get() > 0 ? proxyA : proxyB;
@@ -9031,9 +8290,7 @@ class NanocachedClientTest {
                 // and lands on the survivor — transparently, within this
                 // one call, exactly like any other single-mode redial.
                 assertEquals(Optional.empty(), client.get("k2"));
-                assertTrue(
-                        survivor.connectionCount.get() >= 1,
-                        "the survivor must have been dialed after reconnect");
+                assertTrue(survivor.connectionCount.get() >= 1, "the survivor must have been dialed after reconnect");
             }
         }
     }
@@ -9052,17 +8309,13 @@ class NanocachedClientTest {
         try (MockNode proxyA = new MockNode();
                 MockNode proxyB = new MockNode();
                 MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
-            discovery.proxies =
-                    List.of(
-                            new DiscoveredNode("proxy-a", proxyA.address()),
-                            new DiscoveredNode("proxy-b", proxyB.address()));
+            discovery.proxies = List.of(
+                    new DiscoveredNode("proxy-a", proxyA.address()), new DiscoveredNode("proxy-b", proxyB.address()));
 
-            try (NanocachedClient client =
-                    NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+            try (NanocachedClient client = NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
                 client.set("k", "v");
 
-                Field reconnectCooldownsField =
-                        NanocachedClient.class.getDeclaredField("reconnectCooldowns");
+                Field reconnectCooldownsField = NanocachedClient.class.getDeclaredField("reconnectCooldowns");
                 reconnectCooldownsField.setAccessible(true);
                 Map<?, ?> reconnectCooldowns = (Map<?, ?>) reconnectCooldownsField.get(client);
                 assertTrue(reconnectCooldowns.isEmpty());
@@ -9077,9 +8330,7 @@ class NanocachedClientTest {
                 // on failure), then re-fetches Q and lands on the
                 // survivor -- transparently, within this one call.
                 assertEquals(Optional.empty(), client.get("k2"));
-                assertTrue(
-                        survivor.connectionCount.get() >= 1,
-                        "the survivor must have been dialed after reconnect");
+                assertTrue(survivor.connectionCount.get() >= 1, "the survivor must have been dialed after reconnect");
 
                 // The swap must have purged the dead proxy's
                 // now-unreachable-forever cooldown entry rather than
@@ -9105,37 +8356,28 @@ class NanocachedClientTest {
         try (MockNode proxyA = new MockNode();
                 MockNode proxyB = new MockNode();
                 MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
-            discovery.proxies =
-                    List.of(
-                            new DiscoveredNode("proxy-a", proxyA.address()),
-                            new DiscoveredNode("proxy-b", proxyB.address()));
+            discovery.proxies = List.of(
+                    new DiscoveredNode("proxy-a", proxyA.address()), new DiscoveredNode("proxy-b", proxyB.address()));
 
-            try (NanocachedClient client =
-                    NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
+            try (NanocachedClient client = NanocachedClient.connect(viaProxyOptions(discovery.port()))) {
                 client.set("k", "v");
 
-                Field reconnectCooldownsField =
-                        NanocachedClient.class.getDeclaredField("reconnectCooldowns");
+                Field reconnectCooldownsField = NanocachedClient.class.getDeclaredField("reconnectCooldowns");
                 reconnectCooldownsField.setAccessible(true);
                 @SuppressWarnings("unchecked")
-                Map<String, Object> reconnectCooldowns =
-                        (Map<String, Object>) reconnectCooldownsField.get(client);
+                Map<String, Object> reconnectCooldowns = (Map<String, Object>) reconnectCooldownsField.get(client);
 
                 // Stand in for a retired proxy's leftover cooldown: an
                 // address that is NOT in the roster and is NOT the
                 // previousAddress the #296 purge would catch.
                 String retiredAddress = "10.255.255.1:9999";
-                Class<?> cooldownEntryClass =
-                        Class.forName("org.nanocached.NanocachedClient$CooldownEntry");
-                var ctor =
-                        cooldownEntryClass.getDeclaredConstructor(
-                                long.class, RuntimeException.class);
+                Class<?> cooldownEntryClass = Class.forName("org.nanocached.NanocachedClient$CooldownEntry");
+                var ctor = cooldownEntryClass.getDeclaredConstructor(long.class, RuntimeException.class);
                 ctor.setAccessible(true);
                 reconnectCooldowns.put(
                         retiredAddress,
                         ctor.newInstance(
-                                System.nanoTime() + Duration.ofHours(1).toNanos(),
-                                new RuntimeException("stale")));
+                                System.nanoTime() + Duration.ofHours(1).toNanos(), new RuntimeException("stale")));
                 assertTrue(reconnectCooldowns.containsKey(retiredAddress));
 
                 MockNode connected = proxyA.connectionCount.get() > 0 ? proxyA : proxyB;
@@ -9144,9 +8386,7 @@ class NanocachedClientTest {
                 Thread.sleep(50);
 
                 assertEquals(Optional.empty(), client.get("k2"));
-                assertTrue(
-                        survivor.connectionCount.get() >= 1,
-                        "the survivor must have been dialed after reconnect");
+                assertTrue(survivor.connectionCount.get() >= 1, "the survivor must have been dialed after reconnect");
 
                 assertFalse(
                         reconnectCooldowns.containsKey(retiredAddress),
@@ -9164,16 +8404,11 @@ class NanocachedClientTest {
         try (MockNode proxy = new MockNode();
                 MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
             discovery.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
-            IllegalArgumentException error =
-                    assertThrows(
-                            IllegalArgumentException.class,
-                            () ->
-                                    NanocachedClient.connect(
-                                            viaProxyOptions(discovery.port())
-                                                    .readHedgeAfter(Duration.ofMillis(10))));
-            assertTrue(
-                    error.getMessage().contains("readHedgeAfter has no effect with viaProxy"),
-                    error.getMessage());
+            IllegalArgumentException error = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> NanocachedClient.connect(
+                            viaProxyOptions(discovery.port()).readHedgeAfter(Duration.ofMillis(10))));
+            assertTrue(error.getMessage().contains("readHedgeAfter has no effect with viaProxy"), error.getMessage());
         }
     }
 
@@ -9182,21 +8417,12 @@ class NanocachedClientTest {
         // Issue #488: a CA file is only ever read over TLS; setting one
         // without tls(true) is almost always a forgotten tls(true).
         try (MockNode node = new MockNode()) {
-            IllegalArgumentException error =
-                    assertThrows(
-                            IllegalArgumentException.class,
-                            () ->
-                                    NanocachedClient.connect(
-                                            NanocachedClient.builder()
-                                                    .addresses(
-                                                            List.of(
-                                                                    new Address(
-                                                                            "127.0.0.1",
-                                                                            node.port())))
-                                                    .ca("/nonexistent/ca.pem")));
-            assertTrue(
-                    error.getMessage().contains("ca is only used when tls is enabled"),
-                    error.getMessage());
+            IllegalArgumentException error = assertThrows(
+                    IllegalArgumentException.class,
+                    () -> NanocachedClient.connect(NanocachedClient.builder()
+                            .addresses(List.of(new Address("127.0.0.1", node.port())))
+                            .ca("/nonexistent/ca.pem")));
+            assertTrue(error.getMessage().contains("ca is only used when tls is enabled"), error.getMessage());
         }
     }
 
@@ -9214,32 +8440,29 @@ class NanocachedClientTest {
         // @AfterEach restores the permit count.)
         NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
         try (Cluster cluster = startCluster(2)) {
-            String primary =
-                    new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2).get(0);
+            String primary = new HashRing(NAMES)
+                    .owners("k".getBytes(StandardCharsets.UTF_8), 2)
+                    .get(0);
             try (NanocachedClient client =
                     connectWithReadHedgeAfter(cluster.discovery().port(), 5_000)) {
                 client.set("k", "v");
 
-                Field replicaWritersField =
-                        NanocachedClient.class.getDeclaredField("replicaWriters");
+                Field replicaWritersField = NanocachedClient.class.getDeclaredField("replicaWriters");
                 replicaWritersField.setAccessible(true);
                 ExecutorService replicaWriters = (ExecutorService) replicaWritersField.get(client);
                 // 1 + REPLICA_WRITER_POOL_HEADROOM (16) threads over a queue of the same depth.
                 int threads = 17;
-                java.util.concurrent.CountDownLatch release =
-                        new java.util.concurrent.CountDownLatch(1);
-                java.util.concurrent.CountDownLatch occupied =
-                        new java.util.concurrent.CountDownLatch(threads);
+                java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.CountDownLatch occupied = new java.util.concurrent.CountDownLatch(threads);
                 // Whatever happens below, the blocked tasks must be released:
                 // client.close() waits for them, and would otherwise turn a
                 // failed assertion into a hang.
                 try {
-                    java.util.concurrent.Callable<Object> block =
-                            () -> {
-                                occupied.countDown();
-                                release.await();
-                                return null;
-                            };
+                    java.util.concurrent.Callable<Object> block = () -> {
+                        occupied.countDown();
+                        release.await();
+                        return null;
+                    };
                     // First occupy every thread, and only then fill the queue:
                     // submitting all 2 * threads at once races a worker that
                     // is idle (set() above used one) dequeuing its first task,
@@ -9256,8 +8479,7 @@ class NanocachedClientTest {
                     cluster.nodes().get(primary).delayGets(1_500);
                     java.util.concurrent.atomic.AtomicReference<Optional<String>> read =
                             new java.util.concurrent.atomic.AtomicReference<>();
-                    Thread reader =
-                            new Thread(() -> read.set(client.get("k")), "test-hedged-reader");
+                    Thread reader = new Thread(() -> read.set(client.get("k")), "test-hedged-reader");
                     reader.start();
                     try {
                         // The primary leg is now running inline on the reader thread.
@@ -9265,24 +8487,20 @@ class NanocachedClientTest {
                                 () -> cluster.nodes().get(primary).getCount.get() >= 1,
                                 "the saturated-pool read to reach its primary");
 
-                        java.util.concurrent.CountDownLatch acquired =
-                                new java.util.concurrent.CountDownLatch(1);
-                        Thread probe =
-                                new Thread(
-                                        () -> {
-                                            synchronized (hedgedReadsLock) {
-                                                acquired.countDown();
-                                            }
-                                        },
-                                        "test-lock-probe");
+                        java.util.concurrent.CountDownLatch acquired = new java.util.concurrent.CountDownLatch(1);
+                        Thread probe = new Thread(
+                                () -> {
+                                    synchronized (hedgedReadsLock) {
+                                        acquired.countDown();
+                                    }
+                                },
+                                "test-lock-probe");
                         probe.setDaemon(true);
                         probe.start();
                         assertTrue(
                                 acquired.await(500, java.util.concurrent.TimeUnit.MILLISECONDS),
                                 "hedgedReadsLock is held while a hedge leg runs inline on a saturated pool");
-                        assertTrue(
-                                reader.isAlive(),
-                                "the read should still be in flight, or this proves nothing");
+                        assertTrue(reader.isAlive(), "the read should still be in flight, or this proves nothing");
                     } finally {
                         reader.join(10_000);
                     }
@@ -9304,26 +8522,24 @@ class NanocachedClientTest {
         int originalTimeout = Identify.connectTimeoutMillis;
         List<java.net.ServerSocket> silentServers = new ArrayList<>();
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 List<DiscoveredNode> roster = new ArrayList<>(cluster.discovery().nodes);
                 for (int i = 0; i < 4; i++) {
                     java.net.ServerSocket silent = new java.net.ServerSocket(0);
                     silentServers.add(silent);
-                    Thread acceptor =
-                            new Thread(
-                                    () -> {
-                                        try {
-                                            while (true) silent.accept(); // accepts, never answers
-                                        } catch (java.io.IOException closed) {
-                                            // test over
-                                        }
-                                    },
-                                    "test-silent-accept-" + i);
+                    Thread acceptor = new Thread(
+                            () -> {
+                                try {
+                                    while (true) silent.accept(); // accepts, never answers
+                                } catch (java.io.IOException closed) {
+                                    // test over
+                                }
+                            },
+                            "test-silent-accept-" + i);
                     acceptor.setDaemon(true);
                     acceptor.start();
-                    roster.add(
-                            new DiscoveredNode(
-                                    "silent-" + i, "127.0.0.1:" + silent.getLocalPort()));
+                    roster.add(new DiscoveredNode("silent-" + i, "127.0.0.1:" + silent.getLocalPort()));
                 }
                 cluster.discovery().nodes = roster;
 
@@ -9335,13 +8551,9 @@ class NanocachedClientTest {
                 // Serial: 4 x 400ms = 1.6s+. Concurrent: about one timeout.
                 assertTrue(
                         elapsedMillis < 1_200,
-                        "4 blackholed new nodes should be dialed concurrently, refresh took "
-                                + elapsedMillis
-                                + "ms");
+                        "4 blackholed new nodes should be dialed concurrently, refresh took " + elapsedMillis + "ms");
                 assertEquals(
-                        0,
-                        client.stats().refreshFailures(),
-                        "a failed dial of a listed node is not a failed refresh");
+                        0, client.stats().refreshFailures(), "a failed dial of a listed node is not a failed refresh");
             }
         } finally {
             Identify.connectTimeoutMillis = originalTimeout;
@@ -9356,7 +8568,8 @@ class NanocachedClientTest {
         // choices disagreed with every peer that did reach it (issue #67
         // keeps such a node as a null-connection member everywhere else).
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String deadAddress = "127.0.0.1:" + MockServers.unusedPort();
                 List<DiscoveredNode> roster = new ArrayList<>(cluster.discovery().nodes);
                 roster.add(new DiscoveredNode("dead-new", deadAddress));
@@ -9367,8 +8580,7 @@ class NanocachedClientTest {
                 Field membersField = NanocachedClient.class.getDeclaredField("members");
                 membersField.setAccessible(true);
                 Map<?, ?> members = (Map<?, ?>) membersField.get(client);
-                assertTrue(
-                        members.containsKey("dead-new"), "unreachable new node must stay a member");
+                assertTrue(members.containsKey("dead-new"), "unreachable new node must stay a member");
                 assertNull(memberConnectionOf(client, "dead-new"));
 
                 Field ringField = NanocachedClient.class.getDeclaredField("ring");
@@ -9379,8 +8591,7 @@ class NanocachedClientTest {
                                 .contains("dead-new"),
                         "the ring must be built with the unreachable node, like every peer's");
 
-                Field cooldownsField =
-                        NanocachedClient.class.getDeclaredField("reconnectCooldowns");
+                Field cooldownsField = NanocachedClient.class.getDeclaredField("reconnectCooldowns");
                 cooldownsField.setAccessible(true);
                 assertTrue(
                         ((Map<?, ?>) cooldownsField.get(client)).containsKey(deadAddress),
@@ -9398,7 +8609,8 @@ class NanocachedClientTest {
     @Test
     void aRedialedConnectionIsClosedWhenARefreshDroppedTheMemberMeanwhile() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String victim = NAMES.get(1);
                 MockNode victimNode = cluster.nodes().get(victim);
                 Connection original = memberConnectionOf(client, victim);
@@ -9409,53 +8621,37 @@ class NanocachedClientTest {
                 Field openTargetsField = NanocachedClient.class.getDeclaredField("OPEN_TARGETS");
                 openTargetsField.setAccessible(true);
                 @SuppressWarnings("unchecked")
-                Map<String, Integer> openTargets =
-                        (Map<String, Integer>) openTargetsField.get(null);
-                waitFor(
-                        () -> openTargets.getOrDefault(targetKey, 0) == 2,
-                        "both members connected");
+                Map<String, Integer> openTargets = (Map<String, Integer>) openTargetsField.get(null);
+                waitFor(() -> openTargets.getOrDefault(targetKey, 0) == 2, "both members connected");
 
                 // The victim's connection dies; the next use redials it, and
                 // that dial is held in its handshake.
                 victimNode.dropConnections();
                 waitFor(original::isClosed, "the victim's connection to notice the drop");
-                waitFor(
-                        () -> openTargets.getOrDefault(targetKey, 0) == 1,
-                        "the dead connection to be untracked");
+                waitFor(() -> openTargets.getOrDefault(targetKey, 0) == 1, "the dead connection to be untracked");
                 victimNode.holdAuthReplies();
-                Method memberConnection =
-                        NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
+                Method memberConnection = NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
                 memberConnection.setAccessible(true);
                 ExecutorService redialer = Executors.newSingleThreadExecutor();
                 try {
-                    Future<Object> redial =
-                            redialer.submit(() -> memberConnection.invoke(client, victim));
-                    assertTrue(
-                            victimNode.awaitAuthHeld(5_000),
-                            "the redial must reach the node's handshake");
+                    Future<Object> redial = redialer.submit(() -> memberConnection.invoke(client, victim));
+                    assertTrue(victimNode.awaitAuthHeld(5_000), "the redial must reach the node's handshake");
 
                     // Discovery drops the victim while the dial is in flight.
-                    cluster.discovery().nodes =
-                            List.of(
-                                    new DiscoveredNode(
-                                            NAMES.get(0),
-                                            cluster.nodes().get(NAMES.get(0)).address()));
+                    cluster.discovery().nodes = List.of(new DiscoveredNode(
+                            NAMES.get(0), cluster.nodes().get(NAMES.get(0)).address()));
                     forceRefresh(client);
                     Field membersField = NanocachedClient.class.getDeclaredField("members");
                     membersField.setAccessible(true);
                     assertFalse(((Map<?, ?>) membersField.get(client)).containsKey(victim));
                     victimNode.releaseAuthReplies();
 
-                    ExecutionException failure =
-                            assertThrows(
-                                    ExecutionException.class,
-                                    () -> redial.get(10, java.util.concurrent.TimeUnit.SECONDS));
+                    ExecutionException failure = assertThrows(
+                            ExecutionException.class, () -> redial.get(10, java.util.concurrent.TimeUnit.SECONDS));
                     Throwable cause = ((InvocationTargetException) failure.getCause()).getCause();
                     assertTrue(
-                            cause instanceof NanocachedException.ConnectionLost lost
-                                    && lost.notSent(),
-                            "a member that left while reconnecting is a not-sent connection failure: "
-                                    + cause);
+                            cause instanceof NanocachedException.ConnectionLost lost && lost.notSent(),
+                            "a member that left while reconnecting is a not-sent connection failure: " + cause);
                     waitFor(
                             () -> openTargets.getOrDefault(targetKey, 0) == 1,
                             "the redialed connection to be closed rather than leaked on the dropped member");
@@ -9475,12 +8671,8 @@ class NanocachedClientTest {
         Method singleConnection = NanocachedClient.class.getDeclaredMethod("singleConnection");
         singleConnection.setAccessible(true);
         java.lang.reflect.InvocationTargetException failure =
-                assertThrows(
-                        java.lang.reflect.InvocationTargetException.class,
-                        () -> singleConnection.invoke(client));
-        assertTrue(
-                failure.getCause() instanceof NanocachedException.AlreadyClosed,
-                String.valueOf(failure.getCause()));
+                assertThrows(java.lang.reflect.InvocationTargetException.class, () -> singleConnection.invoke(client));
+        assertTrue(failure.getCause() instanceof NanocachedException.AlreadyClosed, String.valueOf(failure.getCause()));
     }
 
     @Test
@@ -9492,16 +8684,12 @@ class NanocachedClientTest {
 
             singleConnectionAfterClose(client);
 
-            assertEquals(
-                    dialsBefore,
-                    node.connectionCount.get(),
-                    "a closed client must not dial the node again");
+            assertEquals(dialsBefore, node.connectionCount.get(), "a closed client must not dial the node again");
         }
     }
 
     @Test
-    void proxyModeSingleConnectionAfterCloseFailsWithoutDialingOrAskingDiscovery()
-            throws Exception {
+    void proxyModeSingleConnectionAfterCloseFailsWithoutDialingOrAskingDiscovery() throws Exception {
         try (MockNode proxy = new MockNode();
                 MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
             discovery.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
@@ -9530,7 +8718,8 @@ class NanocachedClientTest {
         // without a connection whose cooldown holds the hard error, like a
         // node whose dial failed softly.
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String notACacheNode = "127.0.0.1:" + cluster.discovery().port();
                 List<DiscoveredNode> roster = new ArrayList<>(cluster.discovery().nodes);
                 roster.add(new DiscoveredNode("bad-address", "no-port-here"));
@@ -9555,27 +8744,20 @@ class NanocachedClientTest {
                         owners.contains("bad-address") && owners.contains("not-a-node"),
                         "the ring must be built with both nodes, like every peer's: " + owners);
 
-                Field cooldownsField =
-                        NanocachedClient.class.getDeclaredField("reconnectCooldowns");
+                Field cooldownsField = NanocachedClient.class.getDeclaredField("reconnectCooldowns");
                 cooldownsField.setAccessible(true);
                 Map<?, ?> cooldowns = (Map<?, ?>) cooldownsField.get(client);
-                assertTrue(
-                        cooldowns.containsKey("no-port-here"),
-                        "the unparseable address has its cooldown armed");
-                assertTrue(
-                        cooldowns.containsKey(notACacheNode),
-                        "the non-node address has its cooldown armed");
+                assertTrue(cooldowns.containsKey("no-port-here"), "the unparseable address has its cooldown armed");
+                assertTrue(cooldowns.containsKey(notACacheNode), "the non-node address has its cooldown armed");
                 assertEquals(0, client.stats().refreshFailures());
 
                 // The next use of such a node surfaces the error the dial
                 // produced, without dialing again inside the cooldown.
-                Method memberConnection =
-                        NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
+                Method memberConnection = NanocachedClient.class.getDeclaredMethod("memberConnection", String.class);
                 memberConnection.setAccessible(true);
-                java.lang.reflect.InvocationTargetException failure =
-                        assertThrows(
-                                java.lang.reflect.InvocationTargetException.class,
-                                () -> memberConnection.invoke(client, "bad-address"));
+                java.lang.reflect.InvocationTargetException failure = assertThrows(
+                        java.lang.reflect.InvocationTargetException.class,
+                        () -> memberConnection.invoke(client, "bad-address"));
                 assertTrue(
                         failure.getCause().getMessage().contains("invalid node address"),
                         failure.getCause().getMessage());
@@ -9595,22 +8777,19 @@ class NanocachedClientTest {
         for (String badAddress : List.of("no-port-here", "NOT-A-NODE")) {
             try (Cluster cluster = startCluster(2)) {
                 MockNode live = cluster.nodes().get(NAMES.get(0));
-                cluster.discovery().nodes =
-                        List.of(new DiscoveredNode(NAMES.get(0), live.address()));
-                try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
-                    String address =
-                            badAddress.equals("NOT-A-NODE")
-                                    ? "127.0.0.1:" + cluster.discovery().port()
-                                    : badAddress;
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
+                    String address = badAddress.equals("NOT-A-NODE")
+                            ? "127.0.0.1:" + cluster.discovery().port()
+                            : badAddress;
                     DiscoveredNode bad = new DiscoveredNode("bad-node", address);
-                    cluster.discovery().nodes =
-                            List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
+                    cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
                     forceRefresh(client);
                     assertNull(memberConnectionOf(client, "bad-node"));
 
                     // Discovery drops the node; this client has not seen that yet.
-                    cluster.discovery().nodes =
-                            List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                    cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
                     // Past the minimum interval between forced refreshes.
                     Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 50);
                     List<String> ranked = List.of(NAMES.get(0), "bad-node");
@@ -9619,11 +8798,9 @@ class NanocachedClientTest {
                     assertEquals(Optional.of("v"), client.get(key));
 
                     // Same again for INCR, which only retries a request that never left.
-                    cluster.discovery().nodes =
-                            List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
+                    cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
                     forceRefresh(client);
-                    cluster.discovery().nodes =
-                            List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                    cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
                     Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 50);
                     String counter = keyWithPrimaryAmong(ranked, "bad-node", key);
                     live.store.put(
@@ -9641,8 +8818,7 @@ class NanocachedClientTest {
      */
     private static final class HttpGarbageListener implements AutoCloseable {
         private final java.net.ServerSocket server;
-        private final Set<java.net.Socket> accepted =
-                java.util.concurrent.ConcurrentHashMap.newKeySet();
+        private final Set<java.net.Socket> accepted = java.util.concurrent.ConcurrentHashMap.newKeySet();
         final AtomicInteger connections = new AtomicInteger();
 
         HttpGarbageListener(int port) throws java.io.IOException {
@@ -9664,32 +8840,28 @@ class NanocachedClientTest {
                         Thread.sleep(50);
                     } catch (InterruptedException interrupted) {
                         Thread.currentThread().interrupt();
-                        throw new java.io.InterruptedIOException(
-                                "interrupted while re-binding port " + port);
+                        throw new java.io.InterruptedIOException("interrupted while re-binding port " + port);
                     }
                 }
             }
             server = bound;
-            Thread acceptor =
-                    new Thread(
-                            () -> {
-                                while (!server.isClosed()) {
-                                    try {
-                                        java.net.Socket socket = server.accept();
-                                        connections.incrementAndGet();
-                                        accepted.add(socket);
-                                        socket.getOutputStream()
-                                                .write(
-                                                        "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
-                                                                .getBytes(
-                                                                        StandardCharsets.US_ASCII));
-                                        socket.getOutputStream().flush();
-                                    } catch (java.io.IOException stop) {
-                                        return;
-                                    }
-                                }
-                            },
-                            "http-garbage-accept");
+            Thread acceptor = new Thread(
+                    () -> {
+                        while (!server.isClosed()) {
+                            try {
+                                java.net.Socket socket = server.accept();
+                                connections.incrementAndGet();
+                                accepted.add(socket);
+                                socket.getOutputStream()
+                                        .write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
+                                                .getBytes(StandardCharsets.US_ASCII));
+                                socket.getOutputStream().flush();
+                            } catch (java.io.IOException stop) {
+                                return;
+                            }
+                        }
+                    },
+                    "http-garbage-accept");
             acceptor.setDaemon(true);
             acceptor.start();
         }
@@ -9718,10 +8890,10 @@ class NanocachedClientTest {
                 HttpGarbageListener http = new HttpGarbageListener(0)) {
             MockNode live = cluster.nodes().get(NAMES.get(0));
             cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 DiscoveredNode bad = new DiscoveredNode("bad-node", http.address());
-                cluster.discovery().nodes =
-                        List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
                 forceRefresh(client);
                 assertNull(memberConnectionOf(client, "bad-node"));
 
@@ -9733,31 +8905,25 @@ class NanocachedClientTest {
                         MockNode.keyOf(counter.getBytes(StandardCharsets.UTF_8)),
                         "10".getBytes(StandardCharsets.UTF_8));
                 live.store.put(
-                        MockNode.keyOf(touched.getBytes(StandardCharsets.UTF_8)),
-                        "t".getBytes(StandardCharsets.UTF_8));
+                        MockNode.keyOf(touched.getBytes(StandardCharsets.UTF_8)), "t".getBytes(StandardCharsets.UTF_8));
 
                 // Discovery drops the member; this client has not seen that yet.
-                cluster.discovery().nodes =
-                        List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
                 Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 50);
                 client.set(setKey, "v");
                 assertEquals(Optional.of("v"), client.get(setKey));
 
-                cluster.discovery().nodes =
-                        List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
                 forceRefresh(client);
-                cluster.discovery().nodes =
-                        List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
                 Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 50);
                 assertEquals(java.util.OptionalLong.of(15), client.incr(counter, 5));
 
                 // ttl 0: a chunk whose dial failed this way counts as never
                 // sent, so the touch is rerouted instead of failing.
-                cluster.discovery().nodes =
-                        List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()), bad);
                 forceRefresh(client);
-                cluster.discovery().nodes =
-                        List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
                 Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 50);
                 assertEquals(Map.of(touched, true), client.touchMany(List.of(touched), 0));
             }
@@ -9772,16 +8938,15 @@ class NanocachedClientTest {
             MockNode live = cluster.nodes().get(NAMES.get(0));
             MockNode victim = cluster.nodes().get(NAMES.get(1));
             int victimPort = victim.port();
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 victim.close();
                 Connection old = memberConnectionOf(client, NAMES.get(1));
                 for (int i = 0; i < 200 && !old.isClosed(); i++) Thread.sleep(10);
-                assertTrue(
-                        old.isClosed(), "the client never noticed the member's connection closing");
+                assertTrue(old.isClosed(), "the client never noticed the member's connection closing");
 
                 try (HttpGarbageListener http = new HttpGarbageListener(victimPort)) {
-                    cluster.discovery().nodes =
-                            List.of(new DiscoveredNode(NAMES.get(0), live.address()));
+                    cluster.discovery().nodes = List.of(new DiscoveredNode(NAMES.get(0), live.address()));
                     Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 50);
                     List<String> ranked = NAMES;
                     String setKey = keyWithPrimaryAmong(ranked, NAMES.get(1));
@@ -9791,9 +8956,7 @@ class NanocachedClientTest {
                             "10".getBytes(StandardCharsets.UTF_8));
                     client.set(setKey, "v");
                     assertEquals(Optional.of("v"), client.get(setKey));
-                    assertTrue(
-                            http.connections.get() >= 1,
-                            "the redial never reached the garbage listener");
+                    assertTrue(http.connections.get() >= 1, "the redial never reached the garbage listener");
                     assertEquals(java.util.OptionalLong.of(15), client.incr(counter, 5));
                 }
             }
@@ -9806,22 +8969,21 @@ class NanocachedClientTest {
         // ConnectionLost; connect() against the address itself reports it
         // plainly.
         try (HttpGarbageListener http = new HttpGarbageListener(0)) {
-            int port =
-                    Integer.parseInt(http.address().substring(http.address().lastIndexOf(':') + 1));
-            NanocachedException error =
-                    assertThrows(NanocachedException.class, () -> connect("127.0.0.1", port));
+            int port = Integer.parseInt(http.address().substring(http.address().lastIndexOf(':') + 1));
+            NanocachedException error = assertThrows(NanocachedException.class, () -> connect("127.0.0.1", port));
             assertEquals(NanocachedException.class, error.getClass());
             assertTrue(error.getMessage().contains("unexpected response to A"), error.getMessage());
         }
     }
 
-    private static String keyWithPrimaryAmong(
-            List<String> names, String primary, String... except) {
+    private static String keyWithPrimaryAmong(List<String> names, String primary, String... except) {
         HashRing ring = new HashRing(names);
         for (int i = 0; ; i++) {
             String candidate = "hard-" + i;
             if (List.of(except).contains(candidate)) continue;
-            if (ring.owners(candidate.getBytes(StandardCharsets.UTF_8), 2).get(0).equals(primary)) {
+            if (ring.owners(candidate.getBytes(StandardCharsets.UTF_8), 2)
+                    .get(0)
+                    .equals(primary)) {
                 return candidate;
             }
         }
@@ -9848,13 +9010,12 @@ class NanocachedClientTest {
                 MockNode healthyB = new MockNode()) {
             hung.delayGets(10_000);
             // members iterates in roster order, so the hung node is pinged first.
-            try (MockDiscovery discovery =
-                    new MockDiscovery(
-                            List.of(
-                                    new DiscoveredNode(NAMES.get(0), hung.address()),
-                                    new DiscoveredNode(NAMES.get(1), healthyA.address()),
-                                    new DiscoveredNode("healthy-b", healthyB.address())),
-                            1)) {
+            try (MockDiscovery discovery = new MockDiscovery(
+                    List.of(
+                            new DiscoveredNode(NAMES.get(0), hung.address()),
+                            new DiscoveredNode(NAMES.get(1), healthyA.address()),
+                            new DiscoveredNode("healthy-b", healthyB.address())),
+                    1)) {
                 try (NanocachedClient client = connect("127.0.0.1", discovery.port())) {
                     waitFor(
                             () -> healthyA.getCount.get() >= 3 && healthyB.getCount.get() >= 3,
@@ -9878,19 +9039,16 @@ class NanocachedClientTest {
     void replicaWriterPoolRunsOverflowInlineAndStillRejectsAfterShutdown() throws Exception {
         java.util.concurrent.ExecutorService pool = NanocachedClient.newReplicaWriterPool(1);
         try {
-            java.util.concurrent.CountDownLatch release =
-                    new java.util.concurrent.CountDownLatch(1);
-            java.util.concurrent.CountDownLatch occupied =
-                    new java.util.concurrent.CountDownLatch(1);
-            Runnable block =
-                    () -> {
-                        occupied.countDown();
-                        try {
-                            release.await();
-                        } catch (InterruptedException interrupted) {
-                            Thread.currentThread().interrupt();
-                        }
-                    };
+            java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+            java.util.concurrent.CountDownLatch occupied = new java.util.concurrent.CountDownLatch(1);
+            Runnable block = () -> {
+                occupied.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            };
             pool.execute(block); // occupies the single thread
             assertTrue(occupied.await(5, java.util.concurrent.TimeUnit.SECONDS));
             pool.execute(block); // fills the single queue slot
@@ -9898,9 +9056,7 @@ class NanocachedClientTest {
             Thread[] ranOn = new Thread[1];
             pool.execute(() -> ranOn[0] = Thread.currentThread());
             assertSame(
-                    Thread.currentThread(),
-                    ranOn[0],
-                    "overflow must run on the submitter, not be queued or dropped");
+                    Thread.currentThread(), ranOn[0], "overflow must run on the submitter, not be queued or dropped");
 
             release.countDown();
             pool.shutdown();
@@ -9946,10 +9102,7 @@ class NanocachedClientTest {
                         calls.add(callers.submit(() -> client.set("set-" + n, value)));
                     }
                     for (Future<?> call : calls) {
-                        call.get(
-                                20,
-                                java.util.concurrent.TimeUnit
-                                        .SECONDS); // a failed request throws here
+                        call.get(20, java.util.concurrent.TimeUnit.SECONDS); // a failed request throws here
                     }
                     long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
                     // Loopback moves 96 MB in well under a second; a stall lasts
@@ -9978,25 +9131,23 @@ class NanocachedClientTest {
         // the watchdog (30 s) and the socket stayed open. Python's read
         // loop guards the same hole explicitly (issue #8). No networking:
         // a Socket whose input stream throws the moment it is read.
-        java.io.InputStream throwing =
-                new java.io.InputStream() {
-                    @Override
-                    public int read() {
-                        throw new IllegalStateException("simulated reader-thread failure");
-                    }
-                };
-        java.net.Socket socket =
-                new java.net.Socket() {
-                    @Override
-                    public java.io.InputStream getInputStream() {
-                        return throwing;
-                    }
+        java.io.InputStream throwing = new java.io.InputStream() {
+            @Override
+            public int read() {
+                throw new IllegalStateException("simulated reader-thread failure");
+            }
+        };
+        java.net.Socket socket = new java.net.Socket() {
+            @Override
+            public java.io.InputStream getInputStream() {
+                return throwing;
+            }
 
-                    @Override
-                    public java.io.OutputStream getOutputStream() {
-                        return java.io.OutputStream.nullOutputStream();
-                    }
-                };
+            @Override
+            public java.io.OutputStream getOutputStream() {
+                return java.io.OutputStream.nullOutputStream();
+            }
+        };
         java.util.concurrent.CountDownLatch closed = new java.util.concurrent.CountDownLatch(1);
         // Quiet the JVM's default handler for the reader thread's death on
         // the unfixed code, which is not what this test is about.
@@ -10008,12 +9159,9 @@ class NanocachedClientTest {
                     closed.await(5, java.util.concurrent.TimeUnit.SECONDS),
                     "the reader thread's RuntimeException did not poison the connection");
             assertTrue(socket.isClosed(), "poison() closes the socket");
-            NanocachedException.ConnectionLost error =
-                    assertThrows(
-                            NanocachedException.ConnectionLost.class,
-                            () ->
-                                    connection.get(
-                                            new byte[0], "k".getBytes(StandardCharsets.UTF_8)));
+            NanocachedException.ConnectionLost error = assertThrows(
+                    NanocachedException.ConnectionLost.class,
+                    () -> connection.get(new byte[0], "k".getBytes(StandardCharsets.UTF_8)));
             // A poisoned connection refuses at once (notSent=true: the frame
             // never touched the wire) — no 30 s watchdog wait.
             assertTrue(error.getMessage().contains("closed"), error.getMessage());
@@ -10032,16 +9180,12 @@ class NanocachedClientTest {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("x?", "question");
-                assertThrows(
-                        IllegalArgumentException.class, () -> client.set("x\uD800", "surrogate"));
+                assertThrows(IllegalArgumentException.class, () -> client.set("x\uD800", "surrogate"));
                 assertThrows(IllegalArgumentException.class, () -> client.get("x\uD800"));
                 assertThrows(IllegalArgumentException.class, () -> client.set("k", "v\uDC00"));
                 assertThrows(IllegalArgumentException.class, () -> client.namespace("ns\uD800"));
-                assertThrows(
-                        IllegalArgumentException.class,
-                        () -> client.setMany(Map.of("x\uD800", "v")));
-                assertThrows(
-                        IllegalArgumentException.class, () -> client.getMany(List.of("x\uD800")));
+                assertThrows(IllegalArgumentException.class, () -> client.setMany(Map.of("x\uD800", "v")));
+                assertThrows(IllegalArgumentException.class, () -> client.getMany(List.of("x\uD800")));
                 assertEquals(Optional.of("question"), client.get("x?"));
                 assertEquals(1, node.store.size());
 
@@ -10062,8 +9206,7 @@ class NanocachedClientTest {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 client.set("k", "value");
-                Map<String, String> values =
-                        client.getMany(java.util.Collections.nCopies(2_000, "k"));
+                Map<String, String> values = client.getMany(java.util.Collections.nCopies(2_000, "k"));
                 assertEquals(Map.of("k", "value"), values);
                 assertEquals(1, node.multiGetCount.get());
                 assertEquals(1, node.multiGetFrameBodyBytes.size());
@@ -10087,7 +9230,8 @@ class NanocachedClientTest {
         // are expanded back to the caller's positions, so a repeated key
         // that stayed wrong-node is reported at each of its positions.
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String onA = keyOwnedBy(NAMES.get(0));
                 String onB = keyOwnedBy(NAMES.get(1));
                 client.set(onA, "a");
@@ -10102,9 +9246,7 @@ class NanocachedClientTest {
                     onA.getBytes(StandardCharsets.UTF_8),
                 };
                 NanocachedException.PartialWrongNodeRaw partial =
-                        assertThrows(
-                                NanocachedException.PartialWrongNodeRaw.class,
-                                () -> client.getManyBytes(keys));
+                        assertThrows(NanocachedException.PartialWrongNodeRaw.class, () -> client.getManyBytes(keys));
                 assertArrayEquals(new int[] {0, 2}, partial.unresolvedIndices);
                 assertEquals(3, partial.partialValues.length);
                 assertNull(partial.partialValues[0]);
@@ -10119,16 +9261,14 @@ class NanocachedClientTest {
         HashRing ring = new HashRing(NAMES);
         for (int i = 0; ; i++) {
             String candidate = "key-" + i;
-            if (ring.route(candidate.getBytes(StandardCharsets.UTF_8)).equals(owner))
-                return candidate;
+            if (ring.route(candidate.getBytes(StandardCharsets.UTF_8)).equals(owner)) return candidate;
         }
     }
 
     // ── setMany retries only the legs that failed ───────────────────
 
     @Test
-    void batchedSetRetriesOnlyTheLegsThatFailedAndReportsAnUnreachablePrimaryAsAConnectionFailure()
-            throws Exception {
+    void batchedSetRetriesOnlyTheLegsThatFailedAndReportsAnUnreachablePrimaryAsAConnectionFailure() throws Exception {
         // With R=2 every key goes to both nodes. Node B closes on every
         // `o` frame: the retry pass used to re-send every rank of each
         // key whose primary (B) leg failed, including node A, which had
@@ -10136,7 +9276,8 @@ class NanocachedClientTest {
         // the exhausted retry used to be reported as WrongNode although B
         // never answered `W`: it was unreachable.
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 MockNode nodeA = cluster.nodes().get(NAMES.get(0));
                 MockNode nodeB = cluster.nodes().get(NAMES.get(1));
                 nodeB.failAllMultiSets();
@@ -10147,17 +9288,12 @@ class NanocachedClientTest {
                 for (int i = 0; i < 12; i++) {
                     String key = "key-" + i;
                     batch.put(key, "v" + i);
-                    if (ring.route(key.getBytes(StandardCharsets.UTF_8)).equals(NAMES.get(0)))
-                        primaryOnA.add(key);
+                    if (ring.route(key.getBytes(StandardCharsets.UTF_8)).equals(NAMES.get(0))) primaryOnA.add(key);
                 }
-                assertTrue(
-                        !primaryOnA.isEmpty() && primaryOnA.size() < 12,
-                        "want keys with each primary");
+                assertTrue(!primaryOnA.isEmpty() && primaryOnA.size() < 12, "want keys with each primary");
 
                 NanocachedException.PartialConnectionLostSet failure =
-                        assertThrows(
-                                NanocachedException.PartialConnectionLostSet.class,
-                                () -> client.setMany(batch));
+                        assertThrows(NanocachedException.PartialConnectionLostSet.class, () -> client.setMany(batch));
                 assertEquals(primaryOnA, failure.succeededKeys);
                 assertEquals(12, nodeA.multiSetKeyCount.get(), "every key sent to A exactly once");
                 assertEquals(12, nodeA.store.size());
@@ -10187,24 +9323,18 @@ class NanocachedClientTest {
             int fetchesBefore = cluster.discovery().connectionCount.get();
             ExecutorService caller = Executors.newSingleThreadExecutor();
             try {
-                Future<?> outcome =
-                        caller.submit(() -> {
-                            assertThrows(
-                                    NanocachedException.class,
-                                    () -> client.getMany(List.of(onA, onB)));
-                            return null;
-                        });
+                Future<?> outcome = caller.submit(() -> {
+                    assertThrows(NanocachedException.class, () -> client.getMany(List.of(onA, onB)));
+                    return null;
+                });
                 Thread.sleep(300);
                 long closedAt = System.nanoTime();
                 client.close();
                 outcome.get(15, java.util.concurrent.TimeUnit.SECONDS);
                 long afterClose = (System.nanoTime() - closedAt) / 1_000_000;
                 assertEquals(
-                        fetchesBefore,
-                        cluster.discovery().connectionCount.get(),
-                        "no node-list fetch after close()");
-                assertTrue(
-                        afterClose < 3_000, "getMany finished " + afterClose + "ms after close()");
+                        fetchesBefore, cluster.discovery().connectionCount.get(), "no node-list fetch after close()");
+                assertTrue(afterClose < 3_000, "getMany finished " + afterClose + "ms after close()");
             } finally {
                 caller.shutdownNow();
             }
@@ -10223,7 +9353,8 @@ class NanocachedClientTest {
         // minimum interval (issue #1582), so there are at most two
         // refreshes, never one per caller.
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = keyOwnedBy(NAMES.get(0));
                 client.set(key, "v");
                 cluster.nodes().get(NAMES.get(0)).close();
@@ -10234,26 +9365,21 @@ class NanocachedClientTest {
                 try {
                     List<Future<Long>> elapsed = new ArrayList<>();
                     for (int i = 0; i < 4; i++) {
-                        elapsed.add(
-                                callers.submit(() -> {
-                                    long started = System.nanoTime();
-                                    assertThrows(NanocachedException.class, () -> client.get(key));
-                                    return (System.nanoTime() - started) / 1_000_000;
-                                }));
+                        elapsed.add(callers.submit(() -> {
+                            long started = System.nanoTime();
+                            assertThrows(NanocachedException.class, () -> client.get(key));
+                            return (System.nanoTime() - started) / 1_000_000;
+                        }));
                     }
                     for (Future<Long> caller : elapsed) {
                         long millis = caller.get(10, java.util.concurrent.TimeUnit.SECONDS);
-                        assertTrue(
-                                millis < 1_500,
-                                "a caller waited " + millis + "ms (serialized refreshes?)");
+                        assertTrue(millis < 1_500, "a caller waited " + millis + "ms (serialized refreshes?)");
                     }
                 } finally {
                     callers.shutdownNow();
                 }
                 int refreshes = cluster.discovery().connectionCount.get() - 1;
-                assertTrue(
-                        refreshes >= 1 && refreshes <= 2,
-                        "shared refreshes, not one per caller: " + refreshes);
+                assertTrue(refreshes >= 1 && refreshes <= 2, "shared refreshes, not one per caller: " + refreshes);
             }
         }
     }
@@ -10277,16 +9403,15 @@ class NanocachedClientTest {
         // A caller failing against a dead primary over and over opened one
         // discovery connection per failed operation.
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = stopPrimaryOfAKey(cluster);
                 int before = cluster.discovery().connectionCount.get();
                 for (int i = 0; i < 40; i++) {
                     assertThrows(NanocachedException.class, () -> client.set(key, "v"));
                 }
                 int fetches = cluster.discovery().connectionCount.get() - before;
-                assertTrue(
-                        fetches <= 2,
-                        "discovery saw " + fetches + " node-list fetches for 40 failed operations");
+                assertTrue(fetches <= 2, "discovery saw " + fetches + " node-list fetches for 40 failed operations");
             }
         }
     }
@@ -10294,7 +9419,8 @@ class NanocachedClientTest {
     @Test
     void aForcedRefreshRunsAgainOnceTheMinimumIntervalHasPassed() throws Exception {
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = stopPrimaryOfAKey(cluster);
                 assertThrows(NanocachedException.class, () -> client.set(key, "v"));
                 int afterFirst = cluster.discovery().connectionCount.get();
@@ -10317,24 +9443,21 @@ class NanocachedClientTest {
         // that failed and the operation's one retry would go straight back to
         // it. The failing caller waits it out and runs a refresh of its own.
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = stopPrimaryOfAKey(cluster);
                 cluster.discovery().laterListDelayMillis = 400;
-                Method maybeRefresh =
-                        NanocachedClient.class.getDeclaredMethod("maybeRefresh", boolean.class);
+                Method maybeRefresh = NanocachedClient.class.getDeclaredMethod("maybeRefresh", boolean.class);
                 maybeRefresh.setAccessible(true);
-                Thread inFlight =
-                        new Thread(() -> {
-                            try {
-                                maybeRefresh.invoke(client, true);
-                            } catch (ReflectiveOperationException e) {
-                                throw new AssertionError(e);
-                            }
-                        });
+                Thread inFlight = new Thread(() -> {
+                    try {
+                        maybeRefresh.invoke(client, true);
+                    } catch (ReflectiveOperationException e) {
+                        throw new AssertionError(e);
+                    }
+                });
                 inFlight.start();
-                waitFor(
-                        () -> cluster.discovery().connectionCount.get() == 2,
-                        "the first refresh to reach discovery");
+                waitFor(() -> cluster.discovery().connectionCount.get() == 2, "the first refresh to reach discovery");
 
                 assertThrows(NanocachedException.class, () -> client.set(key, "v"));
                 inFlight.join(10_000);
@@ -10357,24 +9480,21 @@ class NanocachedClientTest {
         // decompressions run one at a time.
         long savedBudget = Compression.maxInflightDecompressedBytes;
         Compression.maxInflightDecompressedBytes = 1;
-        java.util.concurrent.atomic.AtomicInteger inFlight =
-                new java.util.concurrent.atomic.AtomicInteger();
-        java.util.concurrent.atomic.AtomicInteger peak =
-                new java.util.concurrent.atomic.AtomicInteger();
-        Compression.inflateTestHook =
-                phase -> {
-                    if (phase.equals("start")) {
-                        int now = inFlight.incrementAndGet();
-                        peak.accumulateAndGet(now, Math::max);
-                        try {
-                            Thread.sleep(30);
-                        } catch (InterruptedException interrupted) {
-                            Thread.currentThread().interrupt();
-                        }
-                    } else {
-                        inFlight.decrementAndGet();
-                    }
-                };
+        java.util.concurrent.atomic.AtomicInteger inFlight = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.concurrent.atomic.AtomicInteger peak = new java.util.concurrent.atomic.AtomicInteger();
+        Compression.inflateTestHook = phase -> {
+            if (phase.equals("start")) {
+                int now = inFlight.incrementAndGet();
+                peak.accumulateAndGet(now, Math::max);
+                try {
+                    Thread.sleep(30);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            } else {
+                inFlight.decrementAndGet();
+            }
+        };
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client =
                     NanocachedClient.connect(single("127.0.0.1", node.port()).compress(true))) {
@@ -10385,9 +9505,7 @@ class NanocachedClientTest {
                     List<Future<Optional<String>>> reads = new ArrayList<>();
                     for (int i = 0; i < 8; i++) reads.add(readers.submit(() -> client.get("k")));
                     for (Future<Optional<String>> read : reads) {
-                        assertEquals(
-                                Optional.of(value),
-                                read.get(10, java.util.concurrent.TimeUnit.SECONDS));
+                        assertEquals(Optional.of(value), read.get(10, java.util.concurrent.TimeUnit.SECONDS));
                     }
                 } finally {
                     readers.shutdownNow();
@@ -10411,18 +9529,14 @@ class NanocachedClientTest {
         int originalTimeout = Identify.connectTimeoutMillis;
         Identify.connectTimeoutMillis = 500;
         try (Cluster cluster = startCluster(1)) {
-            cluster.discovery().listByteDelayMillis =
-                    100; // the roster is >100 bytes: >10 s untreated
+            cluster.discovery().listByteDelayMillis = 100; // the roster is >100 bytes: >10 s untreated
             long started = System.nanoTime();
-            NanocachedException.ConnectionLost error =
-                    assertThrows(
-                            NanocachedException.ConnectionLost.class,
-                            () -> connect("127.0.0.1", cluster.discovery().port()));
+            NanocachedException.ConnectionLost error = assertThrows(
+                    NanocachedException.ConnectionLost.class,
+                    () -> connect("127.0.0.1", cluster.discovery().port()));
             long elapsedMillis = (System.nanoTime() - started) / 1_000_000;
             assertTrue(elapsedMillis < 2_000, "connect took " + elapsedMillis + "ms");
-            assertTrue(
-                    error.getMessage().contains("identify exchange"),
-                    "unexpected failure: " + error.getMessage());
+            assertTrue(error.getMessage().contains("identify exchange"), "unexpected failure: " + error.getMessage());
         } finally {
             Identify.connectTimeoutMillis = originalTimeout;
         }
@@ -10439,7 +9553,8 @@ class NanocachedClientTest {
         long defaultTimeout = Connection.requestTimeoutMillis;
         Connection.requestTimeoutMillis = 300;
         try (Cluster cluster = startCluster(2)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String key = keyOwnedBy(NAMES.get(0));
                 client.set(key, "warm");
                 MockNode replica = cluster.nodes().get(NAMES.get(1));
@@ -10452,10 +9567,7 @@ class NanocachedClientTest {
                 assertTrue(
                         elapsedMillis >= 250 && elapsedMillis < 550,
                         "set took " + elapsedMillis + "ms, want about one timeout");
-                assertEquals(
-                        connectionsBefore,
-                        replica.connectionCount.get(),
-                        "no redial after a timeout");
+                assertEquals(connectionsBefore, replica.connectionCount.get(), "no redial after a timeout");
                 assertEquals(1, client.stats().replicaWriteFailures());
             }
         } finally {
@@ -10470,16 +9582,11 @@ class NanocachedClientTest {
         try (Cluster cluster = startCluster(1)) {
             int dead = MockServers.unusedPort();
             int dead2 = MockServers.unusedPort();
-            try (NanocachedClient client =
-                    NanocachedClient.connect(
-                            NanocachedClient.builder()
-                                    .addresses(
-                                            List.of(
-                                                    new Address("127.0.0.1", dead),
-                                                    new Address("127.0.0.1", dead2),
-                                                    new Address(
-                                                            "127.0.0.1",
-                                                            cluster.discovery().port()))))) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(List.of(
+                            new Address("127.0.0.1", dead),
+                            new Address("127.0.0.1", dead2),
+                            new Address("127.0.0.1", cluster.discovery().port()))))) {
                 // A working address later in the list: no failure.
                 forceRefresh(client);
                 assertEquals(0, client.stats().refreshFailures());
@@ -10504,42 +9611,37 @@ class NanocachedClientTest {
         int originalTimeout = Identify.connectTimeoutMillis;
         java.net.ServerSocket silent = new java.net.ServerSocket(0);
         java.util.concurrent.CountDownLatch dialing = new java.util.concurrent.CountDownLatch(1);
-        Thread acceptor =
-                new Thread(
-                        () -> {
-                            try {
-                                while (true) {
-                                    silent.accept(); // accepts, never answers
-                                    dialing.countDown();
-                                }
-                            } catch (java.io.IOException closed) {
-                                // test over
-                            }
-                        },
-                        "test-silent-accept-1733");
+        Thread acceptor = new Thread(
+                () -> {
+                    try {
+                        while (true) {
+                            silent.accept(); // accepts, never answers
+                            dialing.countDown();
+                        }
+                    } catch (java.io.IOException closed) {
+                        // test over
+                    }
+                },
+                "test-silent-accept-1733");
         acceptor.setDaemon(true);
         acceptor.start();
         ExecutorService refresher = Executors.newSingleThreadExecutor();
         try (Cluster cluster = startCluster(1)) {
-            try (NanocachedClient client = connect("127.0.0.1", cluster.discovery().port())) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
                 String gone = NAMES.get(1);
                 String key = keyOwnedBy(gone);
                 // The roster drops the second node and adds one whose dial hangs.
-                cluster.discovery().nodes =
-                        List.of(
-                                new DiscoveredNode(
-                                        NAMES.get(0), cluster.nodes().get(NAMES.get(0)).address()),
-                                new DiscoveredNode(
-                                        "slow-new", "127.0.0.1:" + silent.getLocalPort()));
+                cluster.discovery().nodes = List.of(
+                        new DiscoveredNode(
+                                NAMES.get(0), cluster.nodes().get(NAMES.get(0)).address()),
+                        new DiscoveredNode("slow-new", "127.0.0.1:" + silent.getLocalPort()));
                 Identify.connectTimeoutMillis = 2_000;
-                Future<?> refresh =
-                        refresher.submit(() -> {
-                            forceRefresh(client);
-                            return null;
-                        });
-                assertTrue(
-                        dialing.await(5, java.util.concurrent.TimeUnit.SECONDS),
-                        "the new node must be dialed");
+                Future<?> refresh = refresher.submit(() -> {
+                    forceRefresh(client);
+                    return null;
+                });
+                assertTrue(dialing.await(5, java.util.concurrent.TimeUnit.SECONDS), "the new node must be dialed");
 
                 Field membersField = NanocachedClient.class.getDeclaredField("members");
                 membersField.setAccessible(true);
@@ -10583,10 +9685,7 @@ class NanocachedClientTest {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
                 NanocachedClient.Namespace handle = client.namespace(ns);
                 handle.setMany(values);
-                assertEquals(
-                        2,
-                        node.multiSetCount.get(),
-                        "400 keys under a 170,000 B namespace need two `o` frames");
+                assertEquals(2, node.multiSetCount.get(), "400 keys under a 170,000 B namespace need two `o` frames");
 
                 handle.touchMany(keys, 60);
                 assertEquals(2, node.multiTouchFrames.size());

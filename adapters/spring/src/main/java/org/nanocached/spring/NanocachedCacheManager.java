@@ -47,10 +47,9 @@ public final class NanocachedCacheManager implements CacheManager {
         this.defaultTtl = builder.defaultTtl;
         this.ttlByCache = Map.copyOf(builder.ttlByCache);
         this.allowNullValues = builder.allowNullValues;
-        this.fixedCacheNames =
-                builder.fixedCacheNames == null
-                        ? null
-                        : Collections.unmodifiableSet(new LinkedHashSet<>(builder.fixedCacheNames));
+        this.fixedCacheNames = builder.fixedCacheNames == null
+                ? null
+                : Collections.unmodifiableSet(new LinkedHashSet<>(builder.fixedCacheNames));
         if (fixedCacheNames != null) {
             fixedCacheNames.forEach(name -> caches.put(name, createCache(name)));
         }
@@ -73,9 +72,7 @@ public final class NanocachedCacheManager implements CacheManager {
 
     @Override
     public Collection<String> getCacheNames() {
-        return fixedCacheNames != null
-                ? fixedCacheNames
-                : Collections.unmodifiableSet(caches.keySet());
+        return fixedCacheNames != null ? fixedCacheNames : Collections.unmodifiableSet(caches.keySet());
     }
 
     private NanocachedCache createCache(String name) {
@@ -140,8 +137,7 @@ public final class NanocachedCacheManager implements CacheManager {
 
         /** Per-cache TTL override. */
         public Builder ttl(String cacheName, Duration ttl) {
-            this.ttlByCache.put(
-                    Objects.requireNonNull(cacheName, "cacheName"), requireNonNegative(ttl));
+            this.ttlByCache.put(Objects.requireNonNull(cacheName, "cacheName"), requireNonNegative(ttl));
             return this;
         }
 
@@ -166,9 +162,7 @@ public final class NanocachedCacheManager implements CacheManager {
         public NanocachedCacheManager build() {
             if (serializer == null) {
                 serializer =
-                        classLoader == null
-                                ? new JdkCacheValueSerializer()
-                                : new JdkCacheValueSerializer(classLoader);
+                        classLoader == null ? new JdkCacheValueSerializer() : new JdkCacheValueSerializer(classLoader);
             }
             return new NanocachedCacheManager(this);
         }

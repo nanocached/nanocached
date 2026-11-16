@@ -116,12 +116,8 @@ class NanocachedCacheAutoConfigurationTest {
         @Bean(destroyMethod = "close")
         NanocachedClient nanocachedClient(@Value("${nanocached.addresses}") String address) {
             String[] hostPort = address.split(":", 2);
-            return NanocachedClient.connect(
-                    new NanocachedClient.Options()
-                            .addresses(
-                                    List.of(
-                                            new NanocachedClient.Address(
-                                                    hostPort[0], Integer.parseInt(hostPort[1])))));
+            return NanocachedClient.connect(new NanocachedClient.Options()
+                    .addresses(List.of(new NanocachedClient.Address(hostPort[0], Integer.parseInt(hostPort[1])))));
         }
 
         @Bean
@@ -156,10 +152,9 @@ class NanocachedCacheAutoConfigurationTest {
     }
 
     private ConfigurableApplicationContext boot(Class<?> config, String... properties) {
-        SpringApplicationBuilder builder =
-                new SpringApplicationBuilder(config)
-                        .web(WebApplicationType.NONE)
-                        .properties("nanocached.addresses=127.0.0.1:" + node.port());
+        SpringApplicationBuilder builder = new SpringApplicationBuilder(config)
+                .web(WebApplicationType.NONE)
+                .properties("nanocached.addresses=127.0.0.1:" + node.port());
         SpringApplication application = builder.properties(properties).build();
         context = application.run();
         return context;
@@ -178,9 +173,7 @@ class NanocachedCacheAutoConfigurationTest {
         assertEquals(
                 1,
                 node.store("users").keySet().stream()
-                        .filter(key ->
-                                new String(key.array(), StandardCharsets.UTF_8)
-                                        .equals("String:alice"))
+                        .filter(key -> new String(key.array(), StandardCharsets.UTF_8).equals("String:alice"))
                         .count());
     }
 
@@ -199,19 +192,9 @@ class NanocachedCacheAutoConfigurationTest {
     @Test
     void malformedAddressesFailStartupWithAMessageNamingTheOffendingEntry() {
         for (String bad :
-                new String[] {
-                    "localhost",
-                    "localhost:",
-                    ":8357",
-                    "localhost:abc",
-                    "localhost:0",
-                    "localhost:70000"
-                }) {
+                new String[] {"localhost", "localhost:", ":8357", "localhost:abc", "localhost:0", "localhost:70000"}) {
             Exception error =
-                    assertThrows(
-                            Exception.class,
-                            () -> boot(YamlOnlyConfig.class, "nanocached.addresses=" + bad),
-                            bad);
+                    assertThrows(Exception.class, () -> boot(YamlOnlyConfig.class, "nanocached.addresses=" + bad), bad);
             Throwable cause = error;
             while (cause != null && !(cause instanceof IllegalArgumentException)) {
                 cause = cause.getCause();
@@ -229,10 +212,9 @@ class NanocachedCacheAutoConfigurationTest {
     // Binder-based condition must treat both forms as configured.
     @Test
     void indexedYamlListAddressesActivateTheStarter() {
-        SpringApplicationBuilder builder =
-                new SpringApplicationBuilder(YamlOnlyConfig.class)
-                        .web(WebApplicationType.NONE)
-                        .properties("nanocached.addresses[0]=127.0.0.1:" + node.port());
+        SpringApplicationBuilder builder = new SpringApplicationBuilder(YamlOnlyConfig.class)
+                .web(WebApplicationType.NONE)
+                .properties("nanocached.addresses[0]=127.0.0.1:" + node.port());
         context = builder.build().run();
 
         assertInstanceOf(NanocachedCacheManager.class, context.getBean(CacheManager.class));
@@ -254,8 +236,7 @@ class NanocachedCacheAutoConfigurationTest {
     void explicitClientAndManagerBeansAreRespected() {
         boot(ExplicitBeansConfig.class);
 
-        NanocachedClient appClient =
-                context.getBean(ExplicitBeansConfig.class).nanocachedClient("unused:0");
+        NanocachedClient appClient = context.getBean(ExplicitBeansConfig.class).nanocachedClient("unused:0");
         assertSame(
                 appClient,
                 context.getBean(NanocachedClient.class),
@@ -265,10 +246,7 @@ class NanocachedCacheAutoConfigurationTest {
 
     @Test
     void defaultTtlAndPerCacheTtlFlowFromPropertiesToTheWire() {
-        boot(
-                YamlOnlyConfig.class,
-                "nanocached.cache.default-ttl=7m",
-                "nanocached.cache.ttl.nullable=30s");
+        boot(YamlOnlyConfig.class, "nanocached.cache.default-ttl=7m", "nanocached.cache.ttl.nullable=30s");
 
         context.getBean(UserService.class).findUser("alice");
 
@@ -292,23 +270,15 @@ class NanocachedCacheAutoConfigurationTest {
 
     @Test
     void bracketedPerCacheTtlForADottedCacheNameReachesTheWire() {
-        boot(
-                DottedNameConfig.class,
-                "nanocached.cache.default-ttl=7m",
-                "nanocached.cache.ttl.[users.by.id]=40s");
+        boot(DottedNameConfig.class, "nanocached.cache.default-ttl=7m", "nanocached.cache.ttl.[users.by.id]=40s");
 
-        assertEquals(
-                40,
-                dottedNameTtlSeconds(),
-                "the bracketed key must bind to the cache named users.by.id");
+        assertEquals(40, dottedNameTtlSeconds(), "the bracketed key must bind to the cache named users.by.id");
     }
 
     @Test
     void bracketedPerCacheTtlInYamlReachesTheWire(@TempDir Path dir) throws Exception {
         Path yaml = dir.resolve("application.yaml");
-        Files.writeString(
-                yaml,
-                """
+        Files.writeString(yaml, """
                 nanocached:
                   cache:
                     default-ttl: 7m
@@ -326,14 +296,12 @@ class NanocachedCacheAutoConfigurationTest {
         // Spring Boot's binder reads the unbracketed dotted key as a nested
         // path and binds nothing, so the cache would silently have used the
         // default TTL (no expiry unless configured).
-        Exception error =
-                assertThrows(
-                        Exception.class,
-                        () ->
-                                boot(
-                                        DottedNameConfig.class,
-                                        "nanocached.cache.default-ttl=7m",
-                                        "nanocached.cache.ttl.users.by.id=40s"));
+        Exception error = assertThrows(
+                Exception.class,
+                () -> boot(
+                        DottedNameConfig.class,
+                        "nanocached.cache.default-ttl=7m",
+                        "nanocached.cache.ttl.users.by.id=40s"));
 
         String messages = messagesOf(error);
         assertTrue(messages.contains("nanocached.cache.ttl.users.by.id"), messages);
@@ -343,34 +311,23 @@ class NanocachedCacheAutoConfigurationTest {
     @Test
     void unbracketedPerCacheTtlInYamlFailsStartupToo(@TempDir Path dir) throws Exception {
         Path yaml = dir.resolve("application.yaml");
-        Files.writeString(
-                yaml,
-                """
+        Files.writeString(yaml, """
                 nanocached:
                   cache:
                     ttl:
                       users.by.id: 40s
                 """);
 
-        Exception error =
-                assertThrows(
-                        Exception.class,
-                        () ->
-                                boot(
-                                        DottedNameConfig.class,
-                                        "spring.config.additional-location=" + yaml.toUri()));
+        Exception error = assertThrows(
+                Exception.class,
+                () -> boot(DottedNameConfig.class, "spring.config.additional-location=" + yaml.toUri()));
 
-        assertTrue(
-                messagesOf(error).contains("nanocached.cache.ttl.[users.by.id]"),
-                messagesOf(error));
+        assertTrue(messagesOf(error).contains("nanocached.cache.ttl.[users.by.id]"), messagesOf(error));
     }
 
     @Test
     void perCacheTtlKeysWithoutADotStillBindWithoutBrackets() {
-        boot(
-                YamlOnlyConfig.class,
-                "nanocached.cache.ttl.users=40s",
-                "nanocached.cache.ttl.some-cache=10s");
+        boot(YamlOnlyConfig.class, "nanocached.cache.ttl.users=40s", "nanocached.cache.ttl.some-cache=10s");
 
         context.getBean(UserService.class).findUser("alice");
 
@@ -384,9 +341,7 @@ class NanocachedCacheAutoConfigurationTest {
 
         CacheManager manager = context.getBean(CacheManager.class);
         assertEquals(Set.of("users", "sessions"), Set.copyOf(manager.getCacheNames()));
-        assertNull(
-                manager.getCache("unlisted"),
-                "an unlisted name must fall through, not be created on demand");
+        assertNull(manager.getCache("unlisted"), "an unlisted name must fall through, not be created on demand");
     }
 
     @Test
@@ -447,16 +402,13 @@ class NanocachedCacheAutoConfigurationTest {
         // uses via @ConfigurationProperties) rather than booting a full
         // context, since this is purely about the unit each field binds
         // bare numbers with.
-        MapConfigurationPropertySource source =
-                new MapConfigurationPropertySource(
-                        Map.of(
-                                "nanocached.reconnect-cooldown", "2",
-                                "nanocached.read-hedge-after", "50",
-                                "nanocached.cache.default-ttl", "10"));
-        NanocachedProperties properties =
-                new Binder(source)
-                        .bind("nanocached", Bindable.of(NanocachedProperties.class))
-                        .get();
+        MapConfigurationPropertySource source = new MapConfigurationPropertySource(Map.of(
+                "nanocached.reconnect-cooldown", "2",
+                "nanocached.read-hedge-after", "50",
+                "nanocached.cache.default-ttl", "10"));
+        NanocachedProperties properties = new Binder(source)
+                .bind("nanocached", Bindable.of(NanocachedProperties.class))
+                .get();
 
         assertEquals(Duration.ofSeconds(2), properties.getReconnectCooldown());
         assertEquals(Duration.ofMillis(50), properties.getReadHedgeAfter());
@@ -488,15 +440,10 @@ class NanocachedCacheAutoConfigurationTest {
                         .get()
                         .getCache()
                         .getTtl());
-        IllegalStateException error =
-                assertThrows(
-                        IllegalStateException.class,
-                        () ->
-                                NanocachedCacheAutoConfiguration.rejectUnbindablePerCacheTtlKeys(
-                                        environment));
-        assertTrue(
-                error.getMessage().contains("nanocached.cache.ttl.user.sessions"),
-                error.getMessage());
+        IllegalStateException error = assertThrows(
+                IllegalStateException.class,
+                () -> NanocachedCacheAutoConfiguration.rejectUnbindablePerCacheTtlKeys(environment));
+        assertTrue(error.getMessage().contains("nanocached.cache.ttl.user.sessions"), error.getMessage());
         assertFalse(error.getMessage().contains("nanocached.cache.ttl.plain"), error.getMessage());
     }
 
@@ -507,21 +454,18 @@ class NanocachedCacheAutoConfigurationTest {
         // after "ttl" as the key and looks for the value at exactly that
         // name; a dotted name written without brackets has no value there
         // and binds nothing.
-        MapConfigurationPropertySource source =
-                new MapConfigurationPropertySource(
-                        Map.of(
-                                "nanocached.cache.ttl.user_sessions", "1s",
-                                "nanocached.cache.ttl.UserCache", "2s",
-                                "nanocached.cache.ttl.my-cache", "3s",
-                                "nanocached.cache.ttl.[a_b.c]", "4s",
-                                "nanocached.cache.ttl.[users.by.id]", "5s",
-                                "nanocached.cache.ttl.users.by.id", "6s"));
-        Map<String, Duration> ttl =
-                new Binder(source)
-                        .bind("nanocached", Bindable.of(NanocachedProperties.class))
-                        .get()
-                        .getCache()
-                        .getTtl();
+        MapConfigurationPropertySource source = new MapConfigurationPropertySource(Map.of(
+                "nanocached.cache.ttl.user_sessions", "1s",
+                "nanocached.cache.ttl.UserCache", "2s",
+                "nanocached.cache.ttl.my-cache", "3s",
+                "nanocached.cache.ttl.[a_b.c]", "4s",
+                "nanocached.cache.ttl.[users.by.id]", "5s",
+                "nanocached.cache.ttl.users.by.id", "6s"));
+        Map<String, Duration> ttl = new Binder(source)
+                .bind("nanocached", Bindable.of(NanocachedProperties.class))
+                .get()
+                .getCache()
+                .getTtl();
 
         assertEquals(
                 Map.of(
@@ -548,10 +492,9 @@ class NanocachedCacheAutoConfigurationTest {
         // operator.
         MapConfigurationPropertySource source =
                 new MapConfigurationPropertySource(Map.of("nanocached.cache.ttl.sessions", "30"));
-        NanocachedProperties properties =
-                new Binder(source)
-                        .bind("nanocached", Bindable.of(NanocachedProperties.class))
-                        .get();
+        NanocachedProperties properties = new Binder(source)
+                .bind("nanocached", Bindable.of(NanocachedProperties.class))
+                .get();
 
         assertEquals(Duration.ofMillis(30), properties.getCache().getTtl().get("sessions"));
     }
@@ -587,10 +530,9 @@ class NanocachedCacheAutoConfigurationTest {
         // exact way the Boot 3 -> 4 package move would have gone unnoticed.
         // Boot only sorts alphabetically as a fallback, so a stale name
         // would not fail the context tests above; check it here.
-        String[] before =
-                NanocachedCacheAutoConfiguration.class
-                        .getAnnotation(AutoConfiguration.class)
-                        .beforeName();
+        String[] before = NanocachedCacheAutoConfiguration.class
+                .getAnnotation(AutoConfiguration.class)
+                .beforeName();
 
         assertEquals(1, before.length);
         assertEquals(

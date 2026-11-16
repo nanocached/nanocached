@@ -37,13 +37,8 @@ class NanocachedCacheManagerTest {
     @BeforeEach
     void start() throws Exception {
         node = new MockNode();
-        client =
-                NanocachedClient.connect(
-                        new NanocachedClient.Options()
-                                .addresses(
-                                        List.of(
-                                                new NanocachedClient.Address(
-                                                        "127.0.0.1", node.port()))));
+        client = NanocachedClient.connect(new NanocachedClient.Options()
+                .addresses(List.of(new NanocachedClient.Address("127.0.0.1", node.port()))));
     }
 
     @AfterEach
@@ -123,11 +118,10 @@ class NanocachedCacheManagerTest {
 
     @Test
     void perCacheTtlOverridesTheDefaultAndReachesTheWire() {
-        NanocachedCacheManager manager =
-                manager()
-                        .defaultTtl(Duration.ofMinutes(5))
-                        .ttl("sessions", Duration.ofSeconds(30))
-                        .build();
+        NanocachedCacheManager manager = manager()
+                .defaultTtl(Duration.ofMinutes(5))
+                .ttl("sessions", Duration.ofSeconds(30))
+                .build();
 
         manager.getCache("users").put("k", new User("Alice", 30));
         manager.getCache("sessions").put("k", new User("Bob", 40));
@@ -140,16 +134,15 @@ class NanocachedCacheManagerTest {
 
     @Test
     void zeroTtlMeansNoExpiryAndPositiveTtlRoundsUp() {
-        NanocachedCacheManager manager =
-                manager()
-                        .ttl("forever", Duration.ZERO)
-                        .ttl("blink", Duration.ofMillis(200))
-                        // Regression (pass-7 audit): a fractional TTL above 1s must
-                        // round UP, not floor. 2.5s used to reach the wire as 2s
-                        // (Duration.toSeconds floors), expiring the entry up to half
-                        // a second early.
-                        .ttl("fractional", Duration.ofMillis(2500))
-                        .build();
+        NanocachedCacheManager manager = manager()
+                .ttl("forever", Duration.ZERO)
+                .ttl("blink", Duration.ofMillis(200))
+                // Regression (pass-7 audit): a fractional TTL above 1s must
+                // round UP, not floor. 2.5s used to reach the wire as 2s
+                // (Duration.toSeconds floors), expiring the entry up to half
+                // a second early.
+                .ttl("fractional", Duration.ofMillis(2500))
+                .build();
         manager.getCache("forever").put("k", new User("Alice", 30));
         manager.getCache("blink").put("k", new User("Bob", 40));
         manager.getCache("fractional").put("k", new User("Carol", 50));
@@ -199,20 +192,14 @@ class NanocachedCacheManagerTest {
         Cache cache = manager().build().getCache("users");
         AtomicInteger loads = new AtomicInteger();
 
-        User first =
-                cache.get(
-                        "alice",
-                        () -> {
-                            loads.incrementAndGet();
-                            return new User("Alice", 30);
-                        });
-        User second =
-                cache.get(
-                        "alice",
-                        () -> {
-                            loads.incrementAndGet();
-                            return new User("SHOULD NOT LOAD", 0);
-                        });
+        User first = cache.get("alice", () -> {
+            loads.incrementAndGet();
+            return new User("Alice", 30);
+        });
+        User second = cache.get("alice", () -> {
+            loads.incrementAndGet();
+            return new User("SHOULD NOT LOAD", 0);
+        });
 
         assertEquals(new User("Alice", 30), first);
         assertEquals(new User("Alice", 30), second);
@@ -231,23 +218,19 @@ class NanocachedCacheManagerTest {
 
         for (int i = 0; i < callers; i++) {
             int slot = i;
-            threads[i] =
-                    new Thread(() -> {
-                        ready.countDown();
-                        try {
-                            go.await();
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            return;
-                        }
-                        results[slot] =
-                                cache.get(
-                                        "alice",
-                                        () -> {
-                                            loads.incrementAndGet();
-                                            return new User("Alice", 30);
-                                        });
-                    });
+            threads[i] = new Thread(() -> {
+                ready.countDown();
+                try {
+                    go.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                results[slot] = cache.get("alice", () -> {
+                    loads.incrementAndGet();
+                    return new User("Alice", 30);
+                });
+            });
             threads[i].start();
         }
         ready.await();
@@ -266,15 +249,11 @@ class NanocachedCacheManagerTest {
     void getWithLoaderWrapsLoaderFailures() {
         Cache cache = manager().build().getCache("users");
 
-        Cache.ValueRetrievalException thrown =
-                assertThrows(
-                        Cache.ValueRetrievalException.class,
-                        () ->
-                                cache.get(
-                                        "alice",
-                                        () -> {
-                                            throw new IllegalStateException("db down");
-                                        }));
+        Cache.ValueRetrievalException thrown = assertThrows(
+                Cache.ValueRetrievalException.class,
+                () -> cache.get("alice", () -> {
+                    throw new IllegalStateException("db down");
+                }));
         assertInstanceOf(IllegalStateException.class, thrown.getCause());
         // The failure was not cached: a later loader run does compute.
         assertEquals(new User("Alice", 30), cache.get("alice", () -> new User("Alice", 30)));
@@ -342,17 +321,16 @@ class NanocachedCacheManagerTest {
 
         for (int i = 0; i < callers; i++) {
             int slot = i;
-            threads[i] =
-                    new Thread(() -> {
-                        ready.countDown();
-                        try {
-                            go.await();
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            return;
-                        }
-                        results[slot] = cache.putIfAbsent("k", new User("writer-" + slot, slot));
-                    });
+            threads[i] = new Thread(() -> {
+                ready.countDown();
+                try {
+                    go.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                results[slot] = cache.putIfAbsent("k", new User("writer-" + slot, slot));
+            });
             threads[i].start();
         }
         ready.await();
@@ -380,8 +358,7 @@ class NanocachedCacheManagerTest {
 
         assertNotNull(existing, "a cached null is a present entry, not absent");
         assertNull(existing.get());
-        assertNull(
-                cache.get("nobody", User.class), "the cached null must not have been overwritten");
+        assertNull(cache.get("nobody", User.class), "the cached null must not have been overwritten");
     }
 
     @Test
@@ -403,7 +380,8 @@ class NanocachedCacheManagerTest {
 
     @Test
     void fixedNameManagerRejectsUnknownNamesWithNull() {
-        NanocachedCacheManager manager = manager().cacheNames(List.of("users", "orders")).build();
+        NanocachedCacheManager manager =
+                manager().cacheNames(List.of("users", "orders")).build();
 
         assertNotNull(manager.getCache("users"));
         assertNull(manager.getCache("surprise"));
@@ -425,18 +403,17 @@ class NanocachedCacheManagerTest {
 
     @Test
     void customSerializerIsUsedForValues() {
-        CacheValueSerializer utf8 =
-                new CacheValueSerializer() {
-                    @Override
-                    public byte[] serialize(Object value) {
-                        return ((String) value).getBytes(StandardCharsets.UTF_8);
-                    }
+        CacheValueSerializer utf8 = new CacheValueSerializer() {
+            @Override
+            public byte[] serialize(Object value) {
+                return ((String) value).getBytes(StandardCharsets.UTF_8);
+            }
 
-                    @Override
-                    public Object deserialize(byte[] bytes) {
-                        return new String(bytes, StandardCharsets.UTF_8);
-                    }
-                };
+            @Override
+            public Object deserialize(byte[] bytes) {
+                return new String(bytes, StandardCharsets.UTF_8);
+            }
+        };
         Cache cache = manager().serializer(utf8).allowNullValues(false).build().getCache("users");
 
         cache.put("k", "plain text");
@@ -451,8 +428,7 @@ class NanocachedCacheManagerTest {
 
     @Test
     void customKeyConverterIsUsedForKeys() {
-        CacheKeyConverter idOnly =
-                key -> ("user-" + ((User) key).age()).getBytes(StandardCharsets.UTF_8);
+        CacheKeyConverter idOnly = key -> ("user-" + ((User) key).age()).getBytes(StandardCharsets.UTF_8);
         Cache cache = manager().keyConverter(idOnly).build().getCache("users");
 
         cache.put(new User("Alice", 30), new User("Alice", 30));
@@ -476,14 +452,12 @@ class NanocachedCacheManagerTest {
         Object nativeCache = cache.getNativeCache();
         assertInstanceOf(NanocachedClient.Namespace.class, nativeCache);
         assertArrayEquals(
-                "users".getBytes(StandardCharsets.UTF_8),
-                ((NanocachedClient.Namespace) nativeCache).namespace());
+                "users".getBytes(StandardCharsets.UTF_8), ((NanocachedClient.Namespace) nativeCache).namespace());
     }
 
     @Test
     void builderRejectsNegativeTtlAndNullClient() {
-        assertThrows(
-                IllegalArgumentException.class, () -> manager().defaultTtl(Duration.ofSeconds(-1)));
+        assertThrows(IllegalArgumentException.class, () -> manager().defaultTtl(Duration.ofSeconds(-1)));
         assertThrows(NullPointerException.class, () -> NanocachedCacheManager.builder(null));
     }
 }
