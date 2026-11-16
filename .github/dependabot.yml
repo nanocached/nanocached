@@ -63,10 +63,16 @@ updates:
     schedule:
       interval: weekly
   # The .NET SDK pinned in global.json (CI and releases install exactly it).
+  # The SDK's major follows the projects' target framework (net10.0, LTS), so
+  # only patch and feature-band updates are proposed; moving to a later major
+  # goes with a TargetFramework/AnalysisLevel change, on purpose.
   - package-ecosystem: dotnet-sdk
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: dotnet-sdk
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: gradle
     directory: /sdk/java
     schedule:
