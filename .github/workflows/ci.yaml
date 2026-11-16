@@ -86,8 +86,9 @@ jobs:
       fail-fast: false
       matrix:
         # The floor declared in sdk/python/pyproject.toml (requires-python
-        # >=3.11) and the newest CPython release.
-        python-version: ["3.11", "3.15"]
+        # >=3.11) and the newest CPython release, which `3.x` resolves at run
+        # time so the job does not stay on an old one.
+        python-version: ["3.11", "3.x"]
 
     steps:
       - name: Check out repository
@@ -246,7 +247,7 @@ jobs:
         include:
           - python-version: "3.11"
             django: "Django~=5.2.0"
-          - python-version: "3.15"
+          - python-version: "3.x"
             django: "Django>=6.0"
 
     steps:
@@ -435,7 +436,7 @@ jobs:
         with:
           toolchain: 1.88.0
 
-      # The repo-root `rust-toolchain.toml` pins 1.99, which shadows any
+      # The repo-root `rust-toolchain.toml` pins the server's toolchain, which shadows any
       # toolchain requested here unless overridden — without this, the
       # steps above never actually exercise the crate's declared
       # `rust-version = "1.88"` (Cargo.toml), so it could silently drift
