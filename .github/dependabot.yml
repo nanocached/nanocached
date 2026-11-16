@@ -57,6 +57,11 @@ updates:
     directory: /adapters/dotnet
     schedule:
       interval: weekly
+  # The .NET SDK pinned in global.json (CI and releases install exactly it).
+  - package-ecosystem: dotnet-sdk
+    directory: /
+    schedule:
+      interval: weekly
   - package-ecosystem: gradle
     directory: /sdk/java
     schedule:
@@ -71,6 +76,13 @@ updates:
       interval: weekly
   - package-ecosystem: gradle
     directory: /adapters/jcache
+    schedule:
+      interval: weekly
+  # The server's toolchain pinned in rust-toolchain.toml. The Rust SDK's MSRV
+  # (1.88 in sdk/rust/Cargo.toml and ci.yaml) is a floor, not a pin: it stays
+  # until it is raised on purpose.
+  - package-ecosystem: rust-toolchain
+    directory: /
     schedule:
       interval: weekly
   - package-ecosystem: github-actions
