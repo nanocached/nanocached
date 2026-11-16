@@ -42,11 +42,12 @@ java {
 }
 
 // `./gradlew spotlessApply` rewrites sources; `spotlessCheck` (part of
-// `check`) fails on drift. AOSP style is google-java-format with 4-space
-// indentation. google-java-format 2.x needs a JDK 21+ Gradle JVM.
+// `check`) fails on drift. palantir-java-format is google-java-format's fork
+// with 4-space indentation, 120 columns and lambda/chain wrapping that does
+// not drift to the right.
 spotless {
     java {
-        googleJavaFormat('2.0.0').aosp()
+        palantirJavaFormat('2.103.0')
     }
     groovyGradle {
         // Eclipse's defaults indent with tabs; .editorconfig says 4 spaces.

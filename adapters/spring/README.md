@@ -269,7 +269,7 @@ mirrors of this one.
 
 ```
 cd adapters/spring
-./gradlew spotlessApply   # format sources and build scripts (google-java-format, AOSP style)
+./gradlew spotlessApply   # format sources and build scripts (palantir-java-format)
 ./gradlew check           # spotlessCheck + compile with javac -Xlint:all -Werror + tests
 ./gradlew test            # tests only
 ```
