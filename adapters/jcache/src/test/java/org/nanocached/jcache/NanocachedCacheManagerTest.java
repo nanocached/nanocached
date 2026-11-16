@@ -99,7 +99,9 @@ class NanocachedCacheManagerTest {
         // the winner's cache must remain fully usable.
         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
         ObjectName objectName = new ObjectName("javax.cache:type=CacheStatistics,CacheManager="
-                + ObjectName.quote(manager.getURI().toString()) + ",Cache=" + ObjectName.quote("dup-stats"));
+                + ObjectName.quote(manager.getURI().toString())
+                + ",Cache="
+                + ObjectName.quote("dup-stats"));
         assertTrue(mbs.isRegistered(objectName), "the winner's statistics MBean must be registered");
 
         winner.put("a", new User("a", 1));

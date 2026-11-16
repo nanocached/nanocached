@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import socketserver
 import threading
+from collections.abc import Callable
 
 
 class MockNode:
@@ -59,7 +60,7 @@ class MockNode:
         # applied or answered, with the node's lock released — lets a
         # test land a concurrent write in the gap between a read (or a
         # touch) and whatever the client does next with it.
-        self.before_access_applies = None
+        self.before_access_applies: Callable[[], None] | None = None
 
         self._lock = threading.Lock()
         self._server: socketserver.ThreadingTCPServer | None = None
@@ -70,7 +71,7 @@ class MockNode:
     def address(self) -> str:
         return f"127.0.0.1:{self.port}"
 
-    def start(self) -> "MockNode":
+    def start(self) -> MockNode:
         node = self
 
         class Handler(socketserver.BaseRequestHandler):
@@ -279,7 +280,11 @@ class MockNode:
                     value = rfile.read(value_length)
                     self.cas_set_count += 1
                     with self._lock:
-                        current = self.ns_store.get((namespace, key)) if namespace else self.store.get(key)
+                        current = (
+                            self.ns_store.get((namespace, key))
+                            if namespace
+                            else self.store.get(key)
+                        )
                         if cond == b"A":
                             matches = current is None
                         elif cond == b"P":
@@ -349,7 +354,9 @@ class MockNode:
                     keys = [rfile.read(length) for length in key_lengths]
                     self.multi_get_count += 1
                     values = [self._get_entry(namespace, key) for key in keys]
-                    results = [b"%d" % len(value) if value is not None else b"-" for value in values]
+                    results = [
+                        b"%d" % len(value) if value is not None else b"-" for value in values
+                    ]
                     header = b"M %d %b\n" % (n, b" ".join(results))
                     body = b"".join(value for value in values if value is not None)
                     wfile.write(header + body)
@@ -367,12 +374,12 @@ class MockNode:
                     value_lengths = [int(p) for p in pair_fields[1::2]]
                     ttl = int(parts[3 + 2 * n]) if len(parts) > 3 + 2 * n else 0
                     self.multi_set_count += 1
-                    for key_length, value_length in zip(key_lengths, value_lengths):
+                    for key_length, value_length in zip(key_lengths, value_lengths, strict=True):
                         key = rfile.read(key_length)
                         value = rfile.read(value_length)
                         self._set_entry(namespace, key, value, ttl)
-                    results = b" ".join([b"S"] * n)
-                    wfile.write(b"O %d %b\n" % (n, results))
+                    acks = b" ".join([b"S"] * n)
+                    wfile.write(b"O %d %b\n" % (n, acks))
                     wfile.flush()
 
                 else:

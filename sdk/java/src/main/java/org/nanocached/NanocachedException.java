@@ -18,11 +18,10 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * A node answered {@code W} (staged node join): per its own view of cluster
-     * membership it doesn't hold this key — the caller's routing table is
-     * stale. The client catches this internally to refresh the node list
-     * and retry once; it only escapes when that retry also fails, or in
-     * single-node mode where there is no discovery to refresh from.
+     * A node answered {@code W} (staged node join): per its own view of cluster membership it
+     * doesn't hold this key — the caller's routing table is stale. The client catches this
+     * internally to refresh the node list and retry once; it only escapes when that retry also
+     * fails, or in single-node mode where there is no discovery to refresh from.
      */
     public static class WrongNode extends NanocachedException {
         public WrongNode() {
@@ -31,10 +30,9 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * The server rejected the {@code A} handshake's secret — either no
-     * {@code authSecret} was configured for a server that requires one,
-     * or the configured secret is wrong. Never transient: retrying with
-     * the same configuration cannot succeed.
+     * The server rejected the {@code A} handshake's secret — either no {@code authSecret} was
+     * configured for a server that requires one, or the configured secret is wrong. Never
+     * transient: retrying with the same configuration cannot succeed.
      */
     public static final class AuthenticationFailed extends NanocachedException {
         public AuthenticationFailed(String message) {
@@ -43,66 +41,56 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * A discovery server answered {@code L} with {@code B} — it is inside
-     * its startup grace (discovery HA), re-learning membership after a
-     * restart. Try another address, or retry shortly.
+     * A discovery server answered {@code L} with {@code B} — it is inside its startup grace
+     * (discovery HA), re-learning membership after a restart. Try another address, or retry
+     * shortly.
      */
     public static final class DiscoveryBusy extends NanocachedException {
         public DiscoveryBusy() {
-            super("nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's");
+            super(
+                    "nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's");
         }
     }
 
     /**
-     * A connection-level failure; the client redials lazily on the next
-     * use.
+     * A connection-level failure; the client redials lazily on the next use.
      *
-     * <p>Not {@code final} — mirroring {@link WrongNode}'s own stance, for
-     * exactly the same reason (issue #411): {@link
-     * PartialConnectionLost}/{@link PartialConnectionLostStrings}/
-     * {@link PartialConnectionLostRaw}/{@link PartialConnectionLostSet}/
-     * {@link PartialConnectionLostSetRaw} extend this so a batch's
-     * already-succeeded chunks (see {@link
-     * NanocachedClient#getManyBytes(List)}/{@link
-     * NanocachedClient#setManyBytes(Map, long)}'s batch chunking, issue
-     * #222) aren't silently discarded when a later chunk's connection
-     * failure escapes the client's own built-in reconnect-and-retry.
+     * <p>Not {@code final} — mirroring {@link WrongNode}'s own stance, for exactly the same reason
+     * (issue #411): {@link PartialConnectionLost}/{@link PartialConnectionLostStrings}/ {@link
+     * PartialConnectionLostRaw}/{@link PartialConnectionLostSet}/ {@link
+     * PartialConnectionLostSetRaw} extend this so a batch's already-succeeded chunks (see {@link
+     * NanocachedClient#getManyBytes(List)}/{@link NanocachedClient#setManyBytes(Map, long)}'s batch
+     * chunking, issue #222) aren't silently discarded when a later chunk's connection failure
+     * escapes the client's own built-in reconnect-and-retry.
      */
     public static class ConnectionLost extends NanocachedException {
         /**
-         * Issue #225 / #484: {@code true} only when this connection can
-         * prove no complete frame of the failed request reached the
-         * peer — {@link Connection#request}'s pre-write {@code isClosed()}
-         * checks (the connection was already marked closed before this
-         * call ever attempted to write, almost always because the reader
-         * thread had noticed the peer's FIN moments earlier), or the
-         * write/flush itself failing while the connection was still this
-         * SDK's own (a failed write leaves at most a truncated frame,
-         * which the server never executes). Only then is redialing and
-         * resending a <em>non-idempotent</em> request
-         * (INCR/CAS/delete-if-matches) safe — see {@link
-         * NanocachedClient}'s {@code applyReconnectingNonIdempotent}.
-         * Every other {@code ConnectionLost} (a request timeout —
-         * including a write that failed because the timeout watchdog
-         * closed the socket under it — or the reply simply never arriving
-         * after a successful write) leaves the request's fate genuinely
-         * unknown, so it must not be replayed. Irrelevant to get/set/
-         * delete/clear, which stay safe to retry unconditionally because
-         * they're idempotent regardless of this flag — always {@code
-         * false} on the public two-argument constructor those (and every
-         * caller outside {@link Connection}) use.
+         * Issue #225 / #484: {@code true} only when this connection can prove no complete frame of
+         * the failed request reached the peer — {@link Connection#request}'s pre-write {@code
+         * isClosed()} checks (the connection was already marked closed before this call ever
+         * attempted to write, almost always because the reader thread had noticed the peer's FIN
+         * moments earlier), or the write/flush itself failing while the connection was still this
+         * SDK's own (a failed write leaves at most a truncated frame, which the server never
+         * executes). Only then is redialing and resending a <em>non-idempotent</em> request
+         * (INCR/CAS/delete-if-matches) safe — see {@link NanocachedClient}'s {@code
+         * applyReconnectingNonIdempotent}. Every other {@code ConnectionLost} (a request timeout —
+         * including a write that failed because the timeout watchdog closed the socket under it —
+         * or the reply simply never arriving after a successful write) leaves the request's fate
+         * genuinely unknown, so it must not be replayed. Irrelevant to get/set/ delete/clear, which
+         * stay safe to retry unconditionally because they're idempotent regardless of this flag —
+         * always {@code false} on the public two-argument constructor those (and every caller
+         * outside {@link Connection}) use.
          */
         private final boolean notSent;
 
-        /** {@code true} when the request deadline expired with this
-         * request still unanswered ({@link Connection}'s watchdog — also
-         * set on a write that failed because the watchdog closed the
-         * socket under it, and on every request the watchdog's poison
-         * drained). The peer was reachable and simply did not answer in
-         * time, so the client's own redial-and-retry for idempotent
-         * requests does not apply: a second attempt would most likely
-         * wait out another whole deadline. Always {@code false} on the
-         * public two-argument constructor. */
+        /**
+         * {@code true} when the request deadline expired with this request still unanswered ({@link
+         * Connection}'s watchdog — also set on a write that failed because the watchdog closed the
+         * socket under it, and on every request the watchdog's poison drained). The peer was
+         * reachable and simply did not answer in time, so the client's own redial-and-retry for
+         * idempotent requests does not apply: a second attempt would most likely wait out another
+         * whole deadline. Always {@code false} on the public two-argument constructor.
+         */
         private final boolean timedOut;
 
         public ConnectionLost(String message, Throwable cause) {
@@ -131,13 +119,11 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * The node answered {@code En} and is closing the connection (issue
-     * #825). A {@link ConnectionLost}, so every command other than
-     * touch, getAndTouch, touchMany or getManyAndTouch sees exactly the
-     * failure it always did; those four turn it into {@link ServerTooOld}.
-     * Only the node's {@code En} is this (issue #939): the proxy's bare
-     * {@code E} (a request whose outcome it could not determine) stays a
-     * plain {@link ConnectionLost}.
+     * The node answered {@code En} and is closing the connection (issue #825). A {@link
+     * ConnectionLost}, so every command other than touch, getAndTouch, touchMany or getManyAndTouch
+     * sees exactly the failure it always did; those four turn it into {@link ServerTooOld}. Only
+     * the node's {@code En} is this (issue #939): the proxy's bare {@code E} (a request whose
+     * outcome it could not determine) stays a plain {@link ConnectionLost}.
      */
     static final class ServerRejected extends ConnectionLost {
         ServerRejected() {
@@ -146,14 +132,12 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * Raised by touch/getAndTouch (issue #825) when the node answered {@code
-     * En} to the {@code t} command, and by touchMany/getManyAndTouch (issue
-     * #871) when it answered {@code En} to {@code y}: a node that predates
-     * the command does not know it and closes the connection. Every node
-     * must be upgraded before a client sends it; nothing is retried to get
-     * past it, since the same node would answer the same way. {@code En}
-     * is also what a request that is too large or malformed gets, but the
-     * SDK validates size and builds a well-formed frame, so it means the
+     * Raised by touch/getAndTouch (issue #825) when the node answered {@code En} to the {@code t}
+     * command, and by touchMany/getManyAndTouch (issue #871) when it answered {@code En} to {@code
+     * y}: a node that predates the command does not know it and closes the connection. Every node
+     * must be upgraded before a client sends it; nothing is retried to get past it, since the same
+     * node would answer the same way. {@code En} is also what a request that is too large or
+     * malformed gets, but the SDK validates size and builds a well-formed frame, so it means the
      * command is unknown.
      */
     public static class ServerTooOld extends NanocachedException {
@@ -163,11 +147,17 @@ public class NanocachedException extends RuntimeException {
             this("t", cause);
         }
 
-        /** {@code command} is the wire command the node did not know:
-         * {@code "t"} or {@code "y"}. */
+        /**
+         * {@code command} is the wire command the node did not know: {@code "t"} or {@code "y"}.
+         */
         public ServerTooOld(String command, Throwable cause) {
-            super("nanocached: the server does not know the " + ("t".equals(command) ? "touch" : "batched touch")
-                    + " command (" + command + ") — upgrade every node to a release that includes it", cause);
+            super(
+                    "nanocached: the server does not know the "
+                            + ("t".equals(command) ? "touch" : "batched touch")
+                            + " command ("
+                            + command
+                            + ") — upgrade every node to a release that includes it",
+                    cause);
             this.command = command;
         }
 
@@ -178,10 +168,9 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * Raised by get/getBytes when a value with {@code compress} enabled
-     * can't be interpreted — almost always a {@code compress} mismatch
-     * between clients sharing this key (value compression's compatibility
-     * caveat: every client touching a given keyspace must agree on
+     * Raised by get/getBytes when a value with {@code compress} enabled can't be interpreted —
+     * almost always a {@code compress} mismatch between clients sharing this key (value
+     * compression's compatibility caveat: every client touching a given keyspace must agree on
      * {@code compress}), not a transient failure.
      */
     public static final class DecompressionFailed extends NanocachedException {
@@ -195,18 +184,16 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * A request answered {@code R} (issue #125's retryable-error status)
-     * three times running — bounded transparent retry on the SAME
-     * connection (up to 2 retries, 3 attempts total, 50ms then 100ms
-     * between them) exhausted without a real answer. Today only
-     * {@code nanocached-proxy} sends {@code R}, when its upstream node was
-     * briefly unreachable and survived its own one refresh-and-retry; this
-     * is the signal that even that didn't resolve in time.
+     * A request answered {@code R} (issue #125's retryable-error status) three times running —
+     * bounded transparent retry on the SAME connection (up to 2 retries, 3 attempts total, 50ms
+     * then 100ms between them) exhausted without a real answer. Today only {@code nanocached-proxy}
+     * sends {@code R}, when its upstream node was briefly unreachable and survived its own one
+     * refresh-and-retry; this is the signal that even that didn't resolve in time.
      *
-     * <p>Unlike {@link ConnectionLost} or {@link WrongNode}, this never
-     * closes or redials the connection — it stays open and usable for the
-     * next call. Every {@code R} answer, including the three that led
-     * here, is counted in {@link NanocachedClient.ClientStats#transientRetries()}.
+     * <p>Unlike {@link ConnectionLost} or {@link WrongNode}, this never closes or redials the
+     * connection — it stays open and usable for the next call. Every {@code R} answer, including
+     * the three that led here, is counted in {@link
+     * NanocachedClient.ClientStats#transientRetries()}.
      */
     public static final class RetryableError extends NanocachedException {
         public RetryableError() {
@@ -215,12 +202,10 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * A node answered {@code T} to an {@code i} (INCR/DECR, issue #129)
-     * request: the key exists but its stored value isn't INCR's counter
-     * grammar (plain decimal ASCII), or applying the delta would overflow
-     * a 64-bit counter. Never transient — retrying the same request
-     * answers the same way until the key is overwritten with a numeric
-     * value (or deleted).
+     * A node answered {@code T} to an {@code i} (INCR/DECR, issue #129) request: the key exists but
+     * its stored value isn't INCR's counter grammar (plain decimal ASCII), or applying the delta
+     * would overflow a 64-bit counter. Never transient — retrying the same request answers the same
+     * way until the key is overwritten with a numeric value (or deleted).
      */
     public static final class NotNumeric extends NanocachedException {
         public NotNumeric() {
@@ -229,16 +214,13 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * Raised by {@code incr}/{@code decr} (including the namespace handle's
-     * overloads) on a client constructed with {@code compress} enabled
-     * (issue #321) — before any I/O. The protocol has no marker byte
-     * distinguishing a compressed value from INCR's plain-decimal-ASCII
-     * result, so a compress-enabled client can neither read back a value it
-     * increments nor increment a value it (or another compress-enabled
-     * client) wrote: this honest-subset restriction turns that into an
-     * immediate, clear error instead of a confusing runtime failure on
-     * {@code get} ({@link DecompressionFailed}) or on the server
-     * ({@link NotNumeric}).
+     * Raised by {@code incr}/{@code decr} (including the namespace handle's overloads) on a client
+     * constructed with {@code compress} enabled (issue #321) — before any I/O. The protocol has no
+     * marker byte distinguishing a compressed value from INCR's plain-decimal-ASCII result, so a
+     * compress-enabled client can neither read back a value it increments nor increment a value it
+     * (or another compress-enabled client) wrote: this honest-subset restriction turns that into an
+     * immediate, clear error instead of a confusing runtime failure on {@code get} ({@link
+     * DecompressionFailed}) or on the server ({@link NotNumeric}).
      */
     public static final class CompressionIncompatible extends NanocachedException {
         public CompressionIncompatible() {
@@ -248,19 +230,17 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * Raised by {@link NanocachedClient#getManyAndTouchBytes(java.util.List,
-     * long)} (issue #924) in a cluster when one primary answered {@code En}
-     * to {@code y} while other primaries had already resolved their keys —
-     * a subclass of {@link ServerTooOld}, so existing {@code
-     * catch (ServerTooOld)} handling keeps working unchanged. {@code
-     * partialValues} holds every hit that DID resolve; with {@code
-     * ttlSeconds == 0} those values were consumed on the nodes that
-     * returned them and cannot be read again. {@code touchMany} has nothing
-     * partial worth attaching and throws a plain {@link ServerTooOld}.
+     * Raised by {@link NanocachedClient#getManyAndTouchBytes(java.util.List, long)} (issue #924) in
+     * a cluster when one primary answered {@code En} to {@code y} while other primaries had already
+     * resolved their keys — a subclass of {@link ServerTooOld}, so existing {@code catch
+     * (ServerTooOld)} handling keeps working unchanged. {@code partialValues} holds every hit that
+     * DID resolve; with {@code ttlSeconds == 0} those values were consumed on the nodes that
+     * returned them and cannot be read again. {@code touchMany} has nothing partial worth attaching
+     * and throws a plain {@link ServerTooOld}.
      *
-     * <p>Non-generic and split three ways, like {@link PartialWrongNode}:
-     * this is the {@code byte[]} map, {@link PartialServerTooOldStrings}
-     * the decoded one and {@link PartialServerTooOldRaw} the positional one.
+     * <p>Non-generic and split three ways, like {@link PartialWrongNode}: this is the {@code
+     * byte[]} map, {@link PartialServerTooOldStrings} the decoded one and {@link
+     * PartialServerTooOldRaw} the positional one.
      */
     public static final class PartialServerTooOld extends ServerTooOld {
         public final java.util.Map<String, byte[]> partialValues;
@@ -271,8 +251,10 @@ public class NanocachedException extends RuntimeException {
         }
     }
 
-    /** As {@link PartialServerTooOld}, but raised by {@link
-     * NanocachedClient#getManyAndTouch} — the UTF-8-decoded counterpart. */
+    /**
+     * As {@link PartialServerTooOld}, but raised by {@link NanocachedClient#getManyAndTouch} — the
+     * UTF-8-decoded counterpart.
+     */
     public static final class PartialServerTooOldStrings extends ServerTooOld {
         public final java.util.Map<String, String> partialValues;
 
@@ -282,13 +264,13 @@ public class NanocachedException extends RuntimeException {
         }
     }
 
-    /** As {@link PartialServerTooOld}, but raised by the positional,
-     * {@code byte[]}-keyed {@link NanocachedClient#getManyAndTouchBytes(byte[][],
-     * long)}. {@code partialValues} is the array a successful call would
-     * have returned ({@code null} for a miss); since a {@code null} slot
-     * alone cannot tell a miss from a key the old node never answered,
-     * {@code unresolvedIndices} lists (ascending) the positions that did
-     * NOT resolve. */
+    /**
+     * As {@link PartialServerTooOld}, but raised by the positional, {@code byte[]}-keyed {@link
+     * NanocachedClient#getManyAndTouchBytes(byte[][], long)}. {@code partialValues} is the array a
+     * successful call would have returned ({@code null} for a miss); since a {@code null} slot
+     * alone cannot tell a miss from a key the old node never answered, {@code unresolvedIndices}
+     * lists (ascending) the positions that did NOT resolve.
+     */
     public static final class PartialServerTooOldRaw extends ServerTooOld {
         public final byte[][] partialValues;
         public final int[] unresolvedIndices;
@@ -297,30 +279,28 @@ public class NanocachedException extends RuntimeException {
                 Throwable cause, byte[][] partialValues, java.util.List<Integer> unresolvedIndices) {
             super("y", cause);
             this.partialValues = partialValues;
-            this.unresolvedIndices = unresolvedIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
+            this.unresolvedIndices = unresolvedIndices.stream()
+                    .mapToInt(Integer::intValue)
+                    .sorted()
+                    .toArray();
         }
     }
 
     /**
-     * Raised by {@link NanocachedClient#getManyBytes} (issue #151) when
-     * some keys are still wrong-node after the one bounded
-     * refresh-and-retry every batch gets (the per-key analogue of {@code
-     * getBytes}' own {@code W} refresh-and-retry) — a subclass of {@link
-     * WrongNode}, so existing {@code catch (WrongNode)} handling keeps
-     * working unchanged. {@code partialValues} holds every key that DID
-     * resolve — a batch never fails as a whole
-     * (docs/protocol.html#multi), so a handful of stale placements
-     * shouldn't force discarding an otherwise successful batch. {@link
-     * NanocachedClient#setManyBytes} has nothing to return on success, so
-     * it just throws a plain {@link WrongNode} on the same wrong-node
-     * condition — there's no partial payload worth attaching there. (A
-     * connection failure mid-batch is different: see {@link
+     * Raised by {@link NanocachedClient#getManyBytes} (issue #151) when some keys are still
+     * wrong-node after the one bounded refresh-and-retry every batch gets (the per-key analogue of
+     * {@code getBytes}' own {@code W} refresh-and-retry) — a subclass of {@link WrongNode}, so
+     * existing {@code catch (WrongNode)} handling keeps working unchanged. {@code partialValues}
+     * holds every key that DID resolve — a batch never fails as a whole (docs/protocol.html#multi),
+     * so a handful of stale placements shouldn't force discarding an otherwise successful batch.
+     * {@link NanocachedClient#setManyBytes} has nothing to return on success, so it just throws a
+     * plain {@link WrongNode} on the same wrong-node condition — there's no partial payload worth
+     * attaching there. (A connection failure mid-batch is different: see {@link
      * PartialConnectionLostSet}.)
      *
-     * <p>A separate, non-generic class from {@link PartialWrongNodeStrings}
-     * rather than one class parameterized over the value type: the JLS
-     * forbids a generic class from being a (direct or indirect) subclass
-     * of {@link Throwable}.
+     * <p>A separate, non-generic class from {@link PartialWrongNodeStrings} rather than one class
+     * parameterized over the value type: the JLS forbids a generic class from being a (direct or
+     * indirect) subclass of {@link Throwable}.
      */
     public static final class PartialWrongNode extends WrongNode {
         public final java.util.Map<String, byte[]> partialValues;
@@ -331,12 +311,10 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * As {@link PartialWrongNode}, but raised by {@link
-     * NanocachedClient#getMany} — the UTF-8-decoded counterpart, thrown
-     * once the raw {@link PartialWrongNode} its {@code getManyBytes} call
-     * underneath threw has had its {@code partialValues} decoded the same
-     * way a successful {@code getMany} decodes {@code getManyBytes}' own
-     * result.
+     * As {@link PartialWrongNode}, but raised by {@link NanocachedClient#getMany} — the
+     * UTF-8-decoded counterpart, thrown once the raw {@link PartialWrongNode} its {@code
+     * getManyBytes} call underneath threw has had its {@code partialValues} decoded the same way a
+     * successful {@code getMany} decodes {@code getManyBytes}' own result.
      */
     public static final class PartialWrongNodeStrings extends WrongNode {
         public final java.util.Map<String, String> partialValues;
@@ -347,13 +325,11 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * As {@link PartialWrongNode}, but raised by the positional,
-     * {@code byte[]}-keyed {@link NanocachedClient#getManyBytes(byte[][])}
-     * (issue #160). {@code partialValues} is the same positional array a
-     * successful call would have returned ({@code null} for a miss);
-     * since a {@code null} slot alone cannot tell a miss from a key that
-     * is still wrong-node, {@code unresolvedIndices} lists (ascending)
-     * the positions that did NOT resolve.
+     * As {@link PartialWrongNode}, but raised by the positional, {@code byte[]}-keyed {@link
+     * NanocachedClient#getManyBytes(byte[][])} (issue #160). {@code partialValues} is the same
+     * positional array a successful call would have returned ({@code null} for a miss); since a
+     * {@code null} slot alone cannot tell a miss from a key that is still wrong-node, {@code
+     * unresolvedIndices} lists (ascending) the positions that did NOT resolve.
      */
     public static final class PartialWrongNodeRaw extends WrongNode {
         public final byte[][] partialValues;
@@ -361,46 +337,42 @@ public class NanocachedException extends RuntimeException {
 
         public PartialWrongNodeRaw(byte[][] partialValues, java.util.List<Integer> unresolvedIndices) {
             this.partialValues = partialValues;
-            this.unresolvedIndices = unresolvedIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
+            this.unresolvedIndices = unresolvedIndices.stream()
+                    .mapToInt(Integer::intValue)
+                    .sorted()
+                    .toArray();
         }
     }
 
     /**
-     * Raised by {@link NanocachedClient#getManyBytes} (issue #411) when a
-     * batch spans more than one {@code m} sub-frame (batch chunking, issue
-     * #222) and a chunk after the first hits a connection failure the
-     * client's own built-in reconnect-and-retry couldn't recover from —
-     * the analogue of {@link PartialWrongNode}, but for connection loss
-     * mid-batch instead of a stale routing table. {@code partialValues}
-     * holds every key the earlier, already-succeeded chunk(s) resolved, so
-     * that data isn't silently discarded behind what would otherwise look
-     * like a batch that wrote/read nothing at all. Never thrown when the
-     * very first chunk fails — there is nothing partial to carry then, so
-     * a plain {@link ConnectionLost} propagates instead, exactly as it
-     * always has.
+     * Raised by {@link NanocachedClient#getManyBytes} (issue #411) when a batch spans more than one
+     * {@code m} sub-frame (batch chunking, issue #222) and a chunk after the first hits a
+     * connection failure the client's own built-in reconnect-and-retry couldn't recover from — the
+     * analogue of {@link PartialWrongNode}, but for connection loss mid-batch instead of a stale
+     * routing table. {@code partialValues} holds every key the earlier, already-succeeded chunk(s)
+     * resolved, so that data isn't silently discarded behind what would otherwise look like a batch
+     * that wrote/read nothing at all. Never thrown when the very first chunk fails — there is
+     * nothing partial to carry then, so a plain {@link ConnectionLost} propagates instead, exactly
+     * as it always has.
      *
-     * <p>A subclass of {@link ConnectionLost} (not {@link WrongNode}),
-     * so existing {@code catch (ConnectionLost)} handling keeps working
-     * unchanged and this is trivially distinguishable from a total-failure
-     * plain {@link ConnectionLost}.
+     * <p>A subclass of {@link ConnectionLost} (not {@link WrongNode}), so existing {@code catch
+     * (ConnectionLost)} handling keeps working unchanged and this is trivially distinguishable from
+     * a total-failure plain {@link ConnectionLost}.
      */
     public static final class PartialConnectionLost extends ConnectionLost {
         public final java.util.Map<String, byte[]> partialValues;
 
-        public PartialConnectionLost(
-                String message, Throwable cause, java.util.Map<String, byte[]> partialValues) {
+        public PartialConnectionLost(String message, Throwable cause, java.util.Map<String, byte[]> partialValues) {
             super(message, cause);
             this.partialValues = partialValues;
         }
     }
 
     /**
-     * As {@link PartialConnectionLost}, but raised by {@link
-     * NanocachedClient#getMany} — the UTF-8-decoded counterpart, thrown
-     * once the raw {@link PartialConnectionLost} its {@code
-     * getManyBytes} call underneath threw has had its {@code
-     * partialValues} decoded the same way a successful {@code getMany}
-     * decodes {@code getManyBytes}' own result.
+     * As {@link PartialConnectionLost}, but raised by {@link NanocachedClient#getMany} — the
+     * UTF-8-decoded counterpart, thrown once the raw {@link PartialConnectionLost} its {@code
+     * getManyBytes} call underneath threw has had its {@code partialValues} decoded the same way a
+     * successful {@code getMany} decodes {@code getManyBytes}' own result.
      */
     public static final class PartialConnectionLostStrings extends ConnectionLost {
         public final java.util.Map<String, String> partialValues;
@@ -413,24 +385,20 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * As {@link PartialConnectionLost}, but raised by the positional,
-     * {@code byte[]}-keyed {@link NanocachedClient#getManyBytes(byte[][])}
-     * (issue #160's positional form). {@code partialValues} is the same
-     * positional array a successful call would have returned ({@code
-     * null} for a miss); since a {@code null} slot alone cannot tell a
-     * miss from a key the failing chunk (or any chunk after it) never
-     * even attempted, {@code unresolvedIndices} lists (ascending) the
-     * positions that did NOT resolve — exactly {@link
-     * PartialWrongNodeRaw}'s own convention.
+     * As {@link PartialConnectionLost}, but raised by the positional, {@code byte[]}-keyed {@link
+     * NanocachedClient#getManyBytes(byte[][])} (issue #160's positional form). {@code
+     * partialValues} is the same positional array a successful call would have returned ({@code
+     * null} for a miss); since a {@code null} slot alone cannot tell a miss from a key the failing
+     * chunk (or any chunk after it) never even attempted, {@code unresolvedIndices} lists
+     * (ascending) the positions that did NOT resolve — exactly {@link PartialWrongNodeRaw}'s own
+     * convention.
      *
-     * <p>When raised by {@link NanocachedClient#getManyAndTouchBytes(byte[][],
-     * long)} (or {@code getManyAndTouch}, whose partial results derive from
-     * this one) with {@code ttlSeconds == 0}, {@code unresolvedIndices}
-     * lists keys whose frame was never sent <em>and</em> keys whose frame
-     * was sent and whose outcome is unknown; the two cannot be told apart.
-     * The unknown ones may already have been expired by the node, so these
-     * positions must not be sent again with {@code 0}: a second attempt
-     * answers them as misses and the values they held are lost.
+     * <p>When raised by {@link NanocachedClient#getManyAndTouchBytes(byte[][], long)} (or {@code
+     * getManyAndTouch}, whose partial results derive from this one) with {@code ttlSeconds == 0},
+     * {@code unresolvedIndices} lists keys whose frame was never sent <em>and</em> keys whose frame
+     * was sent and whose outcome is unknown; the two cannot be told apart. The unknown ones may
+     * already have been expired by the node, so these positions must not be sent again with {@code
+     * 0}: a second attempt answers them as misses and the values they held are lost.
      */
     public static final class PartialConnectionLostRaw extends ConnectionLost {
         public final byte[][] partialValues;
@@ -440,25 +408,25 @@ public class NanocachedException extends RuntimeException {
                 String message, Throwable cause, byte[][] partialValues, java.util.List<Integer> unresolvedIndices) {
             super(message, cause);
             this.partialValues = partialValues;
-            this.unresolvedIndices = unresolvedIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
+            this.unresolvedIndices = unresolvedIndices.stream()
+                    .mapToInt(Integer::intValue)
+                    .sorted()
+                    .toArray();
         }
     }
 
     /**
-     * Raised by {@link NanocachedClient#setMany}/{@link
-     * NanocachedClient#setManyBytes(Map, long)} (issue #411) when a batch
-     * spans more than one {@code o} sub-frame (batch chunking, issue #222)
-     * and a chunk after the first hits a connection failure the client's
-     * own built-in reconnect-and-retry couldn't recover from.
+     * Raised by {@link NanocachedClient#setMany}/{@link NanocachedClient#setManyBytes(Map, long)}
+     * (issue #411) when a batch spans more than one {@code o} sub-frame (batch chunking, issue
+     * #222) and a chunk after the first hits a connection failure the client's own built-in
+     * reconnect-and-retry couldn't recover from.
      *
-     * <p>Unlike the wrong-node case ({@link WrongNode} — see {@link
-     * PartialWrongNode}'s own doc comment for why a plain, non-carrying
-     * exception is enough there), a connection failure mid-batch DOES have
-     * something worth attaching: {@code succeededKeys} names every key
-     * confirmed stored by the chunk(s) that completed before the failure,
-     * so a caller doesn't have to assume the whole batch was lost. Never
-     * thrown when the very first chunk fails — a plain {@link
-     * ConnectionLost} propagates instead, exactly as it always has.
+     * <p>Unlike the wrong-node case ({@link WrongNode} — see {@link PartialWrongNode}'s own doc
+     * comment for why a plain, non-carrying exception is enough there), a connection failure
+     * mid-batch DOES have something worth attaching: {@code succeededKeys} names every key
+     * confirmed stored by the chunk(s) that completed before the failure, so a caller doesn't have
+     * to assume the whole batch was lost. Never thrown when the very first chunk fails — a plain
+     * {@link ConnectionLost} propagates instead, exactly as it always has.
      */
     public static final class PartialConnectionLostSet extends ConnectionLost {
         public final java.util.Set<String> succeededKeys;
@@ -470,23 +438,24 @@ public class NanocachedException extends RuntimeException {
     }
 
     /**
-     * As {@link PartialConnectionLostSet}, but raised by the positional,
-     * {@code byte[]}-keyed {@link
-     * NanocachedClient#setManyBytes(byte[][], byte[][], long)} (issue
-     * #160's positional form) — {@code succeededIndices} lists (ascending)
-     * the positions the earlier, already-succeeded chunk(s) confirmed
-     * stored (the inverse of {@link PartialWrongNodeRaw#unresolvedIndices}
-     * /{@link PartialConnectionLostRaw#unresolvedIndices}: those name
-     * what's still outstanding, this names what's already done, since a
-     * successful {@code setManyBytes} has no positional array of its own
-     * to splice a "did this position resolve" answer into).
+     * As {@link PartialConnectionLostSet}, but raised by the positional, {@code byte[]}-keyed
+     * {@link NanocachedClient#setManyBytes(byte[][], byte[][], long)} (issue #160's positional
+     * form) — {@code succeededIndices} lists (ascending) the positions the earlier,
+     * already-succeeded chunk(s) confirmed stored (the inverse of {@link
+     * PartialWrongNodeRaw#unresolvedIndices} /{@link PartialConnectionLostRaw#unresolvedIndices}:
+     * those name what's still outstanding, this names what's already done, since a successful
+     * {@code setManyBytes} has no positional array of its own to splice a "did this position
+     * resolve" answer into).
      */
     public static final class PartialConnectionLostSetRaw extends ConnectionLost {
         public final int[] succeededIndices;
 
         public PartialConnectionLostSetRaw(String message, Throwable cause, java.util.List<Integer> succeededIndices) {
             super(message, cause);
-            this.succeededIndices = succeededIndices.stream().mapToInt(Integer::intValue).sorted().toArray();
+            this.succeededIndices = succeededIndices.stream()
+                    .mapToInt(Integer::intValue)
+                    .sorted()
+                    .toArray();
         }
     }
 }

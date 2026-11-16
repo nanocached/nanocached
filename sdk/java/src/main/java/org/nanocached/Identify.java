@@ -28,13 +28,12 @@ import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 
 /**
- * Connect-and-identify: dials {@code host:port}, authenticates, and
- * figures out from the server's own {@code A} response whether it reached
- * a cache node ({@code On}) or a discovery server ({@code Od}) — the
- * caller never says which it expects (the server type in the auth response). A node's socket
- * is handed back live; a discovery connection is used once for {@code L}
- * and closed, returning the name/address list and the cluster's
- * replication factor R (node identity, discovery HA, replication).
+ * Connect-and-identify: dials {@code host:port}, authenticates, and figures out from the server's
+ * own {@code A} response whether it reached a cache node ({@code On}) or a discovery server ({@code
+ * Od}) — the caller never says which it expects (the server type in the auth response). A node's
+ * socket is handed back live; a discovery connection is used once for {@code L} and closed,
+ * returning the name/address list and the cluster's replication factor R (node identity, discovery
+ * HA, replication).
  */
 final class Identify {
     // A server with no secret accepts any non-empty secret; one that
@@ -50,56 +49,54 @@ final class Identify {
 
     record ClusterTarget(List<DiscoveredNode> nodes, int replication) implements Result {}
 
-    /** SDK proxy mode (issue #122, {@code viaProxy}): the roster a
-     * discovery server answers `Q` with — the same name/address shape as
-     * {@link ClusterTarget#nodes()}, reusing {@link DiscoveredNode} even
-     * though a proxy's "name" carries no routing meaning to this client
-     * (unlike a cache node's, it's never hashed) — there is simply no
-     * separate replication field on this response for a proxy client to
-     * need (a proxy owns every key). */
+    /**
+     * SDK proxy mode (issue #122, {@code viaProxy}): the roster a discovery server answers `Q` with
+     * — the same name/address shape as {@link ClusterTarget#nodes()}, reusing {@link
+     * DiscoveredNode} even though a proxy's "name" carries no routing meaning to this client
+     * (unlike a cache node's, it's never hashed) — there is simply no separate replication field on
+     * this response for a proxy client to need (a proxy owns every key).
+     */
     record ProxyRosterTarget(List<DiscoveredNode> proxies) implements Result {}
 
     private Identify() {}
 
-    /** The peer answered {@code A} with something that is not a handshake
-     * reply at all (an HTTP server's error page, say). It is raised while
-     * the handshake is read, before any request exists, so a caller that
-     * redials a member of a ring can classify it as a connection failure
-     * that sent nothing. A {@code connect()} to the address itself reports
-     * it as the plain {@link NanocachedException} it is documented to
-     * throw. */
+    /**
+     * The peer answered {@code A} with something that is not a handshake reply at all (an HTTP
+     * server's error page, say). It is raised while the handshake is read, before any request
+     * exists, so a caller that redials a member of a ring can classify it as a connection failure
+     * that sent nothing. A {@code connect()} to the address itself reports it as the plain {@link
+     * NanocachedException} it is documented to throw.
+     */
     static final class UnexpectedHandshakeReply extends NanocachedException {
         UnexpectedHandshakeReply() {
             super("nanocached: unexpected response to A");
         }
     }
 
-    /** Thrown only when writing/reading the extended {@code A ... T}
-     * exchange fails in a way that looks like a legacy pre-tag server
-     * slamming the connection shut without replying (close/EOF/RST,
-     * never a malformed-but-present reply) — the one case
-     * {@link #connectAndIdentify} retries with the plain form. Never
-     * escapes this class. */
+    /**
+     * Thrown only when writing/reading the extended {@code A ... T} exchange fails in a way that
+     * looks like a legacy pre-tag server slamming the connection shut without replying
+     * (close/EOF/RST, never a malformed-but-present reply) — the one case {@link
+     * #connectAndIdentify} retries with the plain form. Never escapes this class.
+     */
     private static final class LegacyServerSignal extends IOException {
         LegacyServerSignal(IOException cause) {
             super(cause);
         }
     }
 
-    static Result connectAndIdentify(String host, int port, byte[] authSecret, SSLContext tls)
-            throws IOException {
+    static Result connectAndIdentify(String host, int port, byte[] authSecret, SSLContext tls) throws IOException {
         return connectAndIdentify(host, port, authSecret, tls, false);
     }
 
-    /** The extended {@code A} capability tokens this client asks for,
-     * from most to least capable — fixed wire order {@code [T] [R]}
-     * (issue #125's retryable-error probe is layered in front of the
-     * existing {@code T} probe, not a new mechanism of its own). {@link
-     * #connectAndIdentify} starts at {@link #FULL} and steps back one
-     * stage at a time on the legacy-server signal: a server that predates
-     * a token it was sent treats the whole extended {@code A} as a parse
-     * error and closes without replying, rather than rejecting just the
-     * unrecognized token. */
+    /**
+     * The extended {@code A} capability tokens this client asks for, from most to least capable —
+     * fixed wire order {@code [T] [R]} (issue #125's retryable-error probe is layered in front of
+     * the existing {@code T} probe, not a new mechanism of its own). {@link #connectAndIdentify}
+     * starts at {@link #FULL} and steps back one stage at a time on the legacy-server signal: a
+     * server that predates a token it was sent treats the whole extended {@code A} as a parse error
+     * and closes without replying, rather than rejecting just the unrecognized token.
+     */
     private enum ProbeStage {
         FULL(true, true), // "A <len> T R"
         TAGS_ONLY(true, false), // "A <len> T"
@@ -114,18 +111,18 @@ final class Identify {
         }
     }
 
-    /** As {@link #connectAndIdentify(String, int, byte[], SSLContext)}, but
-     * when {@code host:port} identifies as a discovery server, fetches its
-     * proxy roster (`Q`, SDK proxy mode issue #122) instead of its node
-     * list (`L`) — used both for {@code viaProxy}'s initial connect and its
-     * reconnect-time re-fetch. A NODE identity is still returned as a plain
-     * {@link NodeTarget} either way (matches `L`'s own identify-based
-     * dispatch): whether that's a hard "viaProxy needs a discovery address"
-     * error or simply an unusable seed to skip is the caller's call, since
-     * only it knows whether this is the top-level connect address or a
-     * background re-fetch that must never throw. */
-    static Result connectAndIdentify(
-            String host, int port, byte[] authSecret, SSLContext tls, boolean listProxies) throws IOException {
+    /**
+     * As {@link #connectAndIdentify(String, int, byte[], SSLContext)}, but when {@code host:port}
+     * identifies as a discovery server, fetches its proxy roster (`Q`, SDK proxy mode issue #122)
+     * instead of its node list (`L`) — used both for {@code viaProxy}'s initial connect and its
+     * reconnect-time re-fetch. A NODE identity is still returned as a plain {@link NodeTarget}
+     * either way (matches `L`'s own identify-based dispatch): whether that's a hard "viaProxy needs
+     * a discovery address" error or simply an unusable seed to skip is the caller's call, since
+     * only it knows whether this is the top-level connect address or a background re-fetch that
+     * must never throw.
+     */
+    static Result connectAndIdentify(String host, int port, byte[] authSecret, SSLContext tls, boolean listProxies)
+            throws IOException {
         try {
             return identifyOnce(host, port, authSecret, tls, ProbeStage.FULL, listProxies);
         } catch (LegacyServerSignal signal) {
@@ -165,7 +162,8 @@ final class Identify {
 
             AuthIdentity identity;
             try {
-                out.write(("A " + secret.length
+                out.write(("A "
+                                + secret.length
                                 + (stage.requestTags ? " T" : "")
                                 + (stage.requestRetryCapability ? " R" : "")
                                 + "\n")
@@ -188,7 +186,10 @@ final class Identify {
 
             if (!identity.accepted()) {
                 if (authSecret == null) {
-                    throw new NanocachedException.AuthenticationFailed("nanocached: " + host + ":" + port
+                    throw new NanocachedException.AuthenticationFailed("nanocached: "
+                            + host
+                            + ":"
+                            + port
                             + " requires authentication, but no authSecret was given");
                 }
                 throw new NanocachedException.AuthenticationFailed("nanocached: authentication failed");
@@ -238,18 +239,17 @@ final class Identify {
         }
     }
 
-    /** The absolute deadline of one dial-and-identify attempt. A socket
-     * read timeout ({@code SO_TIMEOUT}) bounds each blocking read, not
-     * the exchange: a peer that sent one byte every few seconds kept
-     * {@code connect()} (and a node-list refresh, which every caller
-     * waits behind) going for minutes, and the TLS handshake and {@link
-     * InputStream#readNBytes} loop over many reads inside one call. So a
-     * watchdog closes the socket when the deadline passes, whatever the
-     * dial is doing at that moment, and the resulting failure is reported
-     * as a timeout rather than as the closed socket it looks like. Only
-     * one of the dialing thread and the watchdog ever "finishes" the
-     * attempt: whichever wins {@link #state} decides whether a node
-     * socket is handed on alive or the attempt is a timeout. */
+    /**
+     * The absolute deadline of one dial-and-identify attempt. A socket read timeout ({@code
+     * SO_TIMEOUT}) bounds each blocking read, not the exchange: a peer that sent one byte every few
+     * seconds kept {@code connect()} (and a node-list refresh, which every caller waits behind)
+     * going for minutes, and the TLS handshake and {@link InputStream#readNBytes} loop over many
+     * reads inside one call. So a watchdog closes the socket when the deadline passes, whatever the
+     * dial is doing at that moment, and the resulting failure is reported as a timeout rather than
+     * as the closed socket it looks like. Only one of the dialing thread and the watchdog ever
+     * "finishes" the attempt: whichever wins {@link #state} decides whether a node socket is handed
+     * on alive or the attempt is a timeout.
+     */
     private static final class Deadline {
         private final String host;
         private final int port;
@@ -272,22 +272,28 @@ final class Identify {
             return (int) Math.max(1, TimeUnit.NANOSECONDS.toMillis(deadlineNanos - System.nanoTime()));
         }
 
-        /** Arms the watchdog on {@code socket}; called once the socket
-         * exists, before anything that can block on the peer. */
+        /**
+         * Arms the watchdog on {@code socket}; called once the socket exists, before anything that
+         * can block on the peer.
+         */
         void watch(Socket socket) {
-            watchdog = WATCHDOG.schedule(() -> {
-                if (!state.compareAndSet(RUNNING, FIRED)) return;
-                try {
-                    socket.close();
-                } catch (IOException ignored) {
-                    // The dialing thread's own failure is what gets reported.
-                }
-            }, deadlineNanos - System.nanoTime(), TimeUnit.NANOSECONDS);
+            watchdog = WATCHDOG.schedule(
+                    () -> {
+                        if (!state.compareAndSet(RUNNING, FIRED)) return;
+                        try {
+                            socket.close();
+                        } catch (IOException ignored) {
+                            // The dialing thread's own failure is what gets reported.
+                        }
+                    },
+                    deadlineNanos - System.nanoTime(),
+                    TimeUnit.NANOSECONDS);
         }
 
-        /** Ends the attempt from the dialing thread: {@code true} when it
-         * won against the watchdog (the socket is still open), {@code
-         * false} when the watchdog already fired. Idempotent. */
+        /**
+         * Ends the attempt from the dialing thread: {@code true} when it won against the watchdog
+         * (the socket is still open), {@code false} when the watchdog already fired. Idempotent.
+         */
         boolean finish() {
             state.compareAndSet(RUNNING, FINISHED);
             ScheduledFuture<?> armed = watchdog;
@@ -295,18 +301,23 @@ final class Identify {
             return state.get() != FIRED;
         }
 
-        /** A failure seen after the watchdog closed the socket is the
-         * timeout, whatever shape the closed socket gave it; translated
-         * before the legacy-server fallback in {@link #identifyOnce} can
-         * mistake it for a server that closed without replying. */
+        /**
+         * A failure seen after the watchdog closed the socket is the timeout, whatever shape the
+         * closed socket gave it; translated before the legacy-server fallback in {@link
+         * #identifyOnce} can mistake it for a server that closed without replying.
+         */
         IOException translate(IOException error) {
             return state.get() == FIRED ? timeout() : error;
         }
 
         SocketTimeoutException timeout() {
-            return new SocketTimeoutException(
-                    "nanocached: " + host + ":" + port + " did not complete the identify exchange within "
-                            + timeoutMillis + "ms");
+            return new SocketTimeoutException("nanocached: "
+                    + host
+                    + ":"
+                    + port
+                    + " did not complete the identify exchange within "
+                    + timeoutMillis
+                    + "ms");
         }
     }
 
@@ -327,14 +338,14 @@ final class Identify {
 
     private record AuthIdentity(boolean accepted, char kind, boolean tagged) {}
 
-    /** Parses the reply to `A`: {@code On\n}/{@code En\n} from a cache
-     * node, {@code Od\n}/{@code Ed\n} from a discovery server (see
-     * The server type in the auth response), each stretched to four bytes by a {@code T}
-     * before the LF when the server is echoing the tag capability our
-     * extended {@code A} asked for (echoed response tags). The second byte
-     * is what identifies which kind of server this is — it isn't an
-     * accident of the auth outcome, it's present whether accepted or
-     * rejected. */
+    /**
+     * Parses the reply to `A`: {@code On\n}/{@code En\n} from a cache node, {@code Od\n}/{@code
+     * Ed\n} from a discovery server (see The server type in the auth response), each stretched to
+     * four bytes by a {@code T} before the LF when the server is echoing the tag capability our
+     * extended {@code A} asked for (echoed response tags). The second byte is what identifies which
+     * kind of server this is — it isn't an accident of the auth outcome, it's present whether
+     * accepted or rejected.
+     */
     private static AuthIdentity readIdentity(InputStream in) throws IOException {
         // A node at its connection limit answers a bare {@code B\n} — two
         // bytes, then it closes — instead of the three-byte identity.
@@ -375,13 +386,16 @@ final class Identify {
 
     private static final int CONNECT_TIMEOUT_MS = 5_000;
 
-    /** Bound on host name resolution plus the TCP connect together (the
-     * dial deadline). Mutable only so tests can shorten it. */
+    /**
+     * Bound on host name resolution plus the TCP connect together (the dial deadline). Mutable only
+     * so tests can shorten it.
+     */
     static volatile int connectTimeoutMillis = CONNECT_TIMEOUT_MS;
 
-    /** Host name to address, the one step of a dial the socket's own connect
-     * timeout does not cover. Replaceable only so tests can simulate a
-     * resolver that hangs. */
+    /**
+     * Host name to address, the one step of a dial the socket's own connect timeout does not cover.
+     * Replaceable only so tests can simulate a resolver that hangs.
+     */
     @FunctionalInterface
     interface HostResolver {
         InetAddress resolve(String host) throws UnknownHostException;
@@ -400,8 +414,12 @@ final class Identify {
 
     private static ThreadPoolExecutor newResolverPool() {
         ThreadPoolExecutor pool = new ThreadPoolExecutor(
-                MAX_RESOLVER_THREADS, MAX_RESOLVER_THREADS, 60L, TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(), runnable -> {
+                MAX_RESOLVER_THREADS,
+                MAX_RESOLVER_THREADS,
+                60L,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
+                runnable -> {
                     Thread thread = new Thread(runnable, "nanocached-resolver");
                     thread.setDaemon(true);
                     return thread;
@@ -415,10 +433,11 @@ final class Identify {
     // skip the resolver pool.
     private static final Pattern IPV4_LITERAL = Pattern.compile("\\d{1,3}(\\.\\d{1,3}){3}");
 
-    /** Resolves {@code host} within {@code timeoutMs}, so a stalled DNS
-     * server fails the dial like an unreachable address instead of hanging
-     * it: {@code new InetSocketAddress(host, port)} resolves synchronously
-     * on the calling thread, outside the connect timeout. */
+    /**
+     * Resolves {@code host} within {@code timeoutMs}, so a stalled DNS server fails the dial like
+     * an unreachable address instead of hanging it: {@code new InetSocketAddress(host, port)}
+     * resolves synchronously on the calling thread, outside the connect timeout.
+     */
     private static InetSocketAddress resolve(String host, int port, int timeoutMs) throws IOException {
         if (host.indexOf(':') >= 0 || IPV4_LITERAL.matcher(host).matches()) {
             return new InetSocketAddress(host, port);
@@ -435,8 +454,7 @@ final class Identify {
         } catch (TimeoutException timeout) {
             lookup.cancel(true);
             RESOLVER.remove((Runnable) lookup);
-            throw new SocketTimeoutException(
-                    "nanocached: resolving " + host + " timed out after " + timeoutMs + "ms");
+            throw new SocketTimeoutException("nanocached: resolving " + host + " timed out after " + timeoutMs + "ms");
         } catch (ExecutionException failed) {
             Throwable cause = failed.getCause();
             if (cause instanceof IOException io) {
@@ -473,8 +491,7 @@ final class Identify {
             if (tls == null) {
                 return plain;
             }
-            SSLSocket socket =
-                    (SSLSocket) tls.getSocketFactory().createSocket(plain, host, port, true);
+            SSLSocket socket = (SSLSocket) tls.getSocketFactory().createSocket(plain, host, port, true);
             socket.setSoTimeout(deadline.remainingMillis());
             // Without this, the JDK verifies the certificate chain but
             // never checks it was actually issued to `host` — a valid
@@ -515,8 +532,7 @@ final class Identify {
             throw new NanocachedException.DiscoveryBusy();
         }
         if (!header.startsWith("N ")) {
-            throw new NanocachedException(
-                    "nanocached: unexpected response from discovery server: " + header);
+            throw new NanocachedException("nanocached: unexpected response from discovery server: " + header);
         }
 
         // `N <count> <r>\n` (client-side replication) — the replication factor rides along.
@@ -553,8 +569,7 @@ final class Identify {
             throw new NanocachedException.DiscoveryBusy();
         }
         if (!header.startsWith("N ")) {
-            throw new NanocachedException(
-                    "nanocached: unexpected response from discovery server: " + header);
+            throw new NanocachedException("nanocached: unexpected response from discovery server: " + header);
         }
 
         int count = Connection.parseNonNegativeInt(header.substring(2));
@@ -565,10 +580,11 @@ final class Identify {
         return new ProxyRosterTarget(readNodeEntries(in, count));
     }
 
-    /** The `<name-len> <addr-len>\n<name><addr>\n` entries shared,
-     * byte-for-byte, by both `L`'s node list and `Q`'s proxy roster
-     * (issue #122) — {@code count} is already validated against {@link
-     * #MAX_NODE_COUNT} by the caller before this runs. */
+    /**
+     * The `<name-len> <addr-len>\n<name><addr>\n` entries shared, byte-for-byte, by both `L`'s node
+     * list and `Q`'s proxy roster (issue #122) — {@code count} is already validated against {@link
+     * #MAX_NODE_COUNT} by the caller before this runs.
+     */
     private static List<DiscoveredNode> readNodeEntries(InputStream in, int count) throws IOException {
         // count is bounded by MAX_NODE_COUNT by the caller, so sizing the
         // list's capacity from it is safe — never trust an unvalidated
@@ -606,24 +622,22 @@ final class Identify {
         return entries;
     }
 
-    /** Reads up to (and consuming) the next '\n', returning what preceded
-     * it. Bounded by {@link Connection#MAX_HEADER_LINE_LENGTH} — the same
-     * cap and rationale as {@link Connection}'s own readLine, shared
-     * rather than duplicated: every real discovery header line (`N
-     * <count> <r>`, a `<nameLen> <addrLen>` entry line) is a handful of
-     * bytes, so a malicious or buggy discovery server that streams bytes
-     * with no '\n' must fail fast — connection-classified, so the
-     * built-in redial/retry layer (and fetchNodeList's per-address
-     * fallback) handles it exactly like any other dead/misbehaving
-     * address — instead of growing this buffer without bound (issue:
-     * audit finding, unbounded readLine in Identify; Connection.java's
-     * own readLine already had this cap). */
+    /**
+     * Reads up to (and consuming) the next '\n', returning what preceded it. Bounded by {@link
+     * Connection#MAX_HEADER_LINE_LENGTH} — the same cap and rationale as {@link Connection}'s own
+     * readLine, shared rather than duplicated: every real discovery header line (`N <count> <r>`, a
+     * `<nameLen> <addrLen>` entry line) is a handful of bytes, so a malicious or buggy discovery
+     * server that streams bytes with no '\n' must fail fast — connection-classified, so the
+     * built-in redial/retry layer (and fetchNodeList's per-address fallback) handles it exactly
+     * like any other dead/misbehaving address — instead of growing this buffer without bound
+     * (issue: audit finding, unbounded readLine in Identify; Connection.java's own readLine already
+     * had this cap).
+     */
     private static String readLine(InputStream in) throws IOException {
         StringBuilder line = new StringBuilder();
         for (int b = read(in); b != '\n'; b = read(in)) {
             if (line.length() >= Connection.MAX_HEADER_LINE_LENGTH) {
-                throw new NanocachedException.ConnectionLost(
-                        "nanocached: response header line too long", null);
+                throw new NanocachedException.ConnectionLost("nanocached: response header line too long", null);
             }
             line.append((char) b);
         }

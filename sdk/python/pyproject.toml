@@ -29,3 +29,89 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 nanocached = ["py.typed"]
+
+# PEP 735: the pinned dev toolchain CI and contributors install
+# (`pip install --group dev` / `uv pip install --group dev`). Not part of the
+# published package's metadata.
+[dependency-groups]
+dev = ["ruff==0.17.5", "mypy==2.4.1"]
+
+[tool.ruff]
+target-version = "py311"
+# The width the code was already written to; measured, not reflowed.
+line-length = 100
+# First-party roots for import sorting: the package and the test helpers
+# (mock_servers), which the tests import as top-level modules.
+src = ["src", "tests"]
+# ruff also formats Python blocks inside Markdown; the README's examples keep
+# their hand-aligned comments.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",  # pycodestyle
+  "F",       # pyflakes
+  "I",       # isort
+  "B",       # flake8-bugbear
+  "UP",      # pyupgrade
+  "SIM",     # flake8-simplify
+  "RUF",     # ruff-specific
+  "ASYNC",   # flake8-async
+  "PERF",    # perflint
+  "C4",      # flake8-comprehensions
+  "PIE",     # flake8-pie
+  "PGH",     # pygrep-hooks
+  "FURB",    # refurb
+  "LOG",     # flake8-logging
+  "T10",     # flake8-debugger
+]
+# PT (flake8-pytest-style) is not selected: the suite is unittest, and PT's
+# rules push pytest idioms (PT009 would rewrite every self.assertEqual).
+ignore = [
+  # try/except/pass is this codebase's idiom, each with the reason it is safe
+  # to swallow; contextlib.suppress would add a context manager per call on
+  # hot paths for no behavioral gain.
+  "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+  # Descriptive test-method names run past the width and cannot be wrapped;
+  # the formatter still holds the code itself to line-length.
+  "E501",
+  # Polling lambdas built in a subTest loop are awaited (wait_for) within the
+  # same iteration, never after the loop variable moves on.
+  "B023",
+  # wait_for(condition, what, timeout) is a polling helper; asyncio.timeout
+  # would not express "re-check every 5 ms until the deadline".
+  "ASYNC109",
+]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src", "tests"]
+strict = true
+# warn_unreachable stays off: mypy keeps e.g. self._closed narrowed across an
+# await, so every deliberate re-check after one (close() may have run
+# meanwhile) would read as unreachable.
+enable_error_code = ["ignore-without-code"]
+
+[[tool.mypy.overrides]]
+# The unittest suite is checked non-strictly: mypy's defaults, under which
+# the bodies of unannotated tests (most of them) are skipped. List a new
+# test module here. check_untyped_defs is off because what it adds is the
+# suite's deliberate reaching into private state (module constants patched
+# per test, StreamWriter._protocol, methods borrowed across TestCases).
+module = ["test_client", "test_compression", "test_hashring", "mock_servers"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+disallow_any_generics = false
+warn_return_any = false
+check_untyped_defs = false
+implicit_reexport = true
+# The suite's own `type: ignore`s sit in unchecked (unannotated) bodies.
+warn_unused_ignores = false
+# Tests read Optional client state right after starting it, and monkeypatch
+# methods on purpose; annotation-unchecked only notes the skipped bodies.
+disable_error_code = ["union-attr", "method-assign", "annotation-unchecked"]

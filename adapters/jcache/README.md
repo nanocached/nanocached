@@ -304,10 +304,13 @@ this one.
 
 ```
 cd adapters/jcache
-gradle test
+./gradlew spotlessApply   # format sources and build scripts (palantir-java-format)
+./gradlew check           # spotlessCheck + compile with javac -Xlint:all -Werror + tests
+./gradlew test            # tests only
 ```
 
 The build includes the sibling `sdk/java` sources (Gradle composite
-build), so a checkout needs no locally-installed SDK artifact.
+build), so a checkout needs no locally-installed SDK artifact. Gradle
+itself needs JDK 21+; the code compiles for Java 17 via a toolchain.
 
 MIT license.

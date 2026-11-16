@@ -1,9 +1,23 @@
 import { readFileSync } from "node:fs";
 import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
-import { Connection, ConnectionLostError, CounterOutOfRangeError, isConnectionError, wasRejectedByServer, WrongNodeError } from "./connection.js";
+import {
+  Connection,
+  ConnectionLostError,
+  CounterOutOfRangeError,
+  isConnectionError,
+  wasRejectedByServer,
+  WrongNodeError,
+} from "./connection.js";
 import { ServerTooOldError } from "./connection.js";
-import { connectAndIdentify, connectAndListProxies, HandshakeError, type DiscoveredNode, type IdentifyOptions, type IdentifyResult } from "./identify.js";
+import {
+  connectAndIdentify,
+  connectAndListProxies,
+  HandshakeError,
+  type DiscoveredNode,
+  type IdentifyOptions,
+  type IdentifyResult,
+} from "./identify.js";
 import { HashRing } from "./hashRing.js";
 import { compressValue, decompressValue, DecompressionError, maxMultiGetDecompressedBytes } from "./compression.js";
 import { NanocachedError } from "./errors.js";
@@ -24,7 +38,14 @@ import {
   type MultiEntry,
 } from "./protocol.js";
 
-export { ConnectionLostError, CounterOutOfRangeError, NotNumericError, RetryableError, ServerTooOldError, WrongNodeError } from "./connection.js";
+export {
+  ConnectionLostError,
+  CounterOutOfRangeError,
+  NotNumericError,
+  RetryableError,
+  ServerTooOldError,
+  WrongNodeError,
+} from "./connection.js";
 export { NanocachedError } from "./errors.js";
 export { DecompressionError } from "./compression.js";
 export { contentDigest } from "./protocol.js";
@@ -370,9 +391,7 @@ export function resolveReconnectCooldownMs(options: NanocachedClientOptions): nu
   }
   if (options.disableReconnectCooldown === true) {
     if (configured !== undefined && configured !== 0) {
-      throw new RangeError(
-        "nanocached: disableReconnectCooldown contradicts a non-zero reconnectCooldownMs; unset one of them",
-      );
+      throw new RangeError("nanocached: disableReconnectCooldown contradicts a non-zero reconnectCooldownMs; unset one of them");
     }
     return 0;
   }
@@ -529,7 +548,11 @@ interface LegBytes {
  * is not copied. */
 function detachedLegBytes(key: string | Uint8Array, value?: Buffer): () => LegBytes {
   let copy: LegBytes | undefined;
-  return () => (copy ??= { key: typeof key === "string" ? key : Buffer.from(key), value: value === undefined ? undefined : Buffer.from(value) });
+  return () =>
+    (copy ??= {
+      key: typeof key === "string" ? key : Buffer.from(key),
+      value: value === undefined ? undefined : Buffer.from(value),
+    });
 }
 
 function targetKey(options: { host: string; port: number }): string {
@@ -715,7 +738,9 @@ async function dialClusterNode(
       node,
       kind: "unreachable",
       error: new NanocachedError(`nanocached: discovery server returned a non-node address: ${node.address}`),
-      cooldownError: new ConnectionLostError(`nanocached: ${node.address} does not identify as a cache node`, { requestWasSent: false }),
+      cooldownError: new ConnectionLostError(`nanocached: ${node.address} does not identify as a cache node`, {
+        requestWasSent: false,
+      }),
     };
   }
 
@@ -839,7 +864,10 @@ export class NanocachedNamespace {
    * to its caller. */
   readonly namespace: Buffer;
 
-  constructor(namespace: Buffer, private readonly ops: NamespaceOps) {
+  constructor(
+    namespace: Buffer,
+    private readonly ops: NamespaceOps,
+  ) {
     this.namespace = namespace;
   }
 
@@ -1074,8 +1102,13 @@ export class NanocachedClient {
     if (addresses.length === 0) {
       throw new RangeError("nanocached: connect() needs a non-empty addresses list");
     }
-    if (options.readHedgeAfterMs !== undefined && !(options.readHedgeAfterMs > 0 && options.readHedgeAfterMs <= MAX_READ_HEDGE_AFTER_MS)) {
-      throw new RangeError(`nanocached: readHedgeAfterMs must be a positive number of milliseconds, at most ${MAX_READ_HEDGE_AFTER_MS}`);
+    if (
+      options.readHedgeAfterMs !== undefined &&
+      !(options.readHedgeAfterMs > 0 && options.readHedgeAfterMs <= MAX_READ_HEDGE_AFTER_MS)
+    ) {
+      throw new RangeError(
+        `nanocached: readHedgeAfterMs must be a positive number of milliseconds, at most ${MAX_READ_HEDGE_AFTER_MS}`,
+      );
     }
     // Issue #488: an option that can have no effect in this configuration
     // is a misconfiguration, not something to ignore quietly.
@@ -1119,7 +1152,13 @@ export class NanocachedClient {
 
       let identified;
       try {
-        identified = await connectAndIdentify({ host: address.host, port: address.port, authSecret: options.authSecret, tls: options.tls, ca });
+        identified = await connectAndIdentify({
+          host: address.host,
+          port: address.port,
+          authSecret: options.authSecret,
+          tls: options.tls,
+          ca,
+        });
       } catch (error) {
         lastError = error as Error;
         continue;
@@ -1218,7 +1257,10 @@ export class NanocachedClient {
           reachable++;
         } else {
           members.set(outcome.node.name, { address: outcome.node.address, connection: null });
-          cooldowns.push([outcome.node.address, { until: Date.now() + reconnectCooldownMs, error: outcome.cooldownError ?? outcome.error }]);
+          cooldowns.push([
+            outcome.node.address,
+            { until: Date.now() + reconnectCooldownMs, error: outcome.cooldownError ?? outcome.error },
+          ]);
           lastNodeError = outcome.error;
         }
       }
@@ -1259,8 +1301,8 @@ export class NanocachedClient {
       // (ensureConnected), so the first request for one of these nodes'
       // keys fails over immediately instead of paying a dial timeout, and
       // only redials once the cooldown has elapsed.
-      for (const [address, cooldown] of cooldowns) {
-        client.reconnectCooldowns.set(address, cooldown);
+      for (const [nodeAddress, cooldown] of cooldowns) {
+        client.reconnectCooldowns.set(nodeAddress, cooldown);
       }
       // Retryable-error status (issue #125): same deferred wiring as the
       // single-target branch above, one member connection at a time.
@@ -1297,7 +1339,13 @@ export class NanocachedClient {
     for (const address of addresses) {
       let result;
       try {
-        result = await connectAndListProxies({ host: address.host, port: address.port, authSecret: options.authSecret, tls: options.tls, ca });
+        result = await connectAndListProxies({
+          host: address.host,
+          port: address.port,
+          authSecret: options.authSecret,
+          tls: options.tls,
+          ca,
+        });
       } catch (error) {
         // Unreachable, still warming up (DiscoveryBusyError), or an
         // actual programming bug — either way, try the next address the
@@ -1319,7 +1367,9 @@ export class NanocachedClient {
       }
 
       if (result.proxies.length === 0) {
-        lastError = new NanocachedError(`nanocached: no proxies registered with the discovery server at ${address.host}:${address.port}`);
+        lastError = new NanocachedError(
+          `nanocached: no proxies registered with the discovery server at ${address.host}:${address.port}`,
+        );
         continue;
       }
 
@@ -1329,7 +1379,12 @@ export class NanocachedClient {
       for (const proxy of shuffled(result.proxies)) {
         let identified;
         try {
-          identified = await connectAndIdentify({ ...splitHostPort(proxy.address), authSecret: options.authSecret, tls: options.tls, ca });
+          identified = await connectAndIdentify({
+            ...splitHostPort(proxy.address),
+            authSecret: options.authSecret,
+            tls: options.tls,
+            ca,
+          });
         } catch (error) {
           lastError = error as Error;
           continue;
@@ -1413,14 +1468,14 @@ export class NanocachedClient {
     // abandoning it mid-flight when teardownConnections runs (issue #47
     // item 3 / audit finding, mirroring the Go and Rust SDKs' drain loops).
     while (this.backgroundReplicaWrites.size > 0) {
-      await Promise.allSettled([...this.backgroundReplicaWrites]);
+      await Promise.allSettled(this.backgroundReplicaWrites);
     }
     // Hedged reads (issue #64): same drain shape as backgroundReplicaWrites
     // above, for the same reason — a losing leg is left running detached
     // (readHedged), not cancelled, so close() must still wait for it
     // instead of abandoning it mid-flight.
     while (this.hedgedReads.size > 0) {
-      await Promise.allSettled([...this.hedgedReads]);
+      await Promise.allSettled(this.hedgedReads);
     }
     await Promise.all(this.teardownConnections().map((connection) => connection.whenClosed()));
   }
@@ -1532,7 +1587,10 @@ export class NanocachedClient {
    * be handed straight to `replace`/`deleteIfMatches` to condition on
    * exactly the value just read, regardless of `compress`. `value` is the
    * ordinary, decompressed result `getBytes` would return. */
-  private async getWithTokenInNamespace(namespace: Uint8Array, key: string | Uint8Array): Promise<{ value: Buffer; token: string } | null> {
+  private async getWithTokenInNamespace(
+    namespace: Uint8Array,
+    key: string | Uint8Array,
+  ): Promise<{ value: Buffer; token: string } | null> {
     const raw = await this.getRawInNamespace(namespace, key);
     if (raw === null) return null;
     const token = contentDigest(raw);
@@ -1614,7 +1672,7 @@ export class NanocachedClient {
         // tracking it in backgroundReplicaWrites, mirroring writeToOwners.
         const settled = repaired.catch(() => {});
         this.backgroundReplicaWrites.add(repaired);
-        settled.finally(() => this.backgroundReplicaWrites.delete(repaired));
+        void settled.finally(() => this.backgroundReplicaWrites.delete(repaired));
       }
       return value;
     }
@@ -1871,7 +1929,12 @@ export class NanocachedClient {
     return this.casDeleteInNamespace(EMPTY_NAMESPACE, key, token);
   }
 
-  private async setInNamespace(namespace: Uint8Array, key: string | Uint8Array, value: string | Uint8Array, ttlSeconds: number): Promise<void> {
+  private async setInNamespace(
+    namespace: Uint8Array,
+    key: string | Uint8Array,
+    value: string | Uint8Array,
+    ttlSeconds: number,
+  ): Promise<void> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
     const keyBytes = typeof key === "string" ? utf8Bytes(key) : Buffer.from(key);
@@ -1909,7 +1972,14 @@ export class NanocachedClient {
     // deleted up front would answer `N` for a key that existed.
     return this.withWrongNodeRetry(() =>
       this.target.kind === "cluster"
-        ? this.writeToOwners(key, namespace, (connection, bytes) => connection.delete(bytes.key, namespace), undefined, false, true)
+        ? this.writeToOwners(
+            key,
+            namespace,
+            (connection, bytes) => connection.delete(bytes.key, namespace),
+            undefined,
+            false,
+            true,
+          )
         : this.connectionForSingleTarget().then((connection) => connection.delete(key, namespace)),
     );
   }
@@ -1925,7 +1995,14 @@ export class NanocachedClient {
       return await this.withWrongNodeRetry(
         () =>
           this.target.kind === "cluster"
-            ? this.writeToOwners(key, namespace, (connection, bytes) => connection.touch(bytes.key, ttlSeconds, namespace), undefined, expiring, expiring)
+            ? this.writeToOwners(
+                key,
+                namespace,
+                (connection, bytes) => connection.touch(bytes.key, ttlSeconds, namespace),
+                undefined,
+                expiring,
+                expiring,
+              )
             : this.connectionForSingleTarget().then((connection) => connection.touch(key, ttlSeconds, namespace)),
         { nonIdempotent: expiring, rejectionIsFinal: true },
       );
@@ -1935,12 +2012,20 @@ export class NanocachedClient {
     }
   }
 
-  private async getAndTouchInNamespace(namespace: Uint8Array, key: string | Uint8Array, ttlSeconds: number | null): Promise<string | null> {
+  private async getAndTouchInNamespace(
+    namespace: Uint8Array,
+    key: string | Uint8Array,
+    ttlSeconds: number | null,
+  ): Promise<string | null> {
     const value = await this.getAndTouchBytesInNamespace(namespace, key, ttlSeconds);
     return value === null ? null : UTF8_DECODER.decode(value);
   }
 
-  private async getAndTouchBytesInNamespace(namespace: Uint8Array, key: string | Uint8Array, ttlSeconds: number | null): Promise<Buffer | null> {
+  private async getAndTouchBytesInNamespace(
+    namespace: Uint8Array,
+    key: string | Uint8Array,
+    ttlSeconds: number | null,
+  ): Promise<Buffer | null> {
     if (this.closed) throw new AlreadyClosedError();
     checkTouchTtl(ttlSeconds);
     checkKey(typeof key === "string" ? utf8Bytes(key) : key, namespace);
@@ -1984,12 +2069,23 @@ export class NanocachedClient {
   // one sub-frame per node" does not hold). Keys are deduplicated like
   // getMany's.
 
-  private async touchManyInNamespace(namespace: Uint8Array, keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, boolean>> {
+  private async touchManyInNamespace(
+    namespace: Uint8Array,
+    keys: readonly string[],
+    ttlSeconds: number | null,
+  ): Promise<Map<string, boolean>> {
     return (await this.multiTouch(namespace, keys, ttlSeconds, false, "touchMany")) as Map<string, boolean>;
   }
 
-  private async getManyAndTouchBytesInNamespace(namespace: Uint8Array, keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, Buffer>> {
-    return (await this.multiTouch(namespace, keys, ttlSeconds, true, "getManyAndTouch/getManyAndTouchBytes")) as Map<string, Buffer>;
+  private async getManyAndTouchBytesInNamespace(
+    namespace: Uint8Array,
+    keys: readonly string[],
+    ttlSeconds: number | null,
+  ): Promise<Map<string, Buffer>> {
+    return (await this.multiTouch(namespace, keys, ttlSeconds, true, "getManyAndTouch/getManyAndTouchBytes")) as Map<
+      string,
+      Buffer
+    >;
   }
 
   /** The shared body of touchMany (`get` false: a map of boolean per key)
@@ -2031,7 +2127,13 @@ export class NanocachedClient {
 
     if (this.target.kind !== "cluster") {
       // Single/proxy mode: no retry layer, as in getManyBytesInNamespace.
-      const { entries, resolved, error } = await this.multiTouchChunked(() => this.connectionForSingleTarget(), namespace, keyBytes, ttlSeconds, get);
+      const { entries, resolved, error } = await this.multiTouchChunked(
+        () => this.connectionForSingleTarget(),
+        namespace,
+        keyBytes,
+        ttlSeconds,
+        get,
+      );
       if (error !== undefined) {
         if (wasRejectedByServer(error)) throw new ServerTooOldError("y");
         // issue #411, as for getMany: an earlier sub-frame already
@@ -2048,7 +2150,10 @@ export class NanocachedClient {
         throw error;
       }
       if (entries.some((entry) => entry.kind === "wrongNode")) {
-        if (get) throw new PartialWrongNodeError(collect(new Map(entries.flatMap((entry, i) => (entry.kind === "wrongNode" ? [] : [[i, entry] as const])))));
+        if (get)
+          throw new PartialWrongNodeError(
+            collect(new Map(entries.flatMap((entry, i) => (entry.kind === "wrongNode" ? [] : [[i, entry] as const])))),
+          );
         throw new WrongNodeError();
       }
       return collect(new Map(entries.map((entry, i) => [i, entry] as const)));
@@ -2128,8 +2233,14 @@ export class NanocachedClient {
     get: boolean,
   ): Promise<{ entries: TouchAnswer[]; resolved: number; sentEnd: number; error: unknown }> {
     const entries: TouchAnswer[] = [];
-    for (let start = 0; start < keyBytes.length; ) {
-      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]), maxKeysForNamespace(namespace));
+    for (let start = 0; start < keyBytes.length;) {
+      const end = nextChunkEnd(
+        namespace,
+        keyBytes.length,
+        start,
+        (i) => multiGetEntryCost(keyBytes[i]),
+        maxKeysForNamespace(namespace),
+      );
       let connected = false;
       try {
         const connection = await connectionFor();
@@ -2240,7 +2351,11 @@ export class NanocachedClient {
         if (error !== undefined && holdsPrimary) {
           state.lastCause = error;
           if (wasRejectedByServer(error)) state.rejected = true;
-          else if (ttlSeconds === 0 && isConnectionError(error) && !(error instanceof ConnectionLostError && error.requestWasSent === false)) {
+          else if (
+            ttlSeconds === 0 &&
+            isConnectionError(error) &&
+            !(error instanceof ConnectionLostError && error.requestWasSent === false)
+          ) {
             lostIsFinal = true;
             state.lostCause = error;
           }
@@ -2268,7 +2383,12 @@ export class NanocachedClient {
       };
 
       const pureReplica = leg.isPrimary.every((primary) => !primary);
-      if (this.fireAndForgetReplicas && pureReplica && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+      if (
+        this.fireAndForgetReplicas &&
+        pureReplica &&
+        !this.closed &&
+        this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight
+      ) {
         // Detached, as in multiSetPass: a pure-replica leg holds no
         // primary key, so it has nothing to contribute to `retry`, and
         // `!this.closed` is rechecked synchronously, with no `await`
@@ -2276,7 +2396,7 @@ export class NanocachedClient {
         const background = runLeg();
         const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
-        settled.finally(() => this.backgroundReplicaWrites.delete(background));
+        void settled.finally(() => this.backgroundReplicaWrites.delete(background));
         backgroundLegs.push(background);
         continue;
       }
@@ -2305,7 +2425,11 @@ export class NanocachedClient {
    * no replica leg. Failures are swallowed into stats().replicaWriteFailures
    * as in `multiTouchPass`, and a pure-replica leg is eligible for
    * fireAndForgetReplicas. */
-  private async multiTouchReplicaFanOut(namespace: Uint8Array, keyBytes: readonly Buffer[], state: MultiTouchState): Promise<void> {
+  private async multiTouchReplicaFanOut(
+    namespace: Uint8Array,
+    keyBytes: readonly Buffer[],
+    state: MultiTouchState,
+  ): Promise<void> {
     const legs = new Map<string, number[]>();
     for (const [index, answeredBy] of state.answeredBy) {
       for (const name of this.ownerNames(keyBytes[index], namespace)) {
@@ -2336,7 +2460,7 @@ export class NanocachedClient {
         const background = runLeg();
         const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
-        settled.finally(() => this.backgroundReplicaWrites.delete(background));
+        void settled.finally(() => this.backgroundReplicaWrites.delete(background));
         backgroundLegs.push(background);
         continue;
       }
@@ -2715,7 +2839,7 @@ export class NanocachedClient {
     keyBytes: readonly Buffer[],
   ): Promise<MultiEntry[]> {
     const entries: MultiEntry[] = new Array(keyBytes.length);
-    for (let start = 0; start < keyBytes.length; ) {
+    for (let start = 0; start < keyBytes.length;) {
       const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]));
       try {
         const connection = await connectionFor();
@@ -2751,7 +2875,11 @@ export class NanocachedClient {
     return this.setManyStringInNamespace(EMPTY_NAMESPACE, values, ttlSeconds);
   }
 
-  private async setManyStringInNamespace(namespace: Uint8Array, values: Record<string, string>, ttlSeconds: number): Promise<void> {
+  private async setManyStringInNamespace(
+    namespace: Uint8Array,
+    values: Record<string, string>,
+    ttlSeconds: number,
+  ): Promise<void> {
     // Prototype-less: on a plain `{}`, `raw["__proto__"] = ...` sets the
     // prototype instead of adding an own property, so a key with that
     // name would be silently dropped from the batch (`set` stores it).
@@ -2875,9 +3003,13 @@ export class NanocachedClient {
     const cause = tracker.lastCause;
     const causeMessage = cause instanceof Error ? cause.message : "nanocached: no owner is reachable for these keys";
     const stored = keys.filter((_, index) => tracker.primaryAcknowledged.has(index));
-    throw new PartialConnectionLostError(stored, `nanocached: setMany could not reach the primary of ${retryIndices.length} of ${keys.length} keys: ${causeMessage}`, {
-      requestWasSent: cause instanceof ConnectionLostError ? cause.requestWasSent : true,
-    });
+    throw new PartialConnectionLostError(
+      stored,
+      `nanocached: setMany could not reach the primary of ${retryIndices.length} of ${keys.length} keys: ${causeMessage}`,
+      {
+        requestWasSent: cause instanceof ConnectionLostError ? cause.requestWasSent : true,
+      },
+    );
   }
 
   /** multiGetChunked's write-side twin: one or more `o` sub-frames
@@ -2894,11 +3026,22 @@ export class NanocachedClient {
     ttlSeconds: number,
   ): Promise<MultiAckEntry[]> {
     const entries: MultiAckEntry[] = new Array(keyBytes.length);
-    for (let start = 0; start < keyBytes.length; ) {
-      const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiSetEntryCost(keyBytes[i], valueBytes[i]), maxKeysForNamespace(namespace));
+    for (let start = 0; start < keyBytes.length;) {
+      const end = nextChunkEnd(
+        namespace,
+        keyBytes.length,
+        start,
+        (i) => multiSetEntryCost(keyBytes[i], valueBytes[i]),
+        maxKeysForNamespace(namespace),
+      );
       try {
         const connection = await connectionFor();
-        const chunkEntries = await connection.multiSet(keyBytes.slice(start, end), valueBytes.slice(start, end), ttlSeconds, namespace);
+        const chunkEntries = await connection.multiSet(
+          keyBytes.slice(start, end),
+          valueBytes.slice(start, end),
+          ttlSeconds,
+          namespace,
+        );
         for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];
       } catch (error) {
         // multiGetChunked's write-side twin of the issue #411 fix — see
@@ -2999,7 +3142,13 @@ export class NanocachedClient {
         try {
           const groupKeyBytes = group.indices.map((index) => keyBytes[index]);
           const groupValueBytes = group.indices.map((index) => valueBytes[index]);
-          entries = await this.multiSetChunked(() => this.memberConnection(name), namespace, groupKeyBytes, groupValueBytes, ttlSeconds);
+          entries = await this.multiSetChunked(
+            () => this.memberConnection(name),
+            namespace,
+            groupKeyBytes,
+            groupValueBytes,
+            ttlSeconds,
+          );
         } catch (error) {
           // issue #411: this leg already got chunked into more than one
           // `o` sub-frame, and an earlier one succeeded before the
@@ -3052,7 +3201,12 @@ export class NanocachedClient {
       };
 
       const pureReplica = group.isPrimary.every((primary) => !primary);
-      if (this.fireAndForgetReplicas && pureReplica && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+      if (
+        this.fireAndForgetReplicas &&
+        pureReplica &&
+        !this.closed &&
+        this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight
+      ) {
         // Detached: a pure-replica leg holds no primary key, so it has
         // nothing to contribute to `retry` — see runLeg's own bounds.
         // `!this.closed` is rechecked synchronously, immediately before
@@ -3066,7 +3220,7 @@ export class NanocachedClient {
         const background = runLeg();
         const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
-        settled.finally(() => this.backgroundReplicaWrites.delete(background));
+        void settled.finally(() => this.backgroundReplicaWrites.delete(background));
         backgroundLegs.push(background);
         continue;
       }
@@ -3114,7 +3268,9 @@ export class NanocachedClient {
       () =>
         this.target.kind === "cluster"
           ? this.incrOnOwners(key, namespace, delta)
-          : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) => connection.incr(key, delta, namespace)),
+          : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) =>
+              connection.incr(key, delta, namespace),
+            ),
       { nonIdempotent: true },
     );
     if (result === null) return null;
@@ -3166,7 +3322,9 @@ export class NanocachedClient {
       () =>
         this.target.kind === "cluster"
           ? this.casDeleteOnOwners(key, namespace, token)
-          : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) => connection.casDelete(key, token, namespace)),
+          : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) =>
+              connection.casDelete(key, token, namespace),
+            ),
       { nonIdempotent: true },
     );
   }
@@ -3215,14 +3373,17 @@ export class NanocachedClient {
       incr: (key, delta) => this.incrInNamespace(namespaceBytes, key, delta),
       decr: (key, delta) => this.incrInNamespace(namespaceBytes, key, -delta),
       putIfAbsent: (key, value, ttlSeconds) => this.casInNamespace(namespaceBytes, key, value, { kind: "absent" }, ttlSeconds),
-      replaceIfPresent: (key, value, ttlSeconds) => this.casInNamespace(namespaceBytes, key, value, { kind: "present" }, ttlSeconds),
-      replace: (key, token, newValue, ttlSeconds) => this.casInNamespace(namespaceBytes, key, newValue, { kind: "digest", digest: token }, ttlSeconds),
+      replaceIfPresent: (key, value, ttlSeconds) =>
+        this.casInNamespace(namespaceBytes, key, value, { kind: "present" }, ttlSeconds),
+      replace: (key, token, newValue, ttlSeconds) =>
+        this.casInNamespace(namespaceBytes, key, newValue, { kind: "digest", digest: token }, ttlSeconds),
       deleteIfMatches: (key, token) => this.casDeleteInNamespace(namespaceBytes, key, token),
       touch: (key, ttlSeconds) => this.touchInNamespace(namespaceBytes, key, ttlSeconds),
       getAndTouch: (key, ttlSeconds) => this.getAndTouchInNamespace(namespaceBytes, key, ttlSeconds),
       getAndTouchBytes: (key, ttlSeconds) => this.getAndTouchBytesInNamespace(namespaceBytes, key, ttlSeconds),
       touchMany: (keys, ttlSeconds) => this.touchManyInNamespace(namespaceBytes, keys, ttlSeconds),
-      getManyAndTouch: (keys, ttlSeconds) => this.decodeBatch(this.getManyAndTouchBytesInNamespace(namespaceBytes, keys, ttlSeconds)),
+      getManyAndTouch: (keys, ttlSeconds) =>
+        this.decodeBatch(this.getManyAndTouchBytesInNamespace(namespaceBytes, keys, ttlSeconds)),
       getManyAndTouchBytes: (keys, ttlSeconds) => this.getManyAndTouchBytesInNamespace(namespaceBytes, keys, ttlSeconds),
     });
   }
@@ -3303,10 +3464,7 @@ export class NanocachedClient {
    * HEDGE_READ_TUNING.maxLoserLegs concurrently tracked legs, though, the
    * decided read's own losers are awaited synchronously right here
    * instead (issue #276) — see resolveLosers below. */
-  private async readHedged<T>(
-    op: (connection: Connection) => Promise<T>,
-    ownerNames: string[],
-  ): Promise<T> {
+  private async readHedged<T>(op: (connection: Connection) => Promise<T>, ownerNames: string[]): Promise<T> {
     const hedgeAfterMs = this.readHedgeAfterMs;
     if (hedgeAfterMs === undefined) {
       throw new NanocachedError("nanocached: internal error — readHedged called without readHedgeAfterMs");
@@ -3341,12 +3499,12 @@ export class NanocachedClient {
           (value): Outcome => ({ index, ok: true, value }),
           (error): Outcome => ({ index, ok: false, error }),
         );
-      this.hedgedReads.add(outcome as Promise<unknown>);
+      this.hedgedReads.add(outcome);
       // Self-removing: once this leg settles — whether it's the winner or
       // a loser left running past the read's return — it no longer needs
       // close() to wait on it specifically (a loser still in flight stays
       // in the set via this same entry until then).
-      outcome.finally(() => this.hedgedReads.delete(outcome as Promise<unknown>));
+      void outcome.finally(() => this.hedgedReads.delete(outcome));
       return outcome;
     };
 
@@ -3371,7 +3529,7 @@ export class NanocachedClient {
         return;
       }
       for (const loser of losers) {
-        this.hedgedReads.delete(loser.promise as Promise<unknown>);
+        this.hedgedReads.delete(loser.promise);
       }
       await Promise.allSettled(losers.map((loser) => loser.promise));
     };
@@ -3520,11 +3678,14 @@ export class NanocachedClient {
     replicasAfterPrimary = false,
     /** The value bytes `op` sends when they are the caller's own buffer
      * (an uncompressed `set`), for a background leg to copy. */
-    callerValue: Buffer | undefined = undefined,
+    callerValue?: Buffer,
   ): Promise<T> {
     const [primaryName, ...replicaNames] = this.ownerNames(key, namespace);
     if (primaryName === undefined) {
-      throw new ConnectionLostError("nanocached: no owner is reachable for this key", primaryNotResendable ? { requestWasSent: false } : undefined);
+      throw new ConnectionLostError(
+        "nanocached: no owner is reachable for this key",
+        primaryNotResendable ? { requestWasSent: false } : undefined,
+      );
     }
 
     // Genuine programming errors (non-swallowable) raised by background
@@ -3586,7 +3747,11 @@ export class NanocachedClient {
         // exactly as if fireAndForgetReplicas were off — that leg is awaited
         // by this very call via Promise.allSettled below, so it can't outlive
         // close()'s teardown either.
-        if (this.fireAndForgetReplicas && !this.closed && this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight) {
+        if (
+          this.fireAndForgetReplicas &&
+          !this.closed &&
+          this.backgroundReplicaWrites.size < FIRE_AND_FORGET_TUNING.maxInFlight
+        ) {
           const background = replicaWrite(name, true);
           // Now that replicaWrite can legitimately reject (a programming bug
           // — see isSwallowable), attach a rejection handler synchronously,
@@ -3598,7 +3763,7 @@ export class NanocachedClient {
           // ticks later.
           const settled = background.catch(() => {});
           this.backgroundReplicaWrites.add(background);
-          settled.finally(() => this.backgroundReplicaWrites.delete(background));
+          void settled.finally(() => this.backgroundReplicaWrites.delete(background));
           continue;
         }
         const write = replicaWrite(name);
@@ -3755,7 +3920,7 @@ export class NanocachedClient {
         const background = replicaWrite(name, true);
         const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
-        settled.finally(() => this.backgroundReplicaWrites.delete(background));
+        void settled.finally(() => this.backgroundReplicaWrites.delete(background));
         backgroundLegs.push(background);
         continue;
       }
@@ -3858,7 +4023,7 @@ export class NanocachedClient {
         const background = replicaWrite(name, true);
         const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
-        settled.finally(() => this.backgroundReplicaWrites.delete(background));
+        void settled.finally(() => this.backgroundReplicaWrites.delete(background));
         backgroundLegs.push(background);
         continue;
       }
@@ -3927,7 +4092,7 @@ export class NanocachedClient {
         const background = replicaWrite(name, true);
         const settled = background.catch(() => {});
         this.backgroundReplicaWrites.add(background);
-        settled.finally(() => this.backgroundReplicaWrites.delete(background));
+        void settled.finally(() => this.backgroundReplicaWrites.delete(background));
         backgroundLegs.push(background);
         continue;
       }
@@ -4325,13 +4490,18 @@ export class NanocachedClient {
           // Connection-classified and never sent (like the dial failure
           // above), so the refresh-and-retry layer reroutes an operation
           // that meets the cached error, even a non-idempotent one.
-          error: new ConnectionLostError(`nanocached: discovery returned a non-node address: ${node.address}`, { requestWasSent: false }),
+          error: new ConnectionLostError(`nanocached: discovery returned a non-node address: ${node.address}`, {
+            requestWasSent: false,
+          }),
         });
         continue;
       }
 
       trackOpenTarget(this.url, [nodeIdentified.socket]);
-      members.set(node.name, { address: node.address, connection: new Connection(nodeIdentified.socket, nodeIdentified.tagged, () => this.transientRetries++) });
+      members.set(node.name, {
+        address: node.address,
+        connection: new Connection(nodeIdentified.socket, nodeIdentified.tagged, () => this.transientRetries++),
+      });
     }
 
     this.target = {
@@ -4375,7 +4545,13 @@ export class NanocachedClient {
     for (const address of this.addresses) {
       let identified;
       try {
-        identified = await connectAndIdentify({ host: address.host, port: address.port, authSecret: this.authSecret, tls: this.tls, ca: this.ca });
+        identified = await connectAndIdentify({
+          host: address.host,
+          port: address.port,
+          authSecret: this.authSecret,
+          tls: this.tls,
+          ca: this.ca,
+        });
       } catch (error) {
         // An actual programming bug (isSwallowable) still propagates.
         if (!isSwallowable(error)) throw error;
@@ -4414,7 +4590,13 @@ export class NanocachedClient {
     for (const address of this.addresses) {
       let result;
       try {
-        result = await connectAndListProxies({ host: address.host, port: address.port, authSecret: this.authSecret, tls: this.tls, ca: this.ca });
+        result = await connectAndListProxies({
+          host: address.host,
+          port: address.port,
+          authSecret: this.authSecret,
+          tls: this.tls,
+          ca: this.ca,
+        });
       } catch (error) {
         if (!isSwallowable(error)) throw error;
         continue;
@@ -4469,7 +4651,12 @@ export class NanocachedClient {
 
       let identified;
       try {
-        identified = await connectAndIdentify({ ...splitHostPort(proxy.address), authSecret: this.authSecret, tls: this.tls, ca: this.ca });
+        identified = await connectAndIdentify({
+          ...splitHostPort(proxy.address),
+          authSecret: this.authSecret,
+          tls: this.tls,
+          ca: this.ca,
+        });
       } catch (error) {
         if (!isSwallowable(error)) throw error;
         continue;
@@ -4488,7 +4675,11 @@ export class NanocachedClient {
       }
 
       trackOpenTarget(this.url, [identified.socket]);
-      this.target = { kind: "proxy", connection: new Connection(identified.socket, identified.tagged, () => this.transientRetries++), address: proxy.address };
+      this.target = {
+        kind: "proxy",
+        connection: new Connection(identified.socket, identified.tagged, () => this.transientRetries++),
+        address: proxy.address,
+      };
       this.nodeUrlList = [proxy.address];
       this.lastNodeListFetch = Date.now();
       // In proxy mode `target.address` is the only address this client

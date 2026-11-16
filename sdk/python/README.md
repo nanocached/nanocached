@@ -726,6 +726,22 @@ produce a value the protocol can't safely round-trip — see "Counters
   a convention shared across the SDKs. Authentication
   failure is `AuthenticationError`, a `NanocachedError` subclass.
 
+## Testing
+
+```sh
+cd sdk/python
+python3 -m venv .venv && .venv/bin/python -m pip install --group dev  # pip >= 25.1
+.venv/bin/ruff format --check .   # `ruff format .` applies it
+.venv/bin/ruff check .
+.venv/bin/mypy                    # strict on src/, non-strict on tests/
+PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -v
+```
+
+The `dev` dependency group in `pyproject.toml` pins ruff and mypy;
+`uv venv && uv pip install --group dev` does the same. The SDK itself has
+no dependencies, and the tests run against in-process mock servers
+(`tests/mock_servers.py`), so no server binary is needed.
+
 ## License
 
 MIT

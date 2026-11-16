@@ -8,8 +8,10 @@ from __future__ import annotations
 import unittest
 
 from support import SECRET_NODE
+
 from django.core.cache import caches
 from nanocached import AuthenticationError
+
 from nanocached_django import NanocachedCache
 
 

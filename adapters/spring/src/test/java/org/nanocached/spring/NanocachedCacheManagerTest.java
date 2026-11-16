@@ -158,9 +158,8 @@ class NanocachedCacheManagerTest {
         // Issue #1886: ChronoUnit.FOREVER is Duration.ofSeconds(Long.MAX_VALUE,
         // 999_999_999); rounding its nano part up used to wrap the seconds to
         // Long.MIN_VALUE, which Math.max(1, ..) turned into a 1s TTL.
-        NanocachedCacheManager manager = manager()
-                .ttl("forever", ChronoUnit.FOREVER.getDuration())
-                .build();
+        NanocachedCacheManager manager =
+                manager().ttl("forever", ChronoUnit.FOREVER.getDuration()).build();
         manager.getCache("forever").put("k", new User("Alice", 30));
 
         byte[] key = "String:k".getBytes(StandardCharsets.UTF_8);
@@ -257,9 +256,7 @@ class NanocachedCacheManagerTest {
                 }));
         assertInstanceOf(IllegalStateException.class, thrown.getCause());
         // The failure was not cached: a later loader run does compute.
-        assertEquals(
-                new User("Alice", 30),
-                cache.get("alice", () -> new User("Alice", 30)));
+        assertEquals(new User("Alice", 30), cache.get("alice", () -> new User("Alice", 30)));
     }
 
     @Test
@@ -383,9 +380,8 @@ class NanocachedCacheManagerTest {
 
     @Test
     void fixedNameManagerRejectsUnknownNamesWithNull() {
-        NanocachedCacheManager manager = manager()
-                .cacheNames(List.of("users", "orders"))
-                .build();
+        NanocachedCacheManager manager =
+                manager().cacheNames(List.of("users", "orders")).build();
 
         assertNotNull(manager.getCache("users"));
         assertNull(manager.getCache("surprise"));
@@ -418,11 +414,7 @@ class NanocachedCacheManagerTest {
                 return new String(bytes, StandardCharsets.UTF_8);
             }
         };
-        Cache cache = manager()
-                .serializer(utf8)
-                .allowNullValues(false)
-                .build()
-                .getCache("users");
+        Cache cache = manager().serializer(utf8).allowNullValues(false).build().getCache("users");
 
         cache.put("k", "plain text");
 
@@ -436,8 +428,7 @@ class NanocachedCacheManagerTest {
 
     @Test
     void customKeyConverterIsUsedForKeys() {
-        CacheKeyConverter idOnly = key -> ("user-" + ((User) key).age())
-                .getBytes(StandardCharsets.UTF_8);
+        CacheKeyConverter idOnly = key -> ("user-" + ((User) key).age()).getBytes(StandardCharsets.UTF_8);
         Cache cache = manager().keyConverter(idOnly).build().getCache("users");
 
         cache.put(new User("Alice", 30), new User("Alice", 30));
@@ -461,14 +452,12 @@ class NanocachedCacheManagerTest {
         Object nativeCache = cache.getNativeCache();
         assertInstanceOf(NanocachedClient.Namespace.class, nativeCache);
         assertArrayEquals(
-                "users".getBytes(StandardCharsets.UTF_8),
-                ((NanocachedClient.Namespace) nativeCache).namespace());
+                "users".getBytes(StandardCharsets.UTF_8), ((NanocachedClient.Namespace) nativeCache).namespace());
     }
 
     @Test
     void builderRejectsNegativeTtlAndNullClient() {
-        assertThrows(IllegalArgumentException.class,
-                () -> manager().defaultTtl(Duration.ofSeconds(-1)));
+        assertThrows(IllegalArgumentException.class, () -> manager().defaultTtl(Duration.ofSeconds(-1)));
         assertThrows(NullPointerException.class, () -> NanocachedCacheManager.builder(null));
     }
 }

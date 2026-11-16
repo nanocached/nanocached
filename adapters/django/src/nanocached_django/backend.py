@@ -40,24 +40,29 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import enum
 import math
 import os
 import pickle
 import re
 import threading
 import weakref
+from collections.abc import Callable, Coroutine, Iterable, Mapping
+from typing import Any, Final, Literal, TypeVar
 
 from django.core.cache.backends.base import DEFAULT_TIMEOUT, BaseCache
 from django.core.exceptions import ImproperlyConfigured
-
 from nanocached import (
     CompressionIncompatibleError,
+    Namespace,
     NanocachedClient,
     PartialConnectionLostError,
     PartialSetConnectionLostError,
     PartialWrongNodeError,
     WrongNodeError,
 )
+
+_T = TypeVar("_T")
 
 # OPTIONS.NAMESPACE default — every key this backend touches lives under
 # this namespace unless the CACHES entry overrides it (issue #105).
@@ -93,7 +98,15 @@ _CONNECT_OPTION_KWARGS: dict[str, str] = {
 # this set is a mistake, and it must not be ignored quietly: ``"Tls": True``
 # would otherwise leave TLS off and send the secret in the clear.
 _KNOWN_OPTION_KEYS: frozenset[str] = frozenset(
-    {"NAMESPACE", "SECRET", "CLOSE_ON_REQUEST", "MAX_ENTRIES", "max_entries", "CULL_FREQUENCY", "cull_frequency"}
+    {
+        "NAMESPACE",
+        "SECRET",
+        "CLOSE_ON_REQUEST",
+        "MAX_ENTRIES",
+        "max_entries",
+        "CULL_FREQUENCY",
+        "cull_frequency",
+    }
     | set(_CONNECT_OPTION_KWARGS)
 )
 
@@ -105,6 +118,7 @@ _KNOWN_OPTION_KEYS: frozenset[str] = frozenset(
 # keeps shutting the backend down between every attempt.
 _RUN_RECONNECT_ATTEMPTS = 3
 
+
 # get_backend_timeout()'s sentinel for "don't cache this": Django's
 # timeout=0 (or a negative timeout) means "expire immediately", but
 # nanocached's wire TTL uses the *opposite* polarity — 0 there means "no
@@ -113,7 +127,13 @@ _RUN_RECONNECT_ATTEMPTS = 3
 # TTL at all. Distinguished from a real ttl_seconds int (which is always
 # >= 1 once this sentinel doesn't apply) with `is`, the same way Django's
 # own DEFAULT_TIMEOUT sentinel is compared.
-_DO_NOT_CACHE = object()
+class _Sentinel(enum.Enum):
+    # A one-member enum rather than a bare object(), so a type checker can
+    # narrow ``wire_ttl is _DO_NOT_CACHE`` (PEP 484's sentinel pattern).
+    DO_NOT_CACHE = enum.auto()
+
+
+_DO_NOT_CACHE: Final = _Sentinel.DO_NOT_CACHE
 
 # The largest TTL the wire carries (the SDK validates ``0 <= ttl <= 2**64 -
 # 1``). A longer Django timeout is not an error: BaseCache/LocMemCache just
@@ -174,7 +194,7 @@ def _decode_value(raw: bytes) -> object:
     return pickle.loads(raw)
 
 
-async def _delete_all(handle, cache_keys: list) -> None:
+async def _delete_all(handle: Namespace, cache_keys: list[str]) -> None:
     """``delete_many``'s fan-out (issue #233): every key's ``delete()``
     dispatched concurrently on ``handle``'s own event loop, in the one
     coroutine ``_run`` awaits — a plain generator expression passed
@@ -194,13 +214,17 @@ async def _delete_all(handle, cache_keys: list) -> None:
     partial failure isn't collected per-key (``BaseCache.delete_many`` has
     no per-key return value to collect it into, unlike ``set_many``), it
     raises — just only after every leg has actually finished."""
-    results = await asyncio.gather(*(handle.delete(cache_key) for cache_key in cache_keys), return_exceptions=True)
+    results = await asyncio.gather(
+        *(handle.delete(cache_key) for cache_key in cache_keys), return_exceptions=True
+    )
     for result in results:
         if isinstance(result, BaseException):
             raise result
 
 
-async def _get_many_bytes_resolved(handle, cache_keys: list) -> dict:
+async def _get_many_bytes_resolved(
+    handle: Namespace, cache_keys: list[str | bytes]
+) -> dict[str | bytes, bytes]:
     """``get_many_bytes``, but retrying a mid-batch partial failure's
     still-unresolved remainder once instead of discarding an otherwise-
     successful batch (issue #439, mirroring cache-manager's
@@ -236,7 +260,9 @@ async def _get_many_bytes_resolved(handle, cache_keys: list) -> dict:
         return merged
 
 
-async def _set_many_resolved(handle, payload: dict, ttl_seconds: int) -> None:
+async def _set_many_resolved(
+    handle: Namespace, payload: Mapping[str | bytes, str | bytes], ttl_seconds: int
+) -> None:
     """``set_many``, but retrying a mid-batch partial failure's
     remainder once instead of failing an otherwise-successful batch
     outright (issue #439, mirroring cache-manager's ``msetResolved`` and
@@ -261,9 +287,13 @@ async def _set_many_resolved(handle, payload: dict, ttl_seconds: int) -> None:
         remaining = {key: value for key, value in payload.items() if key not in stored}
         if not remaining:
             return
-        await handle.set_many(remaining, ttl_seconds=ttl_seconds)  # a second failure propagates as-is
+        await handle.set_many(
+            remaining, ttl_seconds=ttl_seconds
+        )  # a second failure propagates as-is
     except WrongNodeError:
-        await handle.set_many(payload, ttl_seconds=ttl_seconds)  # no partial payload — resend the whole batch
+        await handle.set_many(
+            payload, ttl_seconds=ttl_seconds
+        )  # no partial payload — resend the whole batch
 
 
 def _split_host_port(address: str) -> tuple[str, int]:
@@ -275,7 +305,7 @@ def _split_host_port(address: str) -> tuple[str, int]:
     host, separator, port = address.rpartition(":")
     if not separator or not port.isascii() or not port.isdigit():
         raise ImproperlyConfigured(
-            f"nanocached_django: invalid LOCATION address {address!r}, expected \"host:port\""
+            f'nanocached_django: invalid LOCATION address {address!r}, expected "host:port"'
         )
     # An IPv6 literal is written in brackets to keep its colons apart from
     # the port ("[::1]:8357"); the SDK wants the bare address, and would
@@ -285,7 +315,11 @@ def _split_host_port(address: str) -> tuple[str, int]:
     return host, int(port)
 
 
-def _parse_addresses(location) -> list[tuple[str, int]]:
+# None/"": an unset LOCATION, rejected below like an empty list.
+_Location = str | list[str] | tuple[str, ...] | None
+
+
+def _parse_addresses(location: _Location) -> list[tuple[str, int]]:
     """LOCATION accepts what the issue spec's example shows: a list of
     ``"host:port"`` strings (cluster / discovery addresses), or a single
     ``"host:port"`` string — optionally ``;``/``,``-separated for more
@@ -299,7 +333,7 @@ def _parse_addresses(location) -> list[tuple[str, int]]:
         entries = []
     if not entries:
         raise ImproperlyConfigured(
-            "nanocached_django: CACHES LOCATION must name at least one \"host:port\" address"
+            'nanocached_django: CACHES LOCATION must name at least one "host:port" address'
         )
     return [_split_host_port(entry.strip()) for entry in entries]
 
@@ -326,7 +360,12 @@ class _Bridge:
     a cheap handle over the shared client, kept per namespace in
     ``handles``."""
 
-    def __init__(self, addresses, secret, connect_kwargs) -> None:
+    def __init__(
+        self,
+        addresses: list[tuple[str, int]],
+        secret: str | None,
+        connect_kwargs: dict[str, Any],
+    ) -> None:
         self.addresses = addresses
         self.secret = secret
         self.connect_kwargs = connect_kwargs
@@ -338,7 +377,7 @@ class _Bridge:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.thread: threading.Thread | None = None
         self.client: NanocachedClient | None = None
-        self.handles: dict[str, object] = {}
+        self.handles: dict[str, Namespace] = {}
         # The PID that started (and whose thread drives) self.loop — see
         # ensure_started's fork check (issue #393).
         self.pid: int | None = None
@@ -379,9 +418,7 @@ class _Bridge:
                 started.set()
                 loop.run_forever()
 
-            thread = threading.Thread(
-                target=run_loop, name="nanocached-django-loop", daemon=True
-            )
+            thread = threading.Thread(target=run_loop, name="nanocached-django-loop", daemon=True)
             thread.start()
             started.wait()
             # Assigned before the connect below (not after) so a second
@@ -413,7 +450,9 @@ class _Bridge:
         )
         self.handles = {}
 
-    def snapshot(self, namespace: str):
+    def snapshot(
+        self, namespace: str
+    ) -> tuple[asyncio.AbstractEventLoop, Namespace] | tuple[None, None]:
         """``(loop, namespace handle)``, read together under ``lock`` —
         ``(None, None)`` if a shutdown has the bridge torn down (see
         ``NanocachedCache._run``, issue #185)."""
@@ -456,6 +495,7 @@ class _Bridge:
                 asyncio.run_coroutine_threadsafe(client.close(), loop).result()
         finally:
             loop.call_soon_threadsafe(loop.stop)
+            assert thread is not None  # set and cleared together with loop
             thread.join()
             loop.close()
 
@@ -464,20 +504,27 @@ class _Bridge:
 # references on purpose: a bridge is exactly what must outlive the
 # short-lived instances (and threads) that use it. Bounded by the number
 # of distinct CACHES configurations, not by thread or request count.
-_bridges: dict[tuple, _Bridge] = {}
+_BridgeKey = tuple[tuple[tuple[str, int], ...], str | None, str]
+_bridges: dict[_BridgeKey, _Bridge] = {}
 _bridges_lock = threading.Lock()
 # The private bridges of CLOSE_ON_REQUEST instances (issue #1482). Weak, so
 # a discarded instance's bridge is not kept alive by this registry; it only
 # exists so the at-fork hook below can reset those bridges' locks too.
-_private_bridges: "weakref.WeakSet[_Bridge]" = weakref.WeakSet()
+_private_bridges: weakref.WeakSet[_Bridge] = weakref.WeakSet()
 
 
-def _get_bridge(addresses, secret, connect_kwargs, *, shared: bool) -> _Bridge:
+def _get_bridge(
+    addresses: list[tuple[str, int]],
+    secret: str | None,
+    connect_kwargs: dict[str, Any],
+    *,
+    shared: bool,
+) -> _Bridge:
     if not shared:
-        bridge = _Bridge(addresses, secret, connect_kwargs)
+        private = _Bridge(addresses, secret, connect_kwargs)
         with _bridges_lock:
-            _private_bridges.add(bridge)
-        return bridge
+            _private_bridges.add(private)
+        return private
     key = (tuple(addresses), secret, repr(sorted(connect_kwargs.items())))
     with _bridges_lock:
         bridge = _bridges.get(key)
@@ -555,15 +602,16 @@ class NanocachedCache(BaseCache):
     ``BaseCache`` itself (``make_key``/``get_backend_timeout``'s base
     default) exactly as for any other Django cache backend."""
 
-    def __init__(self, server, params) -> None:
+    def __init__(self, server: _Location, params: dict[str, Any]) -> None:
         super().__init__(params)
         self._addresses = _parse_addresses(server)
         options = params.get("OPTIONS", {})
         unknown = sorted(str(key) for key in options if key not in _KNOWN_OPTION_KEYS)
         if unknown:
+            valid = sorted(_KNOWN_OPTION_KEYS - {"max_entries", "cull_frequency"})
             raise ImproperlyConfigured(
                 f"nanocached: unknown OPTIONS key(s) {', '.join(unknown)}; "
-                f"valid keys are {', '.join(sorted(_KNOWN_OPTION_KEYS - {'max_entries', 'cull_frequency'}))}"
+                f"valid keys are {', '.join(valid)}"
             )
         self._namespace = options.get("NAMESPACE", _DEFAULT_NAMESPACE)
         self._secret = options.get("SECRET")
@@ -618,7 +666,7 @@ class NanocachedCache(BaseCache):
         return self._bridge.lock
 
     @property
-    def _namespace_handle(self):
+    def _namespace_handle(self) -> Namespace | None:
         return self._bridge.snapshot(self._namespace)[1]
 
     # ── the sync/async bridge ───────────────────────────────────────
@@ -626,7 +674,7 @@ class NanocachedCache(BaseCache):
     def _ensure_started(self) -> None:
         self._bridge.ensure_started()
 
-    def _run(self, make_coro):
+    def _run(self, make_coro: Callable[[Namespace], Coroutine[Any, Any, _T]]) -> _T:
         """Runs ``make_coro(handle)`` — a one-argument callable that
         builds the coroutine to await from the namespace handle, e.g.
         ``lambda handle: handle.get_bytes(key)`` — on the bridge's loop
@@ -671,7 +719,7 @@ class NanocachedCache(BaseCache):
             "this operation and could not reconnect; retry the operation"
         )
 
-    def close(self, **kwargs) -> None:
+    def close(self, **kwargs: Any) -> None:
         """Called by Django after every request (``request_finished`` →
         ``close_caches``): a no-op unless ``CLOSE_ON_REQUEST`` was set —
         see the module docs' lifecycle note. Use :meth:`shutdown` to
@@ -698,7 +746,11 @@ class NanocachedCache(BaseCache):
 
     # ── timeout translation ─────────────────────────────────────────
 
-    def get_backend_timeout(self, timeout=DEFAULT_TIMEOUT):
+    # BaseCache types this as float | None; here it also yields the
+    # _DO_NOT_CACHE sentinel (see above), which that signature has no room for.
+    def get_backend_timeout(  # type: ignore[override]
+        self, timeout: float | None = DEFAULT_TIMEOUT
+    ) -> int | Literal[_Sentinel.DO_NOT_CACHE]:
         """Django's timeout conventions, translated to nanocached's wire
         TTL (whole seconds, 0 = no expiry — see ``_DO_NOT_CACHE`` above
         for why 0/negative can't just be forwarded as a TTL):
@@ -733,7 +785,13 @@ class NanocachedCache(BaseCache):
 
     # ── BaseCache SPI ────────────────────────────────────────────────
 
-    def add(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
+    def add(
+        self,
+        key: Any,
+        value: Any,
+        timeout: float | None = DEFAULT_TIMEOUT,
+        version: int | None = None,
+    ) -> bool:
         """Atomic add via the SDK's ``put_if_absent`` (issue #141's k/A
         compare-and-set, wired up here in #414): the key's primary owner
         alone evaluates "is this absent" and performs the write, so two
@@ -758,14 +816,20 @@ class NanocachedCache(BaseCache):
             lambda handle: handle.put_if_absent(cache_key, encoded, ttl_seconds=wire_ttl)
         )
 
-    def get(self, key, default=None, version=None):
+    def get(self, key: Any, default: Any | None = None, version: int | None = None) -> Any:
         cache_key = self.make_and_validate_key(key, version=version)
         raw = self._run(lambda handle: handle.get_bytes(cache_key))
         if raw is None:
             return default
         return _decode_value(raw)
 
-    def set(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
+    def set(
+        self,
+        key: Any,
+        value: Any,
+        timeout: float | None = DEFAULT_TIMEOUT,
+        version: int | None = None,
+    ) -> None:
         cache_key = self.make_and_validate_key(key, version=version)
         wire_ttl = self.get_backend_timeout(timeout)
         if wire_ttl is _DO_NOT_CACHE:
@@ -774,7 +838,9 @@ class NanocachedCache(BaseCache):
         encoded = _encode_value(value)
         self._run(lambda handle: handle.set(cache_key, encoded, ttl_seconds=wire_ttl))
 
-    def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
+    def touch(
+        self, key: Any, timeout: float | None = DEFAULT_TIMEOUT, version: int | None = None
+    ) -> bool:
         """The wire's own touch (issue #826): replaces the entry's TTL in
         place, without reading or rewriting the value, so a write that
         lands at the same time is never overwritten. Returns False when
@@ -793,15 +859,15 @@ class NanocachedCache(BaseCache):
         touch_ttl = None if wire_ttl == 0 else wire_ttl
         return self._run(lambda handle: handle.touch(cache_key, touch_ttl))
 
-    def delete(self, key, version=None):
+    def delete(self, key: Any, version: int | None = None) -> bool:
         cache_key = self.make_and_validate_key(key, version=version)
         return self._run(lambda handle: handle.delete(cache_key))
 
-    def has_key(self, key, version=None):
+    def has_key(self, key: Any, version: int | None = None) -> bool:
         cache_key = self.make_and_validate_key(key, version=version)
         return self._run(lambda handle: handle.get_bytes(cache_key)) is not None
 
-    def get_many(self, keys, version=None):
+    def get_many(self, keys: Iterable[Any], version: int | None = None) -> dict[Any, Any]:
         # One wire round trip per involved node (issue #152), via the
         # SDK's get_many_bytes — vs. a get() per key. cache_keys maps
         # the namespaced wire key back to the caller's original key,
@@ -812,7 +878,9 @@ class NanocachedCache(BaseCache):
         # discarding an otherwise-successful batch — see that helper's
         # docstring, and the parity note in adapters/cache-manager's
         # mgetResolved / adapters/jcache's getManyBytesResolvingWrongNode.
-        cache_keys = {self.make_and_validate_key(key, version=version): key for key in keys}
+        cache_keys: dict[str | bytes, Any] = {
+            self.make_and_validate_key(key, version=version): key for key in keys
+        }
         if not cache_keys:
             return {}
         raw = self._run(lambda handle: _get_many_bytes_resolved(handle, list(cache_keys)))
@@ -827,7 +895,7 @@ class NanocachedCache(BaseCache):
         # instead, so a bad entry is simply left out of the result here —
         # matching what get() already does for a *missing* key, just for a
         # value that turned out to be unreadable instead of absent.
-        decoded = {}
+        decoded: dict[Any, Any] = {}
         for cache_key, value in raw.items():
             try:
                 decoded[cache_keys[cache_key]] = _decode_value(value)
@@ -835,7 +903,12 @@ class NanocachedCache(BaseCache):
                 continue
         return decoded
 
-    def set_many(self, data, timeout=DEFAULT_TIMEOUT, version=None):
+    def set_many(
+        self,
+        data: dict[Any, Any],
+        timeout: float | None = DEFAULT_TIMEOUT,
+        version: int | None = None,
+    ) -> list[Any]:
         # One wire round trip per involved node (issue #152), via the
         # SDK's set_many — vs. a set() per key. Always returns [] (the
         # "no failed keys" convention BaseCache's own default set_many
@@ -855,11 +928,14 @@ class NanocachedCache(BaseCache):
         if wire_ttl is _DO_NOT_CACHE:
             self.delete_many(data.keys(), version=version)
             return []
-        payload = {self.make_and_validate_key(key, version=version): _encode_value(value) for key, value in data.items()}
+        payload: dict[str | bytes, str | bytes] = {
+            self.make_and_validate_key(key, version=version): _encode_value(value)
+            for key, value in data.items()
+        }
         self._run(lambda handle: _set_many_resolved(handle, payload, wire_ttl))
         return []
 
-    def delete_many(self, keys, version=None):
+    def delete_many(self, keys: Iterable[Any], version: int | None = None) -> None:
         # Issue #233: fanned out concurrently (asyncio.gather) in one
         # _run round trip, rather than one delete() per key run fully
         # sequentially — each delete() previously blocked the calling
@@ -872,13 +948,13 @@ class NanocachedCache(BaseCache):
             return
         self._run(lambda handle: _delete_all(handle, cache_keys))
 
-    def clear(self):
+    def clear(self) -> None:
         """This namespace's CLEAR (issue #106) — never the whole store,
         so other aliases/namespaces sharing a node or cluster are
         untouched. One ``c`` frame per node, fanned out by the SDK."""
         self._run(lambda handle: handle.clear())
 
-    def incr(self, key, delta=1, version=None):
+    def incr(self, key: Any, delta: int = 1, version: int | None = None) -> int:
         """The SDK's own INCR (issue #129) — atomic on the node that owns
         the key, unlike ``add()``/``touch()`` above. Matches
         ``BaseCache.incr``'s own contract exactly: raises ``ValueError``
@@ -918,7 +994,7 @@ class NanocachedCache(BaseCache):
             raise ValueError(f"Key '{key}' not found")
         return new_value
 
-    def decr(self, key, delta=1, version=None):
+    def decr(self, key: Any, delta: int = 1, version: int | None = None) -> int:
         """``incr(key, -delta, version)`` — decr never sends a separate
         wire op; see incr()."""
         return self.incr(key, -delta, version=version)

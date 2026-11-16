@@ -31,13 +31,14 @@ import math
 import os
 import random
 import re
-from typing import Any
 import ssl as ssl_module
 import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from types import TracebackType
+from typing import Any, TypeVar, cast
 
 from ._compression import (
     _MAX_MULTIGET_DECOMPRESSED_BYTES,
@@ -71,7 +72,14 @@ from ._identify import (
     split_host_port,
 )
 
-# Errors safe for a by-design swallow site (client-side replication / fire-and-forget replica writes / read repair, node-list
+_T = TypeVar("_T")
+# set_many()'s key type. Mapping is invariant in its keys, so a plain
+# Mapping[str | bytes, ...] would reject dict[str, str]; a bound TypeVar
+# accepts str keys, bytes keys, or a mix.
+_Key = TypeVar("_Key", bound=str | bytes)
+
+# Errors safe for a by-design swallow site (client-side replication /
+# fire-and-forget replica writes / read repair, node-list
 # refresh) to absorb: this SDK's own error hierarchy, plus OS-level I/O
 # errors (ConnectionError is itself an OSError subclass, kept in the tuple
 # for readability at each call site). Programming errors — TypeError,
@@ -113,7 +121,7 @@ class _MultiSetTracker:
     leg-level connection failure. Single-threaded (asyncio), so no
     locking."""
 
-    __slots__ = ("acknowledged", "primary_unreachable", "primary_acknowledged", "last_cause")
+    __slots__ = ("acknowledged", "last_cause", "primary_acknowledged", "primary_unreachable")
 
     def __init__(self) -> None:
         self.acknowledged: dict[int, set[str]] = {}
@@ -139,13 +147,13 @@ class _MultiTouchState:
     Single-threaded (asyncio), so no locking."""
 
     __slots__ = (
-        "results",
         "answered_by",
-        "wrong_node",
         "last_cause",
+        "lost",
         "lost_cause",
         "rejected",
-        "lost",
+        "results",
+        "wrong_node",
     )
 
     def __init__(self) -> None:
@@ -163,7 +171,8 @@ class _MultiTouchState:
 @dataclass(frozen=True)
 class ClientStats:
     """Snapshot of counters for failures this client swallows by design
-    (client-side replication / fire-and-forget replica writes / read repair) instead of raising them to a caller — observability
+    (client-side replication / fire-and-forget replica writes / read repair)
+    instead of raising them to a caller — observability
     for silently degrading replication or a stuck node-list refresh, which
     would otherwise be invisible. See ``NanocachedClient.stats()``.
 
@@ -244,7 +253,9 @@ def _resolve_reconnect_cooldown(reconnect_cooldown: float | None, disable: bool)
     off, otherwise the configured value, where 0 means the default (the same
     reading as Go, Rust, Java and .NET). A negative or non-finite value, or a
     non-zero value together with the switch, is a caller mistake."""
-    if reconnect_cooldown is not None and not (math.isfinite(reconnect_cooldown) and reconnect_cooldown >= 0):
+    if reconnect_cooldown is not None and not (
+        math.isfinite(reconnect_cooldown) and reconnect_cooldown >= 0
+    ):
         raise ValueError("nanocached: reconnect_cooldown must be a non-negative number of seconds")
     if disable:
         if reconnect_cooldown not in (None, 0):
@@ -253,7 +264,8 @@ def _resolve_reconnect_cooldown(reconnect_cooldown: float | None, disable: bool)
                 "unset one of them"
             )
         return 0.0
-    return _DEFAULT_RECONNECT_COOLDOWN if not reconnect_cooldown else reconnect_cooldown
+    return reconnect_cooldown or _DEFAULT_RECONNECT_COOLDOWN
+
 
 # TTL (whole seconds — the protocol's TTL unit throughout, see
 # _encode_set in _connection.py) a read-repair write uses
@@ -473,7 +485,9 @@ async def _dial_roster(
         for index, node in pending:
             outcomes[index] = await dial(node)
 
-    workers = [asyncio.ensure_future(worker()) for _ in range(min(_MAX_CONCURRENT_DIALS, len(nodes)))]
+    workers = [
+        asyncio.ensure_future(worker()) for _ in range(min(_MAX_CONCURRENT_DIALS, len(nodes)))
+    ]
     try:
         await asyncio.gather(*workers)
     except BaseException:
@@ -630,7 +644,9 @@ def _check_token(token: str) -> bytes:
     return token.encode("ascii")
 
 
-def _build_ssl_context(tls: bool, ca: str | os.PathLike | None) -> ssl_module.SSLContext | None:
+def _build_ssl_context(
+    tls: bool, ca: str | os.PathLike[str] | None
+) -> ssl_module.SSLContext | None:
     """``ca`` is meaningful only when ``tls`` is true — connect() has
     already rejected a ``ca`` without ``tls`` by the time this runs (issue
     #488). An unreadable/unparseable CA file is a connect-time error
@@ -739,7 +755,9 @@ class NanocachedClient:
         # (issue #47 audit item 5). A previous, separate
         # asyncio.Semaphore(32) just for read-repair let the two
         # categories admit up to twice the intended cap combined.
-        self._background_replica_writes: set[asyncio.Task[None]] = set()
+        # Any: replica writes and touch/set_many legs (whose results are
+        # ignored) share this pool, and Task is invariant in its result.
+        self._background_replica_writes: set[asyncio.Task[Any]] = set()
         self._read_repair: bool = False
         # Hedged reads (issue #64): None = off. See _read_hedged().
         self._read_hedge_after: float | None = None
@@ -795,7 +813,7 @@ class NanocachedClient:
         *,
         auth_secret: str | None = None,
         tls: bool = False,
-        ca: str | os.PathLike | None = None,
+        ca: str | os.PathLike[str] | None = None,
         compress: bool = False,
         compression_threshold: int = _DEFAULT_COMPRESSION_THRESHOLD,
         fire_and_forget_replicas: bool = False,
@@ -804,13 +822,16 @@ class NanocachedClient:
         disable_reconnect_cooldown: bool = False,
         read_hedge_after: float | None = None,
         via_proxy: bool = False,
-    ) -> "NanocachedClient":
+    ) -> NanocachedClient:
         if not addresses:
             raise ValueError("nanocached: connect() needs a non-empty addresses list")
-        resolved_reconnect_cooldown = _resolve_reconnect_cooldown(reconnect_cooldown, disable_reconnect_cooldown)
+        resolved_reconnect_cooldown = _resolve_reconnect_cooldown(
+            reconnect_cooldown, disable_reconnect_cooldown
+        )
         if read_hedge_after is not None and not 0 < read_hedge_after <= _MAX_READ_HEDGE_AFTER:
             raise ValueError(
-                f"nanocached: read_hedge_after must be a positive number of seconds, at most {_MAX_READ_HEDGE_AFTER}"
+                "nanocached: read_hedge_after must be a positive number of seconds, "
+                f"at most {_MAX_READ_HEDGE_AFTER}"
             )
         # Issue #488: an option that can have no effect in this
         # configuration is a misconfiguration, not something to ignore
@@ -881,7 +902,9 @@ class NanocachedClient:
                         f"routing and failover."
                     )
                 client._target_key = key
-                client._single = client._new_connection(identified.reader, identified.writer, identified.tagged)
+                client._single = client._new_connection(
+                    identified.reader, identified.writer, identified.tagged
+                )
                 client._single_address = key
                 client._start_keepalive()
                 return client
@@ -901,12 +924,14 @@ class NanocachedClient:
             client._start_keepalive()
             return client
 
-        raise last_error if last_error is not None else NanocachedError(
-            "nanocached: could not connect to any address"
+        raise (
+            last_error
+            if last_error is not None
+            else NanocachedError("nanocached: could not connect to any address")
         )
 
     @classmethod
-    async def _connect_via_proxy(cls, client: "NanocachedClient") -> "NanocachedClient":
+    async def _connect_via_proxy(cls, client: NanocachedClient) -> NanocachedClient:
         """SDK proxy mode (issue #122): ``client`` already has every
         connect()-time option applied — this only walks the discovery
         seeds for a proxy roster (``Q``) instead of a node roster
@@ -964,8 +989,10 @@ class NanocachedClient:
             client._start_keepalive()
             return client
 
-        raise last_error if last_error is not None else NanocachedError(
-            "nanocached: could not connect to any address"
+        raise (
+            last_error
+            if last_error is not None
+            else NanocachedError("nanocached: could not connect to any address")
         )
 
     def _new_connection(
@@ -1002,7 +1029,9 @@ class NanocachedClient:
 
         nodes = _dedupe_discovered_nodes(identified.nodes)
 
-        async def dial(node):
+        async def dial(
+            node: DiscoveredNode,
+        ) -> tuple[DiscoveredNode, NodeTarget | ClusterTarget | BaseException]:
             try:
                 # Inside the try: a malformed roster entry (no port, port
                 # above 65535) is a NanocachedError, so it is one
@@ -1036,7 +1065,9 @@ class NanocachedClient:
                 self._members[node.name] = _Member(node.address, None)
                 self._redial_cooldowns[node.address] = (
                     time.monotonic() + self._reconnect_cooldown,
-                    ConnectFailedError(f"nanocached: {node.address} does not identify as a cache node"),
+                    ConnectFailedError(
+                        f"nanocached: {node.address} does not identify as a cache node"
+                    ),
                 )
                 last_error = NanocachedError(
                     f"nanocached: discovery server returned a non-node address: {node.address}"
@@ -1131,8 +1162,10 @@ class NanocachedClient:
                 if cooled_address != proxy.address:
                     del self._redial_cooldowns[cooled_address]
             return self._new_connection(target.reader, target.writer, target.tagged)
-        raise last_error if last_error is not None else NanocachedError(
-            "nanocached: no proxies registered with discovery"
+        raise (
+            last_error
+            if last_error is not None
+            else NanocachedError("nanocached: no proxies registered with discovery")
         )
 
     async def _reconnect_via_new_proxy(self) -> Connection:
@@ -1193,7 +1226,8 @@ class NanocachedClient:
 
     def stats(self) -> ClientStats:
         """Observability for failures this client swallows by design
-        (client-side replication / fire-and-forget replica writes / read repair) — lets operators detect silently degrading
+        (client-side replication / fire-and-forget replica writes / read
+        repair) — lets operators detect silently degrading
         replication or a stuck node-list refresh. A snapshot, not a live
         view; each count is monotonic for the lifetime of this client."""
         return ClientStats(
@@ -1335,7 +1369,8 @@ class NanocachedClient:
                 # snapshot of — see close()'s own comment.
                 if (
                     not self._closed
-                    and len(self._background_replica_writes) < _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
+                    and len(self._background_replica_writes)
+                    < _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
                 ):
                     task = asyncio.ensure_future(repair())
                     self._background_replica_writes.add(task)
@@ -1355,9 +1390,7 @@ class NanocachedClient:
         value = await self._get_bytes(namespace, key)
         return value.decode() if value is not None else None
 
-    async def set(
-        self, key: str | bytes, value: str | bytes, *, ttl_seconds: int = 0
-    ) -> None:
+    async def set(self, key: str | bytes, value: str | bytes, *, ttl_seconds: int = 0) -> None:
         """``ttl_seconds`` is whole seconds; 0 (the default) means no
         expiry. Negative values are rejected eagerly, before any I/O.
         Transparently compresses values at or above
@@ -1692,8 +1725,8 @@ class NanocachedClient:
                 self._single_connection, namespace, key_bytes_list
             )
             values: dict[str | bytes, bytes] = {}
-            for original, entry in zip(originals, entries):
-                if isinstance(entry, (bytes, bytearray)):
+            for original, entry in zip(originals, entries, strict=False):
+                if isinstance(entry, bytes):
                     value = self._decompress_for_batch(entry, budget)
                     for spelling in original:
                         values[spelling] = value
@@ -1756,12 +1789,16 @@ class NanocachedClient:
             raise last_error
         return values
 
-    async def _get_many(self, namespace: bytes, keys: Sequence[str | bytes]) -> dict[str | bytes, str]:
+    async def _get_many(
+        self, namespace: bytes, keys: Sequence[str | bytes]
+    ) -> dict[str | bytes, str]:
         """The namespace-carrying implementation behind get_many() and
         Namespace.get_many() — see _get()."""
         return await self._decode_batch(self._get_many_bytes(namespace, keys))
 
-    async def _decode_batch(self, fetch) -> dict[str | bytes, str]:
+    async def _decode_batch(
+        self, fetch: Awaitable[dict[str | bytes, bytes]]
+    ) -> dict[str | bytes, str]:
         """Awaits a batched read's raw result and decodes its values, the
         way get_many() and get_many_and_touch() both do."""
         try:
@@ -1795,8 +1832,11 @@ class NanocachedClient:
         return {key: value.decode() for key, value in raw.items()}
 
     async def _multi_get_chunked(
-        self, connection_getter, namespace: bytes, keys: list[bytes]
-    ) -> tuple[list[bytes | None | object], BaseException | None, int]:
+        self,
+        connection_getter: Callable[[], Awaitable[Connection]],
+        namespace: bytes,
+        keys: list[bytes],
+    ) -> tuple[list[bytes | object | None], BaseException | None, int]:
         """Issues one or more ``m`` sub-frames for ``keys`` — already
         grouped to one owner (or the single/proxy target) by the caller
         — splitting into chunks bounded by both _MAX_BATCH_KEYS and
@@ -1821,7 +1861,7 @@ class NanocachedClient:
         so entries[:failed_at] is real partial data worth keeping" apart
         from "the first chunk itself failed, so there's nothing to
         attach" checks ``failed_at > 0``."""
-        entries: list[bytes | None | object] = [None] * len(keys)
+        entries: list[bytes | object | None] = [None] * len(keys)
         bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], None)
         for start, end in bounds:
             chunk = keys[start:end]
@@ -1866,14 +1906,14 @@ class NanocachedClient:
         all (an empty ring view) count as ``W``: a refresh may populate
         it."""
         pending = list(retry_indices) if retry_indices is not None else list(range(len(originals)))
-        rank: dict[int, int] = {idx: 0 for idx in pending}
+        rank: dict[int, int] = dict.fromkeys(pending, 0)
         wrong_node: list[int] = []
         unreachable: list[int] = []
         last_error: BaseException | None = None
 
         async def run_group(
             owner: str, group_indices: list[int]
-        ) -> tuple[list[int], list[bytes | None | object], BaseException | None, int]:
+        ) -> tuple[list[int], list[bytes | object | None], BaseException | None, int]:
             group_keys = [key_bytes_list[idx] for idx in group_indices]
             entries, error, failed_at = await self._multi_get_chunked(
                 lambda: self._member_connection(owner), namespace, group_keys
@@ -1891,13 +1931,15 @@ class NanocachedClient:
                 else:
                     groups.setdefault(owners[rank[idx]], []).append(idx)
             pending = []
-            results = await asyncio.gather(*(run_group(owner, idxs) for owner, idxs in groups.items()))
+            results = await asyncio.gather(
+                *(run_group(owner, idxs) for owner, idxs in groups.items())
+            )
             for group_indices, entries, error, failed_at in results:
                 resolved = len(group_indices) if error is None else failed_at
-                for idx, entry in zip(group_indices[:resolved], entries[:resolved]):
+                for idx, entry in zip(group_indices[:resolved], entries[:resolved], strict=False):
                     if entry is WRONG_NODE:
                         wrong_node.append(idx)
-                    elif entry is not None:
+                    elif isinstance(entry, bytes):
                         value = self._decompress_for_batch(entry, budget)
                         for spelling in originals[idx]:
                             values[spelling] = value
@@ -1908,9 +1950,7 @@ class NanocachedClient:
                         pending.append(idx)
         return wrong_node, unreachable, last_error
 
-    async def set_many(
-        self, values: Mapping[str | bytes, str | bytes], *, ttl_seconds: int = 0
-    ) -> None:
+    async def set_many(self, values: Mapping[_Key, str | bytes], *, ttl_seconds: int = 0) -> None:
         """Batched set (issues #128/#150/#151): one round trip per
         involved node instead of one per key. ``ttl_seconds`` is shared
         by the whole batch, not per key (one real caller of a batched
@@ -1955,7 +1995,7 @@ class NanocachedClient:
         await self._set_many(b"", values, ttl_seconds=ttl_seconds)
 
     async def _set_many(
-        self, namespace: bytes, values: Mapping[str | bytes, str | bytes], *, ttl_seconds: int = 0
+        self, namespace: bytes, values: Mapping[_Key, str | bytes], *, ttl_seconds: int = 0
     ) -> None:
         """The namespace-carrying implementation behind set_many() and
         Namespace.set_many() — see _set()."""
@@ -2001,7 +2041,7 @@ class NanocachedClient:
                 if failed_at > 0:
                     stored = {
                         original
-                        for original, entry in zip(originals, entries)
+                        for original, entry in zip(originals, entries, strict=False)
                         if entry is True
                     }
                     raise PartialSetConnectionLostError(
@@ -2056,7 +2096,7 @@ class NanocachedClient:
 
     async def _multi_set_chunked(
         self,
-        connection_getter,
+        connection_getter: Callable[[], Awaitable[Connection]],
         namespace: bytes,
         keys: list[bytes],
         values: list[bytes],
@@ -2100,7 +2140,7 @@ class NanocachedClient:
         value_bytes_list: list[bytes],
         ttl_seconds: int,
         retry_indices: list[int] | None,
-        tracker: "_MultiSetTracker",
+        tracker: _MultiSetTracker,
     ) -> list[int]:
         """Runs one pass of set_many's cluster routing: for every key
         still needing resolution (every key, when retry_indices is None,
@@ -2168,12 +2208,16 @@ class NanocachedClient:
             # per-key information beyond what `entries` already exposes,
             # so it's intentionally not consulted below.
             entries, error, _failed_at = await self._multi_set_chunked(
-                lambda: self._member_connection(name), namespace, group_keys, group_values, ttl_seconds
+                lambda: self._member_connection(name),
+                namespace,
+                group_keys,
+                group_values,
+                ttl_seconds,
             )
             if error is not None:
                 tracker.last_cause = error
             leg_retry: list[int] = []
-            for idx, primary, entry in zip(leg_indices, is_primary, entries):
+            for idx, primary, entry in zip(leg_indices, is_primary, entries, strict=False):
                 if entry is True:
                     acknowledged.setdefault(idx, set()).add(name)
                     if primary:
@@ -2453,7 +2497,12 @@ class NanocachedClient:
         raise cause
 
     @staticmethod
-    def _too_old(command: str, get: bool, collect, state: _MultiTouchState) -> ServerTooOldError:
+    def _too_old(
+        command: str,
+        get: bool,
+        collect: Callable[[dict[int, object]], dict[str | bytes, object]],
+        state: _MultiTouchState,
+    ) -> ServerTooOldError:
         """The error for a primary that answered ``En`` to ``y``: with
         ``get``, the hits other primaries already returned ride along (they
         may have been consumed by a ``ttl_seconds == 0`` call), as
@@ -2468,7 +2517,7 @@ class NanocachedClient:
 
     async def _multi_touch_chunked(
         self,
-        connection_getter,
+        connection_getter: Callable[[], Awaitable[Connection]],
         namespace: bytes,
         keys: list[bytes],
         ttl_seconds: int | None,
@@ -2495,14 +2544,22 @@ class NanocachedClient:
         bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], None, True)
         for start, end in bounds:
             chunk = keys[start:end]
+            chunk_entries: Sequence[object]
             try:
                 connection = await connection_getter()
                 if get:
-                    chunk_entries = await connection.multi_get_and_touch(chunk, ttl_seconds, namespace)
+                    chunk_entries = await connection.multi_get_and_touch(
+                        chunk, ttl_seconds, namespace
+                    )
                 else:
                     chunk_entries = await connection.multi_touch(chunk, ttl_seconds, namespace)
             except _SWALLOWABLE_ERRORS as error:
-                return entries, error, start, end if isinstance(error, ConnectionLostError) else start
+                return (
+                    entries,
+                    error,
+                    start,
+                    end if isinstance(error, ConnectionLostError) else start,
+                )
             entries[start:end] = chunk_entries
         return entries, None, len(keys), len(keys)
 
@@ -2578,7 +2635,7 @@ class NanocachedClient:
                     if lost_is_final:
                         state.lost_cause = error
             leg_retry: list[int] = []
-            for pos, (idx, primary) in enumerate(zip(leg_indices, is_primary)):
+            for pos, (idx, primary) in enumerate(zip(leg_indices, is_primary, strict=True)):
                 answered = pos < resolved and entries[pos] is not WRONG_NODE
                 if not primary:
                     if not answered:
@@ -2996,7 +3053,7 @@ class NanocachedClient:
         await self._before_operation()
         await self._fan_out_clear(lambda connection: connection.clear(namespace))
 
-    async def _fan_out_clear(self, op) -> None:
+    async def _fan_out_clear(self, op: Callable[[Connection], Awaitable[object]]) -> None:
         """Shared by clear_all() and _clear() (issue #106): a clear isn't
         key-addressed like get/set/delete — a namespace's keys are spread
         over every node by HRW, so ``op`` (already bound to either
@@ -3033,7 +3090,9 @@ class NanocachedClient:
         names = ", ".join(name for name, _ in failures)
         raise NanocachedError(f"nanocached: clear failed on: {names}")
 
-    async def _clear_round(self, op) -> list[tuple[str, BaseException]]:
+    async def _clear_round(
+        self, op: Callable[[Connection], Awaitable[object]]
+    ) -> list[tuple[str, BaseException]]:
         """One fan-out pass for _fan_out_clear(): every node gets ``op``
         concurrently, with each failure captured here instead of raised
         immediately — a connection-level exception on one node must not
@@ -3058,7 +3117,7 @@ class NanocachedClient:
         outcomes = await asyncio.gather(*(attempt(name) for name in self._members))
         return [(name, error) for name, error in outcomes if error is not None]
 
-    def namespace(self, ns: str | bytes) -> "Namespace":
+    def namespace(self, ns: str | bytes) -> Namespace:
         """A lightweight handle scoped to ``ns`` (issue #105): its
         get/get_bytes/set/delete are this client's own, just with every
         key implicitly scoped to ``ns`` — same routing (HRW over
@@ -3122,7 +3181,7 @@ class NanocachedClient:
         # could log "Task was destroyed but it is pending". gather()'s
         # return_exceptions=True absorbs the resulting CancelledError the
         # same way it absorbs a redial/refresh failure above.
-        pending = list(self._redials.values())
+        pending: list[asyncio.Task[Any]] = [*self._redials.values()]
         if self._refresh_task is not None:
             pending.append(self._refresh_task)
         if self._keepalive_task is not None:
@@ -3155,10 +3214,15 @@ class NanocachedClient:
 
         await self._teardown()
 
-    async def __aenter__(self) -> "NanocachedClient":
+    async def __aenter__(self) -> NanocachedClient:
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         await self.close()
 
     async def _teardown(self) -> None:
@@ -3187,8 +3251,12 @@ class NanocachedClient:
         await self._maybe_refresh()
 
     async def _with_wrong_node_retry(
-        self, operation, *, replay_safe: bool = True, rejection_is_final: bool = False
-    ):
+        self,
+        operation: Callable[[], Awaitable[_T]],
+        *,
+        replay_safe: bool = True,
+        rejection_is_final: bool = False,
+    ) -> _T:
         """Connection-level failures (and `W`) retry once, after a forced
         node-list refresh: the usual cause is a node death that discovery
         has since noticed, so the refresh re-ranks the key onto
@@ -3235,13 +3303,17 @@ class NanocachedClient:
         assert self._ring is not None
         return self._ring.owners(key, self._replication, namespace=namespace)
 
-    async def _read(self, namespace: bytes, key: bytes, op):
+    async def _read(
+        self, namespace: bytes, key: bytes, op: Callable[[Connection], Awaitable[_T]]
+    ) -> _T:
         if self._ring is None:
             return await op(await self._single_connection())
 
         names = self._owner_names(namespace, key)
         if self._read_hedge_after is not None and len(names) > 1:
-            return await self._read_hedged(key, op, names)
+            # The winning leg's own result, or None for a miss — which
+            # every op hedged here also returns for one.
+            return cast(_T, await self._read_hedged(key, op, names))
 
         # Owners in rank order; fall through only on connection-level
         # failure — a replica hedges against a dead holder, not a miss.
@@ -3263,11 +3335,15 @@ class NanocachedClient:
                 # WrongNode answer (issue #8) — matching the TypeScript
                 # SDK's semantics.
                 last_error = error
-        raise last_error if last_error is not None else ConnectFailedError(
-            "nanocached: no owner is reachable for this key"
+        raise (
+            last_error
+            if last_error is not None
+            else ConnectFailedError("nanocached: no owner is reachable for this key")
         )
 
-    async def _read_hedged(self, key: bytes, op, names: list[str]):
+    async def _read_hedged(
+        self, key: bytes, op: Callable[[Connection], Awaitable[object]], names: list[str]
+    ) -> object:
         """Hedged reads (issue #64): one slow — not dead — owner otherwise
         bounds every read that touches it at its full RTT, since the
         sequential path in _read() only moves on to the next owner when
@@ -3479,8 +3555,10 @@ class NanocachedClient:
 
         if replica_missed:
             return None
-        raise last_error if last_error is not None else ConnectFailedError(
-            "nanocached: no owner is reachable for this key"
+        raise (
+            last_error
+            if last_error is not None
+            else ConnectFailedError("nanocached: no owner is reachable for this key")
         )
 
     def _demote_silent_owners(self, names: list[str]) -> list[str]:
@@ -3523,7 +3601,9 @@ class NanocachedClient:
 
         task.add_done_callback(release)
 
-    def _dispatch_replica_writes(self, names: list[str], op) -> list[asyncio.Task[None]]:
+    def _dispatch_replica_writes(
+        self, names: list[str], op: Callable[[Connection], Awaitable[object]]
+    ) -> list[asyncio.Task[None]]:
         """Admits each name in ``names`` as a replica leg running ``op`` —
         the fan-out machinery shared by _write()'s own replica legs and
         incr()'s result-forwarding replicate step (NanocachedClient.incr,
@@ -3578,8 +3658,13 @@ class NanocachedClient:
         return replica_tasks
 
     async def _write(
-        self, namespace: bytes, key: bytes, op, replica_op=None, primary_first: bool = False
-    ):
+        self,
+        namespace: bytes,
+        key: bytes,
+        op: Callable[[Connection], Awaitable[_T]],
+        replica_op: Callable[[Connection], Awaitable[object]] | None = None,
+        primary_first: bool = False,
+    ) -> _T:
         """``replica_op`` (issue #825) is what the non-primary owners are
         sent when it differs from the primary's ``op`` — a get-and-touch
         asks only the primary for the value.
@@ -3613,7 +3698,9 @@ class NanocachedClient:
             if tasks:
                 for outcome in await asyncio.gather(*tasks, return_exceptions=True):
                     if isinstance(outcome, BaseException):
-                        _warn(f"nanocached: a replica write raised an unexpected error: {outcome!r}")
+                        _warn(
+                            f"nanocached: a replica write raised an unexpected error: {outcome!r}"
+                        )
             return result
 
         replica_tasks = self._dispatch_replica_writes(replicas, replica_op or op)
@@ -3642,8 +3729,8 @@ class NanocachedClient:
                 self._background_replica_writes.add(replica_task)
                 replica_task.add_done_callback(self._background_replica_writes.discard)
             raise
-        except BaseException as error:  # noqa: BLE001 - decided below, not swallowed
-            result = None
+        except BaseException as error:  # decided below, not swallowed
+            # result stays unbound: primary_error is raised below.
             primary_error = error
 
         replica_bug: BaseException | None = None
@@ -3741,14 +3828,17 @@ class NanocachedClient:
         task = asyncio.ensure_future(self._open_and_adopt(slot, address))
         self._redials[slot] = task
 
-        def _on_redial_done(t: "asyncio.Task[Connection]") -> None:
+        def _on_redial_done(t: asyncio.Task[Connection]) -> None:
             if self._redials.get(slot) is t:
                 self._redials.pop(slot, None)
             if t.cancelled():
                 return
             error = t.exception()
             if error is not None:
-                self._redial_cooldowns[address] = (time.monotonic() + self._reconnect_cooldown, error)
+                self._redial_cooldowns[address] = (
+                    time.monotonic() + self._reconnect_cooldown,
+                    error,
+                )
             else:
                 self._redial_cooldowns.pop(address, None)
 
@@ -3762,10 +3852,13 @@ class NanocachedClient:
             if self._single is not None and self._single.closed:
                 self._single = connection
                 return connection
-            if self._single is connection or (self._single is not None and not self._single.closed):
-                if self._single is not connection:
-                    connection.close()
-                    return self._single
+            if (
+                self._single is not connection
+                and self._single is not None
+                and not self._single.closed
+            ):
+                connection.close()
+                return self._single
             return connection
 
         current = self._members.get(slot)
@@ -3784,7 +3877,9 @@ class NanocachedClient:
             raise AlreadyClosedError()
         node_host, node_port = split_host_port(address)
         try:
-            identified = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
+            identified = await connect_and_identify(
+                node_host, node_port, self._auth_secret, self._ssl_context
+            )
         except (NanocachedError, OSError) as error:
             # SDK proxy mode (issue #122) reconnect: this is only ever
             # reached via _redial("", self._single_address) — "first
@@ -3801,7 +3896,9 @@ class NanocachedClient:
                 try:
                     return await self._reconnect_via_new_proxy()
                 except HandshakeProtocolError as proxy_error:
-                    raise _handshake_failure_as_connect_failed(address, proxy_error) from proxy_error
+                    raise _handshake_failure_as_connect_failed(
+                        address, proxy_error
+                    ) from proxy_error
             converted = _handshake_failure_as_connect_failed(address, error)
             if converted is error:
                 raise
@@ -3854,7 +3951,9 @@ class NanocachedClient:
             task = self._refresh_task
             if task is None or task.done():
                 if force:
-                    remaining = self._refresh_finished + _FORCED_REFRESH_MIN_INTERVAL - time.monotonic()
+                    remaining = (
+                        self._refresh_finished + _FORCED_REFRESH_MIN_INTERVAL - time.monotonic()
+                    )
                     if remaining > 0:
                         if not waited_out_older_refresh:
                             return
@@ -3911,10 +4010,14 @@ class NanocachedClient:
                 continue
             new_nodes.append(node)
 
-        async def dial(node: DiscoveredNode):
+        async def dial(
+            node: DiscoveredNode,
+        ) -> tuple[DiscoveredNode, NodeTarget | ClusterTarget | BaseException]:
             try:
                 node_host, node_port = split_host_port(node.address)
-                target = await connect_and_identify(node_host, node_port, self._auth_secret, self._ssl_context)
+                target = await connect_and_identify(
+                    node_host, node_port, self._auth_secret, self._ssl_context
+                )
             except _SWALLOWABLE_ERRORS as error:
                 # Same rationale as _fetch_node_list: never fail the
                 # caller over a refresh-time connect failure. A genuine
@@ -3974,7 +4077,9 @@ class NanocachedClient:
                     # A ConnectionError, like a dead address's: only those
                     # make an operation routed here refresh and reroute
                     # (_with_wrong_node_retry).
-                    else ConnectFailedError(f"nanocached: {node.address} does not identify as a cache node")
+                    else ConnectFailedError(
+                        f"nanocached: {node.address} does not identify as a cache node"
+                    )
                 )
                 self._members[node.name] = _Member(node.address, None)
                 self._redial_cooldowns[node.address] = (
@@ -4072,7 +4177,8 @@ class NanocachedClient:
                             # this loop with that exception (issue #192).
                             task.result()
                     connections = (
-                        [self._single] if self._single is not None
+                        [self._single]
+                        if self._single is not None
                         else [
                             member.connection
                             for member in self._members.values()
@@ -4153,9 +4259,7 @@ class Namespace:
         (issues #128/#150/#151)."""
         return await self._client._get_many(self._namespace, keys)
 
-    async def set_many(
-        self, values: Mapping[str | bytes, str | bytes], *, ttl_seconds: int = 0
-    ) -> None:
+    async def set_many(self, values: Mapping[_Key, str | bytes], *, ttl_seconds: int = 0) -> None:
         """Same as NanocachedClient.set_many(), scoped to this namespace
         (issues #128/#150/#151)."""
         await self._client._set_many(self._namespace, values, ttl_seconds=ttl_seconds)

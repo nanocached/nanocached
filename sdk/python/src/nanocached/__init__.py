@@ -3,6 +3,7 @@
 See https://github.com/nanocached/nanocached for the server and protocol.
 """
 
+from ._client import ClientStats, Namespace, NanocachedClient
 from ._compression import DecompressionError
 from ._digest import content_digest
 from ._errors import (
@@ -22,7 +23,6 @@ from ._errors import (
     ServerTooOldError,
     WrongNodeError,
 )
-from ._client import ClientStats, Namespace, NanocachedClient
 
 __all__ = [
     "AlreadyClosedError",

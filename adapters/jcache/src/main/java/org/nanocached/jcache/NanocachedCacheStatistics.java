@@ -4,11 +4,10 @@ import java.util.concurrent.atomic.AtomicLong;
 import javax.cache.management.CacheStatisticsMXBean;
 
 /**
- * A bare-bones {@link CacheStatisticsMXBean} (issue #118): hit/miss/put/
- * removal counts only. Timings ({@code getAverageGetTime} and friends)
- * and evictions aren't tracked — the wire protocol doesn't report
- * server-side LRU evictions to the client, and per-call timing isn't
- * otherwise part of this adapter's scope.
+ * A bare-bones {@link CacheStatisticsMXBean} (issue #118): hit/miss/put/ removal counts only.
+ * Timings ({@code getAverageGetTime} and friends) and evictions aren't tracked — the wire protocol
+ * doesn't report server-side LRU evictions to the client, and per-call timing isn't otherwise part
+ * of this adapter's scope.
  */
 final class NanocachedCacheStatistics implements CacheStatisticsMXBean {
 

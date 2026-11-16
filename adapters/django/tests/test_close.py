@@ -17,6 +17,7 @@ import warnings
 from unittest import mock
 
 import support  # noqa: F401 - configures settings.CACHES / django.setup()
+
 from mock_node import MockNode
 from nanocached_django import NanocachedCache
 
@@ -97,6 +98,8 @@ class CloseLifecycleTests(unittest.TestCase):
         parent_loop = backend._loop
         parent_thread = backend._loop_thread
         parent_client = backend._client
+        assert parent_loop is not None and parent_client is not None
+        assert backend._loop_pid is not None
 
         with mock.patch("os.getpid", return_value=backend._loop_pid + 1):
             self.assertEqual(backend.get("k"), "v")

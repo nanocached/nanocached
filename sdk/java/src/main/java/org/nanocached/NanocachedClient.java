@@ -46,33 +46,32 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManagerFactory;
 
 /**
- * The public client. An address (or an addresses list) may name either a
- * single nanocached-node or discovery server(s) fronting a cluster —
- * {@code connect()} finds out from the server's own handshake response
- * (the server type in the auth response), so calling code is identical either way.
+ * The public client. An address (or an addresses list) may name either a single nanocached-node or
+ * discovery server(s) fronting a cluster — {@code connect()} finds out from the server's own
+ * handshake response (the server type in the auth response), so calling code is identical either
+ * way.
  *
- * <p>Cluster mode implements client-side replication client-side replication: writes fan
- * out to each key's top-R owners (the primary's result decides; a dead
- * replica never fails a write), reads ask the primary and fall over to
- * the next owner only when the holder is unreachable. Dead connections
- * are redialed lazily on use, and a keep-alive that is always on holds
- * connections open across the server's 60s idle timeout.
+ * <p>Cluster mode implements client-side replication client-side replication: writes fan out to
+ * each key's top-R owners (the primary's result decides; a dead replica never fails a write), reads
+ * ask the primary and fall over to the next owner only when the holder is unreachable. Dead
+ * connections are redialed lazily on use, and a keep-alive that is always on holds connections open
+ * across the server's 60s idle timeout.
  *
- * <p>Thread-safe. Requests are pipelined per connection (see
- * {@link Connection}); concurrent callers share it.
+ * <p>Thread-safe. Requests are pipelined per connection (see {@link Connection}); concurrent
+ * callers share it.
  */
 public final class NanocachedClient implements AutoCloseable {
 
     public record Address(String host, int port) {}
 
-    /** A value read alongside its CAS token (issue #141) — returned by
-     * {@link #getWithToken}/{@link Namespace#getWithToken}. {@code value}
-     * is the same decompressed bytes {@link #getBytes} would return;
-     * {@code token} is {@link #contentDigest} of the raw wire bytes
-     * (before decompression, when {@code compress} is enabled — the
-     * server never decompresses either), ready to pass straight to
-     * {@link #replace(byte[], String, byte[], long)}/{@link
-     * #deleteIfMatches(byte[], String)}. */
+    /**
+     * A value read alongside its CAS token (issue #141) — returned by {@link #getWithToken}/{@link
+     * Namespace#getWithToken}. {@code value} is the same decompressed bytes {@link #getBytes} would
+     * return; {@code token} is {@link #contentDigest} of the raw wire bytes (before decompression,
+     * when {@code compress} is enabled — the server never decompresses either), ready to pass
+     * straight to {@link #replace(byte[], String, byte[], long)}/{@link #deleteIfMatches(byte[],
+     * String)}.
+     */
     public record CasEntry(byte[] value, String token) {}
 
     /** Options for {@link #connect(Options)}; build with {@link #builder()}. */
@@ -90,22 +89,24 @@ public final class NanocachedClient implements AutoCloseable {
         private Duration readHedgeAfter;
         private boolean viaProxy;
 
-        /** Discovery replicas (discovery HA), tried in order for connect and every
-         * refresh; a one-element list is the single-target case. */
+        /**
+         * Discovery replicas (discovery HA), tried in order for connect and every refresh; a
+         * one-element list is the single-target case.
+         */
         public Options addresses(List<Address> addresses) {
             this.addresses.addAll(addresses);
             return this;
         }
 
-        /** Shared secret matching NANOCACHED_AUTH_SECRET on the server. An
-         * empty secret is the same as none, matching the other SDKs: sent
-         * literally, an empty string would reach the wire as an explicit
-         * zero-length secret, which the server rejects (EmptySecret) and
-         * closes without replying — turning what should be "no auth
-         * configured" into an opaque {@link NanocachedException.ConnectionLost}
-         * instead of the clear {@link NanocachedException.AuthenticationFailed}
-         * a missing secret against a server that requires one already
-         * gives. */
+        /**
+         * Shared secret matching NANOCACHED_AUTH_SECRET on the server. An empty secret is the same
+         * as none, matching the other SDKs: sent literally, an empty string would reach the wire as
+         * an explicit zero-length secret, which the server rejects (EmptySecret) and closes without
+         * replying — turning what should be "no auth configured" into an opaque {@link
+         * NanocachedException.ConnectionLost} instead of the clear {@link
+         * NanocachedException.AuthenticationFailed} a missing secret against a server that requires
+         * one already gives.
+         */
         public Options authSecret(String secret) {
             // A raw NullPointerException here reads like a bug in this
             // SDK, not a caller mistake — IllegalArgumentException matches
@@ -118,17 +119,19 @@ public final class NanocachedClient implements AutoCloseable {
             return this;
         }
 
-        /** Connect over TLS. Without {@link #ca}, verifies against the
-         * platform trust store; with it, a private CA replaces the default
-         * store. */
+        /**
+         * Connect over TLS. Without {@link #ca}, verifies against the platform trust store; with
+         * it, a private CA replaces the default store.
+         */
         public Options tls(boolean enabled) {
             this.tls = enabled;
             return this;
         }
 
-        /** A PEM file of trusted root certificate(s). Meaningful only when
-         * {@link #tls} is enabled — set without it, {@code connect()}
-         * rejects the options (issue #488). */
+        /**
+         * A PEM file of trusted root certificate(s). Meaningful only when {@link #tls} is enabled —
+         * set without it, {@code connect()} rejects the options (issue #488).
+         */
         public Options ca(Path path) {
             this.ca = path;
             return this;
@@ -144,84 +147,78 @@ public final class NanocachedClient implements AutoCloseable {
             return ca(file.toPath());
         }
 
-        /** Transparently compress values above {@link #compressionThreshold}
-         * on set and decompress them on get/getBytes (value compression).
-         * Off by default. <b>Every client that reads or writes a given set
-         * of keys must agree on this setting</b> — it is a per-keyspace
-         * format decision, not a per-client preference; take care before enabling this against an existing keyspace
-         * another client may still touch with {@code compress} off. Purely
-         * a wire-format choice otherwise — including for {@link
-         * #fireAndForgetReplicas}, whose background replica legs are
-         * always safe against the caller reusing its value {@code byte[]}
-         * after a call returns regardless of this setting (issue #326;
-         * see that option's own doc). */
+        /**
+         * Transparently compress values above {@link #compressionThreshold} on set and decompress
+         * them on get/getBytes (value compression). Off by default. <b>Every client that reads or
+         * writes a given set of keys must agree on this setting</b> — it is a per-keyspace format
+         * decision, not a per-client preference; take care before enabling this against an existing
+         * keyspace another client may still touch with {@code compress} off. Purely a wire-format
+         * choice otherwise — including for {@link #fireAndForgetReplicas}, whose background replica
+         * legs are always safe against the caller reusing its value {@code byte[]} after a call
+         * returns regardless of this setting (issue #326; see that option's own doc).
+         */
         public Options compress(boolean enabled) {
             this.compress = enabled;
             return this;
         }
 
-        /** Values shorter than this (in bytes) are never compressed — the
-         * per-value overhead of attempting it outweighs the savings. Only
-         * meaningful when {@link #compress} is enabled. Default {@value
-         * #DEFAULT_COMPRESSION_THRESHOLD}. Negative is rejected by {@link
-         * #connect} — a negative threshold would otherwise silently force
-         * every set() to attempt compression regardless of value size,
-         * since no value's length is ever less than a negative number
-         * (audit finding; mirrors the Go SDK's identical
-         * Connect-time check). */
+        /**
+         * Values shorter than this (in bytes) are never compressed — the per-value overhead of
+         * attempting it outweighs the savings. Only meaningful when {@link #compress} is enabled.
+         * Default {@value #DEFAULT_COMPRESSION_THRESHOLD}. Negative is rejected by {@link #connect}
+         * — a negative threshold would otherwise silently force every set() to attempt compression
+         * regardless of value size, since no value's length is ever less than a negative number
+         * (audit finding; mirrors the Go SDK's identical Connect-time check).
+         */
         public Options compressionThreshold(int bytes) {
             this.compressionThreshold = bytes;
             return this;
         }
 
-        /** Let set/delete return as soon as the primary owner acks, letting
-         * replica legs finish in the background instead of waiting for them
-         * too (fire-and-forget replica writes). Off by default. Unlike {@link #compress},
-         * this is a pure latency/durability trade for this client's own
-         * writes — it carries no wire format and needs no agreement with
-         * other clients. It also needs no care from the caller around
-         * reusing a value {@code byte[]} right after a set/cas call
-         * returns: with {@link #compress} off, that array isn't copied on
-         * the normal synchronous path, but a background replica leg
-         * scheduled by this option always writes from its own
-         * defensively-copied snapshot instead (issue #326), so a later
-         * mutation to the caller's array can never leak into what a
-         * replica ends up storing. */
+        /**
+         * Let set/delete return as soon as the primary owner acks, letting replica legs finish in
+         * the background instead of waiting for them too (fire-and-forget replica writes). Off by
+         * default. Unlike {@link #compress}, this is a pure latency/durability trade for this
+         * client's own writes — it carries no wire format and needs no agreement with other
+         * clients. It also needs no care from the caller around reusing a value {@code byte[]}
+         * right after a set/cas call returns: with {@link #compress} off, that array isn't copied
+         * on the normal synchronous path, but a background replica leg scheduled by this option
+         * always writes from its own defensively-copied snapshot instead (issue #326), so a later
+         * mutation to the caller's array can never leak into what a replica ends up storing.
+         */
         public Options fireAndForgetReplicas(boolean enabled) {
             this.fireAndForgetReplicas = enabled;
             return this;
         }
 
-        /** On a clean miss (the key's first-reached owner reports it
-         * missing), probe the remaining owners before accepting that, and
-         * repair the primary in the background if one still has the value
-         * (read repair). Off by default. Costs extra reads only on
-         * the misses this actually applies to. */
+        /**
+         * On a clean miss (the key's first-reached owner reports it missing), probe the remaining
+         * owners before accepting that, and repair the primary in the background if one still has
+         * the value (read repair). Off by default. Costs extra reads only on the misses this
+         * actually applies to.
+         */
         public Options readRepair(boolean enabled) {
             this.readRepair = enabled;
             return this;
         }
 
-        /** How long, after a reconnect dial to an address fails, that
-         * address is treated as still down — a call routed to it during
-         * this window fails immediately with the original dial error
-         * instead of paying another full connect timeout redialing an
-         * address that just proved unreachable. Default {@code
-         * DEFAULT_RECONNECT_COOLDOWN} (1s). Keep well under the node-list
-         * staleness window ({@code NODE_LIST_STALE_AFTER}, 30s) so a node
-         * that genuinely recovers isn't shut out for long.
+        /**
+         * How long, after a reconnect dial to an address fails, that address is treated as still
+         * down — a call routed to it during this window fails immediately with the original dial
+         * error instead of paying another full connect timeout redialing an address that just
+         * proved unreachable. Default {@code DEFAULT_RECONNECT_COOLDOWN} (1s). Keep well under the
+         * node-list staleness window ({@code NODE_LIST_STALE_AFTER}, 30s) so a node that genuinely
+         * recovers isn't shut out for long.
          *
-         * <p>{@link Duration#ZERO} means "use the default", not "disable
-         * it" — this matches the Go SDK's zero-value {@code Config}
-         * (whose {@code ReconnectCooldown} field, simply left unset,
-         * can't distinguish "not specified" from "explicitly zero", so
-         * zero has to mean "default" there) and the Rust SDK's {@code
-         * Options::reconnect_cooldown}, for cross-SDK consistency even
-         * though this builder can tell "never called" apart on its own.
-         * Call {@link #disableReconnectCooldown()} to actually disable
-         * the cooldown — the Go SDK's equivalent is a negative {@code
-         * Config.ReconnectCooldown}. A value above one year is rejected
-         * with an {@link IllegalArgumentException}. */
+         * <p>{@link Duration#ZERO} means "use the default", not "disable it" — this matches the Go
+         * SDK's zero-value {@code Config} (whose {@code ReconnectCooldown} field, simply left
+         * unset, can't distinguish "not specified" from "explicitly zero", so zero has to mean
+         * "default" there) and the Rust SDK's {@code Options::reconnect_cooldown}, for cross-SDK
+         * consistency even though this builder can tell "never called" apart on its own. Call
+         * {@link #disableReconnectCooldown()} to actually disable the cooldown — the Go SDK's
+         * equivalent is a negative {@code Config.ReconnectCooldown}. A value above one year is
+         * rejected with an {@link IllegalArgumentException}.
+         */
         public Options reconnectCooldown(Duration cooldown) {
             // Matches authSecret's null handling above (audit
             // finding J3) — a raw NullPointerException here would read
@@ -235,8 +232,7 @@ public final class NanocachedClient implements AutoCloseable {
             // — just not as a side effect of a duration that reads like
             // "immediately".)
             if (cooldown == null || cooldown.isNegative()) {
-                throw new IllegalArgumentException(
-                        "nanocached: reconnectCooldown must not be null or negative");
+                throw new IllegalArgumentException("nanocached: reconnectCooldown must not be null or negative");
             }
             requireWithinMaxDuration("reconnectCooldown", cooldown);
             this.reconnectCooldown = cooldown.isZero() ? DEFAULT_RECONNECT_COOLDOWN : cooldown;
@@ -244,43 +240,38 @@ public final class NanocachedClient implements AutoCloseable {
             return this;
         }
 
-        /** Disables the per-address reconnect cooldown entirely: every
-         * call that finds an address's connection dead pays its own full
-         * dial attempt instead of reusing a cached failure. See
-         * {@link #reconnectCooldown} for what the cooldown is; the Go
-         * SDK's equivalent of this method is a negative {@code
-         * Config.ReconnectCooldown}, and the Rust SDK's is {@code
-         * Options::disable_reconnect_cooldown()}. */
+        /**
+         * Disables the per-address reconnect cooldown entirely: every call that finds an address's
+         * connection dead pays its own full dial attempt instead of reusing a cached failure. See
+         * {@link #reconnectCooldown} for what the cooldown is; the Go SDK's equivalent of this
+         * method is a negative {@code Config.ReconnectCooldown}, and the Rust SDK's is {@code
+         * Options::disable_reconnect_cooldown()}.
+         */
         public Options disableReconnectCooldown() {
             this.reconnectCooldownDisabled = true;
             return this;
         }
 
-        /** Sends the same read to the next owner as well once the primary
-         * has been silent for this long (and so on, one more owner per
-         * interval, until every owner is in flight) — a slow-but-alive
-         * owner (a saturated host, a bad link) no longer bounds every read
-         * that touches it at its full round trip (hedged reads). {@code
-         * null} (the default) is off.
+        /**
+         * Sends the same read to the next owner as well once the primary has been silent for this
+         * long (and so on, one more owner per interval, until every owner is in flight) — a
+         * slow-but-alive owner (a saturated host, a bad link) no longer bounds every read that
+         * touches it at its full round trip (hedged reads). {@code null} (the default) is off.
          *
-         * <p>The first answer decides: a hit from any owner is final; a
-         * miss is final only from the primary — a replica's miss may
-         * simply mean it lacks the copy, so hedging never turns a hit
-         * into a miss. A connection-level (or other SDK) failure hedges
-         * onward immediately; a {@link NanocachedException.WrongNode}
-         * answer propagates exactly as the non-hedged read path's does.
-         * Applies only once a ring is known and the key has at least two
-         * owners — with a single copy there is nobody to hedge to, so
-         * this is simply inert against a single node or {@code
-         * replication == 1}.
+         * <p>The first answer decides: a hit from any owner is final; a miss is final only from the
+         * primary — a replica's miss may simply mean it lacks the copy, so hedging never turns a
+         * hit into a miss. A connection-level (or other SDK) failure hedges onward immediately; a
+         * {@link NanocachedException.WrongNode} answer propagates exactly as the non-hedged read
+         * path's does. Applies only once a ring is known and the key has at least two owners — with
+         * a single copy there is nobody to hedge to, so this is simply inert against a single node
+         * or {@code replication == 1}.
          *
-         * <p>The losing leg of a hedge is never cancelled — interrupting a
-         * request mid-write could desync that connection — but left to
-         * finish on this client's background executor, its result
-         * discarded, and is drained by {@link #close()} exactly like a
-         * {@code fireAndForgetReplicas} write. Writes are unaffected.
-         * A value above one year is rejected with an {@link
-         * IllegalArgumentException}. */
+         * <p>The losing leg of a hedge is never cancelled — interrupting a request mid-write could
+         * desync that connection — but left to finish on this client's background executor, its
+         * result discarded, and is drained by {@link #close()} exactly like a {@code
+         * fireAndForgetReplicas} write. Writes are unaffected. A value above one year is rejected
+         * with an {@link IllegalArgumentException}.
+         */
         public Options readHedgeAfter(Duration interval) {
             if (interval != null && interval.compareTo(Duration.ZERO) <= 0) {
                 throw new IllegalArgumentException(
@@ -291,36 +282,30 @@ public final class NanocachedClient implements AutoCloseable {
             return this;
         }
 
-        /** SDK proxy mode (issue #122). Off by default. Only meaningful
-         * when {@code addresses} names discovery server(s) — {@code
-         * connect()} fails fast, naming the address, if the first one
-         * reached turns out to be a cache node instead (proxy mode needs a
-         * ring to fan a roster fetch out to, not a single node's identity).
+        /**
+         * SDK proxy mode (issue #122). Off by default. Only meaningful when {@code addresses} names
+         * discovery server(s) — {@code connect()} fails fast, naming the address, if the first one
+         * reached turns out to be a cache node instead (proxy mode needs a ring to fan a roster
+         * fetch out to, not a single node's identity).
          *
-         * <p>Routes every request through exactly one {@code
-         * nanocached-proxy} instead of joining the cluster ring: no
-         * per-node connections, no ring view, and no hedged reads — a
-         * proxy is the only owner on this one connection, so there is
-         * nobody to hedge to, and a configured {@link #readHedgeAfter} is
-         * rejected here: {@code connect} throws
-         * {@code IllegalArgumentException} when both are set. Namespaces,
-         * clear/clearAll, tags, keep-alive, and compression all work
-         * unchanged; {@code close()} is unchanged too. From here on this
-         * client behaves exactly like single-node mode, because a proxy
-         * answers the identify handshake exactly like a cache node does
-         * (full G/S/D, never {@code W} — it owns every key) and this SDK's
-         * existing single-connection path already speaks to it correctly.
+         * <p>Routes every request through exactly one {@code nanocached-proxy} instead of joining
+         * the cluster ring: no per-node connections, no ring view, and no hedged reads — a proxy is
+         * the only owner on this one connection, so there is nobody to hedge to, and a configured
+         * {@link #readHedgeAfter} is rejected here: {@code connect} throws {@code
+         * IllegalArgumentException} when both are set. Namespaces, clear/clearAll, tags,
+         * keep-alive, and compression all work unchanged; {@code close()} is unchanged too. From
+         * here on this client behaves exactly like single-node mode, because a proxy answers the
+         * identify handshake exactly like a cache node does (full G/S/D, never {@code W} — it owns
+         * every key) and this SDK's existing single-connection path already speaks to it correctly.
          *
-         * <p>The proxy itself is chosen at random from the roster
-         * discovery serves via {@code Q} — spreads a client fleet across
-         * the whole proxy tier instead of piling every client onto
-         * whichever proxy answers first — with random fail-over across the
-         * rest of the roster if the chosen one is unreachable. On a later
-         * disconnect the client first retries that same proxy (it may
-         * simply have restarted) before re-fetching the roster and picking
-         * another; both paths reuse the existing single-node reconnect
-         * machinery ({@link #reconnectCooldown} included) rather than a
-         * second one built for this mode. */
+         * <p>The proxy itself is chosen at random from the roster discovery serves via {@code Q} —
+         * spreads a client fleet across the whole proxy tier instead of piling every client onto
+         * whichever proxy answers first — with random fail-over across the rest of the roster if
+         * the chosen one is unreachable. On a later disconnect the client first retries that same
+         * proxy (it may simply have restarted) before re-fetching the roster and picking another;
+         * both paths reuse the existing single-node reconnect machinery ({@link #reconnectCooldown}
+         * included) rather than a second one built for this mode.
+         */
         public Options viaProxy(boolean enabled) {
             this.viaProxy = enabled;
             return this;
@@ -328,35 +313,28 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * Point-in-time snapshot returned by {@link #stats()}: counters for
-     * failures this client swallows by design instead of surfacing to the
-     * caller — a dead replica leg on a write (client-side replication,
-     * Fire-and-forget replica writes), a failed background repair of the primary after
-     * read-repair found a value on another owner (read repair), and
-     * a failed node-list refresh attempt or per-node reconnect during one.
-     * None of these ever fail an operation; this is purely observability
-     * so an operator who only watches for thrown exceptions can still
-     * notice replication silently degrading or a node-list refresh stuck
-     * failing.
+     * Point-in-time snapshot returned by {@link #stats()}: counters for failures this client
+     * swallows by design instead of surfacing to the caller — a dead replica leg on a write
+     * (client-side replication, Fire-and-forget replica writes), a failed background repair of the
+     * primary after read-repair found a value on another owner (read repair), and a failed
+     * node-list refresh attempt or per-node reconnect during one. None of these ever fail an
+     * operation; this is purely observability so an operator who only watches for thrown exceptions
+     * can still notice replication silently degrading or a node-list refresh stuck failing.
      *
-     * <p>{@link #backgroundWriteBugs()} counts a genuine programming bug (never an
-     * expected failure — those are already counted above) that escaped a
-     * background replica write or read-repair write-back. Unlike the
-     * other counters, this must never legitimately increase; it exists so
-     * a bug in this SDK's own background-write handling can't vanish
-     * silently the way an ignored {@code CompletableFuture.whenComplete}
-     * error previously could (audit finding). Also logged to
+     * <p>{@link #backgroundWriteBugs()} counts a genuine programming bug (never an expected failure
+     * — those are already counted above) that escaped a background replica write or read-repair
+     * write-back. Unlike the other counters, this must never legitimately increase; it exists so a
+     * bug in this SDK's own background-write handling can't vanish silently the way an ignored
+     * {@code CompletableFuture.whenComplete} error previously could (audit finding). Also logged to
      * stderr when it happens — see {@link #reportBackgroundWriteBug}.
-     * <p>{@link #transientRetries()} counts every {@code R} (transient-failure, issue
-     * #125) response this client has received across every connection,
-     * including the final one on any request that went on to exhaust its
-     * bounded retry budget and raise {@link
-     * NanocachedException.RetryableError}. Unlike the other counters
-     * here, a transient retry is never silently swallowed on its own — a
-     * request either transparently succeeds after one or more, or the
-     * caller sees {@code RetryableError} — this counter exists purely so
-     * an operator can see how often it's happening even when every
-     * individual occurrence resolved fine.
+     *
+     * <p>{@link #transientRetries()} counts every {@code R} (transient-failure, issue #125)
+     * response this client has received across every connection, including the final one on any
+     * request that went on to exhaust its bounded retry budget and raise {@link
+     * NanocachedException.RetryableError}. Unlike the other counters here, a transient retry is
+     * never silently swallowed on its own — a request either transparently succeeds after one or
+     * more, or the caller sees {@code RetryableError} — this counter exists purely so an operator
+     * can see how often it's happening even when every individual occurrence resolved fine.
      */
     public static final class ClientStats {
         private final long replicaWriteFailures;
@@ -365,8 +343,12 @@ public final class NanocachedClient implements AutoCloseable {
         private final long backgroundWriteBugs;
         private final long transientRetries;
 
-        ClientStats(long replicaWriteFailures, long readRepairFailures, long refreshFailures,
-                long backgroundWriteBugs, long transientRetries) {
+        ClientStats(
+                long replicaWriteFailures,
+                long readRepairFailures,
+                long refreshFailures,
+                long backgroundWriteBugs,
+                long transientRetries) {
             this.replicaWriteFailures = replicaWriteFailures;
             this.readRepairFailures = readRepairFailures;
             this.refreshFailures = refreshFailures;
@@ -375,19 +357,29 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         /** Replica writes (client-side replication, fire-and-forget) that failed. */
-        public long replicaWriteFailures() { return replicaWriteFailures; }
+        public long replicaWriteFailures() {
+            return replicaWriteFailures;
+        }
 
         /** Read-repair write-backs to the primary that failed. */
-        public long readRepairFailures() { return readRepairFailures; }
+        public long readRepairFailures() {
+            return readRepairFailures;
+        }
 
         /** Node-list refresh attempts or per-node reconnects that failed. */
-        public long refreshFailures() { return refreshFailures; }
+        public long refreshFailures() {
+            return refreshFailures;
+        }
 
         /** Programming bugs that escaped a background write; must never increase. */
-        public long backgroundWriteBugs() { return backgroundWriteBugs; }
+        public long backgroundWriteBugs() {
+            return backgroundWriteBugs;
+        }
 
         /** Every {@code R} (transient-failure) response received. */
-        public long transientRetries() { return transientRetries; }
+        public long transientRetries() {
+            return transientRetries;
+        }
 
         @Override
         public boolean equals(Object other) {
@@ -401,17 +393,23 @@ public final class NanocachedClient implements AutoCloseable {
 
         @Override
         public int hashCode() {
-            return java.util.Objects.hash(replicaWriteFailures, readRepairFailures, refreshFailures,
-                    backgroundWriteBugs, transientRetries);
+            return java.util.Objects.hash(
+                    replicaWriteFailures, readRepairFailures, refreshFailures, backgroundWriteBugs, transientRetries);
         }
 
         @Override
         public String toString() {
-            return "ClientStats[replicaWriteFailures=" + replicaWriteFailures
-                    + ", readRepairFailures=" + readRepairFailures
-                    + ", refreshFailures=" + refreshFailures
-                    + ", backgroundWriteBugs=" + backgroundWriteBugs
-                    + ", transientRetries=" + transientRetries + "]";
+            return "ClientStats[replicaWriteFailures="
+                    + replicaWriteFailures
+                    + ", readRepairFailures="
+                    + readRepairFailures
+                    + ", refreshFailures="
+                    + refreshFailures
+                    + ", backgroundWriteBugs="
+                    + backgroundWriteBugs
+                    + ", transientRetries="
+                    + transientRetries
+                    + "]";
         }
     }
 
@@ -422,11 +420,12 @@ public final class NanocachedClient implements AutoCloseable {
     // _DEFAULT_RECONNECT_COOLDOWN.
     private static final Duration DEFAULT_RECONNECT_COOLDOWN = Duration.ofMillis(1_000);
 
-    /** Issue #1255: with {@code fireAndForgetReplicas} a replica leg frames
-     * its request after the call has returned, so the arrays it closes over
-     * must not be the caller's own (they may be reused or overwritten at
-     * once). Copies {@code bytes} in that mode and returns it unchanged
-     * otherwise, where every leg finishes before the call returns. */
+    /**
+     * Issue #1255: with {@code fireAndForgetReplicas} a replica leg frames its request after the
+     * call has returned, so the arrays it closes over must not be the caller's own (they may be
+     * reused or overwritten at once). Copies {@code bytes} in that mode and returns it unchanged
+     * otherwise, where every leg finishes before the call returns.
+     */
     private byte[] ownedForBackground(byte[] bytes) {
         return fireAndForgetReplicas ? bytes.clone() : bytes;
     }
@@ -489,15 +488,16 @@ public final class NanocachedClient implements AutoCloseable {
 
     private static final Duration NODE_LIST_STALE_AFTER = Duration.ofSeconds(30);
 
-    /** The minimum time between two forced node-list refreshes (issue
-     * #1582). While discovery still lists a dead node (its liveness
-     * window), every operation whose primary is that node fails and forces
-     * a refresh that installs the same list; without a floor, a sequential
-     * caller opens one discovery connection per failed operation. A forced
-     * caller that finds a refresh completed within this window reuses it,
-     * and callers that waited behind an older refresh share one follow-up
-     * that starts once the window has passed. */
+    /**
+     * The minimum time between two forced node-list refreshes (issue #1582). While discovery still
+     * lists a dead node (its liveness window), every operation whose primary is that node fails and
+     * forces a refresh that installs the same list; without a floor, a sequential caller opens one
+     * discovery connection per failed operation. A forced caller that finds a refresh completed
+     * within this window reuses it, and callers that waited behind an older refresh share one
+     * follow-up that starts once the window has passed.
+     */
     static final Duration FORCED_REFRESH_MIN_INTERVAL = Duration.ofMillis(200);
+
     // Reserved by the SDKs so a real application key can never collide
     // with it: a GET refreshes the pinged key's server-side LRU recency,
     // which is exactly why collision would matter — an app using key
@@ -637,63 +637,78 @@ public final class NanocachedClient implements AutoCloseable {
     private final byte[] authSecret;
     private final SSLContext tls;
     private final boolean compress;
-    /** This client's share of in-flight DEFLATE output — see {@link
-     * Compression#maxInflightDecompressedBytes}. */
+
+    /**
+     * This client's share of in-flight DEFLATE output — see {@link
+     * Compression#maxInflightDecompressedBytes}.
+     */
     private final Compression.InflateBudget inflateBudget =
             new Compression.InflateBudget(Compression.maxInflightDecompressedBytes);
+
     private final int compressionThreshold;
     private final boolean fireAndForgetReplicas;
     private final boolean readRepair;
     private final long reconnectCooldownNanos;
-    /** {@code true} when {@link Options#disableReconnectCooldown()} was
-     * called: {@link #dialWithCooldown} then never records a cooldown
-     * entry at all, so every dial to a known-dead address still pays its
-     * own full connect attempt (see {@link Options#reconnectCooldown}'s
-     * doc for the Duration.ZERO-means-default rule this complements). */
+
+    /**
+     * {@code true} when {@link Options#disableReconnectCooldown()} was called: {@link
+     * #dialWithCooldown} then never records a cooldown entry at all, so every dial to a known-dead
+     * address still pays its own full connect attempt (see {@link Options#reconnectCooldown}'s doc
+     * for the Duration.ZERO-means-default rule this complements).
+     */
     private final boolean reconnectCooldownDisabled;
+
     /** Hedged reads (issue #64): 0 means off. See {@link Options#readHedgeAfter}. */
     private final long readHedgeAfterNanos;
-    /** SDK proxy mode (issue #122): {@code true} routes {@link
-     * #singleConnection}'s reconnect through {@link #reconnectProxy}
-     * (retry-same-then-re-fetch-and-pick-another) instead of {@link
-     * #dialWithCooldown}'s plain single-address redial. See {@link
-     * Options#viaProxy}. */
+
+    /**
+     * SDK proxy mode (issue #122): {@code true} routes {@link #singleConnection}'s reconnect
+     * through {@link #reconnectProxy} (retry-same-then-re-fetch-and-pick-another) instead of {@link
+     * #dialWithCooldown}'s plain single-address redial. See {@link Options#viaProxy}.
+     */
     private final boolean viaProxy;
-    /** Every hedge leg currently in flight — including a read's own
-     * winning leg while it's still racing — added by {@link
-     * #startHedgeLeg} and removed on completion; a losing leg (issue
-     * #64) finishes detached on {@link #hedgeLegs}, its result
-     * discarded, drained by {@link #close()} exactly like {@link
-     * #backgroundReplicaWritePermits}'s writes. Unlike that pool, a leg
-     * is never refused admission here — it must always be started
-     * immediately to race for its read's own answer — but {@link
-     * #maxInFlightHedgeLoserLegs} (issue #276) still bounds how many can
-     * accumulate: see {@link #resolveLosers}. */
+
+    /**
+     * Every hedge leg currently in flight — including a read's own winning leg while it's still
+     * racing — added by {@link #startHedgeLeg} and removed on completion; a losing leg (issue #64)
+     * finishes detached on {@link #hedgeLegs}, its result discarded, drained by {@link #close()}
+     * exactly like {@link #backgroundReplicaWritePermits}'s writes. Unlike that pool, a leg is
+     * never refused admission here — it must always be started immediately to race for its read's
+     * own answer — but {@link #maxInFlightHedgeLoserLegs} (issue #276) still bounds how many can
+     * accumulate: see {@link #resolveLosers}.
+     */
     private final Set<CompletableFuture<?>> hedgedReads = ConcurrentHashMap.newKeySet();
-    /** How many of {@link #hedgedReads} a read left running after it
-     * returned: the legs {@link #maxInFlightHedgeLoserLegs} bounds. The
-     * rest belong to reads still in flight. Package-private for tests. */
+
+    /**
+     * How many of {@link #hedgedReads} a read left running after it returned: the legs {@link
+     * #maxInFlightHedgeLoserLegs} bounds. The rest belong to reads still in flight. Package-private
+     * for tests.
+     */
     final AtomicInteger detachedHedgeLegs = new AtomicInteger();
-    /** Serializes a hedge leg's "check closed, then register" against
-     * {@link #close()}'s "observe the set empty, then stop draining"
-     * (issue #91). Without it a leg could be registered — and dialed
-     * against a connection {@link #teardown()} is closing — after the drain
-     * had already found the set empty. Held only briefly on both sides
-     * (never across a leg's own {@code join()}), so it doesn't serialize
-     * the reads themselves. */
+
+    /**
+     * Serializes a hedge leg's "check closed, then register" against {@link #close()}'s "observe
+     * the set empty, then stop draining" (issue #91). Without it a leg could be registered — and
+     * dialed against a connection {@link #teardown()} is closing — after the drain had already
+     * found the set empty. Held only briefly on both sides (never across a leg's own {@code
+     * join()}), so it doesn't serialize the reads themselves.
+     */
     private final Object hedgedReadsLock = new Object();
 
-    /** Per owner, the hedge legs that were still unanswered when the hedge
-     * interval elapsed and have not finished since. See {@link
-     * #demoteSilentOwners}. An entry is removed when its count reaches 0. */
+    /**
+     * Per owner, the hedge legs that were still unanswered when the hedge interval elapsed and have
+     * not finished since. See {@link #demoteSilentOwners}. An entry is removed when its count
+     * reaches 0.
+     */
     final ConcurrentHashMap<String, Integer> lateHedgeLegs = new ConcurrentHashMap<>();
-    /** Per-address reconnect cooldown (see {@link Options#reconnectCooldown}):
-     * the address of the most recently failed dial, and how long it stays
-     * "down" before another dial to it is attempted. Keyed by address, not
-     * slot — {@link #memberConnection}'s slot (node name) can be
-     * reassigned to a different address by a refresh, but the address
-     * itself is what's actually unreachable. Mirrors TypeScript's
-     * reconnectCooldowns. */
+
+    /**
+     * Per-address reconnect cooldown (see {@link Options#reconnectCooldown}): the address of the
+     * most recently failed dial, and how long it stays "down" before another dial to it is
+     * attempted. Keyed by address, not slot — {@link #memberConnection}'s slot (node name) can be
+     * reassigned to a different address by a refresh, but the address itself is what's actually
+     * unreachable. Mirrors TypeScript's reconnectCooldowns.
+     */
     private final ConcurrentHashMap<String, CooldownEntry> reconnectCooldowns = new ConcurrentHashMap<>();
 
     private static final class CooldownEntry {
@@ -705,6 +720,7 @@ public final class NanocachedClient implements AutoCloseable {
             this.error = error;
         }
     }
+
     // Observability for failures this client swallows by design — see
     // stats(). AtomicLong because they're incremented from whichever
     // thread happens to hit the swallow site (foreground calls,
@@ -714,21 +730,25 @@ public final class NanocachedClient implements AutoCloseable {
     private final AtomicLong readRepairFailures = new AtomicLong();
     private final AtomicLong refreshFailures = new AtomicLong();
     private final AtomicLong backgroundWriteBugs = new AtomicLong();
-    /** Issue #125: every {@code R} (transient-failure) response any
-     * {@link Connection} this client owns has received — wired into each
-     * one via {@link #newTrackedConnection}'s {@code onTransientRetry}
-     * callback. See {@link ClientStats#transientRetries()}. */
+
+    /**
+     * Issue #125: every {@code R} (transient-failure) response any {@link Connection} this client
+     * owns has received — wired into each one via {@link #newTrackedConnection}'s {@code
+     * onTransientRetry} callback. See {@link ClientStats#transientRetries()}.
+     */
     private final AtomicLong transientRetries = new AtomicLong();
+
     private java.util.concurrent.Semaphore backgroundReplicaWritePermits;
     // The permit count backgroundReplicaWritePermits was built with,
     // captured so close() can acquire exactly all of them even if a test
     // mutates the static maxInFlightBackgroundReplicaWrites afterwards.
     private int backgroundReplicaWritePermitCount;
 
-    /** The address that answered connect() — used both to redial in single
-     * mode and as the key for the open-sockets tracker in every mode
-     * (mirrors TypeScript's {@code this.url}). Set once, before this
-     * client ever opens a socket. */
+    /**
+     * The address that answered connect() — used both to redial in single mode and as the key for
+     * the open-sockets tracker in every mode (mirrors TypeScript's {@code this.url}). Set once,
+     * before this client ever opens a socket.
+     */
     private String targetKey;
 
     private volatile boolean closed = false;
@@ -751,7 +771,7 @@ public final class NanocachedClient implements AutoCloseable {
     // double-checked locking. .NET's Connection sidesteps this by
     // routing every access through _stateLock instead of splitting it
     // across a lock and an unlocked fast path.
-    private volatile Connection single;              // single-node mode
+    private volatile Connection single; // single-node mode
     private String singleAddress;
     private final Map<String, Member> members = new LinkedHashMap<>(); // cluster mode
     // volatile: written under stateLock by the refresh, read lock-free on
@@ -772,31 +792,33 @@ public final class NanocachedClient implements AutoCloseable {
     private boolean lastRefreshEnded;
 
     private ExecutorService replicaWriters;
-    /** Issue #500: the pool for the permit-gated background legs only —
-     * fire-and-forget replica writes (set, delete, setMany) and read
-     * repair — sized to exactly {@link #backgroundReplicaWritePermitCount}
-     * threads over a queue of the same depth. Every leg that lands here
-     * holds a permit from {@link #backgroundReplicaWritePermits}, so at
-     * most that many are ever in flight and the pool can never be full:
-     * the "caller runs the task" overflow policy shared with {@link
-     * #replicaWriters} is unreachable here in practice. That is the
-     * point of the split — on the shared pool, a burst of the legs no
-     * permit bounds (synchronous fallbacks, batched get/set owner legs)
-     * could fill the queue and make a permit-holding fire-and-forget
-     * {@code set()} run its replica leg inline, blocking the caller the
-     * option promises to return to as soon as the primary acks. */
+
+    /**
+     * Issue #500: the pool for the permit-gated background legs only — fire-and-forget replica
+     * writes (set, delete, setMany) and read repair — sized to exactly {@link
+     * #backgroundReplicaWritePermitCount} threads over a queue of the same depth. Every leg that
+     * lands here holds a permit from {@link #backgroundReplicaWritePermits}, so at most that many
+     * are ever in flight and the pool can never be full: the "caller runs the task" overflow policy
+     * shared with {@link #replicaWriters} is unreachable here in practice. That is the point of the
+     * split — on the shared pool, a burst of the legs no permit bounds (synchronous fallbacks,
+     * batched get/set owner legs) could fill the queue and make a permit-holding fire-and-forget
+     * {@code set()} run its replica leg inline, blocking the caller the option promises to return
+     * to as soon as the primary acks.
+     */
     private ExecutorService backgroundLegs;
-    /** The pool for hedge legs (issue #1451), every leg of a hedged read
-     * included: a leg to an owner that has stopped answering holds a
-     * thread for the request timeout, and on {@link #replicaWriters} a
-     * burst of such legs within one hedge interval filled that pool's 48
-     * threads and 48-deep queue, so the replica writes and batched owner
-     * legs queued behind them and further hedge legs ran on the caller's
-     * own thread — the stall hedging exists to avoid. Sized from what can
-     * accumulate here, {@link #maxInFlightHedgeLoserLegs} plus headroom
-     * for the legs of reads in flight, with idle threads retiring, and
-     * with the same "caller runs the task" overflow policy. */
+
+    /**
+     * The pool for hedge legs (issue #1451), every leg of a hedged read included: a leg to an owner
+     * that has stopped answering holds a thread for the request timeout, and on {@link
+     * #replicaWriters} a burst of such legs within one hedge interval filled that pool's 48 threads
+     * and 48-deep queue, so the replica writes and batched owner legs queued behind them and
+     * further hedge legs ran on the caller's own thread — the stall hedging exists to avoid. Sized
+     * from what can accumulate here, {@link #maxInFlightHedgeLoserLegs} plus headroom for the legs
+     * of reads in flight, with idle threads retiring, and with the same "caller runs the task"
+     * overflow policy.
+     */
     private ExecutorService hedgeLegs;
+
     private ScheduledExecutorService keepAlive;
 
     private static final class Member {
@@ -817,10 +839,17 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     private NanocachedClient(
-            List<Address> addresses, byte[] authSecret, SSLContext tls,
-            boolean compress, int compressionThreshold, boolean fireAndForgetReplicas,
-            boolean readRepair, Duration reconnectCooldown, boolean reconnectCooldownDisabled,
-            Duration readHedgeAfter, boolean viaProxy) {
+            List<Address> addresses,
+            byte[] authSecret,
+            SSLContext tls,
+            boolean compress,
+            int compressionThreshold,
+            boolean fireAndForgetReplicas,
+            boolean readRepair,
+            Duration reconnectCooldown,
+            boolean reconnectCooldownDisabled,
+            Duration readHedgeAfter,
+            boolean viaProxy) {
         this.addresses = List.copyOf(addresses);
         this.authSecret = authSecret;
         this.tls = tls;
@@ -836,8 +865,7 @@ public final class NanocachedClient implements AutoCloseable {
 
     public static NanocachedClient connect(Options options) {
         if (options.addresses.isEmpty()) {
-            throw new IllegalArgumentException(
-                    "nanocached: connect() needs a non-empty addresses list");
+            throw new IllegalArgumentException("nanocached: connect() needs a non-empty addresses list");
         }
         // Mirrors the Go SDK's Connect-time rejection: a negative
         // threshold would otherwise silently force every set() to
@@ -845,16 +873,14 @@ public final class NanocachedClient implements AutoCloseable {
         // finding).
         if (options.compressionThreshold < 0) {
             throw new IllegalArgumentException(
-                    "nanocached: compressionThreshold must not be negative, got "
-                            + options.compressionThreshold);
+                    "nanocached: compressionThreshold must not be negative, got " + options.compressionThreshold);
         }
         // Issue #488: an option that can have no effect in this
         // configuration is a misconfiguration, not something to ignore
         // quietly.
         if (options.viaProxy && options.readHedgeAfter != null) {
-            throw new IllegalArgumentException(
-                    "nanocached: readHedgeAfter has no effect with viaProxy "
-                            + "(a proxy connection has no replicas to hedge to); unset one of them");
+            throw new IllegalArgumentException("nanocached: readHedgeAfter has no effect with viaProxy "
+                    + "(a proxy connection has no replicas to hedge to); unset one of them");
         }
         if (options.ca != null && !options.tls) {
             throw new IllegalArgumentException(
@@ -863,10 +889,17 @@ public final class NanocachedClient implements AutoCloseable {
 
         SSLContext sslContext = buildSslContext(options.tls, options.ca);
         NanocachedClient client = new NanocachedClient(
-                options.addresses, options.authSecret, sslContext,
-                options.compress, options.compressionThreshold, options.fireAndForgetReplicas,
-                options.readRepair, options.reconnectCooldown, options.reconnectCooldownDisabled,
-                options.readHedgeAfter, options.viaProxy);
+                options.addresses,
+                options.authSecret,
+                sslContext,
+                options.compress,
+                options.compressionThreshold,
+                options.fireAndForgetReplicas,
+                options.readRepair,
+                options.reconnectCooldown,
+                options.reconnectCooldownDisabled,
+                options.readHedgeAfter,
+                options.viaProxy);
 
         // SDK proxy mode (issue #122): a wholly different connect flow —
         // fetch a proxy roster via `Q` rather than a node list via `L`,
@@ -889,14 +922,14 @@ public final class NanocachedClient implements AutoCloseable {
             // connections to the same address makes this heuristic
             // false-positive (issue #12).
             if (client.addresses.size() == 1 && OPEN_TARGETS.containsKey(key)) {
-                System.err.println("nanocached: connect() called for " + key
+                System.err.println("nanocached: connect() called for "
+                        + key
                         + " while a previous connection to it is still open — was close() forgotten?");
             }
 
             Identify.Result identified;
             try {
-                identified = Identify.connectAndIdentify(
-                        address.host(), address.port(), client.authSecret, client.tls);
+                identified = Identify.connectAndIdentify(address.host(), address.port(), client.authSecret, client.tls);
             } catch (Identify.UnexpectedHandshakeReply garbage) {
                 // The plain exception connect() is documented to throw (the
                 // handshake's own type is for the ring members' dial paths).
@@ -914,9 +947,12 @@ public final class NanocachedClient implements AutoCloseable {
 
                 if (identified instanceof Identify.NodeTarget node) {
                     if (client.addresses.size() > 1) {
-                        System.err.println("nanocached: " + key
+                        System.err.println("nanocached: "
+                                + key
                                 + " is a cache node, so this client is pinned to that single server —"
-                                + " the " + (client.addresses.size() - 1) + " remaining address(es)"
+                                + " the "
+                                + (client.addresses.size() - 1)
+                                + " remaining address(es)"
                                 + " will not be used. Point addresses at discovery servers for cluster"
                                 + " routing and failover.");
                     }
@@ -945,28 +981,22 @@ public final class NanocachedClient implements AutoCloseable {
             }
         }
 
-        throw lastError != null
-                ? lastError
-                : new NanocachedException("nanocached: could not connect to any address");
+        throw lastError != null ? lastError : new NanocachedException("nanocached: could not connect to any address");
     }
 
     /**
-     * SDK proxy mode (issue #122) connect: walks {@code client.addresses}
-     * exactly like {@link #connect}'s own loop does for the non-proxy
-     * path — same per-address tolerance for a busy ({@code B}, discovery
-     * HA startup grace) or unreachable seed, same {@code lastError}
-     * fallback message — but fetches the proxy roster ({@code Q}) instead
-     * of the node list ({@code L}), and stops at the first seed that
-     * serves a non-empty one: unlike {@link #openCluster}, this never
-     * goes back to a different discovery seed for a second opinion on the
-     * roster once one seed has answered.
+     * SDK proxy mode (issue #122) connect: walks {@code client.addresses} exactly like {@link
+     * #connect}'s own loop does for the non-proxy path — same per-address tolerance for a busy
+     * ({@code B}, discovery HA startup grace) or unreachable seed, same {@code lastError} fallback
+     * message — but fetches the proxy roster ({@code Q}) instead of the node list ({@code L}), and
+     * stops at the first seed that serves a non-empty one: unlike {@link #openCluster}, this never
+     * goes back to a different discovery seed for a second opinion on the roster once one seed has
+     * answered.
      *
-     * <p>An address that identifies as a cache node is a hard,
-     * non-tolerated error (unlike a busy/unreachable seed) — proxy mode
-     * needs a ring to fetch a roster from, and pointing it at a node
-     * instead is a configuration mistake no amount of address fail-over
-     * fixes, so this fails fast naming the address rather than silently
-     * trying the next one.
+     * <p>An address that identifies as a cache node is a hard, non-tolerated error (unlike a
+     * busy/unreachable seed) — proxy mode needs a ring to fetch a roster from, and pointing it at a
+     * node instead is a configuration mistake no amount of address fail-over fixes, so this fails
+     * fast naming the address rather than silently trying the next one.
      */
     private static NanocachedClient connectViaProxy(NanocachedClient client) {
         RuntimeException lastError = null;
@@ -974,7 +1004,8 @@ public final class NanocachedClient implements AutoCloseable {
             String key = address.host() + ":" + address.port();
 
             if (client.addresses.size() == 1 && OPEN_TARGETS.containsKey(key)) {
-                System.err.println("nanocached: connect() called for " + key
+                System.err.println("nanocached: connect() called for "
+                        + key
                         + " while a previous connection to it is still open — was close() forgotten?");
             }
 
@@ -1019,19 +1050,15 @@ public final class NanocachedClient implements AutoCloseable {
             }
         }
 
-        throw lastError != null
-                ? lastError
-                : new NanocachedException("nanocached: could not connect to any address");
+        throw lastError != null ? lastError : new NanocachedException("nanocached: could not connect to any address");
     }
 
     /**
-     * Dials one proxy from {@code proxies}, in random order — spreads a
-     * client fleet across the whole proxy tier instead of piling
-     * everyone onto whichever entry happens to be first — returning as
-     * soon as one accepts. A proxy identifies exactly like a cache node
-     * on the wire (full G/S/D, never {@code W}: it owns every key), so
-     * {@link #openNodeConnectionOrThrow} — the same dial this class uses
-     * for any ordinary node — is exactly right here too; every entry
+     * Dials one proxy from {@code proxies}, in random order — spreads a client fleet across the
+     * whole proxy tier instead of piling everyone onto whichever entry happens to be first —
+     * returning as soon as one accepts. A proxy identifies exactly like a cache node on the wire
+     * (full G/S/D, never {@code W}: it owns every key), so {@link #openNodeConnectionOrThrow} — the
+     * same dial this class uses for any ordinary node — is exactly right here too; every entry
      * unreachable is this SDK's normal connect error.
      */
     private static NanocachedClient connectToOneProxy(NanocachedClient client, List<DiscoveredNode> proxies) {
@@ -1056,9 +1083,11 @@ public final class NanocachedClient implements AutoCloseable {
                 : new NanocachedException("nanocached: no proxies registered with discovery");
     }
 
-    /** Builds the TLS context to dial with, or {@code null} for a plain
-     * connection. {@code ca} is silently ignored when {@code tlsEnabled} is
-     * false; an unreadable/unparseable CA file is a connect-time error. */
+    /**
+     * Builds the TLS context to dial with, or {@code null} for a plain connection. {@code ca} is
+     * silently ignored when {@code tlsEnabled} is false; an unreadable/unparseable CA file is a
+     * connect-time error.
+     */
     private static SSLContext buildSslContext(boolean tlsEnabled, Path ca) {
         if (!tlsEnabled) return null;
 
@@ -1066,8 +1095,7 @@ public final class NanocachedClient implements AutoCloseable {
             try {
                 return SSLContext.getDefault();
             } catch (NoSuchAlgorithmException error) {
-                throw new NanocachedException(
-                        "nanocached: no default SSL context available: " + error.getMessage());
+                throw new NanocachedException("nanocached: no default SSL context available: " + error.getMessage());
             }
         }
 
@@ -1101,18 +1129,22 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** One bootstrap dial's outcome (issue #67): a live connection, or a
-     * connection-level failure to tolerate — exactly one of {@link
-     * #connection}/{@link #error} is set. A hard failure (an unparseable
-     * address) is a distinct, non-tolerated case — see {@link #hard}
-     * and {@link #dialBootstrapNode}. */
+    /**
+     * One bootstrap dial's outcome (issue #67): a live connection, or a connection-level failure to
+     * tolerate — exactly one of {@link #connection}/{@link #error} is set. A hard failure (an
+     * unparseable address) is a distinct, non-tolerated case — see {@link #hard} and {@link
+     * #dialBootstrapNode}.
+     */
     private static final class DialOutcome {
         final Connection connection;
         final RuntimeException error;
         final boolean hard;
-        /** Set when the address identified as something other than a cache
-         * node: the dead member's error is a not-sent lost connection, but
-         * a connect that reaches no node reports the plain exception. */
+
+        /**
+         * Set when the address identified as something other than a cache node: the dead member's
+         * error is a not-sent lost connection, but a connect that reaches no node reports the plain
+         * exception.
+         */
         final String nonNodeAddress;
 
         private DialOutcome(Connection connection, RuntimeException error, boolean hard) {
@@ -1144,18 +1176,15 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * Dials and identifies one node discovery listed, for {@link
-     * #openCluster}'s concurrent bootstrap (issue #67). Never throws: a
-     * connection-level failure — the dial itself failing, or the
-     * identify exchange failing or being rejected — is tolerated and
-     * comes back as {@link DialOutcome#tolerable}, exactly the class of
-     * failure {@link #dialWithCooldown} already tolerates on a lazy
-     * redial, and so is an address that identifies as something other
-     * than a cache node (a discovery or proxy process that reused the IP).
-     * An unparseable address is a hard error and stays one — reported as
-     * {@link DialOutcome#hard} rather than thrown directly, so {@link #openCluster} can close whatever the other
-     * concurrent dials already opened before it aborts the whole
-     * bootstrap.
+     * Dials and identifies one node discovery listed, for {@link #openCluster}'s concurrent
+     * bootstrap (issue #67). Never throws: a connection-level failure — the dial itself failing, or
+     * the identify exchange failing or being rejected — is tolerated and comes back as {@link
+     * DialOutcome#tolerable}, exactly the class of failure {@link #dialWithCooldown} already
+     * tolerates on a lazy redial, and so is an address that identifies as something other than a
+     * cache node (a discovery or proxy process that reused the IP). An unparseable address is a
+     * hard error and stays one — reported as {@link DialOutcome#hard} rather than thrown directly,
+     * so {@link #openCluster} can close whatever the other concurrent dials already opened before
+     * it aborts the whole bootstrap.
      */
     private DialOutcome dialBootstrapNode(DiscoveredNode node) {
         String address = node.address();
@@ -1173,10 +1202,11 @@ public final class NanocachedClient implements AutoCloseable {
         } catch (Identify.UnexpectedHandshakeReply garbage) {
             return DialOutcome.tolerable(handshakeNotSent(address));
         } catch (IOException | RuntimeException error) {
-            return DialOutcome.tolerable(error instanceof RuntimeException runtime
-                    ? runtime
-                    : new NanocachedException.ConnectionLost(
-                            "nanocached: could not connect to " + address + ": " + error.getMessage(), error));
+            return DialOutcome.tolerable(
+                    error instanceof RuntimeException runtime
+                            ? runtime
+                            : new NanocachedException.ConnectionLost(
+                                    "nanocached: could not connect to " + address + ": " + error.getMessage(), error));
         }
 
         if (!(identified instanceof Identify.NodeTarget nodeTarget)) {
@@ -1184,8 +1214,10 @@ public final class NanocachedClient implements AutoCloseable {
             // (issue #1802): an address whose IP was reused by a discovery
             // or proxy process is a dead member with a reconnect cooldown,
             // not a reason to fail every new client's connect.
-            return DialOutcome.nonNode(new NanocachedException.ConnectionLost(
-                    "nanocached: " + address + " does not identify as a cache node", null, true), address);
+            return DialOutcome.nonNode(
+                    new NanocachedException.ConnectionLost(
+                            "nanocached: " + address + " does not identify as a cache node", null, true),
+                    address);
         }
 
         try {
@@ -1197,11 +1229,9 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * {@link #dialBootstrapNode} for a node a refresh just discovered, but
-     * honoring the per-address reconnect cooldown ({@link
-     * #dialWithCooldown}'s rule): an address whose dial failed within the
-     * cooldown window is not dialed again, it fails with the error that
-     * armed the cooldown.
+     * {@link #dialBootstrapNode} for a node a refresh just discovered, but honoring the per-address
+     * reconnect cooldown ({@link #dialWithCooldown}'s rule): an address whose dial failed within
+     * the cooldown window is not dialed again, it fails with the error that armed the cooldown.
      */
     private DialOutcome dialRefreshNode(DiscoveredNode node) {
         CooldownEntry cooldown = reconnectCooldowns.get(node.address());
@@ -1212,46 +1242,35 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * Dials every node discovery listed, concurrently, on a short-lived
-     * pool capped at {@link #MAX_BOOTSTRAP_DIALER_THREADS} —
-     * {@link #replicaWriters} doesn't exist yet at this point, since
-     * building it needs {@link #replication} from this same cluster
-     * response, so bootstrap dialing gets its own throwaway executor
-     * rather than reusing it. Every dial still honors the same per-dial
-     * connect timeout as any other identify exchange (see
-     * {@code Identify.CONNECT_TIMEOUT_MS}).
+     * Dials every node discovery listed, concurrently, on a short-lived pool capped at {@link
+     * #MAX_BOOTSTRAP_DIALER_THREADS} — {@link #replicaWriters} doesn't exist yet at this point,
+     * since building it needs {@link #replication} from this same cluster response, so bootstrap
+     * dialing gets its own throwaway executor rather than reusing it. Every dial still honors the
+     * same per-dial connect timeout as any other identify exchange (see {@code
+     * Identify.CONNECT_TIMEOUT_MS}).
      *
-     * <p>A node that can't be reached (issue #67: typically one that just
-     * died and discovery hasn't evicted yet — its liveness window is
-     * seconds long, and every key is still served by another owner once
-     * replication &gt; 1) is installed as a member without a connection
-     * and with its reconnect cooldown armed — exactly the state a member
-     * is in after dying mid-life (see {@link #dialWithCooldown}) — so
-     * requests for its keys fail over per request instead of the whole
-     * {@code connect()} call failing, and the next request after the
-     * cooldown redials it. Only a cluster with <em>no</em> reachable node
-     * fails, with the last dial error.
+     * <p>A node that can't be reached (issue #67: typically one that just died and discovery hasn't
+     * evicted yet — its liveness window is seconds long, and every key is still served by another
+     * owner once replication &gt; 1) is installed as a member without a connection and with its
+     * reconnect cooldown armed — exactly the state a member is in after dying mid-life (see {@link
+     * #dialWithCooldown}) — so requests for its keys fail over per request instead of the whole
+     * {@code connect()} call failing, and the next request after the cooldown redials it. Only a
+     * cluster with <em>no</em> reachable node fails, with the last dial error.
      *
-     * <p>A hard failure — an unparseable address — aborts the whole
-     * bootstrap regardless of how any other node fared, exactly as a
-     * sequential dial hitting the same condition always has; every
-     * connection another concurrent dial already opened is closed first
-     * so this doesn't leak a socket for a node this client will now never
-     * adopt.
+     * <p>A hard failure — an unparseable address — aborts the whole bootstrap regardless of how any
+     * other node fared, exactly as a sequential dial hitting the same condition always has; every
+     * connection another concurrent dial already opened is closed first so this doesn't leak a
+     * socket for a node this client will now never adopt.
      */
     /**
-     * Drops repeated node names from discovery's raw list, first
-     * occurrence winning — the same stance {@link HashRing}'s constructor
-     * takes (issues #328/#360), carried into the connection layer (issue
-     * #461, mirroring Go's {@code dedupeDiscoveredNodes} from issue
-     * #389). Without this, {@link #openCluster} and {@link
-     * #refreshNodeList} would dial every listed occurrence of a
-     * duplicated name and then write each dial's outcome into {@code
-     * members} keyed by that name — the last write wins, silently
-     * leaking any live connection an earlier occurrence already
-     * installed (never closed, invisible to the no-longer-listed close
-     * sweep and to {@link #stats}). Deduping before dialing also avoids
-     * a wasteful, racy double-dial of the same node.
+     * Drops repeated node names from discovery's raw list, first occurrence winning — the same
+     * stance {@link HashRing}'s constructor takes (issues #328/#360), carried into the connection
+     * layer (issue #461, mirroring Go's {@code dedupeDiscoveredNodes} from issue #389). Without
+     * this, {@link #openCluster} and {@link #refreshNodeList} would dial every listed occurrence of
+     * a duplicated name and then write each dial's outcome into {@code members} keyed by that name
+     * — the last write wins, silently leaking any live connection an earlier occurrence already
+     * installed (never closed, invisible to the no-longer-listed close sweep and to {@link
+     * #stats}). Deduping before dialing also avoids a wasteful, racy double-dial of the same node.
      */
     private static List<DiscoveredNode> dedupeDiscoveredNodes(List<DiscoveredNode> nodes) {
         Set<String> seen = new HashSet<>(nodes.size());
@@ -1265,12 +1284,11 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * Runs {@code dial} for every node in {@code nodes} on a short-lived
-     * pool capped at {@link #MAX_BOOTSTRAP_DIALER_THREADS} and returns the
-     * outcomes in input order. Shared by {@link #openCluster} and {@link
-     * #refreshNodeList}: both dial a whole roster (or the part of it that is
-     * new) in waves rather than one node at a time, so k unreachable nodes
-     * cost about one connect timeout per wave instead of k of them.
+     * Runs {@code dial} for every node in {@code nodes} on a short-lived pool capped at {@link
+     * #MAX_BOOTSTRAP_DIALER_THREADS} and returns the outcomes in input order. Shared by {@link
+     * #openCluster} and {@link #refreshNodeList}: both dial a whole roster (or the part of it that
+     * is new) in waves rather than one node at a time, so k unreachable nodes cost about one
+     * connect timeout per wave instead of k of them.
      */
     private List<DialOutcome> dialConcurrently(
             List<DiscoveredNode> nodes, java.util.function.Function<DiscoveredNode, DialOutcome> dial) {
@@ -1360,15 +1378,17 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * {@link #newReplicaWriterPool} for hedge legs (issue #1451): the same
-     * bounds in both dimensions and the same overflow policy, but idle
-     * threads retire after {@link #HEDGE_LEG_THREAD_KEEP_ALIVE_SECONDS},
-     * since the pool is sized for the legs a stopped owner can hold, not
-     * for the steady state.
+     * {@link #newReplicaWriterPool} for hedge legs (issue #1451): the same bounds in both
+     * dimensions and the same overflow policy, but idle threads retire after {@link
+     * #HEDGE_LEG_THREAD_KEEP_ALIVE_SECONDS}, since the pool is sized for the legs a stopped owner
+     * can hold, not for the steady state.
      */
     static ExecutorService newHedgeLegPool(int threads) {
         java.util.concurrent.ThreadPoolExecutor pool = new java.util.concurrent.ThreadPoolExecutor(
-                threads, threads, HEDGE_LEG_THREAD_KEEP_ALIVE_SECONDS, TimeUnit.SECONDS,
+                threads,
+                threads,
+                HEDGE_LEG_THREAD_KEEP_ALIVE_SECONDS,
+                TimeUnit.SECONDS,
                 new java.util.concurrent.ArrayBlockingQueue<>(threads),
                 runnable -> {
                     Thread thread = new Thread(runnable, "nanocached-hedge-leg");
@@ -1386,29 +1406,27 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * A leg pool bounded in both dimensions (issue #486): {@code threads}
-     * fixed threads (not newCachedThreadPool, which grows one thread per
-     * submitted task with no cap — see REPLICA_WRITER_POOL_HEADROOM) over
-     * a queue of the same depth. Two instances (issue #500): {@link
-     * #replicaWriters} for the legs nothing bounds ahead of the pool —
-     * synchronous-fallback replica legs and the batched get/set owner
-     * legs, limited only by how many calls the application has in
-     * flight; {@link #hedgeLegs} for the hedge legs (issue #1451); and
-     * {@link #backgroundLegs} for the permit-gated fire-and-forget
-     * legs, which can never fill it. When the queue is full the
-     * submitter runs the task itself — the same synchronous fallback
-     * every call site already has for the permit-exhausted case — which
-     * applies back-pressure to the caller producing the burst, and only
-     * to that caller now that a permit-holding fire-and-forget leg no
-     * longer shares the queue. A pool that has been shut down still
-     * rejects with RejectedExecutionException, so each call site's
-     * existing "close() raced us, run inline" handling keeps working
-     * (the default CallerRunsPolicy would silently discard the task in
-     * that case and leave its CompletableFuture never completing).
+     * A leg pool bounded in both dimensions (issue #486): {@code threads} fixed threads (not
+     * newCachedThreadPool, which grows one thread per submitted task with no cap — see
+     * REPLICA_WRITER_POOL_HEADROOM) over a queue of the same depth. Two instances (issue #500):
+     * {@link #replicaWriters} for the legs nothing bounds ahead of the pool — synchronous-fallback
+     * replica legs and the batched get/set owner legs, limited only by how many calls the
+     * application has in flight; {@link #hedgeLegs} for the hedge legs (issue #1451); and {@link
+     * #backgroundLegs} for the permit-gated fire-and-forget legs, which can never fill it. When the
+     * queue is full the submitter runs the task itself — the same synchronous fallback every call
+     * site already has for the permit-exhausted case — which applies back-pressure to the caller
+     * producing the burst, and only to that caller now that a permit-holding fire-and-forget leg no
+     * longer shares the queue. A pool that has been shut down still rejects with
+     * RejectedExecutionException, so each call site's existing "close() raced us, run inline"
+     * handling keeps working (the default CallerRunsPolicy would silently discard the task in that
+     * case and leave its CompletableFuture never completing).
      */
     static ExecutorService newReplicaWriterPool(int threads) {
         java.util.concurrent.ThreadPoolExecutor pool = new java.util.concurrent.ThreadPoolExecutor(
-                threads, threads, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+                threads,
+                threads,
+                0L,
+                java.util.concurrent.TimeUnit.MILLISECONDS,
                 new java.util.concurrent.ArrayBlockingQueue<>(threads),
                 runnable -> {
                     Thread thread = new Thread(runnable, "nanocached-replica-writer");
@@ -1443,17 +1461,16 @@ public final class NanocachedClient implements AutoCloseable {
     private static final String CAS_PRESENT = "P";
     private static final Pattern CAS_TOKEN_PATTERN = Pattern.compile("[0-9a-f]{32}");
 
-    /** SHA-256 of {@code value}, truncated to its first 16 bytes (128
-     * bits), lowercase hex-encoded (32 characters) — the CAS content
-     * digest (issue #141), computed identically by the server and every
-     * SDK; see docs/protocol.html#cas for the pinned cross-language test
-     * vector. Public and static so code that already holds a value (the
-     * JCache adapter, issue #118, computing an expected token for its
-     * getAndPut family without a prior GET) can compute one directly — see {@link
-     * #replace(byte[], String, byte[], long)}'s doc for why that path is
-     * only safe when the reconstruction is byte-identical to what the
-     * server actually stores, unlike a token taken from {@link
-     * #getWithToken}, which always is. */
+    /**
+     * SHA-256 of {@code value}, truncated to its first 16 bytes (128 bits), lowercase hex-encoded
+     * (32 characters) — the CAS content digest (issue #141), computed identically by the server and
+     * every SDK; see docs/protocol.html#cas for the pinned cross-language test vector. Public and
+     * static so code that already holds a value (the JCache adapter, issue #118, computing an
+     * expected token for its getAndPut family without a prior GET) can compute one directly — see
+     * {@link #replace(byte[], String, byte[], long)}'s doc for why that path is only safe when the
+     * reconstruction is byte-identical to what the server actually stores, unlike a token taken
+     * from {@link #getWithToken}, which always is.
+     */
     public static String contentDigest(byte[] value) {
         MessageDigest sha256;
         try {
@@ -1471,59 +1488,55 @@ public final class NanocachedClient implements AutoCloseable {
         return hex.toString();
     }
 
-    /** Rejects a {@code token} that isn't a well-formed CAS digest (issue
-     * #141) — exactly 32 lowercase hex characters, the only shape {@link
-     * #contentDigest}/{@link #getWithToken} ever produce. Catches an
-     * obviously wrong value (a stale/truncated copy-paste, or accidentally
-     * passing something other than a digest) before it reaches the wire,
-     * where — unlike a length-prefixed field — a malformed {@code <cond>}
-     * has no way to be distinguished from a bare token like the digest's
-     * own {@code "a"}-prefixed hex happening to collide with neither
-     * {@code "A"} nor {@code "P"}. */
+    /**
+     * Rejects a {@code token} that isn't a well-formed CAS digest (issue #141) — exactly 32
+     * lowercase hex characters, the only shape {@link #contentDigest}/{@link #getWithToken} ever
+     * produce. Catches an obviously wrong value (a stale/truncated copy-paste, or accidentally
+     * passing something other than a digest) before it reaches the wire, where — unlike a
+     * length-prefixed field — a malformed {@code <cond>} has no way to be distinguished from a bare
+     * token like the digest's own {@code "a"}-prefixed hex happening to collide with neither {@code
+     * "A"} nor {@code "P"}.
+     */
     private static void validateToken(String token) {
         if (token == null || !CAS_TOKEN_PATTERN.matcher(token).matches()) {
-            throw new IllegalArgumentException(
-                    "nanocached: token must be a 32-character lowercase hex digest "
-                            + "(from contentDigest/getWithToken), got: " + token);
+            throw new IllegalArgumentException("nanocached: token must be a 32-character lowercase hex digest "
+                    + "(from contentDigest/getWithToken), got: "
+                    + token);
         }
     }
 
-    /** A namespace-scoped handle (namespaces, issue #105) — see {@link
-     * Namespace}. {@code namespace} is UTF-8 encoded, matching every other
-     * key-ish {@code String} overload in this class. */
+    /**
+     * A namespace-scoped handle (namespaces, issue #105) — see {@link Namespace}. {@code namespace}
+     * is UTF-8 encoded, matching every other key-ish {@code String} overload in this class.
+     */
     public Namespace namespace(String namespace) {
         return namespace(utf8(namespace, "namespace"));
     }
 
-    /** As {@link #namespace(String)}. An empty {@code namespace} is not
-     * rejected — it returns a handle equivalent to this client itself
-     * (the same legacy wire frames and routing, per the namespaces spec). */
+    /**
+     * As {@link #namespace(String)}. An empty {@code namespace} is not rejected — it returns a
+     * handle equivalent to this client itself (the same legacy wire frames and routing, per the
+     * namespaces spec).
+     */
     public Namespace namespace(byte[] namespace) {
         return new Namespace(namespace);
     }
 
     /**
-     * A lightweight, namespace-scoped view of this client (namespaces,
-     * issue #105): the same {@code get}/{@code getBytes}/{@code set}/
-     * {@code delete} surface {@link NanocachedClient} itself exposes,
-     * every key scoped to {@link #namespace()} — the same key name in two
-     * namespaces (or the default, un-namespaced keyspace) is three
-     * independent entries, since the namespace enters the HRW routing
-     * hash alongside the key (see {@link HashRing}) and leads the body of
-     * the {@code g}/{@code s}/{@code d} wire frames (see {@link
-     * Connection}).
+     * A lightweight, namespace-scoped view of this client (namespaces, issue #105): the same {@code
+     * get}/{@code getBytes}/{@code set}/ {@code delete} surface {@link NanocachedClient} itself
+     * exposes, every key scoped to {@link #namespace()} — the same key name in two namespaces (or
+     * the default, un-namespaced keyspace) is three independent entries, since the namespace enters
+     * the HRW routing hash alongside the key (see {@link HashRing}) and leads the body of the
+     * {@code g}/{@code s}/{@code d} wire frames (see {@link Connection}).
      *
-     * <p>Obtained via {@link #namespace(byte[])}/{@link
-     * #namespace(String)}; cheap (holds only the namespace bytes and this
-     * client's own reference — no networking of its own), shares this
-     * client's connections, and forwards every call to this client's
-     * internal (namespace, key) methods rather than duplicating them —
-     * routing, replication fan-out, hedged reads, {@code W}
-     * refresh-and-retry, response tags, and compression all behave
-     * exactly as they do for the un-namespaced API. Invalid once {@link
-     * #close()} has run, raising the same {@link
-     * NanocachedException.AlreadyClosed} a direct call on this client
-     * would.
+     * <p>Obtained via {@link #namespace(byte[])}/{@link #namespace(String)}; cheap (holds only the
+     * namespace bytes and this client's own reference — no networking of its own), shares this
+     * client's connections, and forwards every call to this client's internal (namespace, key)
+     * methods rather than duplicating them — routing, replication fan-out, hedged reads, {@code W}
+     * refresh-and-retry, response tags, and compression all behave exactly as they do for the
+     * un-namespaced API. Invalid once {@link #close()} has run, raising the same {@link
+     * NanocachedException.AlreadyClosed} a direct call on this client would.
      */
     public final class Namespace {
         private final byte[] namespace;
@@ -1536,19 +1549,22 @@ public final class NanocachedClient implements AutoCloseable {
             this.namespace = namespace.clone();
         }
 
-        /** The namespace this handle scopes every call to. A defensive
-         * copy — unlike a key or value, which this SDK never clones on
-         * the way in or out, this array is reused for every future call
-         * this handle makes, so handing back the live reference would let
-         * a caller who mutates it corrupt this handle's routing from then
-         * on. */
+        /**
+         * The namespace this handle scopes every call to. A defensive copy — unlike a key or value,
+         * which this SDK never clones on the way in or out, this array is reused for every future
+         * call this handle makes, so handing back the live reference would let a caller who mutates
+         * it corrupt this handle's routing from then on.
+         */
         public byte[] namespace() {
             return namespace.clone();
         }
 
-        /** Returns the value decoded as strict UTF-8, or {@code
-         * Optional.empty()} when the key is missing.
-         * @throws UncheckedIOException if the stored value is not valid UTF-8 */
+        /**
+         * Returns the value decoded as strict UTF-8, or {@code Optional.empty()} when the key is
+         * missing.
+         *
+         * @throws UncheckedIOException if the stored value is not valid UTF-8
+         */
         public Optional<String> get(String key) {
             return get(utf8(key, "key"));
         }
@@ -1558,15 +1574,15 @@ public final class NanocachedClient implements AutoCloseable {
             return getBytes(key).map(NanocachedClient::decodeUtf8Strict);
         }
 
-        /** Returns the raw value, or {@code Optional.empty()} when the key
-         * is missing. */
+        /** Returns the raw value, or {@code Optional.empty()} when the key is missing. */
         public Optional<byte[]> getBytes(String key) {
             return getBytes(utf8(key, "key"));
         }
 
-        /** As {@link #getBytes(String)}. Same semantics as {@link
-         * NanocachedClient#getBytes(byte[])} — compression, read repair,
-         * hedged reads — just scoped to {@link #namespace()}. */
+        /**
+         * As {@link #getBytes(String)}. Same semantics as {@link NanocachedClient#getBytes(byte[])}
+         * — compression, read repair, hedged reads — just scoped to {@link #namespace()}.
+         */
         public Optional<byte[]> getBytes(byte[] key) {
             return NanocachedClient.this.getBytes(namespace, key);
         }
@@ -1576,56 +1592,73 @@ public final class NanocachedClient implements AutoCloseable {
             return getWithToken(utf8(key, "key"));
         }
 
-        /** As {@link NanocachedClient#getWithToken(byte[])}, scoped to
-         * {@link #namespace()} (issue #141). */
+        /**
+         * As {@link NanocachedClient#getWithToken(byte[])}, scoped to {@link #namespace()} (issue
+         * #141).
+         */
         public Optional<CasEntry> getWithToken(byte[] key) {
             return NanocachedClient.this.getWithToken(namespace, key);
         }
 
-        /** As {@link NanocachedClient#getMany(List)}, scoped to
-         * {@link #namespace()} (issue #151). */
+        /**
+         * As {@link NanocachedClient#getMany(List)}, scoped to {@link #namespace()} (issue #151).
+         */
         public Map<String, String> getMany(List<String> keys) {
             return NanocachedClient.this.getManyDecoded(namespace, keys);
         }
 
-        /** As {@link NanocachedClient#getManyBytes(List)}, scoped to
-         * {@link #namespace()} (issue #151). */
+        /**
+         * As {@link NanocachedClient#getManyBytes(List)}, scoped to {@link #namespace()} (issue
+         * #151).
+         */
         public Map<String, byte[]> getManyBytes(List<String> keys) {
             return NanocachedClient.this.getManyBytes(namespace, keys);
         }
 
-        /** As {@link NanocachedClient#getManyBytes(byte[][])}, scoped to
-         * {@link #namespace()} (issue #160). */
+        /**
+         * As {@link NanocachedClient#getManyBytes(byte[][])}, scoped to {@link #namespace()} (issue
+         * #160).
+         */
         public byte[][] getManyBytes(byte[][] keys) {
             return NanocachedClient.this.getManyBytes(namespace, keys);
         }
 
-        /** As {@link NanocachedClient#touchMany(List, long)}, scoped to
-         * {@link #namespace()} (issue #871). */
+        /**
+         * As {@link NanocachedClient#touchMany(List, long)}, scoped to {@link #namespace()} (issue
+         * #871).
+         */
         public Map<String, Boolean> touchMany(List<String> keys, long ttlSeconds) {
             return NanocachedClient.this.touchMany(namespace, keys, ttlSeconds);
         }
 
-        /** As {@link NanocachedClient#touchMany(byte[][], long)}, scoped
-         * to {@link #namespace()} (issue #871). */
+        /**
+         * As {@link NanocachedClient#touchMany(byte[][], long)}, scoped to {@link #namespace()}
+         * (issue #871).
+         */
         public boolean[] touchMany(byte[][] keys, long ttlSeconds) {
             return NanocachedClient.this.touchMany(namespace, keys, ttlSeconds);
         }
 
-        /** As {@link NanocachedClient#getManyAndTouch(List, long)}, scoped
-         * to {@link #namespace()} (issue #871). */
+        /**
+         * As {@link NanocachedClient#getManyAndTouch(List, long)}, scoped to {@link #namespace()}
+         * (issue #871).
+         */
         public Map<String, String> getManyAndTouch(List<String> keys, long ttlSeconds) {
             return NanocachedClient.this.getManyAndTouchDecoded(namespace, keys, ttlSeconds);
         }
 
-        /** As {@link NanocachedClient#getManyAndTouchBytes(List, long)},
-         * scoped to {@link #namespace()} (issue #871). */
+        /**
+         * As {@link NanocachedClient#getManyAndTouchBytes(List, long)}, scoped to {@link
+         * #namespace()} (issue #871).
+         */
         public Map<String, byte[]> getManyAndTouchBytes(List<String> keys, long ttlSeconds) {
             return NanocachedClient.this.getManyAndTouchBytes(namespace, keys, ttlSeconds);
         }
 
-        /** As {@link NanocachedClient#getManyAndTouchBytes(byte[][], long)},
-         * scoped to {@link #namespace()} (issue #871). */
+        /**
+         * As {@link NanocachedClient#getManyAndTouchBytes(byte[][], long)}, scoped to {@link
+         * #namespace()} (issue #871).
+         */
         public byte[][] getManyAndTouchBytes(byte[][] keys, long ttlSeconds) {
             return NanocachedClient.this.getManyAndTouchBytes(namespace, keys, ttlSeconds);
         }
@@ -1642,8 +1675,9 @@ public final class NanocachedClient implements AutoCloseable {
             set(key, value, 0L);
         }
 
-        /** As {@link NanocachedClient#set(byte[], byte[], long)}, scoped
-         * to {@link #namespace()}. */
+        /**
+         * As {@link NanocachedClient#set(byte[], byte[], long)}, scoped to {@link #namespace()}.
+         */
         public void set(byte[] key, byte[] value, long ttlSeconds) {
             NanocachedClient.this.set(namespace, key, value, ttlSeconds);
         }
@@ -1652,14 +1686,12 @@ public final class NanocachedClient implements AutoCloseable {
             return delete(utf8(key, "key"));
         }
 
-        /** Returns whether the key existed before this call, scoped to
-         * {@link #namespace()}. */
+        /** Returns whether the key existed before this call, scoped to {@link #namespace()}. */
         public boolean delete(byte[] key) {
             return NanocachedClient.this.delete(namespace, key);
         }
 
-        /** As {@link NanocachedClient#touch(String, long)}, scoped to
-         * {@link #namespace()}. */
+        /** As {@link NanocachedClient#touch(String, long)}, scoped to {@link #namespace()}. */
         public boolean touch(String key, long ttlSeconds) {
             return touch(utf8(key, "key"), ttlSeconds);
         }
@@ -1669,8 +1701,9 @@ public final class NanocachedClient implements AutoCloseable {
             return NanocachedClient.this.touch(namespace, key, ttlSeconds);
         }
 
-        /** As {@link NanocachedClient#getAndTouch(String, long)}, scoped to
-         * {@link #namespace()}. */
+        /**
+         * As {@link NanocachedClient#getAndTouch(String, long)}, scoped to {@link #namespace()}.
+         */
         public Optional<String> getAndTouch(String key, long ttlSeconds) {
             return getAndTouch(utf8(key, "key"), ttlSeconds);
         }
@@ -1680,8 +1713,10 @@ public final class NanocachedClient implements AutoCloseable {
             return getAndTouchBytes(key, ttlSeconds).map(NanocachedClient::decodeUtf8Strict);
         }
 
-        /** As {@link NanocachedClient#getAndTouchBytes(String, long)},
-         * scoped to {@link #namespace()}. */
+        /**
+         * As {@link NanocachedClient#getAndTouchBytes(String, long)}, scoped to {@link
+         * #namespace()}.
+         */
         public Optional<byte[]> getAndTouchBytes(String key, long ttlSeconds) {
             return getAndTouchBytes(utf8(key, "key"), ttlSeconds);
         }
@@ -1695,8 +1730,10 @@ public final class NanocachedClient implements AutoCloseable {
             setMany(values, 0L);
         }
 
-        /** As {@link NanocachedClient#setMany(Map, long)}, scoped to
-         * {@link #namespace()} (issue #151). */
+        /**
+         * As {@link NanocachedClient#setMany(Map, long)}, scoped to {@link #namespace()} (issue
+         * #151).
+         */
         public void setMany(Map<String, String> values, long ttlSeconds) {
             NanocachedClient.this.setManyString(namespace, values, ttlSeconds);
         }
@@ -1705,8 +1742,10 @@ public final class NanocachedClient implements AutoCloseable {
             setManyBytes(values, 0L);
         }
 
-        /** As {@link NanocachedClient#setManyBytes(Map, long)}, scoped
-         * to {@link #namespace()} (issue #151). */
+        /**
+         * As {@link NanocachedClient#setManyBytes(Map, long)}, scoped to {@link #namespace()}
+         * (issue #151).
+         */
         public void setManyBytes(Map<String, byte[]> values, long ttlSeconds) {
             NanocachedClient.this.setManyBytes(namespace, values, ttlSeconds);
         }
@@ -1715,8 +1754,10 @@ public final class NanocachedClient implements AutoCloseable {
             setManyBytes(keys, values, 0L);
         }
 
-        /** As {@link NanocachedClient#setManyBytes(byte[][], byte[][], long)},
-         * scoped to {@link #namespace()} (issue #160). */
+        /**
+         * As {@link NanocachedClient#setManyBytes(byte[][], byte[][], long)}, scoped to {@link
+         * #namespace()} (issue #160).
+         */
         public void setManyBytes(byte[][] keys, byte[][] values, long ttlSeconds) {
             NanocachedClient.this.setManyBytes(namespace, keys, values, ttlSeconds);
         }
@@ -1730,12 +1771,13 @@ public final class NanocachedClient implements AutoCloseable {
             return incr(key, 1L);
         }
 
-        /** As {@link NanocachedClient#incr(byte[], long)}, scoped to
-         * {@link #namespace()} (issue #129).
+        /**
+         * As {@link NanocachedClient#incr(byte[], long)}, scoped to {@link #namespace()} (issue
+         * #129).
          *
-         * @throws NanocachedException.CompressionIncompatible if this
-         *         client was built with {@code compress} enabled (issue
-         *         #321) */
+         * @throws NanocachedException.CompressionIncompatible if this client was built with {@code
+         *     compress} enabled (issue #321)
+         */
         public OptionalLong incr(byte[] key, long delta) {
             return NanocachedClient.this.incr(namespace, key, delta);
         }
@@ -1754,9 +1796,10 @@ public final class NanocachedClient implements AutoCloseable {
             return decr(key, 1L);
         }
 
-        /** As {@link NanocachedClient#decr(byte[], long)}, scoped to
-         * {@link #namespace()} — the same negated-delta {@code i}, never a
-         * separate wire op. */
+        /**
+         * As {@link NanocachedClient#decr(byte[], long)}, scoped to {@link #namespace()} — the same
+         * negated-delta {@code i}, never a separate wire op.
+         */
         public OptionalLong decr(byte[] key, long delta) {
             if (delta == Long.MIN_VALUE) {
                 throw new IllegalArgumentException(
@@ -1779,16 +1822,17 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         public boolean putIfAbsent(String key, String value, long ttlSeconds) {
-            return putIfAbsent(utf8(key, "key"), utf8(value, "value"),
-                    ttlSeconds);
+            return putIfAbsent(utf8(key, "key"), utf8(value, "value"), ttlSeconds);
         }
 
         public boolean putIfAbsent(byte[] key, byte[] value) {
             return putIfAbsent(key, value, 0L);
         }
 
-        /** As {@link NanocachedClient#putIfAbsent(byte[], byte[], long)},
-         * scoped to {@link #namespace()}. */
+        /**
+         * As {@link NanocachedClient#putIfAbsent(byte[], byte[], long)}, scoped to {@link
+         * #namespace()}.
+         */
         public boolean putIfAbsent(byte[] key, byte[] value, long ttlSeconds) {
             return NanocachedClient.this.putIfAbsent(namespace, key, value, ttlSeconds);
         }
@@ -1798,16 +1842,17 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         public boolean replaceIfPresent(String key, String value, long ttlSeconds) {
-            return replaceIfPresent(utf8(key, "key"), utf8(value, "value"),
-                    ttlSeconds);
+            return replaceIfPresent(utf8(key, "key"), utf8(value, "value"), ttlSeconds);
         }
 
         public boolean replaceIfPresent(byte[] key, byte[] value) {
             return replaceIfPresent(key, value, 0L);
         }
 
-        /** As {@link NanocachedClient#replaceIfPresent(byte[], byte[],
-         * long)}, scoped to {@link #namespace()}. */
+        /**
+         * As {@link NanocachedClient#replaceIfPresent(byte[], byte[], long)}, scoped to {@link
+         * #namespace()}.
+         */
         public boolean replaceIfPresent(byte[] key, byte[] value, long ttlSeconds) {
             return NanocachedClient.this.replaceIfPresent(namespace, key, value, ttlSeconds);
         }
@@ -1817,16 +1862,17 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         public boolean replace(String key, String token, String newValue, long ttlSeconds) {
-            return replace(utf8(key, "key"), token, utf8(newValue, "value"),
-                    ttlSeconds);
+            return replace(utf8(key, "key"), token, utf8(newValue, "value"), ttlSeconds);
         }
 
         public boolean replace(byte[] key, String token, byte[] newValue) {
             return replace(key, token, newValue, 0L);
         }
 
-        /** As {@link NanocachedClient#replace(byte[], String, byte[],
-         * long)}, scoped to {@link #namespace()}. */
+        /**
+         * As {@link NanocachedClient#replace(byte[], String, byte[], long)}, scoped to {@link
+         * #namespace()}.
+         */
         public boolean replace(byte[] key, String token, byte[] newValue, long ttlSeconds) {
             return NanocachedClient.this.replace(namespace, key, token, newValue, ttlSeconds);
         }
@@ -1835,121 +1881,132 @@ public final class NanocachedClient implements AutoCloseable {
             return deleteIfMatches(utf8(key, "key"), token);
         }
 
-        /** As {@link NanocachedClient#deleteIfMatches(byte[], String)},
-         * scoped to {@link #namespace()}. */
+        /**
+         * As {@link NanocachedClient#deleteIfMatches(byte[], String)}, scoped to {@link
+         * #namespace()}.
+         */
         public boolean deleteIfMatches(byte[] key, String token) {
             return NanocachedClient.this.deleteIfMatches(namespace, key, token);
         }
 
-        /** Drops every entry in this namespace (CLEAR, issue #106) — see
-         * {@link NanocachedClient#clearAll()} for the whole-store
-         * counterpart. An empty {@link #namespace()} (this handle's own
-         * {@code namespace("")}) clears the default namespace ({@code c
-         * 0}), never rejected. */
+        /**
+         * Drops every entry in this namespace (CLEAR, issue #106) — see {@link
+         * NanocachedClient#clearAll()} for the whole-store counterpart. An empty {@link
+         * #namespace()} (this handle's own {@code namespace("")}) clears the default namespace
+         * ({@code c 0}), never rejected.
+         */
         public void clear() {
             NanocachedClient.this.clear(namespace);
         }
     }
 
     /**
-     * A snapshot of counters for failures this client swallows by design
-     * (replica-leg writes, read repair, and
-     * node-list refresh) — see {@link ClientStats} for exactly what each
-     * counts. Nothing here ever fails an operation; this exists purely so
-     * an operator can detect replication silently degrading or a
-     * node-list refresh that is stuck failing.
+     * A snapshot of counters for failures this client swallows by design (replica-leg writes, read
+     * repair, and node-list refresh) — see {@link ClientStats} for exactly what each counts.
+     * Nothing here ever fails an operation; this exists purely so an operator can detect
+     * replication silently degrading or a node-list refresh that is stuck failing.
      */
     public ClientStats stats() {
         return new ClientStats(
-                replicaWriteFailures.get(), readRepairFailures.get(), refreshFailures.get(),
-                backgroundWriteBugs.get(), transientRetries.get());
+                replicaWriteFailures.get(),
+                readRepairFailures.get(),
+                refreshFailures.get(),
+                backgroundWriteBugs.get(),
+                transientRetries.get());
     }
 
-    /** Inspects a background replica write's ({@code fireAndForgetReplicas},
-     * or read-repair's write-back to the primary) outcome. Both Runnables
-     * already swallow every expected failure internally (the replica
-     * leg's {@code NanocachedException} catch in {@link #write}, counted
-     * via {@link #replicaWriteFailures}; the read-repair leg's identical
-     * catch in {@link #tryReadRepair}, counted via {@link
-     * #readRepairFailures}), so {@code error} here is only ever non-null
-     * for a genuine programming bug that escaped one of those catches —
-     * it must not vanish silently the way an ignored {@code
-     * CompletableFuture.whenComplete} error previously did (audit
-     * finding). Counted in {@link #backgroundWriteBugs}, a stat distinct
-     * from the expected-failure counters above, and logged to stderr —
-     * this class's existing way of surfacing something a caller can't
-     * otherwise observe (see the forgotten-close warning in {@link
-     * #connect}). Mirrors .NET's {@code NanocachedClient.cs} background-task
-     * {@code ContinueWith} handling of the same case, though .NET folds it
-     * back into its single expected-failure counter for lack of a logger
-     * to hand the bug to instead; this SDK has one, so it gets both. */
+    /**
+     * Inspects a background replica write's ({@code fireAndForgetReplicas}, or read-repair's
+     * write-back to the primary) outcome. Both Runnables already swallow every expected failure
+     * internally (the replica leg's {@code NanocachedException} catch in {@link #write}, counted
+     * via {@link #replicaWriteFailures}; the read-repair leg's identical catch in {@link
+     * #tryReadRepair}, counted via {@link #readRepairFailures}), so {@code error} here is only ever
+     * non-null for a genuine programming bug that escaped one of those catches — it must not vanish
+     * silently the way an ignored {@code CompletableFuture.whenComplete} error previously did
+     * (audit finding). Counted in {@link #backgroundWriteBugs}, a stat distinct from the
+     * expected-failure counters above, and logged to stderr — this class's existing way of
+     * surfacing something a caller can't otherwise observe (see the forgotten-close warning in
+     * {@link #connect}). Mirrors .NET's {@code NanocachedClient.cs} background-task {@code
+     * ContinueWith} handling of the same case, though .NET folds it back into its single
+     * expected-failure counter for lack of a logger to hand the bug to instead; this SDK has one,
+     * so it gets both.
+     */
     private void reportBackgroundWriteBug(Throwable error) {
         if (error == null) return;
         backgroundWriteBugs.incrementAndGet();
         System.err.println("nanocached: a background write raised an unexpected error: " + error);
     }
 
-    /** Returns the value decoded as strict UTF-8, or {@code Optional.empty()}
-     * when the key is missing.
-     * @throws UncheckedIOException if the stored value is not valid UTF-8 */
+    /**
+     * Returns the value decoded as strict UTF-8, or {@code Optional.empty()} when the key is
+     * missing.
+     *
+     * @throws UncheckedIOException if the stored value is not valid UTF-8
+     */
     public Optional<String> get(String key) {
         return get(utf8(key, "key"));
     }
 
-    /** Returns the value decoded as strict UTF-8, or {@code Optional.empty()}
-     * when the key is missing.
-     * @throws UncheckedIOException if the stored value is not valid UTF-8 */
+    /**
+     * Returns the value decoded as strict UTF-8, or {@code Optional.empty()} when the key is
+     * missing.
+     *
+     * @throws UncheckedIOException if the stored value is not valid UTF-8
+     */
     public Optional<String> get(byte[] key) {
         return getBytes(key).map(NanocachedClient::decodeUtf8Strict);
     }
 
-    /** Returns the raw value, or {@code Optional.empty()} when the key is
-     * missing. */
+    /** Returns the raw value, or {@code Optional.empty()} when the key is missing. */
     public Optional<byte[]> getBytes(String key) {
         return getBytes(utf8(key, "key"));
     }
 
-    /** Returns the raw value, or {@code Optional.empty()} when the key is
-     * missing. Transparently decompresses when {@code compress} is
-     * enabled (value compression). With {@code readRepair}, a clean miss
-     * probes the remaining owners before being accepted as final
-     * (read repair). */
+    /**
+     * Returns the raw value, or {@code Optional.empty()} when the key is missing. Transparently
+     * decompresses when {@code compress} is enabled (value compression). With {@code readRepair}, a
+     * clean miss probes the remaining owners before being accepted as final (read repair).
+     */
     public Optional<byte[]> getBytes(byte[] key) {
         return getBytes(EMPTY_NAMESPACE, key);
     }
 
-    /** The namespaced counterpart of every {@code get}/{@code getBytes}
-     * overload above (issue #105) — see {@link #namespace}. {@code
-     * namespace} empty is exactly the un-namespaced form: same routing,
-     * same legacy wire frame. */
+    /**
+     * The namespaced counterpart of every {@code get}/{@code getBytes} overload above (issue #105)
+     * — see {@link #namespace}. {@code namespace} empty is exactly the un-namespaced form: same
+     * routing, same legacy wire frame.
+     */
     Optional<byte[]> getBytes(byte[] namespace, byte[] key) {
         byte[] raw = readRawBytes(namespace, key);
         if (raw == null) return Optional.empty();
         return Optional.of(compress ? Compression.decompressValue(raw, inflateBudget) : raw);
     }
 
-    /** As {@link #get(String)}, but returning a {@link CasEntry} carrying
-     * a token ({@link #contentDigest}) alongside the value — the low-level
-     * read half of compare-and-set (issue #141); see {@link
-     * #putIfAbsent}/{@link #replaceIfPresent}/{@link #replace}/{@link
-     * #deleteIfMatches}. */
+    /**
+     * As {@link #get(String)}, but returning a {@link CasEntry} carrying a token ({@link
+     * #contentDigest}) alongside the value — the low-level read half of compare-and-set (issue
+     * #141); see {@link #putIfAbsent}/{@link #replaceIfPresent}/{@link #replace}/{@link
+     * #deleteIfMatches}.
+     */
     public Optional<CasEntry> getWithToken(String key) {
         return getWithToken(utf8(key, "key"));
     }
 
-    /** As {@link #getWithToken(String)}. <b>Correctness note</b>: the
-     * token is computed from the exact raw wire bytes this connection
-     * received — the same bytes a compression-enabled client's marker
-     * byte is part of, since the server never decompresses — never from
-     * the decompressed value this method also returns, so it always
-     * matches what a subsequent {@code k}/{@code x} on the same key would
-     * see server-side, compression or not. */
+    /**
+     * As {@link #getWithToken(String)}. <b>Correctness note</b>: the token is computed from the
+     * exact raw wire bytes this connection received — the same bytes a compression-enabled client's
+     * marker byte is part of, since the server never decompresses — never from the decompressed
+     * value this method also returns, so it always matches what a subsequent {@code k}/{@code x} on
+     * the same key would see server-side, compression or not.
+     */
     public Optional<CasEntry> getWithToken(byte[] key) {
         return getWithToken(EMPTY_NAMESPACE, key);
     }
 
-    /** The namespaced counterpart of {@link #getWithToken(byte[])} (issue
-     * #141) — see {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #getWithToken(byte[])} (issue #141) — see {@link
+     * #namespace}.
+     */
     Optional<CasEntry> getWithToken(byte[] namespace, byte[] key) {
         byte[] raw = readRawBytes(namespace, key);
         if (raw == null) return Optional.empty();
@@ -1957,45 +2014,40 @@ public final class NanocachedClient implements AutoCloseable {
         return Optional.of(new CasEntry(value, contentDigest(raw)));
     }
 
-    /** Shared by {@link #getBytes(byte[], byte[])} and {@link
-     * #getWithToken(byte[], byte[])}: the raw wire bytes for {@code key}
-     * (including a compression-enabled client's marker byte — decompressed
-     * by neither caller, which each do at the point that matches their own
-     * contract), or {@code null} on a miss. Routing, {@code W}
-     * refresh-and-retry, and read repair all happen here exactly once, so
-     * the two callers can't drift on any of it. */
+    /**
+     * Shared by {@link #getBytes(byte[], byte[])} and {@link #getWithToken(byte[], byte[])}: the
+     * raw wire bytes for {@code key} (including a compression-enabled client's marker byte —
+     * decompressed by neither caller, which each do at the point that matches their own contract),
+     * or {@code null} on a miss. Routing, {@code W} refresh-and-retry, and read repair all happen
+     * here exactly once, so the two callers can't drift on any of it.
+     */
     private byte[] readRawBytes(byte[] namespace, byte[] key) {
         validateKey(namespace, key);
         beforeOperation();
-        byte[] value = withWrongNodeRetry(
-                () -> read(namespace, key, connection -> connection.get(namespace, key)));
+        byte[] value = withWrongNodeRetry(() -> read(namespace, key, connection -> connection.get(namespace, key)));
         if (value == null && readRepair && ring != null) {
             value = tryReadRepair(namespace, key);
         }
         return value;
     }
 
-    /** read repair: probes the remaining owners of {@code key} —
-     * every owner but the primary, which the normal read path already
-     * probed and got a clean miss from — in rank order, for a value
-     * (audit finding, tryReadRepair used to re-probe the primary
-     * too, wasting a redundant GET on the one owner already known to
-     * have missed; mirrors the Rust/Go SDKs' identical fix). The first
-     * one that has it wins: its value is returned, and that same value
-     * repairs the true primary in the background (bounded and drained as
-     * described below), with TTL READ_REPAIR_TTL_SECONDS (the original TTL
-     * can't be recovered from a GET, and TTL 0 would permanently
-     * resurrect already-expired data). Every failure along the way
-     * (connection lost, WrongNode, another miss) is swallowed; nothing
-     * here may turn an already-accepted miss into an error. A failure
-     * repairing the primary specifically is counted via {@link
-     * #stats()}'s readRepairFailures. The write-back is bounded by — and
-     * drained on {@link #close()} through — the same {@link
-     * #backgroundReplicaWritePermits} pool as a fireAndForgetReplicas
-     * replica leg (fire-and-forget replica writes): past the cap, the repair for this
-     * miss is simply skipped, since read repair is opportunistic and a
-     * later miss on the same key repairs it (audit finding,
-     * unbounded/undrained read-repair write-backs). */
+    /**
+     * read repair: probes the remaining owners of {@code key} — every owner but the primary, which
+     * the normal read path already probed and got a clean miss from — in rank order, for a value
+     * (audit finding, tryReadRepair used to re-probe the primary too, wasting a redundant GET on
+     * the one owner already known to have missed; mirrors the Rust/Go SDKs' identical fix). The
+     * first one that has it wins: its value is returned, and that same value repairs the true
+     * primary in the background (bounded and drained as described below), with TTL
+     * READ_REPAIR_TTL_SECONDS (the original TTL can't be recovered from a GET, and TTL 0 would
+     * permanently resurrect already-expired data). Every failure along the way (connection lost,
+     * WrongNode, another miss) is swallowed; nothing here may turn an already-accepted miss into an
+     * error. A failure repairing the primary specifically is counted via {@link #stats()}'s
+     * readRepairFailures. The write-back is bounded by — and drained on {@link #close()} through —
+     * the same {@link #backgroundReplicaWritePermits} pool as a fireAndForgetReplicas replica leg
+     * (fire-and-forget replica writes): past the cap, the repair for this miss is simply skipped,
+     * since read repair is opportunistic and a later miss on the same key repairs it (audit
+     * finding, unbounded/undrained read-repair write-backs).
+     */
     private byte[] tryReadRepair(byte[] namespace, byte[] key) {
         List<String> names = ownerNames(namespace, key);
         if (names.isEmpty()) return null;
@@ -2039,16 +2091,15 @@ public final class NanocachedClient implements AutoCloseable {
                     }
                 };
                 try {
-                    CompletableFuture.runAsync(repair, backgroundLegs)
-                            .whenComplete((ignoredResult, error) -> {
-                                backgroundReplicaWritePermits.release();
-                                // error is non-null only for a genuine bug
-                                // that escaped repair's own catch above —
-                                // see reportBackgroundWriteBug (issue:
-                                // audit finding, background writes
-                                // silently discarding this).
-                                reportBackgroundWriteBug(error);
-                            });
+                    CompletableFuture.runAsync(repair, backgroundLegs).whenComplete((ignoredResult, error) -> {
+                        backgroundReplicaWritePermits.release();
+                        // error is non-null only for a genuine bug
+                        // that escaped repair's own catch above —
+                        // see reportBackgroundWriteBug (issue:
+                        // audit finding, background writes
+                        // silently discarding this).
+                        reportBackgroundWriteBug(error);
+                    });
                 } catch (RejectedExecutionException rejected) {
                     // close() shut backgroundLegs down concurrently — see
                     // the matching handling in write(). The repair is
@@ -2065,7 +2116,10 @@ public final class NanocachedClient implements AutoCloseable {
 
     private static String decodeUtf8Strict(byte[] bytes) {
         try {
-            return StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(bytes)).toString();
+            return StandardCharsets.UTF_8
+                    .newDecoder()
+                    .decode(ByteBuffer.wrap(bytes))
+                    .toString();
         } catch (CharacterCodingException malformed) {
             throw new UncheckedIOException(malformed);
         }
@@ -2089,22 +2143,24 @@ public final class NanocachedClient implements AutoCloseable {
     // success, so it just throws a plain NanocachedException.WrongNode on
     // the same condition.
 
-    /** As {@link #getManyBytes(List)}, decoding every hit as strict
-     * UTF-8. A partial failure ({@link NanocachedException.PartialWrongNodeStrings},
-     * {@link NanocachedException.PartialConnectionLostStrings}) carries the
-     * values already resolved, leaving out any that is not valid UTF-8
-     * ({@link #getManyBytes(List)} has its exact bytes).
-     * @throws UncheckedIOException if a stored value is not valid UTF-8 */
+    /**
+     * As {@link #getManyBytes(List)}, decoding every hit as strict UTF-8. A partial failure ({@link
+     * NanocachedException.PartialWrongNodeStrings}, {@link
+     * NanocachedException.PartialConnectionLostStrings}) carries the values already resolved,
+     * leaving out any that is not valid UTF-8 ({@link #getManyBytes(List)} has its exact bytes).
+     *
+     * @throws UncheckedIOException if a stored value is not valid UTF-8
+     */
     public Map<String, String> getMany(List<String> keys) {
         return getManyDecoded(EMPTY_NAMESPACE, keys);
     }
 
-    /** Shared by {@link #getMany(List)} and {@link Namespace#getMany}:
-     * decodes {@link #getManyBytes(byte[], byte[][])}'s raw result, or — on a
-     * partial failure — decodes the {@link
-     * NanocachedException.PartialWrongNode}'s own partial map and
-     * rethrows the UTF-8-decoded counterpart ({@link
-     * NanocachedException.PartialWrongNodeStrings}) instead. */
+    /**
+     * Shared by {@link #getMany(List)} and {@link Namespace#getMany}: decodes {@link
+     * #getManyBytes(byte[], byte[][])}'s raw result, or — on a partial failure — decodes the {@link
+     * NanocachedException.PartialWrongNode}'s own partial map and rethrows the UTF-8-decoded
+     * counterpart ({@link NanocachedException.PartialWrongNodeStrings}) instead.
+     */
     private Map<String, String> getManyDecoded(byte[] namespace, List<String> keys) {
         try {
             return decodeMany(getManyBytes(namespace, keys));
@@ -2116,15 +2172,14 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** Decodes the values a partial-result exception carries. As strict as
-     * {@link #decodeMany}, but a stored value need not be valid UTF-8
-     * (nothing on the write side enforces it), and the {@link
-     * UncheckedIOException} the strict decode throws would replace the
-     * wrong-node or connection-loss exception the caller needs, with every
-     * other resolved value. So a value that is not valid UTF-8 is left out
-     * of the map rather than decoded lossily (a cache must not return a
-     * value it did not store); {@link #getManyBytes(List)} still has its
-     * exact bytes. */
+    /**
+     * Decodes the values a partial-result exception carries. As strict as {@link #decodeMany}, but
+     * a stored value need not be valid UTF-8 (nothing on the write side enforces it), and the
+     * {@link UncheckedIOException} the strict decode throws would replace the wrong-node or
+     * connection-loss exception the caller needs, with every other resolved value. So a value that
+     * is not valid UTF-8 is left out of the map rather than decoded lossily (a cache must not
+     * return a value it did not store); {@link #getManyBytes(List)} still has its exact bytes.
+     */
     private static Map<String, String> decodePartial(Map<String, byte[]> raw) {
         Map<String, String> values = new LinkedHashMap<>(raw.size());
         for (Map.Entry<String, byte[]> entry : raw.entrySet()) {
@@ -2145,40 +2200,37 @@ public final class NanocachedClient implements AutoCloseable {
         return values;
     }
 
-    /** Returns every requested key's raw value in one round trip per
-     * owner (batched get, docs/protocol.html#multi) — a missing key is
-     * simply absent from the returned map, never an error, the same "a
-     * miss is not an error" contract {@link #getBytes(byte[])} itself
-     * has. {@code keys} must be non-empty.
+    /**
+     * Returns every requested key's raw value in one round trip per owner (batched get,
+     * docs/protocol.html#multi) — a missing key is simply absent from the returned map, never an
+     * error, the same "a miss is not an error" contract {@link #getBytes(byte[])} itself has.
+     * {@code keys} must be non-empty.
      *
-     * <p>A batch never fails as a whole, and it survives an unreachable
-     * owner the way a single {@link #getBytes(byte[])} does: a key whose
-     * owner cannot be reached at the connection level (a dead node, a
-     * certificate this client cannot verify) is read from its next owner
-     * in rank order (see {@link #multiGetPass}), so with replication the
-     * batch still resolves. If some keys are still wrong-node after one
-     * bounded refresh-and-retry, throws {@link
-     * NanocachedException.PartialWrongNode} whose {@code partialValues}
-     * holds every key that DID resolve, rather than discarding a
-     * mostly-successful batch over a handful of stale placements. If some
-     * keys' every owner was unreachable, throws {@link
-     * NanocachedException.PartialConnectionLost} (its {@code
-     * partialValues} the keys that did resolve, its cause the last
-     * connection failure), or the bare connection failure when nothing
-     * resolved — a connection loss is never reported as a wrong-node
-     * answer. In single-node/proxy mode a {@code W} propagates
-     * immediately, exactly as {@link #getBytes(byte[])}'s own single-mode
-     * behavior does — there is no ring to refresh against.
+     * <p>A batch never fails as a whole, and it survives an unreachable owner the way a single
+     * {@link #getBytes(byte[])} does: a key whose owner cannot be reached at the connection level
+     * (a dead node, a certificate this client cannot verify) is read from its next owner in rank
+     * order (see {@link #multiGetPass}), so with replication the batch still resolves. If some keys
+     * are still wrong-node after one bounded refresh-and-retry, throws {@link
+     * NanocachedException.PartialWrongNode} whose {@code partialValues} holds every key that DID
+     * resolve, rather than discarding a mostly-successful batch over a handful of stale placements.
+     * If some keys' every owner was unreachable, throws {@link
+     * NanocachedException.PartialConnectionLost} (its {@code partialValues} the keys that did
+     * resolve, its cause the last connection failure), or the bare connection failure when nothing
+     * resolved — a connection loss is never reported as a wrong-node answer. In single-node/proxy
+     * mode a {@code W} propagates immediately, exactly as {@link #getBytes(byte[])}'s own
+     * single-mode behavior does — there is no ring to refresh against.
      *
-     * <p>Larger batches are transparently split into more than one
-     * {@code m} sub-frame per owner (batch chunking, see {@link
-     * #MAX_BATCH_KEYS}) — callers never need to think about this. */
+     * <p>Larger batches are transparently split into more than one {@code m} sub-frame per owner
+     * (batch chunking, see {@link #MAX_BATCH_KEYS}) — callers never need to think about this.
+     */
     public Map<String, byte[]> getManyBytes(List<String> keys) {
         return getManyBytes(EMPTY_NAMESPACE, keys);
     }
 
-    /** The namespaced counterpart of {@link #getManyBytes(List)} (issue
-     * #151) — see {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #getManyBytes(List)} (issue #151) — see {@link
+     * #namespace}.
+     */
     Map<String, byte[]> getManyBytes(byte[] namespace, List<String> keys) {
         if (keys.isEmpty()) {
             throw new IllegalArgumentException("nanocached: getMany/getManyBytes requires at least one key");
@@ -2197,10 +2249,11 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** Re-keys a positional {@link #getManyBytes(byte[], byte[][])}
-     * result by its original {@code String} keys, dropping misses
-     * ({@code null} slots) so "a miss is simply absent" holds for the
-     * map-shaped API. */
+    /**
+     * Re-keys a positional {@link #getManyBytes(byte[], byte[][])} result by its original {@code
+     * String} keys, dropping misses ({@code null} slots) so "a miss is simply absent" holds for the
+     * map-shaped API.
+     */
     private static Map<String, byte[]> spliceMany(List<String> keys, byte[][] positional) {
         Map<String, byte[]> values = new LinkedHashMap<>(keys.size());
         for (int i = 0; i < positional.length; i++) {
@@ -2209,37 +2262,35 @@ public final class NanocachedClient implements AutoCloseable {
         return values;
     }
 
-    /** The {@code byte[]}-keyed counterpart of {@link
-     * #getManyBytes(List)} (issue #160), for callers whose keys are not
-     * UTF-8 text — the bulk analogue of {@link #getBytes(byte[])}. The
-     * result is positional: {@code result[i]} is {@code keys[i]}'s raw
-     * value, or {@code null} for a miss (a {@code byte[]} cannot key a
-     * {@code Map} by content, so a {@code Map<byte[], byte[]>} would be
+    /**
+     * The {@code byte[]}-keyed counterpart of {@link #getManyBytes(List)} (issue #160), for callers
+     * whose keys are not UTF-8 text — the bulk analogue of {@link #getBytes(byte[])}. The result is
+     * positional: {@code result[i]} is {@code keys[i]}'s raw value, or {@code null} for a miss (a
+     * {@code byte[]} cannot key a {@code Map} by content, so a {@code Map<byte[], byte[]>} would be
      * useless). {@code keys} must be non-empty.
      *
-     * <p>Same batch semantics as the {@code String}-keyed form —
-     * chunking, one bounded refresh-and-retry, single-mode {@code W}
-     * propagation — except the partial-failure exception is the
-     * positional {@link NanocachedException.PartialWrongNodeRaw}, whose
-     * {@code partialValues} is this same positional array and whose
-     * {@code unresolvedIndices} names the keys that are still
-     * wrong-node (a {@code null} slot alone can't tell a miss from an
-     * unresolved key). */
+     * <p>Same batch semantics as the {@code String}-keyed form — chunking, one bounded
+     * refresh-and-retry, single-mode {@code W} propagation — except the partial-failure exception
+     * is the positional {@link NanocachedException.PartialWrongNodeRaw}, whose {@code
+     * partialValues} is this same positional array and whose {@code unresolvedIndices} names the
+     * keys that are still wrong-node (a {@code null} slot alone can't tell a miss from an
+     * unresolved key).
+     */
     public byte[][] getManyBytes(byte[][] keys) {
         return getManyBytes(EMPTY_NAMESPACE, keys);
     }
 
-    /** The namespaced, positional core every {@code getMany} variant
-     * is built on — see {@link #getManyBytes(byte[][])}.
+    /**
+     * The namespaced, positional core every {@code getMany} variant is built on — see {@link
+     * #getManyBytes(byte[][])}.
      *
-     * <p>A key that appears more than once is fetched once: the
-     * distinct keys go to the owners, and every position of a repeated
-     * key gets the same result (the same {@code byte[]} instance — a
-     * caller that mutates one slot's array in place sees it in the
-     * other). Without this, a list of many copies of one key sent one
-     * {@code m} frame per 400 copies and retained every frame's reply
-     * until the call returned, so about 60 KB of request could hold
-     * hundreds of MB of replies (a 1 MB value repeated 20,000 times). */
+     * <p>A key that appears more than once is fetched once: the distinct keys go to the owners, and
+     * every position of a repeated key gets the same result (the same {@code byte[]} instance — a
+     * caller that mutates one slot's array in place sees it in the other). Without this, a list of
+     * many copies of one key sent one {@code m} frame per 400 copies and retained every frame's
+     * reply until the call returned, so about 60 KB of request could hold hundreds of MB of replies
+     * (a 1 MB value repeated 20,000 times).
+     */
     byte[][] getManyBytes(byte[] namespace, byte[][] keys) {
         if (keys.length == 0) {
             throw new IllegalArgumentException("nanocached: getMany/getManyBytes requires at least one key");
@@ -2266,14 +2317,17 @@ public final class NanocachedClient implements AutoCloseable {
                     expandIndices(partial.unresolvedIndices, distinctOf));
         } catch (NanocachedException.PartialConnectionLostRaw partial) {
             throw new NanocachedException.PartialConnectionLostRaw(
-                    partial.getMessage(), partial.getCause(),
+                    partial.getMessage(),
+                    partial.getCause(),
                     expandPositions(partial.partialValues, distinctOf),
                     expandIndices(partial.unresolvedIndices, distinctOf));
         }
     }
 
-    /** Maps a result over the distinct keys back onto the caller's
-     * positions: {@code result[i] = distinctValues[distinctOf[i]]}. */
+    /**
+     * Maps a result over the distinct keys back onto the caller's positions: {@code result[i] =
+     * distinctValues[distinctOf[i]]}.
+     */
     private static byte[][] expandPositions(byte[][] distinctValues, int[] distinctOf) {
         byte[][] values = new byte[distinctOf.length][];
         for (int i = 0; i < distinctOf.length; i++) {
@@ -2282,9 +2336,10 @@ public final class NanocachedClient implements AutoCloseable {
         return values;
     }
 
-    /** As {@link #expandPositions}, for a partial-failure exception's
-     * {@code unresolvedIndices}: every caller position of an unresolved
-     * distinct key is unresolved. */
+    /**
+     * As {@link #expandPositions}, for a partial-failure exception's {@code unresolvedIndices}:
+     * every caller position of an unresolved distinct key is unresolved.
+     */
     private static List<Integer> expandIndices(int[] distinctUnresolved, int[] distinctOf) {
         boolean[] unresolved = new boolean[distinctOf.length];
         for (int d : distinctUnresolved) unresolved[d] = true;
@@ -2295,8 +2350,7 @@ public final class NanocachedClient implements AutoCloseable {
         return positions;
     }
 
-    /** {@link #getManyBytes(byte[], byte[][])} over keys already known
-     * to be distinct. */
+    /** {@link #getManyBytes(byte[], byte[][])} over keys already known to be distinct. */
     private byte[][] getManyDistinct(byte[] namespace, byte[][] keys) {
         for (byte[] key : keys) {
             validateKey(namespace, key);
@@ -2377,14 +2431,14 @@ public final class NanocachedClient implements AutoCloseable {
         return values;
     }
 
-    /** Builds {@link NanocachedException.PartialConnectionLostRaw} from a
-     * {@link ChunkedConnectionFailure} escaping single-mode {@link
-     * #multiGetChunked} (issue #411): splices every already-resolved entry
-     * from the chunk(s) before the failure into {@code values} exactly like
-     * the success path does, and collects every position that did NOT
-     * resolve — a per-key {@code W} within an already-completed chunk, or
-     * any position from the failing chunk onward — into {@code
-     * unresolvedIndices}. */
+    /**
+     * Builds {@link NanocachedException.PartialConnectionLostRaw} from a {@link
+     * ChunkedConnectionFailure} escaping single-mode {@link #multiGetChunked} (issue #411): splices
+     * every already-resolved entry from the chunk(s) before the failure into {@code values} exactly
+     * like the success path does, and collects every position that did NOT resolve — a per-key
+     * {@code W} within an already-completed chunk, or any position from the failing chunk onward —
+     * into {@code unresolvedIndices}.
+     */
     private NanocachedException.PartialConnectionLostRaw partialConnectionLostRaw(
             ChunkedConnectionFailure failure, byte[][] values, long[] budget) {
         List<Integer> unresolved = new ArrayList<>();
@@ -2401,34 +2455,32 @@ public final class NanocachedClient implements AutoCloseable {
                 failure.cause.getMessage(), failure.cause, values, unresolved);
     }
 
-    /** {@code compress}'s decompression step (see {@link
-     * #getBytes(byte[], byte[])}), generalized so {@link
-     * #getManyBytes(byte[], byte[][])}'s per-entry splicing can share it: a
-     * no-op when {@code compress} is off. */
+    /**
+     * {@code compress}'s decompression step (see {@link #getBytes(byte[], byte[])}), generalized so
+     * {@link #getManyBytes(byte[], byte[][])}'s per-entry splicing can share it: a no-op when
+     * {@code compress} is off.
+     */
     private byte[] maybeDecompress(byte[] value) {
         return compress ? Compression.decompressValue(value, inflateBudget) : value;
     }
 
-    /** Decompresses one hit value for a {@code getMany} batch and charges
-     * its decompressed size against the response's cumulative budget
-     * (issue #386). {@link Compression#decompressValue} already caps a
-     * single value; this bounds the whole response so a batch of highly
-     * compressible values can't amplify that per-value cap into gigabytes
-     * of allocation. Synchronized on the budget holder because {@link
-     * #runMultiGetLeg} runs one leg per owner concurrently on {@link
-     * #replicaWriters}: once the budget is crossed, remaining entries (in
-     * this and other legs) fail before decompressing rather than each
-     * allocating another value first — peak allocation is therefore the
-     * budget plus one value per concurrent leg.
+    /**
+     * Decompresses one hit value for a {@code getMany} batch and charges its decompressed size
+     * against the response's cumulative budget (issue #386). {@link Compression#decompressValue}
+     * already caps a single value; this bounds the whole response so a batch of highly compressible
+     * values can't amplify that per-value cap into gigabytes of allocation. Synchronized on the
+     * budget holder because {@link #runMultiGetLeg} runs one leg per owner concurrently on {@link
+     * #replicaWriters}: once the budget is crossed, remaining entries (in this and other legs) fail
+     * before decompressing rather than each allocating another value first — peak allocation is
+     * therefore the budget plus one value per concurrent leg.
      *
-     * <p>The budget only applies when {@code compress} is actually enabled
-     * (issue #410b) — with it off, {@link #maybeDecompress} is a no-op and
-     * the per-response read size already bounds this path on its own, so
-     * charging it here would just be an undocumented total-batch cap on
-     * uncompressed batches. And the current entry is charged before the
-     * cap is checked (issue #410a) so the entry that actually crosses it
-     * is caught — and excluded — rather than slipping through, which
-     * matters most when it is the last hit in the response. */
+     * <p>The budget only applies when {@code compress} is actually enabled (issue #410b) — with it
+     * off, {@link #maybeDecompress} is a no-op and the per-response read size already bounds this
+     * path on its own, so charging it here would just be an undocumented total-batch cap on
+     * uncompressed batches. And the current entry is charged before the cap is checked (issue
+     * #410a) so the entry that actually crosses it is caught — and excluded — rather than slipping
+     * through, which matters most when it is the last hit in the response.
+     */
     private byte[] decompressForBatch(byte[] raw, long[] budget) {
         synchronized (budget) {
             byte[] value = maybeDecompress(raw);
@@ -2445,29 +2497,24 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * Internal signal thrown by {@link #multiGetChunked}/{@link
-     * #multiSetChunked} (issue #411) when a chunk after the first hits a
-     * connection failure {@link #applyReconnecting}'s own built-in
-     * redial-and-retry couldn't recover from: carries every earlier
-     * chunk's already-resolved {@link Connection.MultiEntry} results (the
-     * failing chunk's own positions, and every chunk after it, stay {@code
-     * null}) plus the {@link NanocachedException.ConnectionLost} that
-     * escaped, so a caller can build a partial-success exception instead
-     * of losing that data. Never thrown when the very first chunk fails —
-     * there's nothing partial to carry then, so the plain {@code
+     * Internal signal thrown by {@link #multiGetChunked}/{@link #multiSetChunked} (issue #411) when
+     * a chunk after the first hits a connection failure {@link #applyReconnecting}'s own built-in
+     * redial-and-retry couldn't recover from: carries every earlier chunk's already-resolved {@link
+     * Connection.MultiEntry} results (the failing chunk's own positions, and every chunk after it,
+     * stay {@code null}) plus the {@link NanocachedException.ConnectionLost} that escaped, so a
+     * caller can build a partial-success exception instead of losing that data. Never thrown when
+     * the very first chunk fails — there's nothing partial to carry then, so the plain {@code
      * ConnectionLost} propagates unwrapped, exactly as it always has.
      *
-     * <p>Purely internal plumbing: every direct caller of {@link
-     * #multiGetChunked}/{@link #multiSetChunked} must catch this
-     * alongside {@link NanocachedException.ConnectionLost} — it must
-     * never itself escape a public API method.
+     * <p>Purely internal plumbing: every direct caller of {@link #multiGetChunked}/{@link
+     * #multiSetChunked} must catch this alongside {@link NanocachedException.ConnectionLost} — it
+     * must never itself escape a public API method.
      */
     private static final class ChunkedConnectionFailure extends RuntimeException {
         final List<Connection.MultiEntry> partialEntries;
         final NanocachedException.ConnectionLost cause;
 
-        ChunkedConnectionFailure(
-                List<Connection.MultiEntry> partialEntries, NanocachedException.ConnectionLost cause) {
+        ChunkedConnectionFailure(List<Connection.MultiEntry> partialEntries, NanocachedException.ConnectionLost cause) {
             super(cause);
             this.partialEntries = partialEntries;
             this.cause = cause;
@@ -2475,24 +2522,23 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * {@link ChunkedConnectionFailure}'s twin for {@link #multiTouchChunked},
-     * whose {@code cause} may also be a {@link
-     * NanocachedException.RetryableError}: the proxy's {@code R} (issue
-     * #937), which is not a {@link NanocachedException.ConnectionLost}.
-     * The entries of the chunks that did resolve ride along, as they do for
-     * a connection failure — with {@code ttl == 0} those chunks expired
-     * their keys and the values they returned are gone. Purely internal:
-     * every caller of {@code multiTouchChunked} must catch it.
+     * {@link ChunkedConnectionFailure}'s twin for {@link #multiTouchChunked}, whose {@code cause}
+     * may also be a {@link NanocachedException.RetryableError}: the proxy's {@code R} (issue #937),
+     * which is not a {@link NanocachedException.ConnectionLost}. The entries of the chunks that did
+     * resolve ride along, as they do for a connection failure — with {@code ttl == 0} those chunks
+     * expired their keys and the values they returned are gone. Purely internal: every caller of
+     * {@code multiTouchChunked} must catch it.
      */
     private static final class ChunkedTouchFailure extends RuntimeException {
         final List<Connection.MultiEntry> partialEntries;
         final NanocachedException cause;
-        /** Issue #901: how many leading keys of the call the failed
-         * request may have reached the node with — {@code 0} unless it was
-         * an expiring ({@code ttl == 0}) touch whose frame may have been
-         * applied, in which case the unresolved keys below this index must
-         * not be resent. Always {@code 0} for an {@code R}, which means
-         * the chunk was not applied. */
+
+        /**
+         * Issue #901: how many leading keys of the call the failed request may have reached the
+         * node with — {@code 0} unless it was an expiring ({@code ttl == 0}) touch whose frame may
+         * have been applied, in which case the unresolved keys below this index must not be resent.
+         * Always {@code 0} for an {@code R}, which means the chunk was not applied.
+         */
         final int sentEnd;
 
         ChunkedTouchFailure(List<Connection.MultiEntry> partialEntries, NanocachedException cause, int sentEnd) {
@@ -2503,25 +2549,22 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** Issues one or more {@code m} sub-frames against whatever {@code
-     * connectionFor} resolves to — already grouped to one owner (or the
-     * single/proxy target) by the caller — splitting into sub-frames
-     * bounded by both {@link #MAX_BATCH_KEYS} keys (so no reply header
-     * risks exceeding {@link Connection#MAX_HEADER_LINE_LENGTH}) and
-     * {@link #MAX_REQUEST_BYTES} of cumulative wire size (issue #222), so
-     * a batch of individually valid keys can't sum past the server's
-     * MAX_REQUEST_SIZE frame cap. A single key always fits one sub-frame
-     * by itself — {@link #validateKey} already rejected anything that
-     * wouldn't.
+    /**
+     * Issues one or more {@code m} sub-frames against whatever {@code connectionFor} resolves to —
+     * already grouped to one owner (or the single/proxy target) by the caller — splitting into
+     * sub-frames bounded by both {@link #MAX_BATCH_KEYS} keys (so no reply header risks exceeding
+     * {@link Connection#MAX_HEADER_LINE_LENGTH}) and {@link #MAX_REQUEST_BYTES} of cumulative wire
+     * size (issue #222), so a batch of individually valid keys can't sum past the server's
+     * MAX_REQUEST_SIZE frame cap. A single key always fits one sub-frame by itself — {@link
+     * #validateKey} already rejected anything that wouldn't.
      *
-     * <p>Issue #411: if a chunk after the first fails on a connection
-     * error {@link #applyReconnecting} couldn't recover from, throws
-     * {@link ChunkedConnectionFailure} carrying every earlier chunk's
-     * results instead of just letting the bare {@link
-     * NanocachedException.ConnectionLost} propagate and discard them —
-     * every caller must catch it. The very first chunk failing still
-     * throws the plain {@code ConnectionLost} unwrapped, since there is
-     * nothing partial to carry. */
+     * <p>Issue #411: if a chunk after the first fails on a connection error {@link
+     * #applyReconnecting} couldn't recover from, throws {@link ChunkedConnectionFailure} carrying
+     * every earlier chunk's results instead of just letting the bare {@link
+     * NanocachedException.ConnectionLost} propagate and discard them — every caller must catch it.
+     * The very first chunk failing still throws the plain {@code ConnectionLost} unwrapped, since
+     * there is nothing partial to carry.
+     */
     private List<Connection.MultiEntry> multiGetChunked(
             java.util.function.Supplier<Connection> connectionFor, byte[] namespace, byte[][] keys) {
         List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
@@ -2531,8 +2574,7 @@ public final class NanocachedClient implements AutoCloseable {
             byte[][] chunk = Arrays.copyOfRange(keys, start, end);
             List<Connection.MultiEntry> chunkEntries;
             try {
-                chunkEntries = applyReconnecting(
-                        connectionFor, connection -> connection.multiGet(namespace, chunk));
+                chunkEntries = applyReconnecting(connectionFor, connection -> connection.multiGet(namespace, chunk));
             } catch (NanocachedException.ConnectionLost failure) {
                 if (start == 0) throw failure;
                 throw new ChunkedConnectionFailure(entries, failure);
@@ -2545,25 +2587,25 @@ public final class NanocachedClient implements AutoCloseable {
         return entries;
     }
 
-    /** {@code multiGetChunked}'s byte-budgeted chunk boundary: grows
-     * {@code end} past {@code start} while the next key both keeps the
-     * chunk under {@link #MAX_BATCH_KEYS} keys and keeps the {@code m}
-     * frame {@code Connection.buildMultiGetFrame} would build for
-     * {@code keys[start..end)} — namespace once, plus each key's body
-     * bytes and its {@code " <key-len>"} header field
-     * ({@link #multiGetEntryWireBytes}) — under {@link
-     * #MAX_REQUEST_BYTES}. Always advances by at least one key: a single
-     * key's own contribution can never overflow the budget on its own
-     * (see {@link #validateKey}). */
+    /**
+     * {@code multiGetChunked}'s byte-budgeted chunk boundary: grows {@code end} past {@code start}
+     * while the next key both keeps the chunk under {@link #MAX_BATCH_KEYS} keys and keeps the
+     * {@code m} frame {@code Connection.buildMultiGetFrame} would build for {@code
+     * keys[start..end)} — namespace once, plus each key's body bytes and its {@code " <key-len>"}
+     * header field ({@link #multiGetEntryWireBytes}) — under {@link #MAX_REQUEST_BYTES}. Always
+     * advances by at least one key: a single key's own contribution can never overflow the budget
+     * on its own (see {@link #validateKey}).
+     */
     private static int multiGetChunkEnd(int namespaceLength, byte[][] keys, int start) {
         return multiGetChunkEnd(namespaceLength, keys, start, MAX_BATCH_KEYS);
     }
 
-    /** The node rejects an {@code o}/{@code y} frame whose namespace length
-     * times key count exceeds 64 MiB (and closes the connection), so a
-     * chunk of those holds at most this many keys: {@code min(400,
-     * floor(64 MiB / namespace length))}. A namespace is at most 1 MiB,
-     * so this is never below 64. */
+    /**
+     * The node rejects an {@code o}/{@code y} frame whose namespace length times key count exceeds
+     * 64 MiB (and closes the connection), so a chunk of those holds at most this many keys: {@code
+     * min(400, floor(64 MiB / namespace length))}. A namespace is at most 1 MiB, so this is never
+     * below 64.
+     */
     static int maxKeysPerNamespaceChunk(int namespaceLength) {
         if (namespaceLength <= 0) return MAX_BATCH_KEYS;
         return (int) Math.min(MAX_BATCH_KEYS, (64L * 1024 * 1024) / namespaceLength);
@@ -2581,27 +2623,29 @@ public final class NanocachedClient implements AutoCloseable {
         return end;
     }
 
-    /** One key's contribution to an {@code m} frame's wire size: its body
-     * bytes plus the {@code " <key-len>"} header field
-     * {@code Connection.buildMultiGetFrame} writes for it (a leading
-     * space plus that length's decimal digit count — see {@link
-     * #decimalDigits}). */
+    /**
+     * One key's contribution to an {@code m} frame's wire size: its body bytes plus the {@code "
+     * <key-len>"} header field {@code Connection.buildMultiGetFrame} writes for it (a leading space
+     * plus that length's decimal digit count — see {@link #decimalDigits}).
+     */
     private static long multiGetEntryWireBytes(byte[] key) {
         return key.length + 1L + decimalDigits(key.length);
     }
 
-    /** How many decimal digits {@code length}'s text form costs on the
-     * wire — shared by {@link #multiGetEntryWireBytes} and {@link
-     * #multiSetEntryWireBytes} to size each entry's {@code " <n>"}
-     * header field(s) honestly rather than guessing a fixed width. */
+    /**
+     * How many decimal digits {@code length}'s text form costs on the wire — shared by {@link
+     * #multiGetEntryWireBytes} and {@link #multiSetEntryWireBytes} to size each entry's {@code "
+     * <n>"} header field(s) honestly rather than guessing a fixed width.
+     */
     private static int decimalDigits(int length) {
         return Integer.toString(length).length();
     }
 
-    /** What one {@link #multiGetPass} left unresolved: the indices whose
-     * owner answered a per-key {@code W}, the indices whose every owner
-     * was unreachable, and the last connection-level failure seen ({@code
-     * null} when there was none). */
+    /**
+     * What one {@link #multiGetPass} left unresolved: the indices whose owner answered a per-key
+     * {@code W}, the indices whose every owner was unreachable, and the last connection-level
+     * failure seen ({@code null} when there was none).
+     */
     private static final class MultiGetPassOutcome {
         final List<Integer> wrongNode;
         final List<Integer> unreachable;
@@ -2614,30 +2658,25 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** One pass of {@link #getManyBytes(byte[], byte[][])}'s cluster
-     * routing, with the same owner fallback a single {@code get} has
-     * ({@link #read}). The given indices (every key, when {@code
-     * retryIndices} is {@code null} — the initial pass — or just the keys
-     * a previous pass left unresolved) are grouped by their current owner
-     * and one (possibly chunked) {@code m} exchange is dispatched per
-     * owner concurrently; hits are spliced into {@code values}. A key
-     * whose owner answered a per-key {@code W} is done for this pass:
-     * that is stale routing, and the caller's refresh is the answer,
-     * exactly as {@link #read} rethrows a {@code WrongNode} rather than
-     * trying the next owner. A key whose owner group failed at the
-     * connection level — a dead or unreachable node, a certificate this
-     * client cannot verify, a possibly idle-closed connection;
-     * indistinguishable, the stance {@link #read} takes — is sent to its
-     * <em>next</em> owner in rank order, the same walk {@link #read} does
-     * for one key, until an owner answers or the key has run out of
-     * owners. On a chunked group only the keys from the failing chunk
-     * onward move on (issue #411; the hits earlier chunks returned are
-     * kept). Keys with no owners at all (an empty ring view) count as
-     * {@code W}: a refresh may populate it. Called once for the initial
-     * pass and once more, if needed, after a single forced refresh. */
+    /**
+     * One pass of {@link #getManyBytes(byte[], byte[][])}'s cluster routing, with the same owner
+     * fallback a single {@code get} has ({@link #read}). The given indices (every key, when {@code
+     * retryIndices} is {@code null} — the initial pass — or just the keys a previous pass left
+     * unresolved) are grouped by their current owner and one (possibly chunked) {@code m} exchange
+     * is dispatched per owner concurrently; hits are spliced into {@code values}. A key whose owner
+     * answered a per-key {@code W} is done for this pass: that is stale routing, and the caller's
+     * refresh is the answer, exactly as {@link #read} rethrows a {@code WrongNode} rather than
+     * trying the next owner. A key whose owner group failed at the connection level — a dead or
+     * unreachable node, a certificate this client cannot verify, a possibly idle-closed connection;
+     * indistinguishable, the stance {@link #read} takes — is sent to its <em>next</em> owner in
+     * rank order, the same walk {@link #read} does for one key, until an owner answers or the key
+     * has run out of owners. On a chunked group only the keys from the failing chunk onward move on
+     * (issue #411; the hits earlier chunks returned are kept). Keys with no owners at all (an empty
+     * ring view) count as {@code W}: a refresh may populate it. Called once for the initial pass
+     * and once more, if needed, after a single forced refresh.
+     */
     private MultiGetPassOutcome multiGetPass(
-            byte[] namespace, byte[][] keyBytes, byte[][] values, List<Integer> retryIndices,
-            long[] budget) {
+            byte[] namespace, byte[][] keyBytes, byte[][] values, List<Integer> retryIndices, long[] budget) {
         List<Integer> pending;
         if (retryIndices == null) {
             pending = new ArrayList<>(keyBytes.length);
@@ -2668,7 +2707,8 @@ public final class NanocachedClient implements AutoCloseable {
                 } else if (r >= owners.size()) {
                     unreachable.add(idx);
                 } else {
-                    groups.computeIfAbsent(owners.get(r), name -> new ArrayList<>()).add(idx);
+                    groups.computeIfAbsent(owners.get(r), name -> new ArrayList<>())
+                            .add(idx);
                 }
             }
             pending = new ArrayList<>();
@@ -2706,38 +2746,39 @@ public final class NanocachedClient implements AutoCloseable {
         return new MultiGetPassOutcome(new ArrayList<>(wrongNode), unreachable, lastError.get());
     }
 
-    /** One owner group's {@code m} exchange, run on {@link
-     * #replicaWriters} by {@link #multiGetPass} (via {@link
-     * #submitReplicaWrite}): a hit is spliced into {@code values}
-     * (decompression failures propagate, aborting the batch immediately —
-     * never fed into the retry pass, since they're a client-side {@code
-     * compress} mismatch, not a routing outcome); a per-key {@code W} is
-     * added to {@code wrongNode}; a connection-level failure
-     * (indistinguishable from a possibly-idle-closed connection, same
-     * stance {@link #applyReconnecting}'s own callers take elsewhere)
-     * adds whatever the group's chunk(s) never resolved to {@code moved}
-     * so {@link #multiGetPass} can send those keys to their next owner —
-     * the whole group when its first chunk failed, only the tail from the
-     * failing chunk onward when an earlier chunk had already succeeded
-     * (issue #411: a {@link ChunkedConnectionFailure}'s already-resolved
-     * entries are kept, not re-fetched) — and records the failure in
-     * {@code lastError}. {@code wrongNode} and {@code moved} must already
-     * be thread-safe lists — this runs concurrently with every other
+    /**
+     * One owner group's {@code m} exchange, run on {@link #replicaWriters} by {@link #multiGetPass}
+     * (via {@link #submitReplicaWrite}): a hit is spliced into {@code values} (decompression
+     * failures propagate, aborting the batch immediately — never fed into the retry pass, since
+     * they're a client-side {@code compress} mismatch, not a routing outcome); a per-key {@code W}
+     * is added to {@code wrongNode}; a connection-level failure (indistinguishable from a
+     * possibly-idle-closed connection, same stance {@link #applyReconnecting}'s own callers take
+     * elsewhere) adds whatever the group's chunk(s) never resolved to {@code moved} so {@link
+     * #multiGetPass} can send those keys to their next owner — the whole group when its first chunk
+     * failed, only the tail from the failing chunk onward when an earlier chunk had already
+     * succeeded (issue #411: a {@link ChunkedConnectionFailure}'s already-resolved entries are
+     * kept, not re-fetched) — and records the failure in {@code lastError}. {@code wrongNode} and
+     * {@code moved} must already be thread-safe lists — this runs concurrently with every other
      * owner's leg, mirroring {@link #runMultiSetLeg}.
      *
-     * <p>{@link #decompressForBatch}'s {@link
-     * NanocachedException.DecompressionFailed} is deliberately left
-     * uncaught here rather than folded into the connection-failure guard
-     * — it needs to escape this leg, not be swallowed — but that means it
-     * can reach {@link #drainLegsKeepingFirstBug} on a leg other than the
-     * first to fail, since every owner's leg runs concurrently and any of
-     * them can trip the shared {@code budget} check at the same time
-     * (issue #413); {@code drainLegsKeepingFirstBug} knows to classify
-     * that one specially rather than as a background write bug. */
+     * <p>{@link #decompressForBatch}'s {@link NanocachedException.DecompressionFailed} is
+     * deliberately left uncaught here rather than folded into the connection-failure guard — it
+     * needs to escape this leg, not be swallowed — but that means it can reach {@link
+     * #drainLegsKeepingFirstBug} on a leg other than the first to fail, since every owner's leg
+     * runs concurrently and any of them can trip the shared {@code budget} check at the same time
+     * (issue #413); {@code drainLegsKeepingFirstBug} knows to classify that one specially rather
+     * than as a background write bug.
+     */
     private void runMultiGetLeg(
-            byte[] namespace, String owner, List<Integer> groupIndices,
-            byte[][] keyBytes, byte[][] values, List<Integer> wrongNode, List<Integer> moved,
-            java.util.concurrent.atomic.AtomicReference<NanocachedException> lastError, long[] budget) {
+            byte[] namespace,
+            String owner,
+            List<Integer> groupIndices,
+            byte[][] keyBytes,
+            byte[][] values,
+            List<Integer> wrongNode,
+            List<Integer> moved,
+            java.util.concurrent.atomic.AtomicReference<NanocachedException> lastError,
+            long[] budget) {
         byte[][] groupKeys = new byte[groupIndices.size()][];
         for (int i = 0; i < groupIndices.size(); i++) {
             groupKeys[i] = keyBytes[groupIndices.get(i)];
@@ -2790,53 +2831,59 @@ public final class NanocachedClient implements AutoCloseable {
         set(key, value, 0L);
     }
 
-    /** {@code ttlSeconds == 0} means no expiry. Transparently compresses
-     * values at or above {@code compressionThreshold} when {@code
-     * compress} is enabled (value compression). */
+    /**
+     * {@code ttlSeconds == 0} means no expiry. Transparently compresses values at or above {@code
+     * compressionThreshold} when {@code compress} is enabled (value compression).
+     */
     public void set(byte[] key, byte[] value, long ttlSeconds) {
         set(EMPTY_NAMESPACE, key, value, ttlSeconds);
     }
 
-    /** The namespaced counterpart of {@link #set(byte[], byte[], long)}
-     * (issue #105) — see {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #set(byte[], byte[], long)} (issue #105) — see {@link
+     * #namespace}.
+     */
     void set(byte[] namespace, byte[] key, byte[] value, long ttlSeconds) {
         if (ttlSeconds < 0) {
-            throw new IllegalArgumentException(
-                    "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
+            throw new IllegalArgumentException("nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
         }
         validateKeyAndValue(namespace, key, value);
         beforeOperation();
         byte[] outgoing = compress ? Compression.compressValue(value, compressionThreshold) : value;
         Long wireTtlSeconds = ttlSeconds == 0 ? null : ttlSeconds;
         withWrongNodeRetry(() -> {
-            write(namespace, key, connection -> {
-                connection.set(namespace, key, outgoing, wireTtlSeconds);
-                return null;
-            }, () -> {
-                // issue #326: when compress is off, `outgoing` above is the
-                // caller's own `value` array, not a copy — Compression#compressValue
-                // always allocates fresh (see its prefixed() helper), so this copy
-                // is only needed on that branch. A fireAndForgetReplicas leg can
-                // still be running after set() has already returned to the caller;
-                // without this, a caller that reuses/mutates `value` in place right
-                // after the call returns could silently change what a background
-                // replica leg ends up storing. write() only ever calls this
-                // supplier for a leg that is actually going into the background —
-                // every synchronous/joined leg (including the primary) keeps using
-                // the uncopied `outgoing` above, since it always finishes before
-                // this method returns and so can never observe a later mutation.
-                byte[] backgroundSafe = compress ? outgoing : Arrays.copyOf(outgoing, outgoing.length);
-                // Issue #1199: the same holds for the key and the namespace —
-                // the leg frames them only once it runs, so a caller that
-                // reuses those buffers must not change where the replica
-                // stores the value.
-                byte[] backgroundKey = key.clone();
-                byte[] backgroundNamespace = namespace.clone();
-                return connection -> {
-                    connection.set(backgroundNamespace, backgroundKey, backgroundSafe, wireTtlSeconds);
-                    return null;
-                };
-            });
+            write(
+                    namespace,
+                    key,
+                    connection -> {
+                        connection.set(namespace, key, outgoing, wireTtlSeconds);
+                        return null;
+                    },
+                    () -> {
+                        // issue #326: when compress is off, `outgoing` above is the
+                        // caller's own `value` array, not a copy — Compression#compressValue
+                        // always allocates fresh (see its prefixed() helper), so this copy
+                        // is only needed on that branch. A fireAndForgetReplicas leg can
+                        // still be running after set() has already returned to the caller;
+                        // without this, a caller that reuses/mutates `value` in place right
+                        // after the call returns could silently change what a background
+                        // replica leg ends up storing. write() only ever calls this
+                        // supplier for a leg that is actually going into the background —
+                        // every synchronous/joined leg (including the primary) keeps using
+                        // the uncopied `outgoing` above, since it always finishes before
+                        // this method returns and so can never observe a later mutation.
+                        byte[] backgroundSafe = compress ? outgoing : Arrays.copyOf(outgoing, outgoing.length);
+                        // Issue #1199: the same holds for the key and the namespace —
+                        // the leg frames them only once it runs, so a caller that
+                        // reuses those buffers must not change where the replica
+                        // stores the value.
+                        byte[] backgroundKey = key.clone();
+                        byte[] backgroundNamespace = namespace.clone();
+                        return connection -> {
+                            connection.set(backgroundNamespace, backgroundKey, backgroundSafe, wireTtlSeconds);
+                            return null;
+                        };
+                    });
             return null;
         });
     }
@@ -2845,10 +2892,11 @@ public final class NanocachedClient implements AutoCloseable {
         return delete(utf8(key, "key"));
     }
 
-    /** Returns whether the key existed before this call. In a cluster the
-     * other owners are sent the delete only after the primary has
-     * answered, so a primary that has to be rerouted never finds its
-     * replicas have already deleted the key. */
+    /**
+     * Returns whether the key existed before this call. In a cluster the other owners are sent the
+     * delete only after the primary has answered, so a primary that has to be rerouted never finds
+     * its replicas have already deleted the key.
+     */
     public boolean delete(byte[] key) {
         return delete(EMPTY_NAMESPACE, key);
     }
@@ -2856,42 +2904,33 @@ public final class NanocachedClient implements AutoCloseable {
     // ── Touch (issue #825) ───────────────────────────────────────────
 
     /**
-     * Passed as {@code ttlSeconds} to {@link #touch}/{@link #getAndTouch},
-     * removes the entry's TTL so it never expires. A named constant rather
-     * than a bare {@code -1} because the parameter has no default and
-     * {@code 0} is a real value there (expire the entry at once) — the
-     * opposite of {@link #set(byte[], byte[], long)}, where 0 means no
-     * expiry.
+     * Passed as {@code ttlSeconds} to {@link #touch}/{@link #getAndTouch}, removes the entry's TTL
+     * so it never expires. A named constant rather than a bare {@code -1} because the parameter has
+     * no default and {@code 0} is a real value there (expire the entry at once) — the opposite of
+     * {@link #set(byte[], byte[], long)}, where 0 means no expiry.
      */
     public static final long REMOVE_TTL = -1L;
 
     /**
-     * Replaces the TTL of an existing entry in place, without rewriting
-     * its value (issue #825), and returns whether the key existed: {@code
-     * false} for a missing or expired key, which a touch never creates.
-     * {@code ttlSeconds} is counted from the moment the node receives the
-     * request — {@link #REMOVE_TTL} removes the TTL, {@code 0} expires the
-     * entry at once, and any other negative value is rejected before any
-     * I/O with {@link IllegalArgumentException}.
+     * Replaces the TTL of an existing entry in place, without rewriting its value (issue #825), and
+     * returns whether the key existed: {@code false} for a missing or expired key, which a touch
+     * never creates. {@code ttlSeconds} is counted from the moment the node receives the request —
+     * {@link #REMOVE_TTL} removes the TTL, {@code 0} expires the entry at once, and any other
+     * negative value is rejected before any I/O with {@link IllegalArgumentException}.
      *
-     * <p>Unlike INCR and the compare-and-set family a touch is idempotent,
-     * so a request whose reply was lost is retried like get/set/delete are,
-     * never thrown as {@link NanocachedException.ConnectionLost} -- with
-     * one exception (issue #901): {@code 0} expires the entry, so a resend
-     * after the node already applied it would answer {@code false} for a
-     * key that existed. With {@code ttlSeconds == 0} the request is
-     * retried only when it provably never reached the wire (a wrong-node
-     * answer, a failed dial, a connection already known dead); a
-     * connection lost after it was sent is thrown as {@link
-     * NanocachedException.ConnectionLost}, as INCR's is, and the entry
-     * may or may not have expired. In a cluster it goes to every owner,
-     * like a set, and the primary's answer is returned; with {@code
-     * ttlSeconds == 0} the other owners are sent it only after the primary
-     * has answered (issue #934), so a primary that has to be rerouted never
-     * finds its replicas have already expired the entry.
+     * <p>Unlike INCR and the compare-and-set family a touch is idempotent, so a request whose reply
+     * was lost is retried like get/set/delete are, never thrown as {@link
+     * NanocachedException.ConnectionLost} -- with one exception (issue #901): {@code 0} expires the
+     * entry, so a resend after the node already applied it would answer {@code false} for a key
+     * that existed. With {@code ttlSeconds == 0} the request is retried only when it provably never
+     * reached the wire (a wrong-node answer, a failed dial, a connection already known dead); a
+     * connection lost after it was sent is thrown as {@link NanocachedException.ConnectionLost}, as
+     * INCR's is, and the entry may or may not have expired. In a cluster it goes to every owner,
+     * like a set, and the primary's answer is returned; with {@code ttlSeconds == 0} the other
+     * owners are sent it only after the primary has answered (issue #934), so a primary that has to
+     * be rerouted never finds its replicas have already expired the entry.
      *
-     * @throws NanocachedException.ServerTooOld against a node that predates
-     *         the command
+     * @throws NanocachedException.ServerTooOld against a node that predates the command
      */
     public boolean touch(String key, long ttlSeconds) {
         return touch(utf8(key, "key"), ttlSeconds);
@@ -2902,8 +2941,10 @@ public final class NanocachedClient implements AutoCloseable {
         return touch(EMPTY_NAMESPACE, key, ttlSeconds);
     }
 
-    /** The namespaced counterpart of {@link #touch(byte[], long)} (issue
-     * #105) — see {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #touch(byte[], long)} (issue #105) — see {@link
+     * #namespace}.
+     */
     boolean touch(byte[] namespace, byte[] key, long ttlSeconds) {
         validateKey(namespace, key);
         Long wireTtl = touchWireTtl(ttlSeconds);
@@ -2913,35 +2954,38 @@ public final class NanocachedClient implements AutoCloseable {
         byte[] ownedKey = ownedForBackground(key);
         try {
             boolean expiring = expiresAtOnce(wireTtl);
-            return withTouchRetry(expiring, () -> write(
-                    namespace, key, connection -> connection.touch(ownedNamespace, ownedKey, wireTtl),
-                    null, null, !expiring, true, expiring));
+            return withTouchRetry(
+                    expiring,
+                    () -> write(
+                            namespace,
+                            key,
+                            connection -> connection.touch(ownedNamespace, ownedKey, wireTtl),
+                            null,
+                            null,
+                            !expiring,
+                            true,
+                            expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         }
     }
 
     /**
-     * Reads a value and replaces its TTL in one step (issue #825); {@code
-     * Optional.empty()} on a miss, which creates nothing. See {@link
-     * #touch(String, long)} for {@code ttlSeconds}. Decoded as strict
-     * UTF-8, like {@link #get(String)}.
+     * Reads a value and replaces its TTL in one step (issue #825); {@code Optional.empty()} on a
+     * miss, which creates nothing. See {@link #touch(String, long)} for {@code ttlSeconds}. Decoded
+     * as strict UTF-8, like {@link #get(String)}.
      *
-     * <p>A read that writes: it goes to the key's primary like a write (one
-     * refresh and retry on a wrong-node answer or a connection failure; no
-     * hedging, and no fallback to a replica on a miss) and the other owners
-     * are sent the plain touch, so a replica is never the only owner
-     * touched. It counts as a read on the primary, which makes the entry
-     * the most recently used.
+     * <p>A read that writes: it goes to the key's primary like a write (one refresh and retry on a
+     * wrong-node answer or a connection failure; no hedging, and no fallback to a replica on a
+     * miss) and the other owners are sent the plain touch, so a replica is never the only owner
+     * touched. It counts as a read on the primary, which makes the entry the most recently used.
      *
-     * <p>With {@code ttlSeconds == 0} a connection lost after the request
-     * was sent is thrown as {@link NanocachedException.ConnectionLost}
-     * instead of being resent (issue #901): the node may have expired the
-     * entry and consumed its value, and a resend would report a miss.
+     * <p>With {@code ttlSeconds == 0} a connection lost after the request was sent is thrown as
+     * {@link NanocachedException.ConnectionLost} instead of being resent (issue #901): the node may
+     * have expired the entry and consumed its value, and a resend would report a miss.
      *
      * @throws UncheckedIOException if the stored value is not valid UTF-8
-     * @throws NanocachedException.ServerTooOld against a node that predates
-     *         the command
+     * @throws NanocachedException.ServerTooOld against a node that predates the command
      */
     public Optional<String> getAndTouch(String key, long ttlSeconds) {
         return getAndTouch(utf8(key, "key"), ttlSeconds);
@@ -2952,9 +2996,10 @@ public final class NanocachedClient implements AutoCloseable {
         return getAndTouchBytes(key, ttlSeconds).map(NanocachedClient::decodeUtf8Strict);
     }
 
-    /** The raw-bytes companion to {@link #getAndTouch(String, long)}: no
-     * decoding. Transparently decompresses when {@code compress} is
-     * enabled. */
+    /**
+     * The raw-bytes companion to {@link #getAndTouch(String, long)}: no decoding. Transparently
+     * decompresses when {@code compress} is enabled.
+     */
     public Optional<byte[]> getAndTouchBytes(String key, long ttlSeconds) {
         return getAndTouchBytes(utf8(key, "key"), ttlSeconds);
     }
@@ -2964,8 +3009,10 @@ public final class NanocachedClient implements AutoCloseable {
         return getAndTouchBytes(EMPTY_NAMESPACE, key, ttlSeconds);
     }
 
-    /** The namespaced counterpart of {@link #getAndTouchBytes(byte[], long)}
-     * (issue #105) — see {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #getAndTouchBytes(byte[], long)} (issue #105) — see
+     * {@link #namespace}.
+     */
     Optional<byte[]> getAndTouchBytes(byte[] namespace, byte[] key, long ttlSeconds) {
         validateKey(namespace, key);
         Long wireTtl = touchWireTtl(ttlSeconds);
@@ -2976,15 +3023,20 @@ public final class NanocachedClient implements AutoCloseable {
         byte[] raw;
         try {
             boolean expiring = expiresAtOnce(wireTtl);
-            raw = withTouchRetry(expiring, () -> write(
-                    namespace, key,
-                    connection -> connection.getAndTouch(ownedNamespace, ownedKey, wireTtl),
-                    null,
-                    // A replica is sent the plain touch: it has no value to
-                    // return, and `G` there would only move the value over
-                    // the wire for nothing.
-                    connection -> connection.touch(ownedNamespace, ownedKey, wireTtl),
-                    !expiring, true, expiring));
+            raw = withTouchRetry(
+                    expiring,
+                    () -> write(
+                            namespace,
+                            key,
+                            connection -> connection.getAndTouch(ownedNamespace, ownedKey, wireTtl),
+                            null,
+                            // A replica is sent the plain touch: it has no value to
+                            // return, and `G` there would only move the value over
+                            // the wire for nothing.
+                            connection -> connection.touch(ownedNamespace, ownedKey, wireTtl),
+                            !expiring,
+                            true,
+                            expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         }
@@ -2992,8 +3044,10 @@ public final class NanocachedClient implements AutoCloseable {
         return Optional.of(compress ? Compression.decompressValue(raw, inflateBudget) : raw);
     }
 
-    /** {@code null} on the wire for {@link #REMOVE_TTL} (the TTL field is
-     * omitted); the number of seconds, {@code 0} included, otherwise. */
+    /**
+     * {@code null} on the wire for {@link #REMOVE_TTL} (the TTL field is omitted); the number of
+     * seconds, {@code 0} included, otherwise.
+     */
     private static Long touchWireTtl(long ttlSeconds) {
         if (ttlSeconds == REMOVE_TTL) return null;
         if (ttlSeconds < 0) {
@@ -3022,52 +3076,45 @@ public final class NanocachedClient implements AutoCloseable {
     // once is touched once.
 
     /**
-     * Batched {@link #touch(String, long)} (issue #871): replaces the TTL of
-     * every existing key in {@code keys} in place, one round trip per
-     * involved node instead of one per key. {@code keys} must be non-empty.
-     * The result maps each key to whether it existed: {@code true}, or
-     * {@code false} for a missing or expired key, which a touch never
-     * creates. {@code ttlSeconds} is one TTL for the whole batch and means
-     * what it means for {@link #touch(String, long)}: {@link #REMOVE_TTL}
-     * removes it, {@code 0} expires the keys at once, any other negative
-     * value is rejected before any I/O with {@link
-     * IllegalArgumentException}.
+     * Batched {@link #touch(String, long)} (issue #871): replaces the TTL of every existing key in
+     * {@code keys} in place, one round trip per involved node instead of one per key. {@code keys}
+     * must be non-empty. The result maps each key to whether it existed: {@code true}, or {@code
+     * false} for a missing or expired key, which a touch never creates. {@code ttlSeconds} is one
+     * TTL for the whole batch and means what it means for {@link #touch(String, long)}: {@link
+     * #REMOVE_TTL} removes it, {@code 0} expires the keys at once, any other negative value is
+     * rejected before any I/O with {@link IllegalArgumentException}.
      *
-     * <p>Like {@code touch} it is idempotent, so a request whose reply was
-     * lost is retried -- except with {@code ttlSeconds == 0} (issue #901),
-     * where a primary whose connection fails after the frame may have been
-     * applied is not resent: its keys are reported as that connection
-     * failure instead of being read as missing, every other key having
-     * been touched. In a cluster it goes to every owner of a key,
-     * the primary's answer being the key's; with {@code ttlSeconds == 0}
-     * the primaries are sent theirs first and the other owners afterwards,
-     * for the keys a primary answered (issue #934). A replica's failure or {@code
-     * W} is counted in {@link ClientStats#replicaWriteFailures()} and never
-     * fails the batch. Larger batches are transparently split into more
-     * than one {@code y} sub-frame per node (see {@link #MAX_BATCH_KEYS}).
-     * If some keys' primaries are still wrong-node after one bounded
-     * refresh-and-retry this throws a plain {@link
-     * NanocachedException.WrongNode}, and a key whose primary could not be
-     * reached on both passes throws that connection failure — every other
-     * key was still touched, and since a touch is idempotent the whole
-     * batch may simply be sent again, so nothing partial is attached.
+     * <p>Like {@code touch} it is idempotent, so a request whose reply was lost is retried --
+     * except with {@code ttlSeconds == 0} (issue #901), where a primary whose connection fails
+     * after the frame may have been applied is not resent: its keys are reported as that connection
+     * failure instead of being read as missing, every other key having been touched. In a cluster
+     * it goes to every owner of a key, the primary's answer being the key's; with {@code ttlSeconds
+     * == 0} the primaries are sent theirs first and the other owners afterwards, for the keys a
+     * primary answered (issue #934). A replica's failure or {@code W} is counted in {@link
+     * ClientStats#replicaWriteFailures()} and never fails the batch. Larger batches are
+     * transparently split into more than one {@code y} sub-frame per node (see {@link
+     * #MAX_BATCH_KEYS}). If some keys' primaries are still wrong-node after one bounded
+     * refresh-and-retry this throws a plain {@link NanocachedException.WrongNode}, and a key whose
+     * primary could not be reached on both passes throws that connection failure — every other key
+     * was still touched, and since a touch is idempotent the whole batch may simply be sent again,
+     * so nothing partial is attached.
      *
-     * <p>With {@code ttlSeconds == 0} that last step does not hold: the
-     * connection failure covers keys that were never sent and keys whose
-     * frame was sent and whose outcome is unknown (the node may have
-     * expired them already), and the exception cannot tell the two apart.
-     * Do not send the batch again, or the keys that failed, with {@code
-     * 0}: a resend reports a key the first attempt expired as missing.
+     * <p>With {@code ttlSeconds == 0} that last step does not hold: the connection failure covers
+     * keys that were never sent and keys whose frame was sent and whose outcome is unknown (the
+     * node may have expired them already), and the exception cannot tell the two apart. Do not send
+     * the batch again, or the keys that failed, with {@code 0}: a resend reports a key the first
+     * attempt expired as missing.
      *
-     * @throws NanocachedException.ServerTooOld against a node that
-     *         predates the command
+     * @throws NanocachedException.ServerTooOld against a node that predates the command
      */
     public Map<String, Boolean> touchMany(List<String> keys, long ttlSeconds) {
         return touchMany(EMPTY_NAMESPACE, keys, ttlSeconds);
     }
 
-    /** The namespaced counterpart of {@link #touchMany(List, long)} (issue
-     * #871) — see {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #touchMany(List, long)} (issue #871) — see {@link
+     * #namespace}.
+     */
     Map<String, Boolean> touchMany(byte[] namespace, List<String> keys, long ttlSeconds) {
         if (keys.isEmpty()) {
             throw new IllegalArgumentException("nanocached: touchMany requires at least one key");
@@ -3084,16 +3131,19 @@ public final class NanocachedClient implements AutoCloseable {
         return result;
     }
 
-    /** The {@code byte[]}-keyed counterpart of {@link #touchMany(List,
-     * long)}, for callers whose keys are not UTF-8 text. The result is
-     * positional: {@code result[i]} is whether {@code keys[i]} existed.
-     * Same batch semantics as the {@code String}-keyed form. */
+    /**
+     * The {@code byte[]}-keyed counterpart of {@link #touchMany(List, long)}, for callers whose
+     * keys are not UTF-8 text. The result is positional: {@code result[i]} is whether {@code
+     * keys[i]} existed. Same batch semantics as the {@code String}-keyed form.
+     */
     public boolean[] touchMany(byte[][] keys, long ttlSeconds) {
         return touchMany(EMPTY_NAMESPACE, keys, ttlSeconds);
     }
 
-    /** The namespaced, positional core every {@code touchMany} variant is
-     * built on — see {@link #touchMany(byte[][], long)}. */
+    /**
+     * The namespaced, positional core every {@code touchMany} variant is built on — see {@link
+     * #touchMany(byte[][], long)}.
+     */
     boolean[] touchMany(byte[] namespace, byte[][] keys, long ttlSeconds) {
         if (keys.length == 0) {
             throw new IllegalArgumentException("nanocached: touchMany requires at least one key");
@@ -3115,60 +3165,52 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * Batched {@link #getAndTouch(String, long)} (issue #871): reads the
-     * values of {@code keys} and replaces their TTL in one step, one round
-     * trip per involved node. {@code keys} must be non-empty. A miss is
-     * absent from the result, creates nothing and is not an error. See
-     * {@link #touchMany(List, long)} for {@code ttlSeconds}. Decoded as
-     * strict UTF-8, like {@link #get(String)}.
+     * Batched {@link #getAndTouch(String, long)} (issue #871): reads the values of {@code keys} and
+     * replaces their TTL in one step, one round trip per involved node. {@code keys} must be
+     * non-empty. A miss is absent from the result, creates nothing and is not an error. See {@link
+     * #touchMany(List, long)} for {@code ttlSeconds}. Decoded as strict UTF-8, like {@link
+     * #get(String)}.
      *
-     * <p>A read that writes, as {@code getAndTouch} is: each key goes to
-     * its primary in the {@code G} form, with no hedging and no fallback to
-     * a replica on a miss, and its other owners are sent the plain touch,
-     * so a replica is never the only owner touched. It counts as a read on
-     * the primary, which makes the entries the most recently used. A value
-     * the node had no room for in its reply (16 MiB per frame) is left out
-     * and left untouched, so it reads as a miss here.
+     * <p>A read that writes, as {@code getAndTouch} is: each key goes to its primary in the {@code
+     * G} form, with no hedging and no fallback to a replica on a miss, and its other owners are
+     * sent the plain touch, so a replica is never the only owner touched. It counts as a read on
+     * the primary, which makes the entries the most recently used. A value the node had no room for
+     * in its reply (16 MiB per frame) is left out and left untouched, so it reads as a miss here.
      *
-     * <p>Failures follow {@link #getMany(List)}: keys still wrong-node after
-     * one bounded refresh-and-retry throw {@link
-     * NanocachedException.PartialWrongNodeStrings}, and keys whose primary
-     * was unreachable on both passes throw {@link
-     * NanocachedException.PartialConnectionLostStrings} (the bare
-     * connection failure when nothing resolved), each carrying the keys
-     * that did resolve. Unlike {@code getMany} a key is not tried on its
-     * next owner when its primary is down — a replica's answer would leave
-     * the primary untouched. With {@code ttlSeconds == 0} a primary whose
-     * connection fails after the frame may have been applied is not resent
-     * (issue #901): it may have expired and consumed its values already, so
-     * those keys throw at once instead of reading as misses.
+     * <p>Failures follow {@link #getMany(List)}: keys still wrong-node after one bounded
+     * refresh-and-retry throw {@link NanocachedException.PartialWrongNodeStrings}, and keys whose
+     * primary was unreachable on both passes throw {@link
+     * NanocachedException.PartialConnectionLostStrings} (the bare connection failure when nothing
+     * resolved), each carrying the keys that did resolve. Unlike {@code getMany} a key is not tried
+     * on its next owner when its primary is down — a replica's answer would leave the primary
+     * untouched. With {@code ttlSeconds == 0} a primary whose connection fails after the frame may
+     * have been applied is not resent (issue #901): it may have expired and consumed its values
+     * already, so those keys throw at once instead of reading as misses.
      *
      * <p>For that reason, with {@code ttlSeconds == 0} the keys a {@link
      * NanocachedException.PartialConnectionLostStrings} (or {@link
      * NanocachedException.PartialConnectionLost}, {@link
-     * NanocachedException.PartialConnectionLostRaw}) leaves out of its
-     * result are not all "never asked": they include keys whose frame was
-     * sent and whose outcome is unknown, and the exception cannot tell
-     * them apart from keys that were never sent. They must not be fetched
-     * again with {@code 0} -- the first attempt may have expired them, and
-     * a second one reads them as misses, losing the values for good. The
-     * hits it carries are the only values this call will ever return.
+     * NanocachedException.PartialConnectionLostRaw}) leaves out of its result are not all "never
+     * asked": they include keys whose frame was sent and whose outcome is unknown, and the
+     * exception cannot tell them apart from keys that were never sent. They must not be fetched
+     * again with {@code 0} -- the first attempt may have expired them, and a second one reads them
+     * as misses, losing the values for good. The hits it carries are the only values this call will
+     * ever return.
      *
      * @throws UncheckedIOException if a stored value is not valid UTF-8
-     * @throws NanocachedException.ServerTooOld against a node that
-     *         predates the command — in a cluster, when other primaries
-     *         had already answered, its subclass {@link
-     *         NanocachedException.PartialServerTooOldStrings} carrying
-     *         their hits (with {@code ttlSeconds == 0} those values are
-     *         consumed and would otherwise be lost)
+     * @throws NanocachedException.ServerTooOld against a node that predates the command — in a
+     *     cluster, when other primaries had already answered, its subclass {@link
+     *     NanocachedException.PartialServerTooOldStrings} carrying their hits (with {@code
+     *     ttlSeconds == 0} those values are consumed and would otherwise be lost)
      */
     public Map<String, String> getManyAndTouch(List<String> keys, long ttlSeconds) {
         return getManyAndTouchDecoded(EMPTY_NAMESPACE, keys, ttlSeconds);
     }
 
-    /** Shared by {@link #getManyAndTouch(List, long)} and {@link
-     * Namespace#getManyAndTouch}: as {@link #getManyDecoded}, for the
-     * touching read. */
+    /**
+     * Shared by {@link #getManyAndTouch(List, long)} and {@link Namespace#getManyAndTouch}: as
+     * {@link #getManyDecoded}, for the touching read.
+     */
     private Map<String, String> getManyAndTouchDecoded(byte[] namespace, List<String> keys, long ttlSeconds) {
         try {
             return decodeMany(getManyAndTouchBytes(namespace, keys, ttlSeconds));
@@ -3183,20 +3225,24 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** The raw-bytes companion to {@link #getManyAndTouch(List, long)}: no
-     * decoding. Transparently decompresses when {@code compress} is
-     * enabled. Failures are {@link NanocachedException.PartialWrongNode}
-     * and {@link NanocachedException.PartialConnectionLost}, as for
-     * {@link #getManyBytes(List)}. */
+    /**
+     * The raw-bytes companion to {@link #getManyAndTouch(List, long)}: no decoding. Transparently
+     * decompresses when {@code compress} is enabled. Failures are {@link
+     * NanocachedException.PartialWrongNode} and {@link NanocachedException.PartialConnectionLost},
+     * as for {@link #getManyBytes(List)}.
+     */
     public Map<String, byte[]> getManyAndTouchBytes(List<String> keys, long ttlSeconds) {
         return getManyAndTouchBytes(EMPTY_NAMESPACE, keys, ttlSeconds);
     }
 
-    /** The namespaced counterpart of {@link #getManyAndTouchBytes(List,
-     * long)} (issue #871) — see {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #getManyAndTouchBytes(List, long)} (issue #871) — see
+     * {@link #namespace}.
+     */
     Map<String, byte[]> getManyAndTouchBytes(byte[] namespace, List<String> keys, long ttlSeconds) {
         if (keys.isEmpty()) {
-            throw new IllegalArgumentException("nanocached: getManyAndTouch/getManyAndTouchBytes requires at least one key");
+            throw new IllegalArgumentException(
+                    "nanocached: getManyAndTouch/getManyAndTouchBytes requires at least one key");
         }
         byte[][] keyBytes = new byte[keys.size()][];
         for (int i = 0; i < keys.size(); i++) {
@@ -3215,31 +3261,31 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** The {@code byte[]}-keyed counterpart of {@link
-     * #getManyAndTouchBytes(List, long)}, for callers whose keys are not
-     * UTF-8 text. The result is positional: {@code result[i]} is {@code
-     * keys[i]}'s raw value, or {@code null} for a miss. The partial-failure
-     * exceptions are the positional {@link
-     * NanocachedException.PartialWrongNodeRaw} and {@link
-     * NanocachedException.PartialConnectionLostRaw}, as for {@link
-     * #getManyBytes(byte[][])}, whose {@code unresolvedIndices} name the
-     * positions that did not resolve. With {@code ttlSeconds == 0} the
-     * {@code unresolvedIndices} of a {@code PartialConnectionLostRaw}
-     * include positions whose frame was sent and whose outcome is unknown,
-     * not only positions that were never sent; do not fetch them again with
-     * {@code 0} (see {@link #getManyAndTouch(List, long)}). */
+    /**
+     * The {@code byte[]}-keyed counterpart of {@link #getManyAndTouchBytes(List, long)}, for
+     * callers whose keys are not UTF-8 text. The result is positional: {@code result[i]} is {@code
+     * keys[i]}'s raw value, or {@code null} for a miss. The partial-failure exceptions are the
+     * positional {@link NanocachedException.PartialWrongNodeRaw} and {@link
+     * NanocachedException.PartialConnectionLostRaw}, as for {@link #getManyBytes(byte[][])}, whose
+     * {@code unresolvedIndices} name the positions that did not resolve. With {@code ttlSeconds ==
+     * 0} the {@code unresolvedIndices} of a {@code PartialConnectionLostRaw} include positions
+     * whose frame was sent and whose outcome is unknown, not only positions that were never sent;
+     * do not fetch them again with {@code 0} (see {@link #getManyAndTouch(List, long)}).
+     */
     public byte[][] getManyAndTouchBytes(byte[][] keys, long ttlSeconds) {
         return getManyAndTouchBytes(EMPTY_NAMESPACE, keys, ttlSeconds);
     }
 
-    /** The namespaced, positional core every {@code getManyAndTouch}
-     * variant is built on — see {@link #getManyAndTouchBytes(byte[][],
-     * long)}. A key that appears more than once is fetched and touched
-     * once, and every position of it gets the same result, as in {@link
-     * #getManyBytes(byte[], byte[][])}. */
+    /**
+     * The namespaced, positional core every {@code getManyAndTouch} variant is built on — see
+     * {@link #getManyAndTouchBytes(byte[][], long)}. A key that appears more than once is fetched
+     * and touched once, and every position of it gets the same result, as in {@link
+     * #getManyBytes(byte[], byte[][])}.
+     */
     byte[][] getManyAndTouchBytes(byte[] namespace, byte[][] keys, long ttlSeconds) {
         if (keys.length == 0) {
-            throw new IllegalArgumentException("nanocached: getManyAndTouch/getManyAndTouchBytes requires at least one key");
+            throw new IllegalArgumentException(
+                    "nanocached: getManyAndTouch/getManyAndTouchBytes requires at least one key");
         }
         DistinctKeys distinct = DistinctKeys.of(keys);
         try {
@@ -3259,14 +3305,16 @@ public final class NanocachedClient implements AutoCloseable {
         } catch (NanocachedException.PartialConnectionLostRaw partial) {
             if (!distinct.repeated) throw partial;
             throw new NanocachedException.PartialConnectionLostRaw(
-                    partial.getMessage(), partial.getCause(),
+                    partial.getMessage(),
+                    partial.getCause(),
                     expandPositions(partial.partialValues, distinct.positionOf),
                     expandIndices(partial.unresolvedIndices, distinct.positionOf));
         }
     }
 
-    /** {@link #getManyAndTouchBytes(byte[], byte[][], long)} over keys
-     * already known to be distinct. */
+    /**
+     * {@link #getManyAndTouchBytes(byte[], byte[][], long)} over keys already known to be distinct.
+     */
     private byte[][] getManyAndTouchDistinct(byte[] namespace, byte[][] keys, long ttlSeconds) {
         MultiTouchOutcome outcome = multiTouch(namespace, keys, ttlSeconds, true);
         // One decompression budget for the whole response — see
@@ -3300,8 +3348,7 @@ public final class NanocachedClient implements AutoCloseable {
         throw new NanocachedException.PartialConnectionLostRaw(cause.getMessage(), cause, values, outcome.unresolved);
     }
 
-    /** The distinct keys of a batch, and where each caller position's key
-     * sits among them. */
+    /** The distinct keys of a batch, and where each caller position's key sits among them. */
     private static final class DistinctKeys {
         final byte[][] keys;
         final int[] positionOf;
@@ -3329,13 +3376,14 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** What one touchMany/getManyAndTouch call ended with, over its distinct
-     * keys: {@code answers[i]} is the primary's answer for key {@code i},
-     * {@code null} for an unresolved one; {@code unresolved} the positions
-     * (ascending) that never got one; {@code wrongNode} whether any of them
-     * last answered {@code W} rather than failing at the connection level;
-     * {@code cause} the last primary-leg connection failure; {@code
-     * rejected} whether a primary was a node that predates {@code y}. */
+    /**
+     * What one touchMany/getManyAndTouch call ended with, over its distinct keys: {@code
+     * answers[i]} is the primary's answer for key {@code i}, {@code null} for an unresolved one;
+     * {@code unresolved} the positions (ascending) that never got one; {@code wrongNode} whether
+     * any of them last answered {@code W} rather than failing at the connection level; {@code
+     * cause} the last primary-leg connection failure; {@code rejected} whether a primary was a node
+     * that predates {@code y}.
+     */
     private static final class MultiTouchOutcome {
         final Connection.MultiEntry[] answers;
         final List<Integer> unresolved;
@@ -3344,8 +3392,11 @@ public final class NanocachedClient implements AutoCloseable {
         final boolean rejected;
 
         MultiTouchOutcome(
-                Connection.MultiEntry[] answers, List<Integer> unresolved, boolean wrongNode,
-                NanocachedException cause, boolean rejected) {
+                Connection.MultiEntry[] answers,
+                List<Integer> unresolved,
+                boolean wrongNode,
+                NanocachedException cause,
+                boolean rejected) {
             this.answers = answers;
             this.unresolved = unresolved;
             this.wrongNode = wrongNode;
@@ -3354,30 +3405,38 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** What the passes of one multiTouch call learn, shared by its legs
-     * (which run concurrently, so every member is thread-safe): {@code
-     * results} maps a position to its primary's answer; {@code wrongNode}
-     * holds the positions whose primary leg's latest outcome was a {@code
-     * W} rather than a connection failure. */
+    /**
+     * What the passes of one multiTouch call learn, shared by its legs (which run concurrently, so
+     * every member is thread-safe): {@code results} maps a position to its primary's answer; {@code
+     * wrongNode} holds the positions whose primary leg's latest outcome was a {@code W} rather than
+     * a connection failure.
+     */
     private static final class MultiTouchState {
         final Map<Integer, Connection.MultiEntry> results = new ConcurrentHashMap<>();
-        /** Issue #934: the node whose primary leg answered each position
-         * in {@link #results}, for the ttl 0 replica fan-out that follows
-         * the passes. */
+
+        /**
+         * Issue #934: the node whose primary leg answered each position in {@link #results}, for
+         * the ttl 0 replica fan-out that follows the passes.
+         */
         final Map<Integer, String> answeredBy = new ConcurrentHashMap<>();
+
         final Set<Integer> wrongNode = ConcurrentHashMap.newKeySet();
         final AtomicReference<NanocachedException> lastCause = new AtomicReference<>();
-        /** Issue #901: positions a {@code ttl == 0} call must not resend —
-         * their primary leg failed after the frame may have been applied,
-         * so a resend would report them missing (and, with {@code get},
-         * lose the values it consumed). */
+
+        /**
+         * Issue #901: positions a {@code ttl == 0} call must not resend — their primary leg failed
+         * after the frame may have been applied, so a resend would report them missing (and, with
+         * {@code get}, lose the values it consumed).
+         */
         final Set<Integer> lost = ConcurrentHashMap.newKeySet();
+
         volatile boolean rejected;
     }
 
-    /** One owner's keys, in one form, across one {@link #multiTouchPass}:
-     * with {@code get} a key's primary is in a {@code G} leg and every
-     * other owner in a plain one. */
+    /**
+     * One owner's keys, in one form, across one {@link #multiTouchPass}: with {@code get} a key's
+     * primary is in a {@code G} leg and every other owner in a plain one.
+     */
     private static final class TouchLeg {
         final String owner;
         final boolean get;
@@ -3390,12 +3449,12 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** The shared body of touchMany ({@code get} false) and
-     * getManyAndTouch ({@code get} true) over distinct keys: validates,
-     * then sends the batch to every owner (see the section comment) and
-     * reports what resolved. Never throws a routing outcome — the callers
-     * turn {@link MultiTouchOutcome} into the exception their API
-     * promises. */
+    /**
+     * The shared body of touchMany ({@code get} false) and getManyAndTouch ({@code get} true) over
+     * distinct keys: validates, then sends the batch to every owner (see the section comment) and
+     * reports what resolved. Never throws a routing outcome — the callers turn {@link
+     * MultiTouchOutcome} into the exception their API promises.
+     */
     private MultiTouchOutcome multiTouch(byte[] namespace, byte[][] keys, long ttlSeconds, boolean get) {
         Long wireTtl = touchWireTtl(ttlSeconds);
         for (byte[] key : keys) {
@@ -3437,7 +3496,10 @@ public final class NanocachedClient implements AutoCloseable {
                 }
             }
             return new MultiTouchOutcome(
-                    answers, unresolved, wrongNode && failure == null, failure,
+                    answers,
+                    unresolved,
+                    wrongNode && failure == null,
+                    failure,
                     failure instanceof NanocachedException.ServerRejected);
         }
 
@@ -3482,18 +3544,20 @@ public final class NanocachedClient implements AutoCloseable {
         return new MultiTouchOutcome(answers, unresolved, wrongNode, state.lastCause.get(), state.rejected);
     }
 
-    /** {@link #multiGetChunked}'s twin for {@code y}: one or more
-     * sub-frames against whatever {@code connectionFor} resolves to,
-     * chunked like {@code m} (see {@link #multiGetChunkEnd}). {@code get}
-     * selects the {@code G} form. Throws {@link ChunkedTouchFailure}
-     * when a chunk fails (issue #411) — also the first, unlike {@code m}
-     * — so that it can say how far a {@code ttl == 0} request may have
-     * been applied (issue #901); every caller must catch it. A chunk
-     * answered {@code R} (issue #937) fails the same way, with nothing
-     * counted as sent. */
+    /**
+     * {@link #multiGetChunked}'s twin for {@code y}: one or more sub-frames against whatever {@code
+     * connectionFor} resolves to, chunked like {@code m} (see {@link #multiGetChunkEnd}). {@code
+     * get} selects the {@code G} form. Throws {@link ChunkedTouchFailure} when a chunk fails (issue
+     * #411) — also the first, unlike {@code m} — so that it can say how far a {@code ttl == 0}
+     * request may have been applied (issue #901); every caller must catch it. A chunk answered
+     * {@code R} (issue #937) fails the same way, with nothing counted as sent.
+     */
     private List<Connection.MultiEntry> multiTouchChunked(
-            java.util.function.Supplier<Connection> connectionFor, byte[] namespace, byte[][] keys,
-            Long wireTtl, boolean get) {
+            java.util.function.Supplier<Connection> connectionFor,
+            byte[] namespace,
+            byte[][] keys,
+            Long wireTtl,
+            boolean get) {
         List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
         boolean expiring = expiresAtOnce(wireTtl);
         int start = 0;
@@ -3513,8 +3577,8 @@ public final class NanocachedClient implements AutoCloseable {
                 // applied (not provably unsent, and not an `En`, which
                 // applied nothing) must not be resent; later chunks were
                 // never sent.
-                boolean mayHaveApplied = expiring && !failure.notSent()
-                        && !(failure instanceof NanocachedException.ServerRejected);
+                boolean mayHaveApplied =
+                        expiring && !failure.notSent() && !(failure instanceof NanocachedException.ServerRejected);
                 throw new ChunkedTouchFailure(entries, failure, mayHaveApplied ? end : 0);
             } catch (NanocachedException.RetryableError retryable) {
                 // Issue #937: the proxy's `R` means the request was NOT
@@ -3531,32 +3595,33 @@ public final class NanocachedClient implements AutoCloseable {
         return entries;
     }
 
-    /** One pass of the cluster routing of {@link #multiTouch}: every key
-     * still needing resolution (every key when {@code retryIndices} is
-     * {@code null}, or just what the previous pass left unresolved) is
-     * sent to <b>every owner</b>, in one leg per (owner, form): with
-     * {@code get} a key's primary gets it in the {@code G} form and every
-     * other owner in the plain one, without it every owner gets the plain
-     * form, so a node holding some keys as primary and others as replica
-     * gets one frame in the second case and two in the first. Only the
-     * primary's answer is recorded in {@code state.results}; a replica's
-     * failure or {@code W} is counted in {@link #replicaWriteFailures}, as
-     * in {@link #runMultiSetLeg}. A leg that holds no key as primary is
-     * eligible for {@code fireAndForgetReplicas}, exactly like a
-     * single-key replica write.
+    /**
+     * One pass of the cluster routing of {@link #multiTouch}: every key still needing resolution
+     * (every key when {@code retryIndices} is {@code null}, or just what the previous pass left
+     * unresolved) is sent to <b>every owner</b>, in one leg per (owner, form): with {@code get} a
+     * key's primary gets it in the {@code G} form and every other owner in the plain one, without
+     * it every owner gets the plain form, so a node holding some keys as primary and others as
+     * replica gets one frame in the second case and two in the first. Only the primary's answer is
+     * recorded in {@code state.results}; a replica's failure or {@code W} is counted in {@link
+     * #replicaWriteFailures}, as in {@link #runMultiSetLeg}. A leg that holds no key as primary is
+     * eligible for {@code fireAndForgetReplicas}, exactly like a single-key replica write.
      *
-     * <p>With {@code primaryOnly} (issue #934, a TTL that expires the
-     * keys) only the primary's leg is built; the other owners are sent
-     * theirs by {@link #multiTouchReplicas} once the passes are over.
+     * <p>With {@code primaryOnly} (issue #934, a TTL that expires the keys) only the primary's leg
+     * is built; the other owners are sent theirs by {@link #multiTouchReplicas} once the passes are
+     * over.
      *
-     * <p>Returns the positions whose primary answered {@code W} or could
-     * not be reached (a key with no owners at all counts as {@code W}: a
-     * refresh may populate the ring). {@code state} learns which of the
-     * two it was, and whether a primary was a node that predates {@code
-     * y}. */
+     * <p>Returns the positions whose primary answered {@code W} or could not be reached (a key with
+     * no owners at all counts as {@code W}: a refresh may populate the ring). {@code state} learns
+     * which of the two it was, and whether a primary was a node that predates {@code y}.
+     */
     private List<Integer> multiTouchPass(
-            byte[] namespace, byte[][] keyBytes, Long wireTtl, boolean get, List<Integer> retryIndices,
-            MultiTouchState state, boolean primaryOnly) {
+            byte[] namespace,
+            byte[][] keyBytes,
+            Long wireTtl,
+            boolean get,
+            List<Integer> retryIndices,
+            MultiTouchState state,
+            boolean primaryOnly) {
         List<Integer> indices = retryIndices;
         if (indices == null) {
             indices = new ArrayList<>(keyBytes.length);
@@ -3586,18 +3651,15 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * The fan-out of a ttl 0 batch touch that follows its primary-only
-     * passes (issue #934): every position whose primary answered (a hit, a
-     * touch or a miss: a miss may still have a replica copy, and the
-     * caller's intent is to expire it everywhere) is sent as the plain
-     * touch to its other owners on the ring in force now, grouped by owner
-     * into one leg each. A position whose primary answered {@code W},
-     * failed or was lost is not among them, so no replica is touched for
-     * it. A replica's failure is counted in {@link #replicaWriteFailures}
-     * and never fails the batch, exactly as for the concurrent fan-out.
+     * The fan-out of a ttl 0 batch touch that follows its primary-only passes (issue #934): every
+     * position whose primary answered (a hit, a touch or a miss: a miss may still have a replica
+     * copy, and the caller's intent is to expire it everywhere) is sent as the plain touch to its
+     * other owners on the ring in force now, grouped by owner into one leg each. A position whose
+     * primary answered {@code W}, failed or was lost is not among them, so no replica is touched
+     * for it. A replica's failure is counted in {@link #replicaWriteFailures} and never fails the
+     * batch, exactly as for the concurrent fan-out.
      */
-    private void multiTouchReplicas(
-            byte[] namespace, byte[][] keyBytes, Long wireTtl, MultiTouchState state) {
+    private void multiTouchReplicas(byte[] namespace, byte[][] keyBytes, Long wireTtl, MultiTouchState state) {
         Map<String, TouchLeg> legs = new LinkedHashMap<>();
         for (Map.Entry<Integer, String> answered : new java.util.TreeMap<>(state.answeredBy).entrySet()) {
             int idx = answered.getKey();
@@ -3613,10 +3675,16 @@ public final class NanocachedClient implements AutoCloseable {
         dispatchTouchLegs(namespace, legs, keyBytes, wireTtl, Collections.synchronizedList(new ArrayList<>()), state);
     }
 
-    /** Runs the legs of one {@link #multiTouchPass} (or of {@link
-     * #multiTouchReplicas}) concurrently and waits for all of them. */
+    /**
+     * Runs the legs of one {@link #multiTouchPass} (or of {@link #multiTouchReplicas}) concurrently
+     * and waits for all of them.
+     */
     private void dispatchTouchLegs(
-            byte[] namespace, Map<String, TouchLeg> legs, byte[][] keyBytes, Long wireTtl, List<Integer> retry,
+            byte[] namespace,
+            Map<String, TouchLeg> legs,
+            byte[][] keyBytes,
+            Long wireTtl,
+            List<Integer> retry,
             MultiTouchState state) {
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         for (TouchLeg leg : legs.values()) {
@@ -3634,11 +3702,10 @@ public final class NanocachedClient implements AutoCloseable {
                 Runnable backgroundLeg =
                         () -> runMultiTouchLeg(backgroundNamespace, leg, backgroundKeys, wireTtl, retry, state);
                 try {
-                    CompletableFuture.runAsync(backgroundLeg, backgroundLegs)
-                            .whenComplete((ignoredResult, error) -> {
-                                backgroundReplicaWritePermits.release();
-                                reportBackgroundWriteBug(error);
-                            });
+                    CompletableFuture.runAsync(backgroundLeg, backgroundLegs).whenComplete((ignoredResult, error) -> {
+                        backgroundReplicaWritePermits.release();
+                        reportBackgroundWriteBug(error);
+                    });
                 } catch (RejectedExecutionException rejected) {
                     backgroundReplicaWritePermits.release();
                     backgroundLeg.run();
@@ -3654,18 +3721,22 @@ public final class NanocachedClient implements AutoCloseable {
         if (legBug != null) throw legBug;
     }
 
-    /** Dispatches one {@link TouchLeg} (via {@link #multiTouchChunked}) and
-     * applies its result: only a primary-held position can end up in
-     * {@code retry}; every replica-held position's failure or {@code W} is
-     * counted in {@link #replicaWriteFailures} instead, mirroring {@link
-     * #applyLegOutcome}. A connection failure for the whole leg is treated
-     * the same way, position by position, since the same sub-frame can
-     * carry both primary- and replica-held keys; when a chunk after the
-     * first failed (issue #411) only the positions from it onward are
-     * unresolved. {@code retry} must already be a thread-safe list — this
-     * runs concurrently with every other leg. */
+    /**
+     * Dispatches one {@link TouchLeg} (via {@link #multiTouchChunked}) and applies its result: only
+     * a primary-held position can end up in {@code retry}; every replica-held position's failure or
+     * {@code W} is counted in {@link #replicaWriteFailures} instead, mirroring {@link
+     * #applyLegOutcome}. A connection failure for the whole leg is treated the same way, position
+     * by position, since the same sub-frame can carry both primary- and replica-held keys; when a
+     * chunk after the first failed (issue #411) only the positions from it onward are unresolved.
+     * {@code retry} must already be a thread-safe list — this runs concurrently with every other
+     * leg.
+     */
     private void runMultiTouchLeg(
-            byte[] namespace, TouchLeg leg, byte[][] keyBytes, Long wireTtl, List<Integer> retry,
+            byte[] namespace,
+            TouchLeg leg,
+            byte[][] keyBytes,
+            Long wireTtl,
+            List<Integer> retry,
             MultiTouchState state) {
         byte[][] groupKeys = new byte[leg.indices.size()][];
         for (int i = 0; i < leg.indices.size(); i++) {
@@ -3715,8 +3786,9 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** The namespaced counterpart of {@link #delete(byte[])} (issue #105) —
-     * see {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #delete(byte[])} (issue #105) — see {@link #namespace}.
+     */
     boolean delete(byte[] namespace, byte[] key) {
         validateKey(namespace, key);
         beforeOperation();
@@ -3728,9 +3800,15 @@ public final class NanocachedClient implements AutoCloseable {
         // replica would delete its copy while a primary that failed or
         // answered W is rerouted to it, and the call would return false for
         // a key that existed.
-        return withWrongNodeRetry(
-                () -> write(namespace, key, connection -> connection.delete(ownedNamespace, ownedKey),
-                        null, null, true, false, true));
+        return withWrongNodeRetry(() -> write(
+                namespace,
+                key,
+                connection -> connection.delete(ownedNamespace, ownedKey),
+                null,
+                null,
+                true,
+                false,
+                true));
     }
 
     public void setMany(Map<String, String> values) {
@@ -3754,39 +3832,35 @@ public final class NanocachedClient implements AutoCloseable {
         setManyBytes(values, 0L);
     }
 
-    /** Stores every raw value in {@code values} in one round trip per
-     * involved node (batched set, docs/protocol.html#multi).
-     * {@code ttlSeconds == 0} means no expiry, shared by the whole batch
-     * — not per key, since every real caller of a batched set (Django's
-     * {@code set_many}, cache-manager's {@code mset}) already passes one
-     * TTL per call. {@code values} must be non-empty. Transparently
-     * compresses values at or above {@code compressionThreshold} when
-     * {@code compress} is enabled, exactly like {@link #set(byte[],
-     * byte[], long)}.
+    /**
+     * Stores every raw value in {@code values} in one round trip per involved node (batched set,
+     * docs/protocol.html#multi). {@code ttlSeconds == 0} means no expiry, shared by the whole batch
+     * — not per key, since every real caller of a batched set (Django's {@code set_many},
+     * cache-manager's {@code mset}) already passes one TTL per call. {@code values} must be
+     * non-empty. Transparently compresses values at or above {@code compressionThreshold} when
+     * {@code compress} is enabled, exactly like {@link #set(byte[], byte[], long)}.
      *
-     * <p>Within one batch, the same node can be a key's primary and
-     * another key's replica at once — it receives exactly one {@code o}
-     * sub-frame either way, and only its answer for the keys it is
-     * primary for decides that key's outcome; a replica-held key's
-     * failure or {@code W} is logged-and-swallowed into {@link
-     * #stats()}'s {@code replicaWriteFailures}, exactly like {@link
-     * #set(byte[], byte[], long)}'s own replica legs ({@link #write}). A
-     * batch never fails as a whole: if some keys' primaries are still
-     * wrong-node after one bounded refresh-and-retry, this throws {@link
-     * NanocachedException.WrongNode} — every other key in the batch was
-     * still stored. In single-node/proxy mode a {@code W} propagates
-     * immediately, exactly as {@link #set(byte[], byte[], long)}'s own
-     * single-mode behavior does.
+     * <p>Within one batch, the same node can be a key's primary and another key's replica at once —
+     * it receives exactly one {@code o} sub-frame either way, and only its answer for the keys it
+     * is primary for decides that key's outcome; a replica-held key's failure or {@code W} is
+     * logged-and-swallowed into {@link #stats()}'s {@code replicaWriteFailures}, exactly like
+     * {@link #set(byte[], byte[], long)}'s own replica legs ({@link #write}). A batch never fails
+     * as a whole: if some keys' primaries are still wrong-node after one bounded refresh-and-retry,
+     * this throws {@link NanocachedException.WrongNode} — every other key in the batch was still
+     * stored. In single-node/proxy mode a {@code W} propagates immediately, exactly as {@link
+     * #set(byte[], byte[], long)}'s own single-mode behavior does.
      *
-     * <p>Larger batches are transparently split into more than one
-     * {@code o} sub-frame per node (batch chunking, see {@link
-     * #MAX_BATCH_KEYS}). */
+     * <p>Larger batches are transparently split into more than one {@code o} sub-frame per node
+     * (batch chunking, see {@link #MAX_BATCH_KEYS}).
+     */
     public void setManyBytes(Map<String, byte[]> values, long ttlSeconds) {
         setManyBytes(EMPTY_NAMESPACE, values, ttlSeconds);
     }
 
-    /** The namespaced counterpart of {@link #setManyBytes(Map, long)}
-     * (issue #151) — see {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #setManyBytes(Map, long)} (issue #151) — see {@link
+     * #namespace}.
+     */
     void setManyBytes(byte[] namespace, Map<String, byte[]> values, long ttlSeconds) {
         byte[][] keyBytes = new byte[values.size()][];
         byte[][] valueBytes = new byte[values.size()][];
@@ -3806,14 +3880,14 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** Re-keys a positional {@link
-     * NanocachedException.PartialConnectionLostSetRaw#succeededIndices}
-     * (or the same shape from any other positions-into-keys splice) by the
-     * original {@code String} keys those positions came from — {@link
-     * #setManyBytes(byte[], Map, long)}'s counterpart to {@link
-     * #spliceMany} on the read side. A {@link Set} rather than a list:
-     * {@link NanocachedException.PartialConnectionLostSet#succeededKeys}
-     * only needs "was this key confirmed stored", not positional order. */
+    /**
+     * Re-keys a positional {@link NanocachedException.PartialConnectionLostSetRaw#succeededIndices}
+     * (or the same shape from any other positions-into-keys splice) by the original {@code String}
+     * keys those positions came from — {@link #setManyBytes(byte[], Map, long)}'s counterpart to
+     * {@link #spliceMany} on the read side. A {@link Set} rather than a list: {@link
+     * NanocachedException.PartialConnectionLostSet#succeededKeys} only needs "was this key
+     * confirmed stored", not positional order.
+     */
     private static Set<String> spliceKeys(List<String> keys, int[] indices) {
         Set<String> succeeded = new LinkedHashSet<>(indices.length);
         for (int idx : indices) succeeded.add(keys.get(idx));
@@ -3824,19 +3898,21 @@ public final class NanocachedClient implements AutoCloseable {
         setManyBytes(keys, values, 0L);
     }
 
-    /** The {@code byte[]}-keyed counterpart of {@link
-     * #setManyBytes(Map, long)} (issue #160): stores {@code values[i]}
-     * under {@code keys[i]} for every position, with the same batch
-     * semantics (shared {@code ttlSeconds}, chunking, one bounded
-     * refresh-and-retry, plain {@link NanocachedException.WrongNode} if
-     * some keys are still wrong-node afterwards). {@code keys} and
-     * {@code values} must be non-empty and the same length. */
+    /**
+     * The {@code byte[]}-keyed counterpart of {@link #setManyBytes(Map, long)} (issue #160): stores
+     * {@code values[i]} under {@code keys[i]} for every position, with the same batch semantics
+     * (shared {@code ttlSeconds}, chunking, one bounded refresh-and-retry, plain {@link
+     * NanocachedException.WrongNode} if some keys are still wrong-node afterwards). {@code keys}
+     * and {@code values} must be non-empty and the same length.
+     */
     public void setManyBytes(byte[][] keys, byte[][] values, long ttlSeconds) {
         setManyBytes(EMPTY_NAMESPACE, keys, values, ttlSeconds);
     }
 
-    /** The namespaced, positional core every {@code setMany} variant is
-     * built on — see {@link #setManyBytes(byte[][], byte[][], long)}. */
+    /**
+     * The namespaced, positional core every {@code setMany} variant is built on — see {@link
+     * #setManyBytes(byte[][], byte[][], long)}.
+     */
     void setManyBytes(byte[] namespace, byte[][] keys, byte[][] values, long ttlSeconds) {
         if (keys.length == 0) {
             throw new IllegalArgumentException("nanocached: setMany/setManyBytes requires at least one key");
@@ -3846,8 +3922,7 @@ public final class NanocachedClient implements AutoCloseable {
                     "nanocached: setManyBytes got " + keys.length + " keys but " + values.length + " values");
         }
         if (ttlSeconds < 0) {
-            throw new IllegalArgumentException(
-                    "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
+            throw new IllegalArgumentException("nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
         }
         byte[][] valueBytes = new byte[keys.length][];
         for (int i = 0; i < keys.length; i++) {
@@ -3896,28 +3971,25 @@ public final class NanocachedClient implements AutoCloseable {
         }
         NanocachedException cause = tracker.lastCause.get();
         if (cause == null) {
-            cause = new NanocachedException.ConnectionLost(
-                    "nanocached: no owner is reachable for these keys", null);
+            cause = new NanocachedException.ConnectionLost("nanocached: no owner is reachable for these keys", null);
         }
         List<Integer> succeeded = new ArrayList<>(tracker.primaryAcknowledged);
         Collections.sort(succeeded);
         throw new NanocachedException.PartialConnectionLostSetRaw(cause.getMessage(), cause, succeeded);
     }
 
-    /** What one {@link #setManyBytes(byte[], byte[][], byte[][], long)}
-     * call learns across its two {@link #multiSetPass} passes. {@code
-     * acknowledged} records, per position, every owner (by name) that
-     * answered {@code S} for it, so the retry pass sends a position
-     * only to the owners that have not acknowledged it yet — a key
-     * whose primary leg failed used to be re-sent to every owner after
-     * the refresh, including a replica that had already stored it,
-     * which was duplicate traffic and a chance to re-apply an older
-     * value over a newer concurrent write. {@code primaryUnreachable}
-     * holds the positions whose primary leg's latest outcome was a
-     * connection failure rather than a {@code W}; {@code
-     * primaryAcknowledged} the positions whose primary stored them;
-     * {@code lastCause} the most recent leg-level connection failure.
-     * Legs run concurrently, so every member is thread-safe. */
+    /**
+     * What one {@link #setManyBytes(byte[], byte[][], byte[][], long)} call learns across its two
+     * {@link #multiSetPass} passes. {@code acknowledged} records, per position, every owner (by
+     * name) that answered {@code S} for it, so the retry pass sends a position only to the owners
+     * that have not acknowledged it yet — a key whose primary leg failed used to be re-sent to
+     * every owner after the refresh, including a replica that had already stored it, which was
+     * duplicate traffic and a chance to re-apply an older value over a newer concurrent write.
+     * {@code primaryUnreachable} holds the positions whose primary leg's latest outcome was a
+     * connection failure rather than a {@code W}; {@code primaryAcknowledged} the positions whose
+     * primary stored them; {@code lastCause} the most recent leg-level connection failure. Legs run
+     * concurrently, so every member is thread-safe.
+     */
     private static final class MultiSetTracker {
         final Map<Integer, Set<String>> acknowledged = new ConcurrentHashMap<>();
         final Set<Integer> primaryUnreachable = ConcurrentHashMap.newKeySet();
@@ -3930,17 +4002,19 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         void acknowledge(int idx, String owner) {
-            acknowledged.computeIfAbsent(idx, ignored -> ConcurrentHashMap.newKeySet()).add(owner);
+            acknowledged
+                    .computeIfAbsent(idx, ignored -> ConcurrentHashMap.newKeySet())
+                    .add(owner);
         }
     }
 
-    /** Builds {@link NanocachedException.PartialConnectionLostSetRaw}
-     * from a {@link ChunkedConnectionFailure} escaping single-mode {@link
-     * #multiSetChunked} (issue #411): every position the chunk(s) before
-     * the failure actually confirmed stored ({@code entry.ok()}) goes into
-     * {@code succeededIndices} — a position whose chunk never even ran
-     * ({@code null}) or that came back {@code W} isn't "succeeded", so it's
-     * left out. */
+    /**
+     * Builds {@link NanocachedException.PartialConnectionLostSetRaw} from a {@link
+     * ChunkedConnectionFailure} escaping single-mode {@link #multiSetChunked} (issue #411): every
+     * position the chunk(s) before the failure actually confirmed stored ({@code entry.ok()}) goes
+     * into {@code succeededIndices} — a position whose chunk never even ran ({@code null}) or that
+     * came back {@code W} isn't "succeeded", so it's left out.
+     */
     private NanocachedException.PartialConnectionLostSetRaw partialConnectionLostSetRaw(
             ChunkedConnectionFailure failure) {
         List<Integer> succeeded = new ArrayList<>();
@@ -3953,19 +4027,22 @@ public final class NanocachedClient implements AutoCloseable {
                 failure.cause.getMessage(), failure.cause, succeeded);
     }
 
-    /** {@link #multiGetChunked}'s write-side twin: one or more {@code o}
-     * sub-frames against whatever {@code connectionFor} resolves to,
-     * split the same way by both {@link #MAX_BATCH_KEYS} keys and {@link
-     * #MAX_REQUEST_BYTES} of cumulative wire size (issue #222) — a batch
-     * of individually valid (per {@link #validateKeyAndValue}) pairs
-     * can't sum past the server's MAX_REQUEST_SIZE frame cap. A single
-     * pair always fits one sub-frame by itself.
+    /**
+     * {@link #multiGetChunked}'s write-side twin: one or more {@code o} sub-frames against whatever
+     * {@code connectionFor} resolves to, split the same way by both {@link #MAX_BATCH_KEYS} keys
+     * and {@link #MAX_REQUEST_BYTES} of cumulative wire size (issue #222) — a batch of individually
+     * valid (per {@link #validateKeyAndValue}) pairs can't sum past the server's MAX_REQUEST_SIZE
+     * frame cap. A single pair always fits one sub-frame by itself.
      *
-     * <p>Issue #411: same {@link ChunkedConnectionFailure} contract as
-     * {@link #multiGetChunked} — every caller must catch it. */
+     * <p>Issue #411: same {@link ChunkedConnectionFailure} contract as {@link #multiGetChunked} —
+     * every caller must catch it.
+     */
     private List<Connection.MultiEntry> multiSetChunked(
-            java.util.function.Supplier<Connection> connectionFor, byte[] namespace,
-            byte[][] keys, byte[][] values, Long ttlSeconds) {
+            java.util.function.Supplier<Connection> connectionFor,
+            byte[] namespace,
+            byte[][] keys,
+            byte[][] values,
+            Long ttlSeconds) {
         List<Connection.MultiEntry> entries = new ArrayList<>(Collections.nCopies(keys.length, null));
         int start = 0;
         while (start < keys.length) {
@@ -3975,8 +4052,7 @@ public final class NanocachedClient implements AutoCloseable {
             List<Connection.MultiEntry> chunkEntries;
             try {
                 chunkEntries = applyReconnecting(
-                        connectionFor,
-                        connection -> connection.multiSet(namespace, keyChunk, valueChunk, ttlSeconds));
+                        connectionFor, connection -> connection.multiSet(namespace, keyChunk, valueChunk, ttlSeconds));
             } catch (NanocachedException.ConnectionLost failure) {
                 if (start == 0) throw failure;
                 throw new ChunkedConnectionFailure(entries, failure);
@@ -3989,21 +4065,19 @@ public final class NanocachedClient implements AutoCloseable {
         return entries;
     }
 
-    /** {@code multiSetChunked}'s byte-budgeted chunk boundary — {@link
-     * #multiGetChunkEnd}'s write-side twin: grows {@code end} past
-     * {@code start} while the next pair keeps the chunk under {@link
-     * #MAX_BATCH_KEYS} keys and keeps the {@code o} frame {@code
-     * Connection.buildMultiSetFrame} would build for {@code
-     * keys[start..end)}/{@code values[start..end)} — namespace once,
-     * plus each pair's body bytes and its {@code " <key-len> <value-
-     * len>"} header fields ({@link #multiSetEntryWireBytes}) — under
-     * {@link #MAX_REQUEST_BYTES}. Always advances by at least one pair:
-     * a single pair's own contribution can never overflow the budget on
-     * its own (see {@link #validateKeyAndValue}). The shared TTL field
-     * (at most one {@code " <ttl>"}, present or not for the whole frame)
-     * isn't tracked per entry — its handful of bytes are covered by
-     * {@link #MAX_REQUEST_BYTES}'s existing 256-byte headroom below the
-     * server's actual 1 MiB cap. */
+    /**
+     * {@code multiSetChunked}'s byte-budgeted chunk boundary — {@link #multiGetChunkEnd}'s
+     * write-side twin: grows {@code end} past {@code start} while the next pair keeps the chunk
+     * under {@link #MAX_BATCH_KEYS} keys and keeps the {@code o} frame {@code
+     * Connection.buildMultiSetFrame} would build for {@code keys[start..end)}/{@code
+     * values[start..end)} — namespace once, plus each pair's body bytes and its {@code " <key-len>
+     * <value-len>"} header fields ({@link #multiSetEntryWireBytes}) — under {@link
+     * #MAX_REQUEST_BYTES}. Always advances by at least one pair: a single pair's own contribution
+     * can never overflow the budget on its own (see {@link #validateKeyAndValue}). The shared TTL
+     * field (at most one {@code " <ttl>"}, present or not for the whole frame) isn't tracked per
+     * entry — its handful of bytes are covered by {@link #MAX_REQUEST_BYTES}'s existing 256-byte
+     * headroom below the server's actual 1 MiB cap.
+     */
     private static int multiSetChunkEnd(int namespaceLength, byte[][] keys, byte[][] values, int start) {
         int end = start + 1;
         long frameBytes = namespaceLength + multiSetEntryWireBytes(keys[start], values[start]);
@@ -4017,42 +4091,45 @@ public final class NanocachedClient implements AutoCloseable {
         return end;
     }
 
-    /** One pair's contribution to an {@code o} frame's wire size: its key
-     * and value body bytes plus the {@code " <key-len> <value-len>"}
-     * header fields {@code Connection.buildMultiSetFrame} writes for it
-     * (see {@link #decimalDigits}). */
+    /**
+     * One pair's contribution to an {@code o} frame's wire size: its key and value body bytes plus
+     * the {@code " <key-len> <value-len>"} header fields {@code Connection.buildMultiSetFrame}
+     * writes for it (see {@link #decimalDigits}).
+     */
     private static long multiSetEntryWireBytes(byte[] key, byte[] value) {
         return key.length + value.length + 2L + decimalDigits(key.length) + decimalDigits(value.length);
     }
 
-    /** One owner's key/isPrimary membership across one {@link
-     * #multiSetPass} call — see that method's own doc comment for why a
-     * key can appear here with {@code isPrimary} false: the same node
-     * can be primary for one key in the batch and a replica for
-     * another. */
+    /**
+     * One owner's key/isPrimary membership across one {@link #multiSetPass} call — see that
+     * method's own doc comment for why a key can appear here with {@code isPrimary} false: the same
+     * node can be primary for one key in the batch and a replica for another.
+     */
     private static final class OwnerBatch {
         final List<Integer> indices = new ArrayList<>();
         final List<Boolean> isPrimary = new ArrayList<>();
     }
 
-    /** One pass of {@link #setManyBytes(byte[], byte[][], byte[][], long)}'s cluster
-     * routing: for every key still needing resolution (every key, when
-     * {@code retryIndices} is {@code null}, or just what a previous pass
-     * left unresolved), build one sub-batch per <b>owner name across
-     * every rank</b> — not just primaries, unlike {@link
-     * #multiGetPass} — because within one batch the same node can be
-     * primary for one key and a replica for another; each owner
-     * therefore gets exactly one {@code o} sub-frame covering every key
-     * it holds in any role. Only a leg's <em>primary</em> keys can end
-     * up in the returned retry list; a leg's replica-held keys are
-     * logged-and-swallowed into {@link #replicaWriteFailures} instead,
-     * mirroring {@link #write}'s stance for single-key set. A leg that is
-     * a pure replica for every key it holds is eligible for {@code
-     * fireAndForgetReplicas}, exactly like a single-key replica write —
-     * see {@link #runMultiSetLeg}. */
+    /**
+     * One pass of {@link #setManyBytes(byte[], byte[][], byte[][], long)}'s cluster routing: for
+     * every key still needing resolution (every key, when {@code retryIndices} is {@code null}, or
+     * just what a previous pass left unresolved), build one sub-batch per <b>owner name across
+     * every rank</b> — not just primaries, unlike {@link #multiGetPass} — because within one batch
+     * the same node can be primary for one key and a replica for another; each owner therefore gets
+     * exactly one {@code o} sub-frame covering every key it holds in any role. Only a leg's
+     * <em>primary</em> keys can end up in the returned retry list; a leg's replica-held keys are
+     * logged-and-swallowed into {@link #replicaWriteFailures} instead, mirroring {@link #write}'s
+     * stance for single-key set. A leg that is a pure replica for every key it holds is eligible
+     * for {@code fireAndForgetReplicas}, exactly like a single-key replica write — see {@link
+     * #runMultiSetLeg}.
+     */
     private List<Integer> multiSetPass(
-            byte[] namespace, byte[][] keyBytes, byte[][] valueBytes,
-            Long ttlSeconds, List<Integer> retryIndices, MultiSetTracker tracker) {
+            byte[] namespace,
+            byte[][] keyBytes,
+            byte[][] valueBytes,
+            Long ttlSeconds,
+            List<Integer> retryIndices,
+            MultiSetTracker tracker) {
         List<Integer> indices = retryIndices;
         if (indices == null) {
             indices = new ArrayList<>(keyBytes.length);
@@ -4112,11 +4189,10 @@ public final class NanocachedClient implements AutoCloseable {
                 Runnable backgroundLeg = () -> runMultiSetLeg(
                         backgroundNamespace, name, batch, backgroundKeys, backgroundValues, ttlSeconds, retry, null);
                 try {
-                    CompletableFuture.runAsync(backgroundLeg, backgroundLegs)
-                            .whenComplete((ignoredResult, error) -> {
-                                backgroundReplicaWritePermits.release();
-                                reportBackgroundWriteBug(error);
-                            });
+                    CompletableFuture.runAsync(backgroundLeg, backgroundLegs).whenComplete((ignoredResult, error) -> {
+                        backgroundReplicaWritePermits.release();
+                        reportBackgroundWriteBug(error);
+                    });
                 } catch (RejectedExecutionException rejected) {
                     backgroundReplicaWritePermits.release();
                     backgroundLeg.run();
@@ -4137,36 +4213,31 @@ public final class NanocachedClient implements AutoCloseable {
         return retry;
     }
 
-    /** Drains every leg in {@code legs}, keeping only the <em>first</em>
-     * bug to rethrow to the caller and reporting every additional leg's
-     * bug via {@link #reportBackgroundWriteBug} instead of discarding it
-     * — the shared stance {@link #multiGetPass}, {@link #multiSetPass},
-     * and {@link #clearFanOutOnce} all take (issue #230; {@link
-     * #multiGetPass} used to have its own duplicate equivalent loop,
-     * folded into this shared helper as part of issue #277's
-     * submitReplicaWrite routing). Issue #233: both callers used to just
-     * overwrite a single tracked bug on every failing leg in turn, so
-     * only the LAST leg's bug ever reached the caller and every earlier
-     * one vanished without even being counted. Package-private rather
-     * than private so a test can drive it directly with synthetic legs,
-     * without needing a real bug to escape a network round trip (every
-     * protocol-level failure this SDK produces is already wrapped as a
-     * {@link NanocachedException} and caught well before here — a
-     * genuine, uncaught bug is by definition not reproducible that way).
+    /**
+     * Drains every leg in {@code legs}, keeping only the <em>first</em> bug to rethrow to the
+     * caller and reporting every additional leg's bug via {@link #reportBackgroundWriteBug} instead
+     * of discarding it — the shared stance {@link #multiGetPass}, {@link #multiSetPass}, and {@link
+     * #clearFanOutOnce} all take (issue #230; {@link #multiGetPass} used to have its own duplicate
+     * equivalent loop, folded into this shared helper as part of issue #277's submitReplicaWrite
+     * routing). Issue #233: both callers used to just overwrite a single tracked bug on every
+     * failing leg in turn, so only the LAST leg's bug ever reached the caller and every earlier one
+     * vanished without even being counted. Package-private rather than private so a test can drive
+     * it directly with synthetic legs, without needing a real bug to escape a network round trip
+     * (every protocol-level failure this SDK produces is already wrapped as a {@link
+     * NanocachedException} and caught well before here — a genuine, uncaught bug is by definition
+     * not reproducible that way).
      *
-     * <p>One deliberate exception to that: {@link #runMultiGetLeg} lets a
-     * {@link NanocachedException.DecompressionFailed} from {@link
-     * #decompressForBatch} escape uncaught by design, and since every
-     * owner's leg runs concurrently, more than one leg can trip it at
-     * once (the same shared decompression-budget check, tripped by
-     * multiple legs racing past it together). Only the first such bug
-     * reaching here is a real signal — it's already the one this method
-     * rethrows to the caller, aborting the whole batch — so any further
-     * one is a redundant echo of the same client-side condition, not an
-     * independent programming bug, and reporting it via {@link
-     * #reportBackgroundWriteBug} would violate that counter's own
-     * documented invariant (issue #413). It's dropped instead.
-     * Returns the first bug, or {@code null} if every leg succeeded. */
+     * <p>One deliberate exception to that: {@link #runMultiGetLeg} lets a {@link
+     * NanocachedException.DecompressionFailed} from {@link #decompressForBatch} escape uncaught by
+     * design, and since every owner's leg runs concurrently, more than one leg can trip it at once
+     * (the same shared decompression-budget check, tripped by multiple legs racing past it
+     * together). Only the first such bug reaching here is a real signal — it's already the one this
+     * method rethrows to the caller, aborting the whole batch — so any further one is a redundant
+     * echo of the same client-side condition, not an independent programming bug, and reporting it
+     * via {@link #reportBackgroundWriteBug} would violate that counter's own documented invariant
+     * (issue #413). It's dropped instead. Returns the first bug, or {@code null} if every leg
+     * succeeded.
+     */
     RuntimeException drainLegsKeepingFirstBug(List<CompletableFuture<Void>> legs) {
         Throwable legBug = null;
         for (CompletableFuture<Void> pending : legs) {
@@ -4186,40 +4257,34 @@ public final class NanocachedClient implements AutoCloseable {
         return asRuntimeOrThrowError(legBug);
     }
 
-    /** Dispatches one owner's {@code o} sub-batch (via {@link
-     * #multiSetChunked}) and applies its result to {@code retry}/{@link
-     * #replicaWriteFailures}: only primary-held keys can end up appended
-     * to {@code retry}; every replica-held key's failure or {@code W} is
-     * counted in {@link #replicaWriteFailures} instead, mirroring {@link
-     * #write}'s own stance for single-key set. A connection-level
-     * failure for the whole leg is treated the same way, key by key,
-     * since the SAME sub-frame can carry both primary- and replica-held
-     * keys and a transport failure doesn't distinguish between them.
-     * {@code retry} must already be a thread-safe list — this runs
+    /**
+     * Dispatches one owner's {@code o} sub-batch (via {@link #multiSetChunked}) and applies its
+     * result to {@code retry}/{@link #replicaWriteFailures}: only primary-held keys can end up
+     * appended to {@code retry}; every replica-held key's failure or {@code W} is counted in {@link
+     * #replicaWriteFailures} instead, mirroring {@link #write}'s own stance for single-key set. A
+     * connection-level failure for the whole leg is treated the same way, key by key, since the
+     * SAME sub-frame can carry both primary- and replica-held keys and a transport failure doesn't
+     * distinguish between them. {@code retry} must already be a thread-safe list — this runs
      * concurrently with every other owner's leg.
      *
-     * <p>Issue #411: when this leg's own batch needed more than one
-     * {@code o} sub-frame (batch chunking) and a chunk after the first hit
-     * a connection failure, only the positions that chunk (and any chunk
-     * after it) never got an answer for are "failed" — a position an
-     * earlier, already-succeeded chunk confirmed stored must not also be
-     * counted, or {@link #replicaWriteFailures} overcounts and a primary
-     * key that already landed gets uselessly resent on the next pass.
-     * {@link #applyLegOutcome} is shared by both the total-failure branch
-     * below (every position unresolved) and the chunked-partial-failure
-     * branch (only the positions past the failure point). */
+     * <p>Issue #411: when this leg's own batch needed more than one {@code o} sub-frame (batch
+     * chunking) and a chunk after the first hit a connection failure, only the positions that chunk
+     * (and any chunk after it) never got an answer for are "failed" — a position an earlier,
+     * already-succeeded chunk confirmed stored must not also be counted, or {@link
+     * #replicaWriteFailures} overcounts and a primary key that already landed gets uselessly resent
+     * on the next pass. {@link #applyLegOutcome} is shared by both the total-failure branch below
+     * (every position unresolved) and the chunked-partial-failure branch (only the positions past
+     * the failure point).
+     */
 
     /**
-     * Issue #326: builds a defensively-copied {@code valueBytes} for a
-     * fire-and-forget {@link #multiSetPass} leg that goes to the
-     * background — copies only the entries {@code indices} (this leg's
-     * own {@link OwnerBatch#indices}) actually reads, leaving every other
-     * slot {@code null} since {@link #runMultiSetLeg} never looks at
-     * them. Only called for values when {@code compress} is off for the
-     * whole batch (see the caller) — when it's on, every element is
-     * already a fresh array from {@link Compression#compressValue} and
-     * needs no copy. Also used for the key arrays (issue #1199), which
-     * are never compressed and so always need the copy.
+     * Issue #326: builds a defensively-copied {@code valueBytes} for a fire-and-forget {@link
+     * #multiSetPass} leg that goes to the background — copies only the entries {@code indices}
+     * (this leg's own {@link OwnerBatch#indices}) actually reads, leaving every other slot {@code
+     * null} since {@link #runMultiSetLeg} never looks at them. Only called for values when {@code
+     * compress} is off for the whole batch (see the caller) — when it's on, every element is
+     * already a fresh array from {@link Compression#compressValue} and needs no copy. Also used for
+     * the key arrays (issue #1199), which are never compressed and so always need the copy.
      */
     private static byte[][] copyValuesForBackground(byte[][] valueBytes, List<Integer> indices) {
         byte[][] copy = new byte[valueBytes.length][];
@@ -4231,8 +4296,14 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     private void runMultiSetLeg(
-            byte[] namespace, String name, OwnerBatch batch, byte[][] keyBytes, byte[][] valueBytes,
-            Long ttlSeconds, List<Integer> retry, MultiSetTracker tracker) {
+            byte[] namespace,
+            String name,
+            OwnerBatch batch,
+            byte[][] keyBytes,
+            byte[][] valueBytes,
+            Long ttlSeconds,
+            List<Integer> retry,
+            MultiSetTracker tracker) {
         byte[][] groupKeys = new byte[batch.indices.size()][];
         byte[][] groupValues = new byte[batch.indices.size()][];
         for (int i = 0; i < batch.indices.size(); i++) {
@@ -4257,21 +4328,22 @@ public final class NanocachedClient implements AutoCloseable {
         applyLegOutcome(name, batch, entries, retry, tracker);
     }
 
-    /** Shared by {@link #runMultiSetLeg}'s three outcomes (a clean
-     * multi-set reply, a total connection failure, and issue #411's
-     * chunked partial failure): a {@code null} entry (every position, on a
-     * total failure; only the positions from the failing chunk onward, on
-     * a partial one) is treated exactly like a {@code W} — unresolved.
-     * Only a primary-held unresolved position is appended to {@code
-     * retry}; a replica-held one is counted into {@link
-     * #replicaWriteFailures} instead — see {@link #runMultiSetLeg}'s own
-     * doc comment. A position with a real {@code entry.ok()} answer is
-     * recorded as acknowledged by this owner in {@code tracker} (when
-     * there is one — a fire-and-forget leg passes {@code null}) so the
-     * retry pass skips it, and is otherwise left alone: it already
-     * succeeded. */
+    /**
+     * Shared by {@link #runMultiSetLeg}'s three outcomes (a clean multi-set reply, a total
+     * connection failure, and issue #411's chunked partial failure): a {@code null} entry (every
+     * position, on a total failure; only the positions from the failing chunk onward, on a partial
+     * one) is treated exactly like a {@code W} — unresolved. Only a primary-held unresolved
+     * position is appended to {@code retry}; a replica-held one is counted into {@link
+     * #replicaWriteFailures} instead — see {@link #runMultiSetLeg}'s own doc comment. A position
+     * with a real {@code entry.ok()} answer is recorded as acknowledged by this owner in {@code
+     * tracker} (when there is one — a fire-and-forget leg passes {@code null}) so the retry pass
+     * skips it, and is otherwise left alone: it already succeeded.
+     */
     private void applyLegOutcome(
-            String owner, OwnerBatch batch, List<Connection.MultiEntry> entries, List<Integer> retry,
+            String owner,
+            OwnerBatch batch,
+            List<Connection.MultiEntry> entries,
+            List<Integer> retry,
             MultiSetTracker tracker) {
         for (int i = 0; i < batch.indices.size(); i++) {
             Connection.MultiEntry entry = entries.get(i);
@@ -4332,9 +4404,8 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * @throws NanocachedException.CompressionIncompatible if this client
-     *         was built with {@code compress} enabled (issue #321) — see
-     *         {@link #incr(byte[], byte[], long)}
+     * @throws NanocachedException.CompressionIncompatible if this client was built with {@code
+     *     compress} enabled (issue #321) — see {@link #incr(byte[], byte[], long)}
      */
     public OptionalLong incr(byte[] key, long delta) {
         return incr(EMPTY_NAMESPACE, key, delta);
@@ -4354,14 +4425,14 @@ public final class NanocachedClient implements AutoCloseable {
         return decr(key, 1L);
     }
 
-    /** Sends the exact same {@code i} op as {@link #incr(byte[], long)}
-     * with the delta negated — there is no separate decrement opcode on
-     * the wire (see {@link Connection#incr}). {@code delta} is the
-     * (non-negative in spirit, but unchecked beyond this) amount to
-     * subtract; {@code Long.MIN_VALUE} is rejected since two's complement
-     * has no positive value to negate it to. Not idempotent — see this
-     * section's own doc comment (issue #225) for the at-least-once
-     * caveat on a lost reply. */
+    /**
+     * Sends the exact same {@code i} op as {@link #incr(byte[], long)} with the delta negated —
+     * there is no separate decrement opcode on the wire (see {@link Connection#incr}). {@code
+     * delta} is the (non-negative in spirit, but unchecked beyond this) amount to subtract; {@code
+     * Long.MIN_VALUE} is rejected since two's complement has no positive value to negate it to. Not
+     * idempotent — see this section's own doc comment (issue #225) for the at-least-once caveat on
+     * a lost reply.
+     */
     public OptionalLong decr(byte[] key, long delta) {
         if (delta == Long.MIN_VALUE) {
             throw new IllegalArgumentException(
@@ -4375,22 +4446,20 @@ public final class NanocachedClient implements AutoCloseable {
         return decr(key, 1L);
     }
 
-    /** The namespaced counterpart of every incr/decr overload above
-     * (issue #105-style scoping applied to issue #129) — see {@link
-     * #namespace}. {@code namespace} empty is exactly the un-namespaced
-     * form: INCR always carries an explicit namespace length on the wire
-     * (0 meaning default), so — unlike {@code get}/{@code set}/{@code
-     * delete} — there is no separate legacy frame to fall back to; this
-     * is simply the one and only frame shape.
+    /**
+     * The namespaced counterpart of every incr/decr overload above (issue #105-style scoping
+     * applied to issue #129) — see {@link #namespace}. {@code namespace} empty is exactly the
+     * un-namespaced form: INCR always carries an explicit namespace length on the wire (0 meaning
+     * default), so — unlike {@code get}/{@code set}/{@code delete} — there is no separate legacy
+     * frame to fall back to; this is simply the one and only frame shape.
      *
-     * <p>Incompatible with value compression (issue #321): a client
-     * constructed with {@code compress} enabled rejects every incr/decr
-     * call here, before any I/O, rather than write an unmarked counter
-     * result a compress-enabled {@code get} can't decompress. See {@link
+     * <p>Incompatible with value compression (issue #321): a client constructed with {@code
+     * compress} enabled rejects every incr/decr call here, before any I/O, rather than write an
+     * unmarked counter result a compress-enabled {@code get} can't decompress. See {@link
      * NanocachedException.CompressionIncompatible}.
      *
-     * @throws NanocachedException.CompressionIncompatible if this client
-     *         was built with {@code compress} enabled
+     * @throws NanocachedException.CompressionIncompatible if this client was built with {@code
+     *     compress} enabled
      */
     OptionalLong incr(byte[] namespace, byte[] key, long delta) {
         if (compress) {
@@ -4398,8 +4467,7 @@ public final class NanocachedClient implements AutoCloseable {
         }
         validateKey(namespace, key);
         beforeOperation();
-        Connection.IncrResult result =
-                withWrongNodeRetry(() -> incrPrimaryThenReplicate(namespace, key, delta), false);
+        Connection.IncrResult result = withWrongNodeRetry(() -> incrPrimaryThenReplicate(namespace, key, delta), false);
         return result == null ? OptionalLong.empty() : OptionalLong.of(result.value());
     }
 
@@ -4442,22 +4510,23 @@ public final class NanocachedClient implements AutoCloseable {
         return putIfAbsent(key, value, 0L);
     }
 
-    /** Stores {@code value} at {@code key} only if the key is currently
-     * absent — including lazily expired — the {@code A}-conditioned
-     * {@code k} ({@code add}/{@code putIfAbsent}). Returns whether it was
-     * stored: {@code false} means the key already existed and nothing
-     * changed. {@code ttlSeconds == 0} means no expiry, same as {@link
-     * #set(byte[], byte[], long)}. See this section's own doc comment for
-     * why this is not a distributed lock, and for the at-least-once
-     * caveat (issue #225) on a lost reply — not idempotent, so never
-     * blindly retried after a connection failure. */
+    /**
+     * Stores {@code value} at {@code key} only if the key is currently absent — including lazily
+     * expired — the {@code A}-conditioned {@code k} ({@code add}/{@code putIfAbsent}). Returns
+     * whether it was stored: {@code false} means the key already existed and nothing changed.
+     * {@code ttlSeconds == 0} means no expiry, same as {@link #set(byte[], byte[], long)}. See this
+     * section's own doc comment for why this is not a distributed lock, and for the at-least-once
+     * caveat (issue #225) on a lost reply — not idempotent, so never blindly retried after a
+     * connection failure.
+     */
     public boolean putIfAbsent(byte[] key, byte[] value, long ttlSeconds) {
         return putIfAbsent(EMPTY_NAMESPACE, key, value, ttlSeconds);
     }
 
-    /** The namespaced counterpart of {@link #putIfAbsent(byte[], byte[],
-     * long)} (issue #105-style scoping applied to issue #141) — see
-     * {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #putIfAbsent(byte[], byte[], long)} (issue #105-style
+     * scoping applied to issue #141) — see {@link #namespace}.
+     */
     boolean putIfAbsent(byte[] namespace, byte[] key, byte[] value, long ttlSeconds) {
         return cas(namespace, key, value, ttlSeconds, CAS_ABSENT);
     }
@@ -4467,27 +4536,28 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     public boolean replaceIfPresent(String key, String value, long ttlSeconds) {
-        return replaceIfPresent(
-                utf8(key, "key"), utf8(value, "value"), ttlSeconds);
+        return replaceIfPresent(utf8(key, "key"), utf8(value, "value"), ttlSeconds);
     }
 
     public boolean replaceIfPresent(byte[] key, byte[] value) {
         return replaceIfPresent(key, value, 0L);
     }
 
-    /** Stores {@code value} at {@code key} only if the key currently holds
-     * any (unexpired) value, whatever it is — the {@code P}-conditioned
-     * {@code k}, the two-argument {@code replace(key, value)}. Returns
-     * whether it was stored: {@code false} means the key was absent and
-     * nothing changed. {@code ttlSeconds == 0} means no expiry. Not
-     * idempotent — see this section's own doc comment for the
-     * at-least-once caveat (issue #225) on a lost reply. */
+    /**
+     * Stores {@code value} at {@code key} only if the key currently holds any (unexpired) value,
+     * whatever it is — the {@code P}-conditioned {@code k}, the two-argument {@code replace(key,
+     * value)}. Returns whether it was stored: {@code false} means the key was absent and nothing
+     * changed. {@code ttlSeconds == 0} means no expiry. Not idempotent — see this section's own doc
+     * comment for the at-least-once caveat (issue #225) on a lost reply.
+     */
     public boolean replaceIfPresent(byte[] key, byte[] value, long ttlSeconds) {
         return replaceIfPresent(EMPTY_NAMESPACE, key, value, ttlSeconds);
     }
 
-    /** The namespaced counterpart of {@link #replaceIfPresent(byte[],
-     * byte[], long)} (issue #141) — see {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #replaceIfPresent(byte[], byte[], long)} (issue #141) —
+     * see {@link #namespace}.
+     */
     boolean replaceIfPresent(byte[] namespace, byte[] key, byte[] value, long ttlSeconds) {
         return cas(namespace, key, value, ttlSeconds, CAS_PRESENT);
     }
@@ -4497,57 +4567,55 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     public boolean replace(String key, String token, String newValue, long ttlSeconds) {
-        return replace(utf8(key, "key"), token, utf8(newValue, "value"),
-                ttlSeconds);
+        return replace(utf8(key, "key"), token, utf8(newValue, "value"), ttlSeconds);
     }
 
     public boolean replace(byte[] key, String token, byte[] newValue) {
         return replace(key, token, newValue, 0L);
     }
 
-    /** Stores {@code newValue} at {@code key} only if the key currently
-     * holds an unexpired value whose {@link #contentDigest} equals {@code
-     * token} exactly — the digest-conditioned {@code k}, the
-     * three-argument {@code replace(key, old, new)}. Returns whether it
-     * was stored: {@code false} means the stored value's digest didn't
-     * match (including if the key was absent) and nothing changed.
-     * {@code ttlSeconds == 0} means no expiry.
+    /**
+     * Stores {@code newValue} at {@code key} only if the key currently holds an unexpired value
+     * whose {@link #contentDigest} equals {@code token} exactly — the digest-conditioned {@code k},
+     * the three-argument {@code replace(key, old, new)}. Returns whether it was stored: {@code
+     * false} means the stored value's digest didn't match (including if the key was absent) and
+     * nothing changed. {@code ttlSeconds == 0} means no expiry.
      *
-     * <p>{@code token} is normally taken from a real prior read ({@link
-     * #getWithToken}) — that path is always correct. A token instead
-     * reconstructed by re-serializing/re-compressing a value the caller
-     * already holds is <em>content</em>-based CAS's version of memcached's
-     * own value-based CAS hazard: it's only correct if that reconstruction
-     * produces byte-identical output to what the server actually stores —
-     * true within one client sharing one serializer/compressor, not
+     * <p>{@code token} is normally taken from a real prior read ({@link #getWithToken}) — that path
+     * is always correct. A token instead reconstructed by re-serializing/re-compressing a value the
+     * caller already holds is <em>content</em>-based CAS's version of memcached's own value-based
+     * CAS hazard: it's only correct if that reconstruction produces byte-identical output to what
+     * the server actually stores — true within one client sharing one serializer/compressor, not
      * guaranteed across languages with client-side compression enabled.
      *
-     * <p>Not idempotent — see this section's own doc comment for the
-     * at-least-once caveat (issue #225) on a lost reply.
+     * <p>Not idempotent — see this section's own doc comment for the at-least-once caveat (issue
+     * #225) on a lost reply.
      *
-     * @throws IllegalArgumentException if {@code token} isn't a
-     * well-formed 32-character lowercase hex digest */
+     * @throws IllegalArgumentException if {@code token} isn't a well-formed 32-character lowercase
+     *     hex digest
+     */
     public boolean replace(byte[] key, String token, byte[] newValue, long ttlSeconds) {
         return replace(EMPTY_NAMESPACE, key, token, newValue, ttlSeconds);
     }
 
-    /** The namespaced counterpart of {@link #replace(byte[], String,
-     * byte[], long)} (issue #141) — see {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #replace(byte[], String, byte[], long)} (issue #141) —
+     * see {@link #namespace}.
+     */
     boolean replace(byte[] namespace, byte[] key, String token, byte[] newValue, long ttlSeconds) {
         validateToken(token);
         return cas(namespace, key, newValue, ttlSeconds, token);
     }
 
-    /** Shared validation/dispatch for {@link #putIfAbsent}/{@link
-     * #replaceIfPresent}/{@link #replace} — {@code cond} is {@link
-     * #CAS_ABSENT}, {@link #CAS_PRESENT}, or (already validated by {@link
-     * #replace}) a digest. Mirrors {@link #set(byte[], byte[], byte[],
-     * long)}'s own ttl/size validation and {@code withWrongNodeRetry}
-     * wrapping. */
+    /**
+     * Shared validation/dispatch for {@link #putIfAbsent}/{@link #replaceIfPresent}/{@link
+     * #replace} — {@code cond} is {@link #CAS_ABSENT}, {@link #CAS_PRESENT}, or (already validated
+     * by {@link #replace}) a digest. Mirrors {@link #set(byte[], byte[], byte[], long)}'s own
+     * ttl/size validation and {@code withWrongNodeRetry} wrapping.
+     */
     private boolean cas(byte[] namespace, byte[] key, byte[] value, long ttlSeconds, String cond) {
         if (ttlSeconds < 0) {
-            throw new IllegalArgumentException(
-                    "nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
+            throw new IllegalArgumentException("nanocached: ttlSeconds must be non-negative, got " + ttlSeconds);
         }
         validateKeyAndValue(namespace, key, value);
         beforeOperation();
@@ -4558,31 +4626,32 @@ public final class NanocachedClient implements AutoCloseable {
         // decompress it.
         byte[] outgoing = compress ? Compression.compressValue(value, compressionThreshold) : value;
         Long wireTtlSeconds = ttlSeconds == 0 ? null : ttlSeconds;
-        return withWrongNodeRetry(
-                () -> casPrimaryThenReplicate(namespace, key, outgoing, wireTtlSeconds, cond), false);
+        return withWrongNodeRetry(() -> casPrimaryThenReplicate(namespace, key, outgoing, wireTtlSeconds, cond), false);
     }
 
     public boolean deleteIfMatches(String key, String token) {
         return deleteIfMatches(utf8(key, "key"), token);
     }
 
-    /** Removes {@code key} only if its current stored value's {@link
-     * #contentDigest} equals {@code token} exactly — the two-argument
-     * {@code remove(key, old)}. Returns whether it was removed: {@code
-     * false} means a mismatch or a missing key, not an exception. See
-     * {@link #replace(byte[], String, byte[], long)}'s doc for the same
-     * token-reconstruction caveat, and the CAS section's own doc comment
-     * for the at-least-once caveat (issue #225) on a lost reply — not
-     * idempotent, so never blindly retried after a connection failure.
+    /**
+     * Removes {@code key} only if its current stored value's {@link #contentDigest} equals {@code
+     * token} exactly — the two-argument {@code remove(key, old)}. Returns whether it was removed:
+     * {@code false} means a mismatch or a missing key, not an exception. See {@link
+     * #replace(byte[], String, byte[], long)}'s doc for the same token-reconstruction caveat, and
+     * the CAS section's own doc comment for the at-least-once caveat (issue #225) on a lost reply —
+     * not idempotent, so never blindly retried after a connection failure.
      *
-     * @throws IllegalArgumentException if {@code token} isn't a
-     * well-formed 32-character lowercase hex digest */
+     * @throws IllegalArgumentException if {@code token} isn't a well-formed 32-character lowercase
+     *     hex digest
+     */
     public boolean deleteIfMatches(byte[] key, String token) {
         return deleteIfMatches(EMPTY_NAMESPACE, key, token);
     }
 
-    /** The namespaced counterpart of {@link #deleteIfMatches(byte[],
-     * String)} (issue #141) — see {@link #namespace}. */
+    /**
+     * The namespaced counterpart of {@link #deleteIfMatches(byte[], String)} (issue #141) — see
+     * {@link #namespace}.
+     */
     boolean deleteIfMatches(byte[] namespace, byte[] key, String token) {
         validateToken(token);
         validateKey(namespace, key);
@@ -4591,20 +4660,16 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * CLEAR (issue #106): flushes every namespace, the default one
-     * included, on every node in this client's current node list — a
-     * single sub-map drop per node, not key-addressed (protocol.html: "c
-     * / F — clear a namespace, flush everything"), so there is no owner
-     * ranking to consult and no {@code W} to react to; the same {@code F}
-     * frame goes to every node. Succeeds only once every node has acked
-     * {@code C}: a node that failed (a dead connection, a bad/missing
-     * ack, a timeout) gets one node-list refresh and one retry against
-     * the refreshed list — the same refresh-and-retry path a
-     * {@code W}/dead primary get/set/delete uses (see {@link
-     * #withWrongNodeRetry}) — so this never silently reports success on a
-     * partial clear: a node still failing after that retry fails this
-     * call, naming it. The operation is idempotent, so a caller that sees
-     * this throw can simply call it again.
+     * CLEAR (issue #106): flushes every namespace, the default one included, on every node in this
+     * client's current node list — a single sub-map drop per node, not key-addressed
+     * (protocol.html: "c / F — clear a namespace, flush everything"), so there is no owner ranking
+     * to consult and no {@code W} to react to; the same {@code F} frame goes to every node.
+     * Succeeds only once every node has acked {@code C}: a node that failed (a dead connection, a
+     * bad/missing ack, a timeout) gets one node-list refresh and one retry against the refreshed
+     * list — the same refresh-and-retry path a {@code W}/dead primary get/set/delete uses (see
+     * {@link #withWrongNodeRetry}) — so this never silently reports success on a partial clear: a
+     * node still failing after that retry fails this call, naming it. The operation is idempotent,
+     * so a caller that sees this throw can simply call it again.
      *
      * <p>Standalone (single-node) mode sends {@code F} to that one node.
      */
@@ -4613,33 +4678,33 @@ public final class NanocachedClient implements AutoCloseable {
         fanOutClear(null);
     }
 
-    /** The namespaced counterpart of {@link #clearAll()} (issue #106) —
-     * see {@link #namespace} and {@link Namespace#clear()}. An empty
-     * {@code namespace} clears the default namespace ({@code c 0}) rather
-     * than every namespace — never rejected. */
+    /**
+     * The namespaced counterpart of {@link #clearAll()} (issue #106) — see {@link #namespace} and
+     * {@link Namespace#clear()}. An empty {@code namespace} clears the default namespace ({@code c
+     * 0}) rather than every namespace — never rejected.
+     */
     void clear(byte[] namespace) {
         validateNamespace(namespace);
         beforeOperation();
         fanOutClear(namespace);
     }
 
-    /** Rejects an empty key or a (namespace, key) pair so large that {@code
-     * "G "}/{@code "D "}/{@code "g "}/{@code "d "} plus the namespace and
-     * key alone would already risk tripping the server's MAX_REQUEST_SIZE
-     * (audit finding J2; namespace bytes folded in for issue #105 —
-     * they lead the body exactly like the key does, so they count toward
-     * the same frame-size risk) — checked synchronously, before any
-     * connection is touched, mirroring {@link #set(byte[], byte[],
-     * byte[], long)}'s ttlSeconds check. The namespace itself has no
-     * length limit beyond this shared one (namespaces spec): there is no
-     * separate namespace-only cap. */
-    /** The UTF-8 encoding every {@code String} key, namespace and value
-     * overload in this class uses. {@code String.getBytes(UTF_8)} silently
-     * replaces a lone surrogate (half of a UTF-16 pair with no partner)
-     * with {@code '?'}, so {@code "x\uD800"} and {@code "x?"} would address
-     * the same cache entry and a read under one key would return the
-     * other's value. Strings that are not well-formed UTF-16 are rejected
-     * instead, the way every other caller mistake in this class is. */
+    /**
+     * Rejects an empty key or a (namespace, key) pair so large that {@code "G "}/{@code "D
+     * "}/{@code "g "}/{@code "d "} plus the namespace and key alone would already risk tripping the
+     * server's MAX_REQUEST_SIZE (audit finding J2; namespace bytes folded in for issue #105 — they
+     * lead the body exactly like the key does, so they count toward the same frame-size risk) —
+     * checked synchronously, before any connection is touched, mirroring {@link #set(byte[],
+     * byte[], byte[], long)}'s ttlSeconds check. The namespace itself has no length limit beyond
+     * this shared one (namespaces spec): there is no separate namespace-only cap.
+     */
+    /**
+     * The UTF-8 encoding every {@code String} key, namespace and value overload in this class uses.
+     * {@code String.getBytes(UTF_8)} silently replaces a lone surrogate (half of a UTF-16 pair with
+     * no partner) with {@code '?'}, so {@code "x\uD800"} and {@code "x?"} would address the same
+     * cache entry and a read under one key would return the other's value. Strings that are not
+     * well-formed UTF-16 are rejected instead, the way every other caller mistake in this class is.
+     */
     static byte[] utf8(String text, String what) {
         for (int i = 0, n = text.length(); i < n; i++) {
             char c = text.charAt(i);
@@ -4648,8 +4713,12 @@ public final class NanocachedClient implements AutoCloseable {
                 i++;
                 continue;
             }
-            throw new IllegalArgumentException("nanocached: " + what + " is not well-formed UTF-16 (a lone surrogate "
-                    + "at index " + i + " cannot be encoded as UTF-8)");
+            throw new IllegalArgumentException("nanocached: "
+                    + what
+                    + " is not well-formed UTF-16 (a lone surrogate "
+                    + "at index "
+                    + i
+                    + " cannot be encoded as UTF-8)");
         }
         return text.getBytes(StandardCharsets.UTF_8);
     }
@@ -4660,49 +4729,64 @@ public final class NanocachedClient implements AutoCloseable {
         }
         long total = (long) namespace.length + key.length;
         if (total > MAX_REQUEST_BYTES) {
-            throw new IllegalArgumentException(
-                    "nanocached: namespace (" + namespace.length + " bytes) + key (" + key.length
-                            + " bytes) = " + total + " bytes, which exceeds the " + MAX_REQUEST_BYTES
-                            + "-byte request limit (the server accepts requests of up to 1 MiB)");
+            throw new IllegalArgumentException("nanocached: namespace ("
+                    + namespace.length
+                    + " bytes) + key ("
+                    + key.length
+                    + " bytes) = "
+                    + total
+                    + " bytes, which exceeds the "
+                    + MAX_REQUEST_BYTES
+                    + "-byte request limit (the server accepts requests of up to 1 MiB)");
         }
     }
 
-    /** As {@link #validateKey}, plus rejects a namespace+key+value triple
-     * too large for a single {@code S}/{@code s} request to have any
-     * chance of fitting under the server's MAX_REQUEST_SIZE (audit
-     * finding J2; namespace folded in for issue #105). Checked against the
-     * caller-supplied value, before compression — compression only ever
-     * shrinks what actually goes on the wire, so this is the conservative
-     * (never falsely permissive) side to check. */
+    /**
+     * As {@link #validateKey}, plus rejects a namespace+key+value triple too large for a single
+     * {@code S}/{@code s} request to have any chance of fitting under the server's MAX_REQUEST_SIZE
+     * (audit finding J2; namespace folded in for issue #105). Checked against the caller-supplied
+     * value, before compression — compression only ever shrinks what actually goes on the wire, so
+     * this is the conservative (never falsely permissive) side to check.
+     */
     private static void validateKeyAndValue(byte[] namespace, byte[] key, byte[] value) {
         validateKey(namespace, key);
         long total = (long) namespace.length + key.length + value.length;
         if (total > MAX_REQUEST_BYTES) {
-            throw new IllegalArgumentException(
-                    "nanocached: namespace (" + namespace.length + " bytes) + key (" + key.length
-                            + " bytes) + value (" + value.length + " bytes) = " + total
-                            + " bytes, which exceeds the " + MAX_REQUEST_BYTES
-                            + "-byte request limit (the server accepts requests of up to 1 MiB)");
+            throw new IllegalArgumentException("nanocached: namespace ("
+                    + namespace.length
+                    + " bytes) + key ("
+                    + key.length
+                    + " bytes) + value ("
+                    + value.length
+                    + " bytes) = "
+                    + total
+                    + " bytes, which exceeds the "
+                    + MAX_REQUEST_BYTES
+                    + "-byte request limit (the server accepts requests of up to 1 MiB)");
         }
     }
 
-    /** As {@link #validateKey}, but for {@link #clear(byte[])} (issue
-     * #106): no key is involved — the namespace alone is the entire body
-     * of a {@code c} frame — so only it needs to stay clear of the same
-     * MAX_REQUEST_BYTES headroom. {@link #clearAll()} needs no such
-     * check: an {@code F} frame's body is always empty. */
+    /**
+     * As {@link #validateKey}, but for {@link #clear(byte[])} (issue #106): no key is involved —
+     * the namespace alone is the entire body of a {@code c} frame — so only it needs to stay clear
+     * of the same MAX_REQUEST_BYTES headroom. {@link #clearAll()} needs no such check: an {@code F}
+     * frame's body is always empty.
+     */
     private static void validateNamespace(byte[] namespace) {
         if (namespace.length > MAX_REQUEST_BYTES) {
-            throw new IllegalArgumentException(
-                    "nanocached: namespace (" + namespace.length + " bytes) exceeds the "
-                            + MAX_REQUEST_BYTES
-                            + "-byte request limit (the server accepts requests of up to 1 MiB)");
+            throw new IllegalArgumentException("nanocached: namespace ("
+                    + namespace.length
+                    + " bytes) exceeds the "
+                    + MAX_REQUEST_BYTES
+                    + "-byte request limit (the server accepts requests of up to 1 MiB)");
         }
     }
 
-    /** Idempotent (later get/set/delete throw {@link NanocachedException.AlreadyClosed}),
-     * but a second call warns to stderr — usually a sign the caller lost
-     * track of this instance's lifecycle. */
+    /**
+     * Idempotent (later get/set/delete throw {@link NanocachedException.AlreadyClosed}), but a
+     * second call warns to stderr — usually a sign the caller lost track of this instance's
+     * lifecycle.
+     */
     @Override
     public void close() {
         if (!closeCalled.compareAndSet(false, true)) {
@@ -4765,31 +4849,30 @@ public final class NanocachedClient implements AutoCloseable {
         teardown();
     }
 
-    /** How long {@link #close()} waits for {@link #replicaWriters} to
-     * terminate: the connection request timeout (the longest a still-running
-     * synchronous replica leg can be blocked in {@code future.join()}) plus
-     * the same thread-teardown margin keepAlive gets — see the call site and
-     * {@link #EXECUTOR_TERMINATION_TIMEOUT_SECONDS} (issue #97). Reads the
-     * live {@code Connection.requestTimeoutMillis}, so a test that shortens
-     * it shortens this too. */
+    /**
+     * How long {@link #close()} waits for {@link #replicaWriters} to terminate: the connection
+     * request timeout (the longest a still-running synchronous replica leg can be blocked in {@code
+     * future.join()}) plus the same thread-teardown margin keepAlive gets — see the call site and
+     * {@link #EXECUTOR_TERMINATION_TIMEOUT_SECONDS} (issue #97). Reads the live {@code
+     * Connection.requestTimeoutMillis}, so a test that shortens it shortens this too.
+     */
     private static long replicaWriterDrainTimeoutMillis() {
         return Connection.requestTimeoutMillis + executorTerminationTimeoutMillis;
     }
 
-    /** Blocks until every hedge leg still tracked in {@link #hedgedReads}
-     * (the losing legs of reads that already returned via their winning
-     * leg) has finished, its outcome discarded either way. Looped, not a
-     * single pass over one snapshot: a read racing this close() call can
-     * still register a new leg after a snapshot was taken but before this
-     * method returns, so re-checking until the set is genuinely empty keeps
-     * one from leaking past close() undrained. The emptiness check is taken
-     * under {@link #hedgedReadsLock} (issue #91): {@link #close()} sets
-     * {@code closed} before calling this, and {@link #startHedgeLeg} checks
-     * {@code closed} under the same lock before registering, so once this
-     * observes the set empty while holding the lock no further leg can be
-     * added — {@code startHedgeLeg} would see {@code closed} and throw. The
-     * blocking {@code join()}s happen outside the lock so they never block a
-     * concurrent (doomed) registration. */
+    /**
+     * Blocks until every hedge leg still tracked in {@link #hedgedReads} (the losing legs of reads
+     * that already returned via their winning leg) has finished, its outcome discarded either way.
+     * Looped, not a single pass over one snapshot: a read racing this close() call can still
+     * register a new leg after a snapshot was taken but before this method returns, so re-checking
+     * until the set is genuinely empty keeps one from leaking past close() undrained. The emptiness
+     * check is taken under {@link #hedgedReadsLock} (issue #91): {@link #close()} sets {@code
+     * closed} before calling this, and {@link #startHedgeLeg} checks {@code closed} under the same
+     * lock before registering, so once this observes the set empty while holding the lock no
+     * further leg can be added — {@code startHedgeLeg} would see {@code closed} and throw. The
+     * blocking {@code join()}s happen outside the lock so they never block a concurrent (doomed)
+     * registration.
+     */
     private void drainHedgedReads() {
         while (true) {
             List<CompletableFuture<?>> snapshot;
@@ -4839,22 +4922,19 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** Closes every connection this attempt opened. Called both from
-     * {@link #close()} (after it has already drained/shut down {@link
-     * #replicaWriters}/{@link #backgroundLegs}/{@link #keepAlive} itself) and from {@link
-     * #connect}'s catch blocks whenever anything after {@link
-     * #openCluster} fails — including {@link #startKeepAlive} itself
-     * throwing, which can happen after openCluster already built {@link
-     * #replicaWriters} and {@link #backgroundReplicaWritePermits}. That
-     * second caller used to leave replicaWriters running (its daemon
-     * threads survive until the executor is GC'd) and its permits
-     * un-drained, because this method only ever closed connections
-     * (audit finding, connect()-failure teardown missing
-     * replicaWriters/keepAlive). Shutting them down here too — redundant
-     * but harmless when {@link #close()} already did it, a no-op when
-     * they were never created — makes this method a complete teardown of
-     * everything a partially-succeeded connect() attempt could have
-     * built, not just its sockets. */
+    /**
+     * Closes every connection this attempt opened. Called both from {@link #close()} (after it has
+     * already drained/shut down {@link #replicaWriters}/{@link #backgroundLegs}/{@link #keepAlive}
+     * itself) and from {@link #connect}'s catch blocks whenever anything after {@link #openCluster}
+     * fails — including {@link #startKeepAlive} itself throwing, which can happen after openCluster
+     * already built {@link #replicaWriters} and {@link #backgroundReplicaWritePermits}. That second
+     * caller used to leave replicaWriters running (its daemon threads survive until the executor is
+     * GC'd) and its permits un-drained, because this method only ever closed connections (audit
+     * finding, connect()-failure teardown missing replicaWriters/keepAlive). Shutting them down
+     * here too — redundant but harmless when {@link #close()} already did it, a no-op when they
+     * were never created — makes this method a complete teardown of everything a
+     * partially-succeeded connect() attempt could have built, not just its sockets.
+     */
     private void teardown() {
         synchronized (stateLock) {
             if (single != null) single.close();
@@ -4888,43 +4968,35 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * As {@link #withWrongNodeRetry(java.util.function.Supplier, boolean)}
-     * with {@code retryConnectionFailure} true — every idempotent caller
-     * (get/set/delete/clear).
+     * As {@link #withWrongNodeRetry(java.util.function.Supplier, boolean)} with {@code
+     * retryConnectionFailure} true — every idempotent caller (get/set/delete/clear).
      */
     private <T> T withWrongNodeRetry(java.util.function.Supplier<T> operation) {
         return withWrongNodeRetry(operation, true);
     }
 
     /**
-     * Runs the operation; on a {@code W} answer (stale routing) <em>or</em>,
-     * when {@code retryConnectionFailure}, a connection-level failure that
-     * exhausted the current ranking (e.g. the key's primary died), forces
-     * a node-list refresh and retries the whole operation once against
-     * the fresh ranking. The retry window for a dead node is therefore
-     * bounded by discovery's liveness timeout — once discovery drops the
-     * node, the refreshed ranking routes around it. A second failure
-     * after a fresh refresh propagates. {@code W} is always retried this
-     * way regardless of {@code retryConnectionFailure}: it's a
-     * well-formed reply proving the primary applied nothing, so it carries
-     * no idempotency concern.
+     * Runs the operation; on a {@code W} answer (stale routing) <em>or</em>, when {@code
+     * retryConnectionFailure}, a connection-level failure that exhausted the current ranking (e.g.
+     * the key's primary died), forces a node-list refresh and retries the whole operation once
+     * against the fresh ranking. The retry window for a dead node is therefore bounded by
+     * discovery's liveness timeout — once discovery drops the node, the refreshed ranking routes
+     * around it. A second failure after a fresh refresh propagates. {@code W} is always retried
+     * this way regardless of {@code retryConnectionFailure}: it's a well-formed reply proving the
+     * primary applied nothing, so it carries no idempotency concern.
      *
-     * <p>INCR/CAS/delete-if-matches (issue #225) pass {@code
-     * retryConnectionFailure} false: by the time a {@code
-     * ConnectionLost} reaches here for one of those, {@link
-     * #applyReconnectingNonIdempotent} has already redialed and retried
-     * it once for the one case that's safe (the request never reached the
-     * wire) — reaching here at all means the primary may already have
-     * applied it, and resending the whole operation, possibly to that
-     * very same primary if discovery hasn't yet dropped it, risks
-     * double-applying a non-idempotent op. So this must not retry it
-     * again; the caller sees {@code ConnectionLost} instead. The one
+     * <p>INCR/CAS/delete-if-matches (issue #225) pass {@code retryConnectionFailure} false: by the
+     * time a {@code ConnectionLost} reaches here for one of those, {@link
+     * #applyReconnectingNonIdempotent} has already redialed and retried it once for the one case
+     * that's safe (the request never reached the wire) — reaching here at all means the primary may
+     * already have applied it, and resending the whole operation, possibly to that very same
+     * primary if discovery hasn't yet dropped it, risks double-applying a non-idempotent op. So
+     * this must not retry it again; the caller sees {@code ConnectionLost} instead. The one
      * exception is a {@code ConnectionLost} that is {@link
-     * NanocachedException.ConnectionLost#notSent() notSent} -- a dial that
-     * failed, or a connection known dead before the frame was written
-     * (issue #1481): nothing reached the wire, so the refresh-and-retry
-     * cannot double-apply anything and routes around a dead primary as it
-     * does for set/get/delete.
+     * NanocachedException.ConnectionLost#notSent() notSent} -- a dial that failed, or a connection
+     * known dead before the frame was written (issue #1481): nothing reached the wire, so the
+     * refresh-and-retry cannot double-apply anything and routes around a dead primary as it does
+     * for set/get/delete.
      */
     private <T> T withWrongNodeRetry(java.util.function.Supplier<T> operation, boolean retryConnectionFailure) {
         try {
@@ -4943,12 +5015,11 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * {@link #withWrongNodeRetry} for a touch: with {@code expiring} (issue
-     * #901, {@code ttl == 0}) a connection failure is retried after a
-     * refresh only if the request provably never reached the wire; the
-     * node may already have applied anything else and expired the entry.
-     * {@code W} is always retried, as for every command; an {@code En} (a
-     * node that predates the command) never is (issue #902).
+     * {@link #withWrongNodeRetry} for a touch: with {@code expiring} (issue #901, {@code ttl == 0})
+     * a connection failure is retried after a refresh only if the request provably never reached
+     * the wire; the node may already have applied anything else and expired the entry. {@code W} is
+     * always retried, as for every command; an {@code En} (a node that predates the command) never
+     * is (issue #902).
      */
     private <T> T withTouchRetry(boolean expiring, java.util.function.Supplier<T> operation) {
         try {
@@ -4967,16 +5038,19 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** {@code true} for a touch TTL that expires the entry at once — not
-     * {@link #REMOVE_TTL} (a {@code null} wire TTL) and not a positive
-     * TTL. */
+    /**
+     * {@code true} for a touch TTL that expires the entry at once — not {@link #REMOVE_TTL} (a
+     * {@code null} wire TTL) and not a positive TTL.
+     */
     private static boolean expiresAtOnce(Long wireTtl) {
         return wireTtl != null && wireTtl == 0L;
     }
 
-    /** {@code namespace} empty is exactly the un-namespaced form — {@link
-     * HashRing#owners(byte[], byte[], int)} treats it identically to
-     * {@link HashRing#owners(byte[], int)} (namespaces, issue #105). */
+    /**
+     * {@code namespace} empty is exactly the un-namespaced form — {@link HashRing#owners(byte[],
+     * byte[], int)} treats it identically to {@link HashRing#owners(byte[], int)} (namespaces,
+     * issue #105).
+     */
     private List<String> ownerNames(byte[] namespace, byte[] key) {
         synchronized (stateLock) {
             return ring.owners(namespace, key, replication);
@@ -4984,36 +5058,29 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * Runs {@code op} against {@code source}'s connection, retrying once
-     * on a connection-level failure. Unlike Node or Python, a Java socket
-     * doesn't learn about a peer FIN (e.g. the server's 60s idle timeout)
-     * until an I/O call fails — so lazy reconnect-on-use here means: the
-     * failed request poisons the connection, {@code source} redials, and
-     * the operation runs again. Safe because get/set/delete/clear are all
-     * idempotent — replaying one after a redial can never change the
-     * outcome the caller sees beyond what a lost-and-retried request
-     * always risks (e.g. two sets racing), which is inherent to the
-     * protocol, not something this retry adds.
+     * Runs {@code op} against {@code source}'s connection, retrying once on a connection-level
+     * failure. Unlike Node or Python, a Java socket doesn't learn about a peer FIN (e.g. the
+     * server's 60s idle timeout) until an I/O call fails — so lazy reconnect-on-use here means: the
+     * failed request poisons the connection, {@code source} redials, and the operation runs again.
+     * Safe because get/set/delete/clear are all idempotent — replaying one after a redial can never
+     * change the outcome the caller sees beyond what a lost-and-retried request always risks (e.g.
+     * two sets racing), which is inherent to the protocol, not something this retry adds.
      *
-     * <p>NOT used for INCR/CAS/delete-if-matches (issue #225) — those
-     * aren't idempotent, so blindly resending after <em>any</em>
-     * connection failure could double-apply an INCR or report an
-     * already-succeeded CAS as a mismatch, if the primary actually
-     * applied the op and only its reply was lost. See {@link
-     * #applyReconnectingNonIdempotent} instead.
+     * <p>NOT used for INCR/CAS/delete-if-matches (issue #225) — those aren't idempotent, so blindly
+     * resending after <em>any</em> connection failure could double-apply an INCR or report an
+     * already-succeeded CAS as a mismatch, if the primary actually applied the op and only its
+     * reply was lost. See {@link #applyReconnectingNonIdempotent} instead.
      */
-    private <T> T applyReconnecting(
-            java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
+    private <T> T applyReconnecting(java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
         return applyReconnecting(source, op, false);
     }
 
     /**
-     * As {@link #applyReconnecting(java.util.function.Supplier,
-     * ConnectionOp)}; with {@code rejectionIsFinal} an {@code En} (a node
-     * that predates the command) is surfaced as it is instead of being
-     * redialled and resent. The same node would answer {@code En} again, so
-     * the resend only costs a dial and a round trip. Only batched touch asks
-     * for it: every other command keeps the retry it always had.
+     * As {@link #applyReconnecting(java.util.function.Supplier, ConnectionOp)}; with {@code
+     * rejectionIsFinal} an {@code En} (a node that predates the command) is surfaced as it is
+     * instead of being redialled and resent. The same node would answer {@code En} again, so the
+     * resend only costs a dial and a round trip. Only batched touch asks for it: every other
+     * command keeps the retry it always had.
      */
     private <T> T applyReconnecting(
             java.util.function.Supplier<Connection> source, ConnectionOp<T> op, boolean rejectionIsFinal) {
@@ -5034,24 +5101,19 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * As {@link #applyReconnecting}, but for {@code op}s that are
-     * <em>not</em> idempotent — {@code i}/{@code k}/{@code x} (INCR, CAS,
-     * delete-if-matches, issue #225). {@link
-     * NanocachedException.ConnectionLost#notSent()} is what tells apart
-     * the one case where a redial-and-retry is still safe from every case
-     * where it isn't: {@code true} means this connection was already
-     * known dead — the idle-FIN case {@link #applyReconnecting}'s own doc
-     * describes — before {@code op}'s frame ever touched the wire, so
-     * nothing was sent and retrying once, exactly like {@link
-     * #applyReconnecting} always does, is exactly as safe here. Anything
-     * else — the write itself failing partway, a request timeout, or the
-     * reply simply never arriving after a successful write — leaves the
-     * request's fate genuinely unknown (the primary may well have applied
-     * it), so this surfaces {@link NanocachedException.ConnectionLost}
-     * to the caller instead of ever resending it.
+     * As {@link #applyReconnecting}, but for {@code op}s that are <em>not</em> idempotent — {@code
+     * i}/{@code k}/{@code x} (INCR, CAS, delete-if-matches, issue #225). {@link
+     * NanocachedException.ConnectionLost#notSent()} is what tells apart the one case where a
+     * redial-and-retry is still safe from every case where it isn't: {@code true} means this
+     * connection was already known dead — the idle-FIN case {@link #applyReconnecting}'s own doc
+     * describes — before {@code op}'s frame ever touched the wire, so nothing was sent and retrying
+     * once, exactly like {@link #applyReconnecting} always does, is exactly as safe here. Anything
+     * else — the write itself failing partway, a request timeout, or the reply simply never
+     * arriving after a successful write — leaves the request's fate genuinely unknown (the primary
+     * may well have applied it), so this surfaces {@link NanocachedException.ConnectionLost} to the
+     * caller instead of ever resending it.
      */
-    private <T> T applyReconnectingNonIdempotent(
-            java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
+    private <T> T applyReconnectingNonIdempotent(java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
         // A failure to obtain the connection at all (a dial that failed, a
         // member with no connection) is proof nothing was sent, so it is
         // flagged notSent (see connectionNotSent) and surfaces without an
@@ -5067,17 +5129,14 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * As {@link #applyReconnectingNonIdempotent}, for a touch whose TTL
-     * expires the entry (issue #901): a resend after the node applied it
-     * would find the key gone. Same boundary as INCR/CAS -- {@link
-     * NanocachedException.ConnectionLost#notSent()} -- with one addition:
-     * a failure to obtain the connection at all (a dial that failed, a
-     * member with no connection) is itself proof that nothing was sent, so
-     * it is flagged {@code notSent} too and the caller may route around the
-     * dead node after a refresh, as it always could.
+     * As {@link #applyReconnectingNonIdempotent}, for a touch whose TTL expires the entry (issue
+     * #901): a resend after the node applied it would find the key gone. Same boundary as INCR/CAS
+     * -- {@link NanocachedException.ConnectionLost#notSent()} -- with one addition: a failure to
+     * obtain the connection at all (a dial that failed, a member with no connection) is itself
+     * proof that nothing was sent, so it is flagged {@code notSent} too and the caller may route
+     * around the dead node after a refresh, as it always could.
      */
-    private <T> T applyReconnectingUnlessSent(
-            java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
+    private <T> T applyReconnectingUnlessSent(java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
         try {
             return op.apply(connectionNotSent(source));
         } catch (NanocachedException.ConnectionLost retryable) {
@@ -5127,27 +5186,32 @@ public final class NanocachedClient implements AutoCloseable {
                 lastError = error;
             }
         }
-        throw lastError != null
-                ? lastError
-                : new NanocachedException("nanocached: no owner is reachable for this key");
+        throw lastError != null ? lastError : new NanocachedException("nanocached: no owner is reachable for this key");
     }
 
-    /** One hedge leg's outcome, however it happened — see {@link
-     * #readHedged}. Exactly one of {@code wrongNode}/{@code failure}/
-     * {@code bug} is set for anything but a hit ({@code value} may
-     * legitimately be {@code null} too, for a miss). */
+    /**
+     * One hedge leg's outcome, however it happened — see {@link #readHedged}. Exactly one of {@code
+     * wrongNode}/{@code failure}/ {@code bug} is set for anything but a hit ({@code value} may
+     * legitimately be {@code null} too, for a miss).
+     */
     static final class LegOutcome<T> {
         final T value;
         final NanocachedException.WrongNode wrongNode;
         final NanocachedException failure;
         final RuntimeException bug;
-        /** An {@link Error} (OutOfMemoryError, LinkageError, AssertionError, ...)
-         * thrown by the leg: rethrown as itself on the caller's thread
-         * (issue #1150). */
+
+        /**
+         * An {@link Error} (OutOfMemoryError, LinkageError, AssertionError, ...) thrown by the leg:
+         * rethrown as itself on the caller's thread (issue #1150).
+         */
         final Error fatal;
 
-        private LegOutcome(T value, NanocachedException.WrongNode wrongNode,
-                NanocachedException failure, RuntimeException bug, Error fatal) {
+        private LegOutcome(
+                T value,
+                NanocachedException.WrongNode wrongNode,
+                NanocachedException failure,
+                RuntimeException bug,
+                Error fatal) {
             this.value = value;
             this.wrongNode = wrongNode;
             this.failure = failure;
@@ -5175,15 +5239,15 @@ public final class NanocachedClient implements AutoCloseable {
             return new LegOutcome<>(null, null, null, null, error);
         }
 
-        /** Issue #1248: what {@link #startHedgeLeg} records when a leg ended
-         * without an outcome of its own. Allocated once, at class
-         * initialization: that case is exactly an arm above having failed to
-         * allocate (an OutOfMemoryError while the leg was settling), and
-         * building a fresh outcome there would fail the same way, so the
-         * reader would never be signalled. A bug outcome carries no value, so
-         * sharing one across element types is safe. */
-        private static final LegOutcome<Object> ENDED_WITHOUT_OUTCOME = LegOutcome.bug(
-                new NanocachedException("nanocached: hedged read leg ended without an outcome"));
+        /**
+         * Issue #1248: what {@link #startHedgeLeg} records when a leg ended without an outcome of
+         * its own. Allocated once, at class initialization: that case is exactly an arm above
+         * having failed to allocate (an OutOfMemoryError while the leg was settling), and building
+         * a fresh outcome there would fail the same way, so the reader would never be signalled. A
+         * bug outcome carries no value, so sharing one across element types is safe.
+         */
+        private static final LegOutcome<Object> ENDED_WITHOUT_OUTCOME =
+                LegOutcome.bug(new NanocachedException("nanocached: hedged read leg ended without an outcome"));
 
         @SuppressWarnings("unchecked")
         static <T> LegOutcome<T> endedWithoutOutcome() {
@@ -5191,23 +5255,21 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** Issue #1265: where a hedge leg reports its outcome to {@link
-     * #readHedged}, built so that reporting allocates nothing. The earlier
-     * shape -- a {@code ConcurrentHashMap.put} plus a {@code
-     * LinkedBlockingQueue.add} of a boxed index -- created a map node, a
-     * queue node and an {@code Integer} at the moment a leg settled; under
-     * an {@code OutOfMemoryError} that is the one place a failure must not
-     * be able to happen, because the reader waits for exactly this signal.
-     * Here there is one slot per owner and a {@link
-     * java.util.concurrent.Semaphore}, both created by the reader before
-     * the first leg starts; {@link #settle} is an array store plus {@code
-     * Semaphore.release()}, which is a CAS and an unpark, nothing more.
+    /**
+     * Issue #1265: where a hedge leg reports its outcome to {@link #readHedged}, built so that
+     * reporting allocates nothing. The earlier shape -- a {@code ConcurrentHashMap.put} plus a
+     * {@code LinkedBlockingQueue.add} of a boxed index -- created a map node, a queue node and an
+     * {@code Integer} at the moment a leg settled; under an {@code OutOfMemoryError} that is the
+     * one place a failure must not be able to happen, because the reader waits for exactly this
+     * signal. Here there is one slot per owner and a {@link java.util.concurrent.Semaphore}, both
+     * created by the reader before the first leg starts; {@link #settle} is an array store plus
+     * {@code Semaphore.release()}, which is a CAS and an unpark, nothing more.
      *
-     * <p>The reader takes the lowest-indexed settled slot, not the
-     * earliest-settled one. That only matters when several legs have
-     * settled by the time the reader looks, and then it is the better
-     * order: the primary's answer, which is the only miss that is final,
-     * is considered before a replica's. */
+     * <p>The reader takes the lowest-indexed settled slot, not the earliest-settled one. That only
+     * matters when several legs have settled by the time the reader looks, and then it is the
+     * better order: the primary's answer, which is the only miss that is final, is considered
+     * before a replica's.
+     */
     static final class HedgeSettlement<T> {
         private final java.util.concurrent.atomic.AtomicReferenceArray<LegOutcome<T>> slots;
         private final java.util.concurrent.Semaphore settled = new java.util.concurrent.Semaphore(0);
@@ -5216,17 +5278,19 @@ public final class NanocachedClient implements AutoCloseable {
             slots = new java.util.concurrent.atomic.AtomicReferenceArray<>(legs);
         }
 
-        /** Called once per leg, from the leg. Allocation-free: store first,
-         * signal second, so a reader that acquired a permit always finds a
-         * slot. */
+        /**
+         * Called once per leg, from the leg. Allocation-free: store first, signal second, so a
+         * reader that acquired a permit always finds a slot.
+         */
         void settle(int index, LegOutcome<T> outcome) {
             slots.set(index, outcome);
             settled.release();
         }
 
-        /** Waits up to {@code timeoutNanos} for a leg to settle and returns
-         * its index, or {@code -1} if none did. The slot is left in place;
-         * {@link #take} consumes it. Reader thread only. */
+        /**
+         * Waits up to {@code timeoutNanos} for a leg to settle and returns its index, or {@code -1}
+         * if none did. The slot is left in place; {@link #take} consumes it. Reader thread only.
+         */
         int await(long timeoutNanos) throws InterruptedException {
             if (!settled.tryAcquire(timeoutNanos, TimeUnit.NANOSECONDS)) {
                 return -1;
@@ -5246,21 +5310,19 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** Issue #1265: the longest {@link #readHedged} waits, with every owner
-     * in flight, for a leg to report -- a backstop, so that a leg that ends
-     * without reporting for a reason nobody anticipated (the settle path no
-     * longer allocates, but that is one cause among possible others) fails
-     * the read instead of parking the caller for good. It must never fire
-     * on a read that is merely slow, so it is built from the limits a leg
-     * already runs under rather than chosen separately: one attempt is a
-     * dial ({@code Identify.connectTimeoutMillis}) plus a request ({@code
-     * Connection.requestTimeoutMillis}); {@link #applyReconnecting} makes a
-     * second attempt after a non-timeout connection failure; the thread
-     * teardown margin covers scheduling slack; and the whole is doubled
-     * because a hedge leg may sit in {@link #hedgeLegs}' queue (as
-     * deep as the pool is wide) behind running legs that each take up to
-     * the same time. Read live, so tests that shorten the timeouts shorten
-     * this. */
+    /**
+     * Issue #1265: the longest {@link #readHedged} waits, with every owner in flight, for a leg to
+     * report -- a backstop, so that a leg that ends without reporting for a reason nobody
+     * anticipated (the settle path no longer allocates, but that is one cause among possible
+     * others) fails the read instead of parking the caller for good. It must never fire on a read
+     * that is merely slow, so it is built from the limits a leg already runs under rather than
+     * chosen separately: one attempt is a dial ({@code Identify.connectTimeoutMillis}) plus a
+     * request ({@code Connection.requestTimeoutMillis}); {@link #applyReconnecting} makes a second
+     * attempt after a non-timeout connection failure; the thread teardown margin covers scheduling
+     * slack; and the whole is doubled because a hedge leg may sit in {@link #hedgeLegs}' queue (as
+     * deep as the pool is wide) behind running legs that each take up to the same time. Read live,
+     * so tests that shorten the timeouts shorten this.
+     */
     static long hedgeSettleBoundMillis() {
         long oneLeg = 2 * (Connection.requestTimeoutMillis + Identify.connectTimeoutMillis)
                 + executorTerminationTimeoutMillis;
@@ -5268,36 +5330,31 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * Hedged reads (issue #64): one slow — not dead — owner otherwise
-     * bounds every read that touches it at its full round trip, since the
-     * sequential path above only moves on to the next owner when the
-     * current one *fails*. Here the read starts at the primary ({@code
-     * names.get(0)}), and if no answer has arrived within {@code
-     * readHedgeAfterNanos} the same read is also sent to the next owner
-     * (and so on, one more owner per interval, until every owner is in
-     * flight); the first answer decides:
+     * Hedged reads (issue #64): one slow — not dead — owner otherwise bounds every read that
+     * touches it at its full round trip, since the sequential path above only moves on to the next
+     * owner when the current one *fails*. Here the read starts at the primary ({@code
+     * names.get(0)}), and if no answer has arrived within {@code readHedgeAfterNanos} the same read
+     * is also sent to the next owner (and so on, one more owner per interval, until every owner is
+     * in flight); the first answer decides:
      *
      * <ul>
-     * <li>a hit from any owner is final;
-     * <li>a miss is final only from the primary — a replica's miss is
-     * provisional (it may simply lack the copy) and the primary is still
-     * waited for, so hedging never turns a hit into a miss; it is
-     * accepted only once every owner has answered or failed;
-     * <li>a failure ({@link NanocachedException} other than {@link
-     * NanocachedException.WrongNode}, or a connection-level one) hedges
-     * onward immediately — the moment nothing else is still in flight,
-     * not after waiting out another full interval;
-     * <li>{@link NanocachedException.WrongNode} propagates exactly as the
-     * sequential path's does;
-     * <li>an {@link Error} thrown by a leg is rethrown as itself on the
-     * calling thread (issue #1150).
+     *   <li>a hit from any owner is final;
+     *   <li>a miss is final only from the primary — a replica's miss is provisional (it may simply
+     *       lack the copy) and the primary is still waited for, so hedging never turns a hit into a
+     *       miss; it is accepted only once every owner has answered or failed;
+     *   <li>a failure ({@link NanocachedException} other than {@link
+     *       NanocachedException.WrongNode}, or a connection-level one) hedges onward immediately —
+     *       the moment nothing else is still in flight, not after waiting out another full
+     *       interval;
+     *   <li>{@link NanocachedException.WrongNode} propagates exactly as the sequential path's does;
+     *   <li>an {@link Error} thrown by a leg is rethrown as itself on the calling thread (issue
+     *       #1150).
      * </ul>
      *
-     * A losing leg is never cancelled (interrupting a request mid-write
-     * could desync that connection — see {@link Connection}) but left to
-     * run to completion, detached, on {@link #hedgeLegs}; its result
-     * is discarded and {@link #close()} drains it via {@link
-     * #hedgedReads} exactly like a {@code fireAndForgetReplicas} write.
+     * A losing leg is never cancelled (interrupting a request mid-write could desync that
+     * connection — see {@link Connection}) but left to run to completion, detached, on {@link
+     * #hedgeLegs}; its result is discarded and {@link #close()} drains it via {@link #hedgedReads}
+     * exactly like a {@code fireAndForgetReplicas} write.
      */
     private <T> T readHedged(ConnectionOp<T> op, List<String> names) {
         // The primary is tracked by name: demoteSilentOwners may move it
@@ -5346,15 +5403,14 @@ public final class NanocachedClient implements AutoCloseable {
                     if (index < 0) {
                         // Not resolveLosers: that joins the legs, and these
                         // are the ones that did not report.
-                        throw new NanocachedException(
-                                "nanocached: a hedged read leg did not report an outcome within "
-                                        + boundMillis + " ms");
+                        throw new NanocachedException("nanocached: a hedged read leg did not report an outcome within "
+                                + boundMillis
+                                + " ms");
                     }
                 }
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-                throw new NanocachedException(
-                        "nanocached: interrupted while waiting for a hedged read", interrupted);
+                throw new NanocachedException("nanocached: interrupted while waiting for a hedged read", interrupted);
             }
 
             if (index < 0) {
@@ -5416,19 +5472,17 @@ public final class NanocachedClient implements AutoCloseable {
         }
 
         if (replicaMissed) return null;
-        throw lastError != null
-                ? lastError
-                : new NanocachedException("nanocached: no owner is reachable for this key");
+        throw lastError != null ? lastError : new NanocachedException("nanocached: no owner is reachable for this key");
     }
 
-    /** Moves owners that have stopped answering to the end of {@code names},
-     * keeping the relative order of both groups: an owner with at least
-     * {@link #hedgeSuspectLateLegs} late hedge legs outstanding is one
-     * whose reads are mostly being answered by its replica anyway, so the
-     * replica is asked first. The order is left alone when no owner or every
-     * owner is in that state: with none there is nothing to demote, and with
-     * all of them the primary's position still decides which answer is
-     * final. */
+    /**
+     * Moves owners that have stopped answering to the end of {@code names}, keeping the relative
+     * order of both groups: an owner with at least {@link #hedgeSuspectLateLegs} late hedge legs
+     * outstanding is one whose reads are mostly being answered by its replica anyway, so the
+     * replica is asked first. The order is left alone when no owner or every owner is in that
+     * state: with none there is nothing to demote, and with all of them the primary's position
+     * still decides which answer is final.
+     */
     List<String> demoteSilentOwners(List<String> names) {
         if (lateHedgeLegs.isEmpty()) {
             return names;
@@ -5451,31 +5505,30 @@ public final class NanocachedClient implements AutoCloseable {
         return answering;
     }
 
-    /** Counts {@code leg} as late for {@code name} until it completes. The
-     * release is a completion callback, so it runs exactly once whether the
-     * leg is still running, finishes right now, or has already finished. */
+    /**
+     * Counts {@code leg} as late for {@code name} until it completes. The release is a completion
+     * callback, so it runs exactly once whether the leg is still running, finishes right now, or
+     * has already finished.
+     */
     private void countLateLeg(String name, CompletableFuture<Void> leg) {
         lateHedgeLegs.merge(name, 1, Integer::sum);
         leg.whenComplete((ignoredResult, ignoredError) ->
                 lateHedgeLegs.computeIfPresent(name, (key, late) -> late <= 1 ? null : late - 1));
     }
 
-    /** Issue #276: {@link #readHedged} has already decided its outcome,
-     * with {@code losers} — each already tracked in {@link #hedgedReads}
-     * by {@link #startHedgeLeg} — left running. Normally they're left
-     * exactly as they are: running detached in the background, drained
-     * eventually by {@link #close()}, same as always, and counted in
-     * {@link #detachedHedgeLegs} until they finish. But past {@link
-     * #maxInFlightHedgeLoserLegs} legs already left running that way
-     * (the legs of reads still in flight are not accumulation and do not
-     * count, so a burst of concurrent reads cannot by itself force every
-     * read to wait for its slow loser) — so a client issuing many
-     * concurrent hedged reads against a slow owner can't accumulate an
-     * unbounded number of background legs — this read instead joins them
-     * right here before returning, the same "fall back to synchronous"
-     * shape {@link #backgroundReplicaWritePermits} uses past its own
-     * cap. Outcomes are ignored either way: a loser's result was never
-     * going to be used. */
+    /**
+     * Issue #276: {@link #readHedged} has already decided its outcome, with {@code losers} — each
+     * already tracked in {@link #hedgedReads} by {@link #startHedgeLeg} — left running. Normally
+     * they're left exactly as they are: running detached in the background, drained eventually by
+     * {@link #close()}, same as always, and counted in {@link #detachedHedgeLegs} until they
+     * finish. But past {@link #maxInFlightHedgeLoserLegs} legs already left running that way (the
+     * legs of reads still in flight are not accumulation and do not count, so a burst of concurrent
+     * reads cannot by itself force every read to wait for its slow loser) — so a client issuing
+     * many concurrent hedged reads against a slow owner can't accumulate an unbounded number of
+     * background legs — this read instead joins them right here before returning, the same "fall
+     * back to synchronous" shape {@link #backgroundReplicaWritePermits} uses past its own cap.
+     * Outcomes are ignored either way: a loser's result was never going to be used.
+     */
     private void resolveLosers(Collection<CompletableFuture<Void>> losers) {
         if (losers.isEmpty()) {
             return;
@@ -5502,23 +5555,22 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** Starts one hedge leg against {@code names.get(index)} (via {@code
-     * name}), running it on {@link #hedgeLegs} — falling back to
-     * running it inline if that pool was concurrently shut down by {@link
-     * #close()}, mirroring {@link #submitReplicaWrite} — and reporting its
-     * outcome through {@code settlement} (an allocation-free slot plus
-     * signal, see {@link HedgeSettlement}), rather than through the {@link
-     * CompletableFuture}'s own result: {@link #readHedged} needs to learn
-     * of a completion the instant it happens, including one that races in
-     * while it's blocked waiting on an earlier leg, which a signal gives
-     * for free and a bare future does not. The future itself exists only
-     * so {@link #hedgedReads}/{@link #drainHedgedReads} can still block
-     * {@link #close()} until this leg — win or lose — actually finishes.
-     * Also returned directly, so {@link #readHedged} can join it itself
-     * via {@link #resolveLosers} past {@link #maxInFlightHedgeLoserLegs}
-     * (issue #276) without waiting on {@link #close()}. */
-    private <T> CompletableFuture<Void> startHedgeLeg(int index, String name, ConnectionOp<T> op,
-            HedgeSettlement<T> settlement) {
+    /**
+     * Starts one hedge leg against {@code names.get(index)} (via {@code name}), running it on
+     * {@link #hedgeLegs} — falling back to running it inline if that pool was concurrently shut
+     * down by {@link #close()}, mirroring {@link #submitReplicaWrite} — and reporting its outcome
+     * through {@code settlement} (an allocation-free slot plus signal, see {@link
+     * HedgeSettlement}), rather than through the {@link CompletableFuture}'s own result: {@link
+     * #readHedged} needs to learn of a completion the instant it happens, including one that races
+     * in while it's blocked waiting on an earlier leg, which a signal gives for free and a bare
+     * future does not. The future itself exists only so {@link #hedgedReads}/{@link
+     * #drainHedgedReads} can still block {@link #close()} until this leg — win or lose — actually
+     * finishes. Also returned directly, so {@link #readHedged} can join it itself via {@link
+     * #resolveLosers} past {@link #maxInFlightHedgeLoserLegs} (issue #276) without waiting on
+     * {@link #close()}.
+     */
+    private <T> CompletableFuture<Void> startHedgeLeg(
+            int index, String name, ConnectionOp<T> op, HedgeSettlement<T> settlement) {
         Runnable task = () -> {
             // Issue #1150: whatever happens, record an outcome and signal the
             // reader -- it waits on `settlement` once every owner is in
@@ -5539,8 +5591,8 @@ public final class NanocachedClient implements AutoCloseable {
                 outcome = LegOutcome.fatal(error);
             } catch (Throwable error) {
                 // Not reachable without a sneaky throw, but must still settle.
-                outcome = LegOutcome.bug(new NanocachedException(
-                        "nanocached: hedged read leg failed unexpectedly", error));
+                outcome = LegOutcome.bug(
+                        new NanocachedException("nanocached: hedged read leg failed unexpectedly", error));
             } finally {
                 if (outcome == null) {
                     outcome = LegOutcome.endedWithoutOutcome();
@@ -5602,89 +5654,91 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * As {@link #write(byte[], byte[], ConnectionOp)}, but {@code
-     * backgroundSafeOp} — when non-null — lazily supplies a variant of
-     * {@code op} to use for any replica leg that ends up running via the
-     * {@code fireAndForgetReplicas} background path (issue #326). Such a
-     * leg can still be running well after this method has already
-     * returned to its caller; if {@code op} closes over a byte[] the
-     * caller still owns (e.g. {@code compress} off, where the array isn't
-     * copied — see {@link #set}), a caller that reuses/mutates that array
-     * in place right after the call returns could otherwise silently
-     * change what the background leg stores. A synchronous/joined leg
-     * (including the primary) never needs this: it always finishes before
-     * this method returns, so it can never observe a later mutation, and
-     * keeps using {@code op} directly. {@code backgroundSafeOp} is called
-     * at most once per {@code write()} call — its result is reused by
-     * every fire-and-forget leg below, not rebuilt per leg — since the
-     * defensive copy it makes is immutable once made and safe to share.
+     * As {@link #write(byte[], byte[], ConnectionOp)}, but {@code backgroundSafeOp} — when non-null
+     * — lazily supplies a variant of {@code op} to use for any replica leg that ends up running via
+     * the {@code fireAndForgetReplicas} background path (issue #326). Such a leg can still be
+     * running well after this method has already returned to its caller; if {@code op} closes over
+     * a byte[] the caller still owns (e.g. {@code compress} off, where the array isn't copied — see
+     * {@link #set}), a caller that reuses/mutates that array in place right after the call returns
+     * could otherwise silently change what the background leg stores. A synchronous/joined leg
+     * (including the primary) never needs this: it always finishes before this method returns, so
+     * it can never observe a later mutation, and keeps using {@code op} directly. {@code
+     * backgroundSafeOp} is called at most once per {@code write()} call — its result is reused by
+     * every fire-and-forget leg below, not rebuilt per leg — since the defensive copy it makes is
+     * immutable once made and safe to share.
      */
     private <T> T write(
-            byte[] namespace, byte[] key, ConnectionOp<T> op,
+            byte[] namespace,
+            byte[] key,
+            ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp) {
         return write(namespace, key, op, backgroundSafeOp, null);
     }
 
     /**
-     * As the four-argument {@code write}, with {@code replicaOp} (issue
-     * #825) — when non-null — sent to every non-primary owner, background
-     * legs included, instead of {@code op}: only the primary's answer
-     * decides the result, so a get-and-touch asks just the primary for the
-     * value and sends the others the plain touch.
+     * As the four-argument {@code write}, with {@code replicaOp} (issue #825) — when non-null —
+     * sent to every non-primary owner, background legs included, instead of {@code op}: only the
+     * primary's answer decides the result, so a get-and-touch asks just the primary for the value
+     * and sends the others the plain touch.
      */
     private <T> T write(
-            byte[] namespace, byte[] key, ConnectionOp<T> op,
+            byte[] namespace,
+            byte[] key,
+            ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
             ConnectionOp<?> replicaOp) {
         return write(namespace, key, op, backgroundSafeOp, replicaOp, true, false);
     }
 
-    /** As the seven-argument {@code write}, with {@code rejectionIsFinal}
-     * false. */
+    /** As the seven-argument {@code write}, with {@code rejectionIsFinal} false. */
     private <T> T write(
-            byte[] namespace, byte[] key, ConnectionOp<T> op,
+            byte[] namespace,
+            byte[] key,
+            ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
-            ConnectionOp<?> replicaOp, boolean primaryReplaySafe) {
+            ConnectionOp<?> replicaOp,
+            boolean primaryReplaySafe) {
         return write(namespace, key, op, backgroundSafeOp, replicaOp, primaryReplaySafe, false);
     }
 
-    /** As the eight-argument {@code write}, with {@code replicasAfterPrimary}
-     * false. */
+    /** As the eight-argument {@code write}, with {@code replicasAfterPrimary} false. */
     private <T> T write(
-            byte[] namespace, byte[] key, ConnectionOp<T> op,
+            byte[] namespace,
+            byte[] key,
+            ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
-            ConnectionOp<?> replicaOp, boolean primaryReplaySafe, boolean rejectionIsFinal) {
-        return write(
-                namespace, key, op, backgroundSafeOp, replicaOp, primaryReplaySafe, rejectionIsFinal, false);
+            ConnectionOp<?> replicaOp,
+            boolean primaryReplaySafe,
+            boolean rejectionIsFinal) {
+        return write(namespace, key, op, backgroundSafeOp, replicaOp, primaryReplaySafe, rejectionIsFinal, false);
     }
 
     /**
-     * As the five-argument {@code write}; with {@code primaryReplaySafe}
-     * false (issue #901: a touch whose TTL expires the entry) the primary
-     * leg is redialled and resent only when the request provably never
-     * reached the wire (see {@link #applyReconnectingUnlessSent}). A
-     * replica leg keeps its plain retry: only the primary's answer is
-     * reported, so a replica that already expired the entry changes
-     * nothing. With {@code rejectionIsFinal} (issue #902, touch) an
-     * {@code En} from a node, a replica leg included (issue #924), is
-     * surfaced as it is instead of being redialled and resent.
+     * As the five-argument {@code write}; with {@code primaryReplaySafe} false (issue #901: a touch
+     * whose TTL expires the entry) the primary leg is redialled and resent only when the request
+     * provably never reached the wire (see {@link #applyReconnectingUnlessSent}). A replica leg
+     * keeps its plain retry: only the primary's answer is reported, so a replica that already
+     * expired the entry changes nothing. With {@code rejectionIsFinal} (issue #902, touch) an
+     * {@code En} from a node, a replica leg included (issue #924), is surfaced as it is instead of
+     * being redialled and resent.
      *
-     * <p>With {@code replicasAfterPrimary} (issue #934, a touch whose TTL
-     * expires the entry) the other owners are sent their leg only after the
-     * primary has answered, as the result fan-out of INCR/CAS is. Sent
-     * together with the primary's, a replica would expire its copy at once;
-     * if the primary then turned out to be unreachable or answered {@code
-     * W}, the retry over the refreshed ring would reach that replica as the
-     * new primary, find the key gone and report a miss, and the value
-     * would be lost. A primary that fails sends no replica leg at all. The
-     * replica legs therefore run after the primary's answer, outside the
-     * pipelined-order guarantee, the same class as the existing retry
-     * paths.
+     * <p>With {@code replicasAfterPrimary} (issue #934, a touch whose TTL expires the entry) the
+     * other owners are sent their leg only after the primary has answered, as the result fan-out of
+     * INCR/CAS is. Sent together with the primary's, a replica would expire its copy at once; if
+     * the primary then turned out to be unreachable or answered {@code W}, the retry over the
+     * refreshed ring would reach that replica as the new primary, find the key gone and report a
+     * miss, and the value would be lost. A primary that fails sends no replica leg at all. The
+     * replica legs therefore run after the primary's answer, outside the pipelined-order guarantee,
+     * the same class as the existing retry paths.
      */
     private <T> T write(
-            byte[] namespace, byte[] key, ConnectionOp<T> op,
+            byte[] namespace,
+            byte[] key,
+            ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
-            ConnectionOp<?> replicaOp, boolean primaryReplaySafe, boolean rejectionIsFinal,
+            ConnectionOp<?> replicaOp,
+            boolean primaryReplaySafe,
+            boolean rejectionIsFinal,
             boolean replicasAfterPrimary) {
         if (ring == null) {
             return primaryReplaySafe
@@ -5765,17 +5819,18 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * Sends the replica leg of a write to each of {@code replicas} and
-     * returns the synchronous legs' futures for the caller to drain (a
-     * {@code fireAndForgetReplicas} leg is not among them). A replica's
-     * failure is swallowed and counted in {@link #replicaWriteFailures}; see
-     * the matching comments in the body for the rest of the contract the
-     * single-key {@link #write} documents.
+     * Sends the replica leg of a write to each of {@code replicas} and returns the synchronous
+     * legs' futures for the caller to drain (a {@code fireAndForgetReplicas} leg is not among
+     * them). A replica's failure is swallowed and counted in {@link #replicaWriteFailures}; see the
+     * matching comments in the body for the rest of the contract the single-key {@link #write}
+     * documents.
      */
     private <T> List<CompletableFuture<Void>> startReplicaWrites(
-            List<String> replicas, ConnectionOp<T> op,
+            List<String> replicas,
+            ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
-            ConnectionOp<?> replicaOp, boolean rejectionIsFinal) {
+            ConnectionOp<?> replicaOp,
+            boolean rejectionIsFinal) {
         ConnectionOp<T> backgroundOp = null; // lazily built at most once; see write()'s javadoc (issue #326)
         List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
         for (String replica : replicas) {
@@ -5794,7 +5849,8 @@ public final class NanocachedClient implements AutoCloseable {
                     try {
                         applyReconnecting(() -> memberConnection(replica), legOp, rejectionIsFinal);
                     } catch (NanocachedException ignored) {
-                        // Swallowed by design (client-side replication): a dead or disagreeing
+                        // Swallowed by design (client-side replication): a dead or
+                        // disagreeing
                         // replica leaves the key under-replicated until the next
                         // node-list refresh, never fails the write. Counted via
                         // stats().replicaWriteFailures so operators can spot
@@ -5807,16 +5863,15 @@ public final class NanocachedClient implements AutoCloseable {
                     }
                 };
                 try {
-                    CompletableFuture.runAsync(replicaWrite, backgroundLegs)
-                            .whenComplete((ignoredResult, error) -> {
-                                backgroundReplicaWritePermits.release();
-                                // error is non-null only for a genuine bug
-                                // that escaped replicaWrite's own catch
-                                // above — see reportBackgroundWriteBug
-                                // (audit finding, background writes
-                                // silently discarding this).
-                                reportBackgroundWriteBug(error);
-                            });
+                    CompletableFuture.runAsync(replicaWrite, backgroundLegs).whenComplete((ignoredResult, error) -> {
+                        backgroundReplicaWritePermits.release();
+                        // error is non-null only for a genuine bug
+                        // that escaped replicaWrite's own catch
+                        // above — see reportBackgroundWriteBug
+                        // (audit finding, background writes
+                        // silently discarding this).
+                        reportBackgroundWriteBug(error);
+                    });
                 } catch (RejectedExecutionException rejected) {
                     // close() shut backgroundLegs down concurrently: the
                     // permit was already acquired, but the task was never
@@ -5859,24 +5914,19 @@ public final class NanocachedClient implements AutoCloseable {
     // aiming for the same arithmetic.
 
     /**
-     * INCR's own write driver (issue #129). Sends {@code i} to the
-     * primary owner only and awaits it; a miss ({@code null}, mirroring
-     * {@link #getBytes(byte[], byte[])}'s own null-on-miss convention) or
-     * {@link NanocachedException.NotNumeric} is returned/thrown directly
-     * without touching any replica, since nothing was written. A hit's
-     * result is fanned out to the remaining owners via {@link
-     * #replicateIncrResult} before being returned. {@link
-     * #withWrongNodeRetry} already wraps a call to this whole method (see
-     * {@link #incr(byte[], byte[], long)}) and retries it on {@code W}
-     * (stale routing) — since replication only ever runs after the
-     * primary leg above has already returned successfully, that retry
-     * only ever re-runs the primary leg again (a second, freshly routed
-     * primary attempt), never a duplicate replica fan-out. It is NOT
-     * retried on {@code ConnectionLost} (issue #225 —
-     * {@code retryConnectionFailure} false): INCR isn't idempotent, so
-     * the primary leg below already owns the only safe retry, via {@link
-     * #applyReconnectingNonIdempotent}; see its doc for why a redial is
-     * safe only when the request never reached the wire.
+     * INCR's own write driver (issue #129). Sends {@code i} to the primary owner only and awaits
+     * it; a miss ({@code null}, mirroring {@link #getBytes(byte[], byte[])}'s own null-on-miss
+     * convention) or {@link NanocachedException.NotNumeric} is returned/thrown directly without
+     * touching any replica, since nothing was written. A hit's result is fanned out to the
+     * remaining owners via {@link #replicateIncrResult} before being returned. {@link
+     * #withWrongNodeRetry} already wraps a call to this whole method (see {@link #incr(byte[],
+     * byte[], long)}) and retries it on {@code W} (stale routing) — since replication only ever
+     * runs after the primary leg above has already returned successfully, that retry only ever
+     * re-runs the primary leg again (a second, freshly routed primary attempt), never a duplicate
+     * replica fan-out. It is NOT retried on {@code ConnectionLost} (issue #225 — {@code
+     * retryConnectionFailure} false): INCR isn't idempotent, so the primary leg below already owns
+     * the only safe retry, via {@link #applyReconnectingNonIdempotent}; see its doc for why a
+     * redial is safe only when the request never reached the wire.
      */
     private Connection.IncrResult incrPrimaryThenReplicate(byte[] namespace, byte[] key, long delta) {
         if (ring == null) {
@@ -5898,21 +5948,17 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * Fans {@code result} — the primary's own literal INCR outcome, never
-     * replayed as another {@code i} — out to {@code names}' remaining
-     * owners as a {@code set} carrying that exact value and TTL. Mirrors
-     * {@link #write}'s own replica-leg scheduling ({@code
-     * fireAndForgetReplicas} runs up to the configured cap in the
-     * background; the rest run concurrently and are joined here), and the
-     * same expected-failure handling (swallowed, counted via {@link
-     * #replicaWriteFailures}). Unlike {@link #write}, there is no primary
-     * failure for a genuine replica-leg bug to attach to — the primary
-     * already succeeded by the time this runs — so any bug that escapes a
-     * leg is simply logged via {@link #reportBackgroundWriteBug}, exactly
-     * as a {@code fireAndForgetReplicas} leg's own bug already is.
+     * Fans {@code result} — the primary's own literal INCR outcome, never replayed as another
+     * {@code i} — out to {@code names}' remaining owners as a {@code set} carrying that exact value
+     * and TTL. Mirrors {@link #write}'s own replica-leg scheduling ({@code fireAndForgetReplicas}
+     * runs up to the configured cap in the background; the rest run concurrently and are joined
+     * here), and the same expected-failure handling (swallowed, counted via {@link
+     * #replicaWriteFailures}). Unlike {@link #write}, there is no primary failure for a genuine
+     * replica-leg bug to attach to — the primary already succeeded by the time this runs — so any
+     * bug that escapes a leg is simply logged via {@link #reportBackgroundWriteBug}, exactly as a
+     * {@code fireAndForgetReplicas} leg's own bug already is.
      */
-    private void replicateIncrResult(
-            byte[] namespace, byte[] key, List<String> names, Connection.IncrResult result) {
+    private void replicateIncrResult(byte[] namespace, byte[] key, List<String> names, Connection.IncrResult result) {
         byte[] valueBytes = Long.toString(result.value()).getBytes(StandardCharsets.US_ASCII);
         // Issue #1255: a background replica leg frames these after the call returned.
         byte[] ownedNamespace = ownedForBackground(namespace);
@@ -5924,45 +5970,37 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * Fans {@code op} — an already-decided result, never a condition or
-     * computation to redo — out to {@code names}' remaining owners (index
-     * 1 onward). Shared by {@link #replicateIncrResult} (issue #129) and
-     * compare-and-set's {@link #casPrimaryThenReplicate}/{@link
-     * #casDeletePrimaryThenReplicate} (issue #141): all three run this
-     * only after a primary op has already succeeded, so — unlike {@link
-     * #write}, which fans out concurrently with a still-pending primary —
-     * there is never a primary failure for a replica-leg bug to attach to
-     * here; one that escapes {@code op}'s own {@link
-     * NanocachedException}-only catch is simply logged via {@link
-     * #reportBackgroundWriteBug}, exactly as a {@code
-     * fireAndForgetReplicas} leg's own bug already is. Mirrors {@link
-     * #write}'s replica-leg scheduling otherwise: {@code
-     * fireAndForgetReplicas} runs up to the configured cap in the
-     * background; the rest run concurrently and are joined here, with
-     * every expected failure swallowed and counted via {@link
-     * #replicaWriteFailures}.
+     * Fans {@code op} — an already-decided result, never a condition or computation to redo — out
+     * to {@code names}' remaining owners (index 1 onward). Shared by {@link #replicateIncrResult}
+     * (issue #129) and compare-and-set's {@link #casPrimaryThenReplicate}/{@link
+     * #casDeletePrimaryThenReplicate} (issue #141): all three run this only after a primary op has
+     * already succeeded, so — unlike {@link #write}, which fans out concurrently with a
+     * still-pending primary — there is never a primary failure for a replica-leg bug to attach to
+     * here; one that escapes {@code op}'s own {@link NanocachedException}-only catch is simply
+     * logged via {@link #reportBackgroundWriteBug}, exactly as a {@code fireAndForgetReplicas}
+     * leg's own bug already is. Mirrors {@link #write}'s replica-leg scheduling otherwise: {@code
+     * fireAndForgetReplicas} runs up to the configured cap in the background; the rest run
+     * concurrently and are joined here, with every expected failure swallowed and counted via
+     * {@link #replicaWriteFailures}.
      */
     private void replicateResultToReplicas(List<String> names, ConnectionOp<Void> op) {
         replicateResultToReplicas(names, op, null);
     }
 
     /**
-     * As {@link #replicateResultToReplicas(List, ConnectionOp)}, but
-     * {@code backgroundSafeOp} — when non-null — lazily supplies a
-     * variant of {@code op} for any leg that ends up running via the
-     * {@code fireAndForgetReplicas} background path, exactly mirroring
-     * {@link #write}'s own {@code backgroundSafeOp} parameter (issue
-     * #326) — see that overload's javadoc for the full rationale.
-     * {@link #replicateIncrResult} (issue #129) never needs this: its
-     * {@code valueBytes} is always a fresh {@code Long.toString(...)
-     * .getBytes(...)} array, never caller-owned, so it keeps calling the
-     * two-argument overload above unchanged. Only {@link
-     * #casPrimaryThenReplicate} (issue #141) — whose {@code value} can be
-     * the caller's own array when {@code compress} is off, see {@link
-     * #cas} — passes one.
+     * As {@link #replicateResultToReplicas(List, ConnectionOp)}, but {@code backgroundSafeOp} —
+     * when non-null — lazily supplies a variant of {@code op} for any leg that ends up running via
+     * the {@code fireAndForgetReplicas} background path, exactly mirroring {@link #write}'s own
+     * {@code backgroundSafeOp} parameter (issue #326) — see that overload's javadoc for the full
+     * rationale. {@link #replicateIncrResult} (issue #129) never needs this: its {@code valueBytes}
+     * is always a fresh {@code Long.toString(...) .getBytes(...)} array, never caller-owned, so it
+     * keeps calling the two-argument overload above unchanged. Only {@link
+     * #casPrimaryThenReplicate} (issue #141) — whose {@code value} can be the caller's own array
+     * when {@code compress} is off, see {@link #cas} — passes one.
      */
     private void replicateResultToReplicas(
-            List<String> names, ConnectionOp<Void> op,
+            List<String> names,
+            ConnectionOp<Void> op,
             java.util.function.Supplier<ConnectionOp<Void>> backgroundSafeOp) {
         ConnectionOp<Void> backgroundOp = null; // lazily built at most once; see write()'s matching field
         List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
@@ -5986,11 +6024,10 @@ public final class NanocachedClient implements AutoCloseable {
                     }
                 };
                 try {
-                    CompletableFuture.runAsync(replicaWrite, backgroundLegs)
-                            .whenComplete((ignoredResult, error) -> {
-                                backgroundReplicaWritePermits.release();
-                                reportBackgroundWriteBug(error);
-                            });
+                    CompletableFuture.runAsync(replicaWrite, backgroundLegs).whenComplete((ignoredResult, error) -> {
+                        backgroundReplicaWritePermits.release();
+                        reportBackgroundWriteBug(error);
+                    });
                 } catch (RejectedExecutionException rejected) {
                     // close() shut backgroundLegs down concurrently — see
                     // write()'s identical handling.
@@ -6032,25 +6069,22 @@ public final class NanocachedClient implements AutoCloseable {
     // against its own possibly-different copy could reach a different
     // outcome than the primary just did.
 
-    /** putIfAbsent/replaceIfPresent/replace's write driver (issue #141).
-     * Sends {@code k} to the primary owner only; a condition mismatch
-     * ({@code false}) is returned directly without touching any replica,
-     * since nothing was written. A success is fanned out to the remaining
-     * owners via {@link #replicateResultToReplicas}, carrying the exact
-     * same {@code value}/{@code ttlSeconds} just written to the primary,
-     * before returning {@code true}. {@link #withWrongNodeRetry} already
-     * wraps a call to this whole method (see {@link #cas}) and retries it
-     * on {@code W} (stale routing) — since replication only ever runs
-     * after the primary leg above has already returned successfully, that
-     * retry only ever re-runs the primary leg again, never a duplicate
-     * replica fan-out. It is NOT retried on {@code ConnectionLost}
-     * (issue #225 — {@code retryConnectionFailure} false): a CAS store
-     * isn't idempotent (a successful-but-unacknowledged store must not be
-     * replayed only to be reported as a mismatch), so the primary leg
-     * below already owns the only safe retry, via {@link
-     * #applyReconnectingNonIdempotent}. */
-    private boolean casPrimaryThenReplicate(
-            byte[] namespace, byte[] key, byte[] value, Long ttlSeconds, String cond) {
+    /**
+     * putIfAbsent/replaceIfPresent/replace's write driver (issue #141). Sends {@code k} to the
+     * primary owner only; a condition mismatch ({@code false}) is returned directly without
+     * touching any replica, since nothing was written. A success is fanned out to the remaining
+     * owners via {@link #replicateResultToReplicas}, carrying the exact same {@code value}/{@code
+     * ttlSeconds} just written to the primary, before returning {@code true}. {@link
+     * #withWrongNodeRetry} already wraps a call to this whole method (see {@link #cas}) and retries
+     * it on {@code W} (stale routing) — since replication only ever runs after the primary leg
+     * above has already returned successfully, that retry only ever re-runs the primary leg again,
+     * never a duplicate replica fan-out. It is NOT retried on {@code ConnectionLost} (issue #225 —
+     * {@code retryConnectionFailure} false): a CAS store isn't idempotent (a
+     * successful-but-unacknowledged store must not be replayed only to be reported as a mismatch),
+     * so the primary leg below already owns the only safe retry, via {@link
+     * #applyReconnectingNonIdempotent}.
+     */
+    private boolean casPrimaryThenReplicate(byte[] namespace, byte[] key, byte[] value, Long ttlSeconds, String cond) {
         if (ring == null) {
             return applyReconnectingNonIdempotent(
                     this::singleConnection, connection -> connection.casSet(namespace, key, value, ttlSeconds, cond));
@@ -6061,43 +6095,46 @@ public final class NanocachedClient implements AutoCloseable {
             throw new NanocachedException("nanocached: no owner is reachable for this key");
         }
 
-        boolean stored = applyReconnectingNonIdempotent(() -> memberConnection(names.get(0)),
+        boolean stored = applyReconnectingNonIdempotent(
+                () -> memberConnection(names.get(0)),
                 connection -> connection.casSet(namespace, key, value, ttlSeconds, cond));
         if (!stored) return false;
 
         // Issue #1255: a background replica leg frames these after the call returned.
         byte[] ownedNamespace = ownedForBackground(namespace);
         byte[] ownedKey = ownedForBackground(key);
-        replicateResultToReplicas(names, connection -> {
-            connection.set(ownedNamespace, ownedKey, value, ttlSeconds);
-            return null;
-        }, () -> {
-            // issue #326: `value` here is cas()'s own `outgoing` — the caller's
-            // array when compress is off (never a copy on that branch; see
-            // set()'s matching comment). Same fix as write()'s: only a
-            // fireAndForgetReplicas leg that is actually going into the
-            // background gets this defensively-copied variant, since only that
-            // leg can still be running after casPrimaryThenReplicate (and so
-            // cas()) has already returned to the caller.
-            byte[] backgroundSafe = compress ? value : Arrays.copyOf(value, value.length);
-            return connection -> {
-                connection.set(ownedNamespace, ownedKey, backgroundSafe, ttlSeconds);
-                return null;
-            };
-        });
+        replicateResultToReplicas(
+                names,
+                connection -> {
+                    connection.set(ownedNamespace, ownedKey, value, ttlSeconds);
+                    return null;
+                },
+                () -> {
+                    // issue #326: `value` here is cas()'s own `outgoing` — the caller's
+                    // array when compress is off (never a copy on that branch; see
+                    // set()'s matching comment). Same fix as write()'s: only a
+                    // fireAndForgetReplicas leg that is actually going into the
+                    // background gets this defensively-copied variant, since only that
+                    // leg can still be running after casPrimaryThenReplicate (and so
+                    // cas()) has already returned to the caller.
+                    byte[] backgroundSafe = compress ? value : Arrays.copyOf(value, value.length);
+                    return connection -> {
+                        connection.set(ownedNamespace, ownedKey, backgroundSafe, ttlSeconds);
+                        return null;
+                    };
+                });
         return true;
     }
 
-    /** deleteIfMatches's write driver (issue #141) — as {@link
-     * #casPrimaryThenReplicate}, but for {@code x}/{@code remove(key,
-     * old)}: a success's replica leg is an ordinary (unconditional)
-     * delete, since the primary's own successful digest match already
-     * proved the key existed. As {@link #casPrimaryThenReplicate}, not
-     * retried on {@code ConnectionLost} by {@link #withWrongNodeRetry}
-     * (issue #225): a successful-but-unacknowledged delete must not be
-     * replayed only to be reported as a mismatch/missing key, so the
-     * primary leg below already owns the only safe retry, via {@link
-     * #applyReconnectingNonIdempotent}. */
+    /**
+     * deleteIfMatches's write driver (issue #141) — as {@link #casPrimaryThenReplicate}, but for
+     * {@code x}/{@code remove(key, old)}: a success's replica leg is an ordinary (unconditional)
+     * delete, since the primary's own successful digest match already proved the key existed. As
+     * {@link #casPrimaryThenReplicate}, not retried on {@code ConnectionLost} by {@link
+     * #withWrongNodeRetry} (issue #225): a successful-but-unacknowledged delete must not be
+     * replayed only to be reported as a mismatch/missing key, so the primary leg below already owns
+     * the only safe retry, via {@link #applyReconnectingNonIdempotent}.
+     */
     private boolean casDeletePrimaryThenReplicate(byte[] namespace, byte[] key, String cond) {
         if (ring == null) {
             return applyReconnectingNonIdempotent(
@@ -6123,43 +6160,43 @@ public final class NanocachedClient implements AutoCloseable {
         return true;
     }
 
-    /** Unwraps a replica leg's {@link CompletionException} (from {@link
-     * CompletableFuture#join}) down to the raw bug that caused it — a
-     * {@code Runnable} run via {@link CompletableFuture#runAsync} can
-     * only ever throw unchecked, and replicaWrite's own catch already
-     * narrows to {@code NanocachedException}, so whatever reaches here is
-     * a genuine programming bug. Every exception escaping this SDK's
-     * public API must extend {@link NanocachedException} or be the raw
-     * bug itself — never a {@link CompletionException} (audit
+    /**
+     * Unwraps a replica leg's {@link CompletionException} (from {@link CompletableFuture#join})
+     * down to the raw bug that caused it — a {@code Runnable} run via {@link
+     * CompletableFuture#runAsync} can only ever throw unchecked, and replicaWrite's own catch
+     * already narrows to {@code NanocachedException}, so whatever reaches here is a genuine
+     * programming bug. Every exception escaping this SDK's public API must extend {@link
+     * NanocachedException} or be the raw bug itself — never a {@link CompletionException} (audit
      * finding, see {@link #write}).
      *
-     * <p>An {@link Error} cause (an {@code OutOfMemoryError}, a {@code
-     * LinkageError}, an {@code AssertionError} under {@code -ea}) is
-     * returned as itself too, exactly as {@link #readHedged} rethrows one
-     * (issue #1150); {@link #asRuntimeOrThrowError} is what turns it back
-     * into a throw (issue #1215). */
+     * <p>An {@link Error} cause (an {@code OutOfMemoryError}, a {@code LinkageError}, an {@code
+     * AssertionError} under {@code -ea}) is returned as itself too, exactly as {@link #readHedged}
+     * rethrows one (issue #1150); {@link #asRuntimeOrThrowError} is what turns it back into a throw
+     * (issue #1215).
+     */
     private static Throwable unwrapReplicaBug(CompletionException wrapped) {
         Throwable cause = wrapped.getCause();
         return cause instanceof RuntimeException || cause instanceof Error ? cause : wrapped;
     }
 
-    /** The bug {@link #unwrapReplicaBug} returned, as the unchecked value
-     * callers hand back to their own caller: an {@link Error} is thrown
-     * right here instead (so it reaches the caller as itself, never wrapped
-     * in a {@link CompletionException}), {@code null} stays {@code null}. */
+    /**
+     * The bug {@link #unwrapReplicaBug} returned, as the unchecked value callers hand back to their
+     * own caller: an {@link Error} is thrown right here instead (so it reaches the caller as
+     * itself, never wrapped in a {@link CompletionException}), {@code null} stays {@code null}.
+     */
     private static RuntimeException asRuntimeOrThrowError(Throwable bug) {
         if (bug instanceof Error error) throw error;
         return (RuntimeException) bug;
     }
 
-    /** Submits {@code replicaWrite} to {@link #replicaWriters}, falling
-     * back to running it inline on this thread if the pool was
-     * concurrently shut down by {@link #close()} — the synchronous-fallback
-     * counterpart of the fire-and-forget path's own
-     * {@code RejectedExecutionException} handling in {@link #write}, so a
-     * write racing close() never throws a raw
-     * {@link RejectedExecutionException} out to the caller (audit
-     * finding, background-write permit leak on close race). */
+    /**
+     * Submits {@code replicaWrite} to {@link #replicaWriters}, falling back to running it inline on
+     * this thread if the pool was concurrently shut down by {@link #close()} — the
+     * synchronous-fallback counterpart of the fire-and-forget path's own {@code
+     * RejectedExecutionException} handling in {@link #write}, so a write racing close() never
+     * throws a raw {@link RejectedExecutionException} out to the caller (audit finding,
+     * background-write permit leak on close race).
+     */
     private CompletableFuture<Void> submitReplicaWrite(Runnable replicaWrite) {
         try {
             return CompletableFuture.runAsync(replicaWrite, replicaWriters);
@@ -6171,21 +6208,19 @@ public final class NanocachedClient implements AutoCloseable {
 
     // ── CLEAR namespace / flush everything (issue #106) ─────────────
 
-    /** Fans a clear out to every node — {@code namespace == null} means
-     * {@code F} ({@link #clearAll()}), otherwise {@code c <namespace>}
-     * ({@link #clear(byte[])}) — shared by both. Single mode sends
-     * straight to the one connection, exactly like {@link #write}'s own
-     * {@code ring == null} branch (no discovery to refresh from, so a
-     * failure here is only ever {@link #applyReconnecting}'s one redial).
-     * Cluster mode sends to every node concurrently (client-side
-     * replication's own {@link #replicaWriters} pool — a clear is exactly
-     * the kind of per-node fan-out that pool already exists for), then —
-     * unlike a replica leg's failure, silently tolerated there — retries
-     * once against a freshly refreshed node list on any failure, exactly
-     * as {@link #withWrongNodeRetry} does for a {@code W}/dead-primary
-     * get/set/delete; a node still failing after that retry fails this
-     * call, naming it, so a clear can never silently report success while
-     * one node's data survives. */
+    /**
+     * Fans a clear out to every node — {@code namespace == null} means {@code F} ({@link
+     * #clearAll()}), otherwise {@code c <namespace>} ({@link #clear(byte[])}) — shared by both.
+     * Single mode sends straight to the one connection, exactly like {@link #write}'s own {@code
+     * ring == null} branch (no discovery to refresh from, so a failure here is only ever {@link
+     * #applyReconnecting}'s one redial). Cluster mode sends to every node concurrently (client-side
+     * replication's own {@link #replicaWriters} pool — a clear is exactly the kind of per-node
+     * fan-out that pool already exists for), then — unlike a replica leg's failure, silently
+     * tolerated there — retries once against a freshly refreshed node list on any failure, exactly
+     * as {@link #withWrongNodeRetry} does for a {@code W}/dead-primary get/set/delete; a node still
+     * failing after that retry fails this call, naming it, so a clear can never silently report
+     * success while one node's data survives.
+     */
     private void fanOutClear(byte[] namespace) {
         if (ring == null) {
             applyReconnecting(this::singleConnection, connection -> {
@@ -6201,8 +6236,7 @@ public final class NanocachedClient implements AutoCloseable {
         maybeRefresh(true);
         failed = clearFanOutOnce(allMemberNames(), namespace);
         if (!failed.isEmpty()) {
-            throw new NanocachedException(
-                    "nanocached: clear failed on node(s): " + String.join(", ", failed));
+            throw new NanocachedException("nanocached: clear failed on node(s): " + String.join(", ", failed));
         }
     }
 
@@ -6211,26 +6245,26 @@ public final class NanocachedClient implements AutoCloseable {
         else connection.clear(namespace);
     }
 
-    /** Every member name in this client's current node list, snapshotted
-     * under {@link #stateLock} (mirrors {@link #refreshNodeList}'s own
-     * {@code new ArrayList<>(members.keySet())}) — {@link #fanOutClear}'s
-     * fan-out target. Distinct from {@link #ownerNames}, which ranks only
-     * a key's few owners by HRW: a clear touches every node regardless of
-     * what it currently owns. */
+    /**
+     * Every member name in this client's current node list, snapshotted under {@link #stateLock}
+     * (mirrors {@link #refreshNodeList}'s own {@code new ArrayList<>(members.keySet())}) — {@link
+     * #fanOutClear}'s fan-out target. Distinct from {@link #ownerNames}, which ranks only a key's
+     * few owners by HRW: a clear touches every node regardless of what it currently owns.
+     */
     private List<String> allMemberNames() {
         synchronized (stateLock) {
             return new ArrayList<>(members.keySet());
         }
     }
 
-    /** Sends one clear pass concurrently to every name in {@code names},
-     * on {@link #replicaWriters}, returning the names that failed rather
-     * than throwing — {@link #fanOutClear} decides whether that's grounds
-     * for a refresh-and-retry or a final error. A connection-level
-     * failure counts as a failure here; a genuine programming bug is not
-     * caught, and the first one propagates once every leg has been
-     * joined ({@link #drainLegsKeepingFirstBug}), mirroring {@link
-     * #write}'s replicaBug handling via {@link #unwrapReplicaBug}. */
+    /**
+     * Sends one clear pass concurrently to every name in {@code names}, on {@link #replicaWriters},
+     * returning the names that failed rather than throwing — {@link #fanOutClear} decides whether
+     * that's grounds for a refresh-and-retry or a final error. A connection-level failure counts as
+     * a failure here; a genuine programming bug is not caught, and the first one propagates once
+     * every leg has been joined ({@link #drainLegsKeepingFirstBug}), mirroring {@link #write}'s
+     * replicaBug handling via {@link #unwrapReplicaBug}.
+     */
     private Set<String> clearFanOutOnce(List<String> names, byte[] namespace) {
         Set<String> failed = ConcurrentHashMap.newKeySet();
         List<CompletableFuture<Void>> futures = new ArrayList<>(names.size());
@@ -6290,18 +6324,15 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * SDK proxy mode reconnect (issue #122). Called with the single-mode
-     * redial lock already held, exactly like {@link #dialWithCooldown}'s
-     * other callers. First retries {@link #singleAddress} — the same
-     * proxy, which may simply have restarted — through {@link
-     * #dialWithCooldown} itself, so a proxy that just failed stays
-     * "down" for the usual cooldown window instead of being redialed on
-     * every call. Only once that fails does this re-fetch the roster
-     * ({@code Q}) from discovery and, in random order, dial the rest of
-     * it through {@link #dialWithCooldown} too — reusing the exact same
-     * per-address cooldown bookkeeping {@link #connectToOneProxy}'s
-     * initial pick and every ordinary node redial already use, rather
-     * than a second reconnect machine built for this mode.
+     * SDK proxy mode reconnect (issue #122). Called with the single-mode redial lock already held,
+     * exactly like {@link #dialWithCooldown}'s other callers. First retries {@link #singleAddress}
+     * — the same proxy, which may simply have restarted — through {@link #dialWithCooldown} itself,
+     * so a proxy that just failed stays "down" for the usual cooldown window instead of being
+     * redialed on every call. Only once that fails does this re-fetch the roster ({@code Q}) from
+     * discovery and, in random order, dial the rest of it through {@link #dialWithCooldown} too —
+     * reusing the exact same per-address cooldown bookkeeping {@link #connectToOneProxy}'s initial
+     * pick and every ordinary node redial already use, rather than a second reconnect machine built
+     * for this mode.
      */
     private Connection reconnectProxy() {
         String previousAddress = singleAddress;
@@ -6360,16 +6391,13 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * SDK proxy mode (issue #122): re-fetches the proxy roster by walking
-     * {@link #addresses} exactly like {@link #fetchNodeList} walks them
-     * for a cluster-mode node-list refresh — same per-address tolerance
-     * for a busy/unreachable discovery seed, counted the same way via
-     * {@link #refreshFailures} (this is a reconnect, so — like that
-     * method — it must never throw past its caller). {@code null} means
-     * every address failed outright; a caller must still treat a
-     * successfully-fetched but empty roster ({@code proxies.isEmpty()})
-     * as "nothing to fail over to" itself, since that's a legitimate —
-     * if inconvenient — answer, not a fetch failure.
+     * SDK proxy mode (issue #122): re-fetches the proxy roster by walking {@link #addresses}
+     * exactly like {@link #fetchNodeList} walks them for a cluster-mode node-list refresh — same
+     * per-address tolerance for a busy/unreachable discovery seed, counted the same way via {@link
+     * #refreshFailures} (this is a reconnect, so — like that method — it must never throw past its
+     * caller). {@code null} means every address failed outright; a caller must still treat a
+     * successfully-fetched but empty roster ({@code proxies.isEmpty()}) as "nothing to fail over
+     * to" itself, since that's a legitimate — if inconvenient — answer, not a fetch failure.
      */
     private List<DiscoveredNode> fetchProxyRoster() {
         for (Address address : addresses) {
@@ -6402,13 +6430,14 @@ public final class NanocachedClient implements AutoCloseable {
         return null;
     }
 
-    /** Redials {@code address}, honoring the per-address reconnect
-     * cooldown (see {@link #reconnectCooldowns}): an address whose dial
-     * just failed stays "down" for {@code reconnectCooldownNanos}, so a
-     * burst of calls routed to it — or one call every keep-alive tick —
-     * fails immediately with the same error the dial itself produced,
-     * instead of each paying another full connect timeout in turn.
-     * Callers must hold the redial lock for the relevant slot. */
+    /**
+     * Redials {@code address}, honoring the per-address reconnect cooldown (see {@link
+     * #reconnectCooldowns}): an address whose dial just failed stays "down" for {@code
+     * reconnectCooldownNanos}, so a burst of calls routed to it — or one call every keep-alive tick
+     * — fails immediately with the same error the dial itself produced, instead of each paying
+     * another full connect timeout in turn. Callers must hold the redial lock for the relevant
+     * slot.
+     */
     private Connection dialWithCooldown(String address) {
         CooldownEntry cooldown = reconnectCooldowns.get(address);
         if (cooldown != null && System.nanoTime() < cooldown.untilNanos) {
@@ -6425,14 +6454,14 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** Arms {@code address}'s reconnect cooldown with {@code error}: a
-     * call routed to it during {@link #reconnectCooldownNanos} fails
-     * immediately with this same error instead of paying another full
-     * connect timeout. Shared by {@link #dialWithCooldown}'s own failed
-     * redial and, for issue #67, {@link #openCluster} installing a member
-     * whose bootstrap dial failed — the same mechanism either way, so a
-     * node discovery still lists but that couldn't be reached is treated
-     * identically whether it died before or after this client bootstrapped. */
+    /**
+     * Arms {@code address}'s reconnect cooldown with {@code error}: a call routed to it during
+     * {@link #reconnectCooldownNanos} fails immediately with this same error instead of paying
+     * another full connect timeout. Shared by {@link #dialWithCooldown}'s own failed redial and,
+     * for issue #67, {@link #openCluster} installing a member whose bootstrap dial failed — the
+     * same mechanism either way, so a node discovery still lists but that couldn't be reached is
+     * treated identically whether it died before or after this client bootstrapped.
+     */
     private void armReconnectCooldown(String address, RuntimeException error) {
         // disableReconnectCooldown() (Options): never record a cooldown
         // entry at all, so every dial to this address keeps paying its
@@ -6447,8 +6476,9 @@ public final class NanocachedClient implements AutoCloseable {
             // node-list refresh, neither of which proxy mode ever does. This
             // keeps the map bounded by the addresses that failed within the
             // last reconnectCooldown, whichever code path dials.
-            reconnectCooldowns.entrySet().removeIf(
-                    entry -> !entry.getKey().equals(address) && now >= entry.getValue().untilNanos);
+            reconnectCooldowns
+                    .entrySet()
+                    .removeIf(entry -> !entry.getKey().equals(address) && now >= entry.getValue().untilNanos);
             reconnectCooldowns.put(address, new CooldownEntry(now + reconnectCooldownNanos, error));
         }
     }
@@ -6462,8 +6492,7 @@ public final class NanocachedClient implements AutoCloseable {
             // Connection-classified (issue #8): the usual cause is a
             // refresh racing this operation, which the refresh-and-retry
             // layer heals.
-            throw new NanocachedException.ConnectionLost(
-                    "nanocached: " + name + " has no open connection", null);
+            throw new NanocachedException.ConnectionLost("nanocached: " + name + " has no open connection", null);
         }
         // member.connection is null for a member listed by discovery but
         // unreachable when this client bootstrapped (issue #67) — treated
@@ -6521,27 +6550,27 @@ public final class NanocachedClient implements AutoCloseable {
         }
     }
 
-    /** {@code null} on anything {@link Connection#parseNonNegativeInt}
-     * would reject — every SDK exception must extend {@link
-     * NanocachedException}, so a raw {@link NumberFormatException} must
-     * never escape a discovery response's port field, and (issue #462) a
-     * leading {@code '+'} — which {@link Integer#parseInt} alone would
-     * silently accept — must be rejected too. Out-of-range ports are
-     * rejected here too: {@code new InetSocketAddress(host, port)} in
-     * {@code Identify.open} throws a raw {@link IllegalArgumentException}
-     * outside 0-65535, which the get/set/delete reconnect path does not
-     * catch. Mirrors .NET's {@code int.TryParse} handling at the same
-     * spot (Identify.SplitHostPort). */
+    /**
+     * {@code null} on anything {@link Connection#parseNonNegativeInt} would reject — every SDK
+     * exception must extend {@link NanocachedException}, so a raw {@link NumberFormatException}
+     * must never escape a discovery response's port field, and (issue #462) a leading {@code '+'} —
+     * which {@link Integer#parseInt} alone would silently accept — must be rejected too.
+     * Out-of-range ports are rejected here too: {@code new InetSocketAddress(host, port)} in {@code
+     * Identify.open} throws a raw {@link IllegalArgumentException} outside 0-65535, which the
+     * get/set/delete reconnect path does not catch. Mirrors .NET's {@code int.TryParse} handling at
+     * the same spot (Identify.SplitHostPort).
+     */
     private static Integer parsePort(String text) {
         int port = Connection.parseNonNegativeInt(text);
         return port < 0 || port > 65535 ? null : port;
     }
 
-    /** The failure of a dial to a ring member that answered the {@code A}
-     * handshake with something that is not a handshake reply (issue #1671):
-     * a connection failure that never sent a request, handled as for a dead
-     * node -- a forced refresh and a reroute -- rather than the plain
-     * exception the handshake itself raises. */
+    /**
+     * The failure of a dial to a ring member that answered the {@code A} handshake with something
+     * that is not a handshake reply (issue #1671): a connection failure that never sent a request,
+     * handled as for a dead node -- a forced refresh and a reroute -- rather than the plain
+     * exception the handshake itself raises.
+     */
     private static NanocachedException.ConnectionLost handshakeNotSent(String address) {
         return new NanocachedException.ConnectionLost(
                 "nanocached: unexpected response to A from " + address, null, true);
@@ -6580,21 +6609,19 @@ public final class NanocachedClient implements AutoCloseable {
         return newTrackedConnection(node.socket(), node.tagged());
     }
 
-    /** Wraps {@code socket} in a {@link Connection}, incrementing this
-     * client's open-sockets count under {@link #targetKey} and arranging
-     * for it to be decremented the moment that connection closes for any
-     * reason — self-poisoning on a protocol error, a refresh dropping the
-     * node, a lazy redial discarding it, or {@link #close()}.
+    /**
+     * Wraps {@code socket} in a {@link Connection}, incrementing this client's open-sockets count
+     * under {@link #targetKey} and arranging for it to be decremented the moment that connection
+     * closes for any reason — self-poisoning on a protocol error, a refresh dropping the node, a
+     * lazy redial discarding it, or {@link #close()}.
      *
-     * <p>{@link Connection}'s constructor calls {@code socket
-     * .getInputStream()}/{@code getOutputStream()}, which can throw
-     * {@link IOException} (e.g. the socket died between accept and here).
-     * If that happens after {@link #trackOpenTarget} already ran, both the
-     * open-target counter and the socket itself would otherwise leak —
-     * nothing else ever closes a socket whose {@code Connection} never got
-     * built. On that failure, undo the tracking and close the socket
-     * (suppressing a close error — the constructor's is the interesting
-     * one) before rethrowing. */
+     * <p>{@link Connection}'s constructor calls {@code socket .getInputStream()}/{@code
+     * getOutputStream()}, which can throw {@link IOException} (e.g. the socket died between accept
+     * and here). If that happens after {@link #trackOpenTarget} already ran, both the open-target
+     * counter and the socket itself would otherwise leak — nothing else ever closes a socket whose
+     * {@code Connection} never got built. On that failure, undo the tracking and close the socket
+     * (suppressing a close error — the constructor's is the interesting one) before rethrowing.
+     */
     private Connection newTrackedConnection(Socket socket, boolean tagged) throws IOException {
         trackOpenTarget(targetKey);
         try {
@@ -6800,11 +6827,9 @@ public final class NanocachedClient implements AutoCloseable {
             ring = new HashRing(new ArrayList<>(members.keySet()));
             replication = cluster.replication();
         }
-
     }
 
-    /** Walks every address (discovery HA); {@code null} means keep the
-     * last-known list. */
+    /** Walks every address (discovery HA); {@code null} means keep the last-known list. */
     private Identify.ClusterTarget fetchNodeList() {
         for (Address address : addresses) {
             Identify.Result identified;
@@ -6860,44 +6885,48 @@ public final class NanocachedClient implements AutoCloseable {
             return thread;
         });
         Set<Connection> pingsInFlight = ConcurrentHashMap.newKeySet();
-        keepAlive.scheduleAtFixedRate(() -> {
-            List<Connection> connections = new ArrayList<>();
-            synchronized (stateLock) {
-                if (single != null) connections.add(single);
-                for (Member member : members.values()) {
-                    // null for a member never reached (issue #67) — stays
-                    // lazy, exactly like a closed connection, until a
-                    // foreground request redials it.
-                    if (member.connection != null) connections.add(member.connection);
-                }
-            }
-            for (Connection connection : connections) {
-                if (connection.isClosed()) continue; // dead ones stay lazy
-                // Issue #1894: skip only a connection used within the last
-                // half interval. Skipping every one idle for less than a
-                // full interval left a connection used just after a tick
-                // unpinged until almost two intervals — the server's 60s
-                // idle limit — so any tick drift let the server close it.
-                if (connection.idleNanos() < interval.toNanos() / 2) continue;
-                if (!pingsInFlight.add(connection)) continue;
-                try {
-                    keepAlive.execute(() -> {
-                        try {
-                            // Any parseable reply proves liveness — N, or W from a
-                            // non-owner — and resets the server's idle timer.
-                            connection.get(KEEPALIVE_KEY);
-                        } catch (RuntimeException ignored) {
-                            // Keep-alive failures never surface; use redials lazily.
-                        } finally {
-                            pingsInFlight.remove(connection);
+        keepAlive.scheduleAtFixedRate(
+                () -> {
+                    List<Connection> connections = new ArrayList<>();
+                    synchronized (stateLock) {
+                        if (single != null) connections.add(single);
+                        for (Member member : members.values()) {
+                            // null for a member never reached (issue #67) — stays
+                            // lazy, exactly like a closed connection, until a
+                            // foreground request redials it.
+                            if (member.connection != null) connections.add(member.connection);
                         }
-                    });
-                } catch (RejectedExecutionException shutDown) {
-                    // close() is tearing the pool down; nothing left to ping for.
-                    pingsInFlight.remove(connection);
-                    return;
-                }
-            }
-        }, interval.toNanos(), interval.toNanos(), TimeUnit.NANOSECONDS);
+                    }
+                    for (Connection connection : connections) {
+                        if (connection.isClosed()) continue; // dead ones stay lazy
+                        // Issue #1894: skip only a connection used within the last
+                        // half interval. Skipping every one idle for less than a
+                        // full interval left a connection used just after a tick
+                        // unpinged until almost two intervals — the server's 60s
+                        // idle limit — so any tick drift let the server close it.
+                        if (connection.idleNanos() < interval.toNanos() / 2) continue;
+                        if (!pingsInFlight.add(connection)) continue;
+                        try {
+                            keepAlive.execute(() -> {
+                                try {
+                                    // Any parseable reply proves liveness — N, or W from a
+                                    // non-owner — and resets the server's idle timer.
+                                    connection.get(KEEPALIVE_KEY);
+                                } catch (RuntimeException ignored) {
+                                    // Keep-alive failures never surface; use redials lazily.
+                                } finally {
+                                    pingsInFlight.remove(connection);
+                                }
+                            });
+                        } catch (RejectedExecutionException shutDown) {
+                            // close() is tearing the pool down; nothing left to ping for.
+                            pingsInFlight.remove(connection);
+                            return;
+                        }
+                    }
+                },
+                interval.toNanos(),
+                interval.toNanos(),
+                TimeUnit.NANOSECONDS);
     }
 }

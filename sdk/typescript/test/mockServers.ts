@@ -1160,7 +1160,12 @@ export async function startMockNode(
                 tokens = tokens.concat(new Array(wanted - tokens.length).fill(get ? "-" : "N"));
               }
             }
-            reply(Buffer.concat([Buffer.from(`${get ? "M" : "Y"} ${tokens.length}${tokens.map((t) => ` ${t}`).join("")}${tag}\n`), ...hits]));
+            reply(
+              Buffer.concat([
+                Buffer.from(`${get ? "M" : "Y"} ${tokens.length}${tokens.map((t) => ` ${t}`).join("")}${tag}\n`),
+                ...hits,
+              ]),
+            );
             break;
           }
 
@@ -1179,14 +1184,9 @@ export async function startMockNode(
             const cond = parts[4];
             if (buffer.length < bodyStart + namespaceLength + keyLength + valueLength) return;
             const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
-            const key = buffer
-              .subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength)
-              .toString("utf8");
+            const key = buffer.subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength).toString("utf8");
             const value = Buffer.from(
-              buffer.subarray(
-                bodyStart + namespaceLength + keyLength,
-                bodyStart + namespaceLength + keyLength + valueLength,
-              ),
+              buffer.subarray(bodyStart + namespaceLength + keyLength, bodyStart + namespaceLength + keyLength + valueLength),
             );
             buffer = buffer.subarray(bodyStart + namespaceLength + keyLength + valueLength);
             // The TTL, when present, is the field after `<cond>`; on a
@@ -1213,7 +1213,11 @@ export async function startMockNode(
             const targetStore = storeFor(namespace);
             const existing = targetStore.get(key);
             const conditionHolds =
-              cond === "A" ? existing === undefined : cond === "P" ? existing !== undefined : existing !== undefined && digestOf(existing) === cond;
+              cond === "A"
+                ? existing === undefined
+                : cond === "P"
+                  ? existing !== undefined
+                  : existing !== undefined && digestOf(existing) === cond;
 
             if (!conditionHolds) {
               socket.write(`N${tag}\n`);
@@ -1247,9 +1251,7 @@ export async function startMockNode(
             const cond = parts[3];
             if (buffer.length < bodyStart + namespaceLength + keyLength) return;
             const namespace = Buffer.from(buffer.subarray(bodyStart, bodyStart + namespaceLength));
-            const key = buffer
-              .subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength)
-              .toString("utf8");
+            const key = buffer.subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength).toString("utf8");
             buffer = buffer.subarray(bodyStart + namespaceLength + keyLength);
             casDeleteRequests++;
 
@@ -1358,7 +1360,8 @@ export async function startMockNode(
     port,
     address: `127.0.0.1:${port}`,
     store,
-    namespacedStore: (namespace) => storeFor(typeof namespace === "string" ? Buffer.from(namespace, "utf8") : Buffer.from(namespace)),
+    namespacedStore: (namespace) =>
+      storeFor(typeof namespace === "string" ? Buffer.from(namespace, "utf8") : Buffer.from(namespace)),
     answerWrongNodeOnce: () => {
       wrongNodeReplies++;
     },

@@ -36,10 +36,10 @@ async function writeInChunks(socket: Socket, payload: Buffer, chunkSize: number)
 /** Counts every byte handed to `Buffer.concat` from now on. */
 function countConcatBytes(): { bytes: () => number } {
   let total = 0;
-  const original = Buffer.concat;
+  const original = Buffer.concat.bind(Buffer);
   mock.method(Buffer, "concat", (list: readonly Uint8Array[], totalLength?: number) => {
     total += totalLength ?? list.reduce((sum, b) => sum + b.length, 0);
-    return original.call(Buffer, list, totalLength);
+    return original(list, totalLength);
   });
   return { bytes: () => total };
 }
@@ -147,7 +147,10 @@ describe("identify reads a large roster in one pass", () => {
     assert.equal(result.kind, "cluster");
     if (result.kind !== "cluster") return;
     assert.deepEqual(result.proxies, nodes);
-    assert.ok(counter.bytes() <= 2 * proxyWire.length, `${counter.bytes()} bytes concatenated for a ${proxyWire.length}-byte roster`);
+    assert.ok(
+      counter.bytes() <= 2 * proxyWire.length,
+      `${counter.bytes()} bytes concatenated for a ${proxyWire.length}-byte roster`,
+    );
   });
 
   for (const chunkSize of [1, 3, 17, 100]) {

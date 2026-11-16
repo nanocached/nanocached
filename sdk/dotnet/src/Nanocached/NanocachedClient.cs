@@ -2426,7 +2426,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// <summary>Validation shared by the batched touches: the TTL, at
     /// least one key, every key's size — all before any I/O — and the
     /// batch's distinct keys (first occurrence wins), with their bytes.</summary>
-    private (List<string> Distinct, byte[][] KeyBytes) PrepareTouchBatch(
+    private static (List<string> Distinct, byte[][] KeyBytes) PrepareTouchBatch(
         byte[] namespaceBytes, IReadOnlyList<string> keys, long? ttlSeconds)
     {
         ValidateTouchTtl(ttlSeconds);
@@ -3425,7 +3425,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<long?> DecrAsync(string key, long delta, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<long?>(cancellationToken)
-        : Cancellation.Abandonable(IncrAsync(key, NegateDecrDelta(delta)), cancellationToken);
+        : Cancellation.Abandonable(IncrAsync(key, NegateDecrDelta(delta), CancellationToken.None), cancellationToken);
 
     /// <summary>issue #129: <see cref="IncrAsync(byte[], long, CancellationToken)"/> with
     /// <paramref name="delta"/> negated — never a different wire op;
@@ -3438,7 +3438,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     public Task<long?> DecrAsync(byte[] key, long delta, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<long?>(cancellationToken)
-        : Cancellation.Abandonable(IncrAsync(Cancellation.Own(key, cancellationToken), NegateDecrDelta(delta)), cancellationToken);
+        : Cancellation.Abandonable(IncrAsync(Cancellation.Own(key, cancellationToken), NegateDecrDelta(delta), CancellationToken.None), cancellationToken);
 
     internal Task<long?> DecrAsync(byte[] namespaceBytes, string key, long delta) =>
         IncrAsync(namespaceBytes, key, NegateDecrDelta(delta));
@@ -4995,7 +4995,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
 
     private async Task<Connection> SlotConnectionAsync(string? slot)
     {
-        (string slotKey, string address, Connection? current) = SnapshotSlot(slot);
+        (string slotKey, _, Connection? current) = SnapshotSlot(slot);
         // current is null for a member that bootstrapped without a
         // connection (issue #67) — treated exactly like an already-closed
         // one below: it just goes straight to dialing.
@@ -5016,6 +5016,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
+            string address;
             (_, address, current) = SnapshotSlot(slot);
             if (current is not null && !current.IsClosed) return current;
 

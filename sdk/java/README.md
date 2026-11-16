@@ -713,9 +713,15 @@ exposes.
 ## Build
 
 ```sh
-gradle test    # unit tests against in-process mock servers
-gradle jar
+./gradlew spotlessApply   # format sources and build scripts (palantir-java-format)
+./gradlew check           # spotlessCheck + compile with javac -Xlint:all -Werror + tests
+./gradlew test            # unit tests against in-process mock servers
+./gradlew jar
 ```
+
+Gradle itself needs JDK 21+ (the build scripts' Eclipse Groovy formatter
+runs in the Gradle JVM); the code compiles for Java 17 via a toolchain,
+which Gradle downloads if it isn't installed.
 
 This SDK speaks the current wire protocol (rendezvous hashing,
 replication-aware `L`/`W`); it requires an up-to-date server. Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise.

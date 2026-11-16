@@ -1,0 +1,66 @@
+{
+  // Kept identical in sdk/typescript, adapters/cache-manager and adapters/keyv:
+  // oxlint only reads the config in the directory it runs from.
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "oxc", "import", "promise", "node"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error"
+  },
+  "options": {
+    // Type-aware rules (oxlint-tsgolint, typescript-go) see test/ through
+    // test/tsconfig.json, which extends tsconfig.test.json.
+    "typeAware": true
+  },
+  "env": {
+    "node": true,
+    "es2022": true
+  },
+  "ignorePatterns": ["dist", "dist-test"],
+  "rules": {
+    // node:test's describe/it return promises the runner itself tracks.
+    "typescript/no-floating-promises": [
+      "error",
+      {
+        "allowForKnownSafeCalls": [
+          {
+            "from": "package",
+            "package": "node:test",
+            "name": ["describe", "it", "test", "suite", "before", "after", "beforeEach", "afterEach"]
+          }
+        ]
+      }
+    ],
+    // `as` is how wire-parsed values and Node API results are narrowed after
+    // validation, and how tests reach private state; tsc strict checks the rest.
+    "typescript/no-unsafe-type-assertion": "off",
+    // Explicit `=== true` / `=== false` is the house style for flags, kept
+    // uniform whether or not the operand can also be undefined.
+    "typescript/no-unnecessary-boolean-literal-compare": "off",
+    // Exhaustive switches over a union return on every path; tsc already
+    // rejects a function that can fall off the end of a non-void return type.
+    "typescript/consistent-return": "off",
+    // `new Array(n)` deliberately preallocates arrays that are filled by index.
+    "unicorn/no-new-array": "off",
+    // Every sort is on a fresh copy; Array#toSorted is not in the ES2022 lib.
+    "unicorn/no-array-sort": "off",
+    // Single-use helpers stay next to their caller.
+    "unicorn/consistent-function-scoping": "off",
+    // `.then()` continuations that only update bookkeeping resolve to void.
+    "promise/always-return": "off",
+    // Side-effect-only import (decorator metadata polyfill for NestJS).
+    "import/no-unassigned-import": ["error", { "allow": ["reflect-metadata"] }],
+    // Decorated empty classes are how NestJS declares modules.
+    "typescript/no-extraneous-class": ["error", { "allowWithDecorator": true }]
+  },
+  "overrides": [
+    {
+      // Tests re-import modules inside test bodies and destructure fixtures
+      // whose names (`mock`, `createServer`) match top-level imports.
+      "files": ["test/**"],
+      "rules": {
+        "eslint/no-shadow": "off"
+      }
+    }
+  ]
+}

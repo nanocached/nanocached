@@ -10,69 +10,73 @@ import org.springframework.boot.context.properties.NestedConfigurationProperty;
 import org.springframework.boot.convert.DurationUnit;
 
 /**
- * Binds the {@code nanocached.*} namespace for {@link
- * NanocachedCacheAutoConfiguration}. Mirrors {@code
- * org.nanocached.NanocachedClient.Options} for the client-level settings,
- * and {@code org.nanocached.spring.NanocachedCacheManager.Builder} for the
- * {@code cache.*} group.
+ * Binds the {@code nanocached.*} namespace for {@link NanocachedCacheAutoConfiguration}. Mirrors
+ * {@code org.nanocached.NanocachedClient.Options} for the client-level settings, and {@code
+ * org.nanocached.spring.NanocachedCacheManager.Builder} for the {@code cache.*} group.
  */
 @ConfigurationProperties("nanocached")
 public class NanocachedProperties {
 
-    /** {@code "host:port"} pairs. Required — the autoconfiguration is
-     * inert (see {@link NanocachedCacheAutoConfiguration}) until this is
-     * set, so a bare dependency changes nothing. */
+    /**
+     * {@code "host:port"} pairs. Required — the autoconfiguration is inert (see {@link
+     * NanocachedCacheAutoConfiguration}) until this is set, so a bare dependency changes nothing.
+     */
     private List<String> addresses;
 
-    /** Shared-secret auth; unset means anonymous auth, same as the SDK
-     * default. */
+    /** Shared-secret auth; unset means anonymous auth, same as the SDK default. */
     private String secret;
 
-    /** Whether connections use TLS. Default {@code false}, same as the
-     * SDK default. */
+    /** Whether connections use TLS. Default {@code false}, same as the SDK default. */
     private boolean tls;
 
-    /** Path to a CA certificate file trusted for TLS; it replaces the platform
-     * trust store rather than adding to it. Requires {@code tls: true}: the
-     * client refuses to connect with a CA and TLS off. */
+    /**
+     * Path to a CA certificate file trusted for TLS; it replaces the platform trust store rather
+     * than adding to it. Requires {@code tls: true}: the client refuses to connect with a CA and
+     * TLS off.
+     */
     private String ca;
 
-    /** Whether values are transparently compressed. Unset defers to the
-     * SDK default ({@code false}). */
+    /**
+     * Whether values are transparently compressed. Unset defers to the SDK default ({@code false}).
+     */
     private Boolean compress;
 
-    /** Minimum value size, in bytes, before compression kicks in. Unset
-     * defers to the SDK default. Only meaningful with {@code compress:
-     * true}. */
+    /**
+     * Minimum value size, in bytes, before compression kicks in. Unset defers to the SDK default.
+     * Only meaningful with {@code compress: true}.
+     */
     private Integer compressionThreshold;
 
-    /** Whether replica writes are dispatched fire-and-forget. Unset defers
-     * to the SDK default ({@code false}). Mirrors {@code
-     * Options.fireAndForgetReplicas}. */
+    /**
+     * Whether replica writes are dispatched fire-and-forget. Unset defers to the SDK default
+     * ({@code false}). Mirrors {@code Options.fireAndForgetReplicas}.
+     */
     private Boolean fireAndForgetReplicas;
 
-    /** Whether a clean miss probes the remaining owners and repairs the
-     * primary in the background (read repair). Unset defers to the SDK
-     * default ({@code false}). Mirrors {@code Options.readRepair}. */
+    /**
+     * Whether a clean miss probes the remaining owners and repairs the primary in the background
+     * (read repair). Unset defers to the SDK default ({@code false}). Mirrors {@code
+     * Options.readRepair}.
+     */
     private Boolean readRepair;
 
-    /** How long an address stays "down" after a failed reconnect dial.
-     * Unset defers to the SDK default (1s). A bare number (no unit
-     * suffix, e.g. {@code 2} rather than {@code 2s}) is seconds. Mirrors
-     * {@code Options.reconnectCooldown}; a zero duration (e.g. {@code
-     * 0s}) disables the cooldown entirely ({@code
-     * Options.disableReconnectCooldown()}) instead of mapping to the SDK
-     * default, since {@code Options.reconnectCooldown(Duration.ZERO)}
-     * itself means "use the default" — see {@link
-     * NanocachedCacheAutoConfiguration}. */
+    /**
+     * How long an address stays "down" after a failed reconnect dial. Unset defers to the SDK
+     * default (1s). A bare number (no unit suffix, e.g. {@code 2} rather than {@code 2s}) is
+     * seconds. Mirrors {@code Options.reconnectCooldown}; a zero duration (e.g. {@code 0s})
+     * disables the cooldown entirely ({@code Options.disableReconnectCooldown()}) instead of
+     * mapping to the SDK default, since {@code Options.reconnectCooldown(Duration.ZERO)} itself
+     * means "use the default" — see {@link NanocachedCacheAutoConfiguration}.
+     */
     @DurationUnit(ChronoUnit.SECONDS)
     private Duration reconnectCooldown;
 
-    /** Send a read to the next owner once the primary has been silent this
-     * long (hedged reads). Unset (the default) is off. A bare number (no
-     * unit suffix, e.g. {@code 50} rather than {@code 50ms}) is
-     * milliseconds, matching the sub-second granularity this setting is
-     * meant to be tuned at. Mirrors {@code Options.readHedgeAfter}. */
+    /**
+     * Send a read to the next owner once the primary has been silent this long (hedged reads).
+     * Unset (the default) is off. A bare number (no unit suffix, e.g. {@code 50} rather than {@code
+     * 50ms}) is milliseconds, matching the sub-second granularity this setting is meant to be tuned
+     * at. Mirrors {@code Options.readHedgeAfter}.
+     */
     @DurationUnit(ChronoUnit.MILLIS)
     private Duration readHedgeAfter;
 
@@ -163,34 +167,37 @@ public class NanocachedProperties {
         return cache;
     }
 
-    /** {@code nanocached.cache.*} — passed straight to {@code
-     * NanocachedCacheManager.Builder}. */
+    /** {@code nanocached.cache.*} — passed straight to {@code NanocachedCacheManager.Builder}. */
     public static class Cache {
 
-        /** TTL for caches without a per-cache override. Default zero =
-         * entries live until evicted or deleted, same as the manager's
-         * own default. A bare number (no unit suffix, e.g. {@code 10}
-         * rather than {@code 10s}) is seconds, matching {@code
-         * NanocachedCache}'s own whole-seconds TTL granularity. */
+        /**
+         * TTL for caches without a per-cache override. Default zero = entries live until evicted or
+         * deleted, same as the manager's own default. A bare number (no unit suffix, e.g. {@code
+         * 10} rather than {@code 10s}) is seconds, matching {@code NanocachedCache}'s own
+         * whole-seconds TTL granularity.
+         */
         @DurationUnit(ChronoUnit.SECONDS)
         private Duration defaultTtl = Duration.ZERO;
 
-        /** Per-cache TTL override, keyed by cache (namespace) name.
-         * <b>Unlike {@link #defaultTtl}</b>, a bare number here is
-         * milliseconds, not seconds — {@code @DurationUnit} does not
-         * apply to {@code Map} value types (Spring Boot's {@code
-         * MapBinder} does not forward the field's converter annotations
-         * to the per-entry {@code Bindable}), so always give an explicit
-         * unit suffix (e.g. {@code sessions: 30s}) for entries here. */
+        /**
+         * Per-cache TTL override, keyed by cache (namespace) name. <b>Unlike {@link
+         * #defaultTtl}</b>, a bare number here is milliseconds, not seconds — {@code @DurationUnit}
+         * does not apply to {@code Map} value types (Spring Boot's {@code MapBinder} does not
+         * forward the field's converter annotations to the per-entry {@code Bindable}), so always
+         * give an explicit unit suffix (e.g. {@code sessions: 30s}) for entries here.
+         */
         private Map<String, Duration> ttl = new LinkedHashMap<>();
 
-        /** Whether {@code null} is a cacheable value. Default {@code
-         * true}, same as the manager's own default. */
+        /**
+         * Whether {@code null} is a cacheable value. Default {@code true}, same as the manager's
+         * own default.
+         */
         private boolean allowNullValues = true;
 
-        /** Restricts the manager to exactly these cache names, created
-         * eagerly. Unset (the default) creates caches on first use.
-         * Aligned with {@code spring.cache.cache-names}. */
+        /**
+         * Restricts the manager to exactly these cache names, created eagerly. Unset (the default)
+         * creates caches on first use. Aligned with {@code spring.cache.cache-names}.
+         */
         private List<String> cacheNames;
 
         public Duration getDefaultTtl() {

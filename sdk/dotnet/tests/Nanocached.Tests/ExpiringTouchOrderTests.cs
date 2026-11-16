@@ -271,7 +271,7 @@ public class ExpiringTouchOrderTests
         // interval between forced refreshes (issue #1583).
         await Task.Delay(NanocachedClient.ForcedRefreshMinInterval + TimeSpan.FromMilliseconds(100));
         cluster.Discovery.SetNodes(new List<(string, string)> { (Names[1], replica.Address) });
-        var hits =await cluster.Client.GetManyAndTouchAsync(keys, 0);
+        var hits = await cluster.Client.GetManyAndTouchAsync(keys, 0);
         Assert.Equal(keys.OrderBy(k => k), hits.Keys.OrderBy(k => k));
         // One frame per pass: the rerouted batch, the survivor being the primary.
         Assert.Single(replica.MultiTouchFrames);

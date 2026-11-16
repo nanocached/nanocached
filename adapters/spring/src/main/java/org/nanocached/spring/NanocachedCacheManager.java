@@ -14,17 +14,14 @@ import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 
 /**
- * Spring {@link CacheManager} on top of a {@link NanocachedClient}
- * (issue #107): each named cache is one nanocached namespace, created on
- * first use — namespaces need no server-side setup, so by default any
- * cache name works ({@code @Cacheable("anything")}); restrict with
- * {@link Builder#cacheNames}. The client is borrowed, not owned: closing
- * it is the caller's job (typically a Spring {@code @Bean(destroyMethod
- * = "close")} on the client itself).
+ * Spring {@link CacheManager} on top of a {@link NanocachedClient} (issue #107): each named cache
+ * is one nanocached namespace, created on first use — namespaces need no server-side setup, so by
+ * default any cache name works ({@code @Cacheable("anything")}); restrict with {@link
+ * Builder#cacheNames}. The client is borrowed, not owned: closing it is the caller's job (typically
+ * a Spring {@code @Bean(destroyMethod = "close")} on the client itself).
  *
- * <p>Policy note: framework adapters like this module are
- * ecosystem-specific and live <em>outside</em> the six-language SDK
- * parity policy (#25) — parity applies to the SDK core only.
+ * <p>Policy note: framework adapters like this module are ecosystem-specific and live
+ * <em>outside</em> the six-language SDK parity policy (#25) — parity applies to the SDK core only.
  */
 public final class NanocachedCacheManager implements CacheManager {
 
@@ -34,9 +31,13 @@ public final class NanocachedCacheManager implements CacheManager {
     private final Duration defaultTtl;
     private final Map<String, Duration> ttlByCache;
     private final boolean allowNullValues;
-    /** Null = dynamic mode (any name); non-null = the closed set of
-     * allowed names, eagerly created so getCacheNames() is complete. */
+
+    /**
+     * Null = dynamic mode (any name); non-null = the closed set of allowed names, eagerly created
+     * so getCacheNames() is complete.
+     */
     private final Set<String> fixedCacheNames;
+
     private final ConcurrentHashMap<String, NanocachedCache> caches = new ConcurrentHashMap<>();
 
     private NanocachedCacheManager(Builder builder) {
@@ -46,10 +47,9 @@ public final class NanocachedCacheManager implements CacheManager {
         this.defaultTtl = builder.defaultTtl;
         this.ttlByCache = Map.copyOf(builder.ttlByCache);
         this.allowNullValues = builder.allowNullValues;
-        this.fixedCacheNames =
-                builder.fixedCacheNames == null
-                        ? null
-                        : Collections.unmodifiableSet(new LinkedHashSet<>(builder.fixedCacheNames));
+        this.fixedCacheNames = builder.fixedCacheNames == null
+                ? null
+                : Collections.unmodifiableSet(new LinkedHashSet<>(builder.fixedCacheNames));
         if (fixedCacheNames != null) {
             fixedCacheNames.forEach(name -> caches.put(name, createCache(name)));
         }
@@ -72,9 +72,7 @@ public final class NanocachedCacheManager implements CacheManager {
 
     @Override
     public Collection<String> getCacheNames() {
-        return fixedCacheNames != null
-                ? fixedCacheNames
-                : Collections.unmodifiableSet(caches.keySet());
+        return fixedCacheNames != null ? fixedCacheNames : Collections.unmodifiableSet(caches.keySet());
     }
 
     private NanocachedCache createCache(String name) {
@@ -101,36 +99,37 @@ public final class NanocachedCacheManager implements CacheManager {
             this.client = Objects.requireNonNull(client, "client");
         }
 
-        /** How the cached values become bytes; default JDK serialization
-         * ({@link JdkCacheValueSerializer}). */
+        /**
+         * How the cached values become bytes; default JDK serialization ({@link
+         * JdkCacheValueSerializer}).
+         */
         public Builder serializer(CacheValueSerializer serializer) {
             this.serializer = Objects.requireNonNull(serializer, "serializer");
             return this;
         }
 
-        /** The class loader the default {@link JdkCacheValueSerializer}
-         * resolves cached values' classes with — the application's
-         * context loader when the adapter lives in a parent loader (a
-         * Spring Boot devtools restart, a shared server library
-         * directory); the Boot starter sets it. Ignored when a custom
-         * {@link #serializer} is configured, which resolves classes its
-         * own way. Without it the serializer uses each reading thread's
-         * context class loader. */
+        /**
+         * The class loader the default {@link JdkCacheValueSerializer} resolves cached values'
+         * classes with — the application's context loader when the adapter lives in a parent loader
+         * (a Spring Boot devtools restart, a shared server library directory); the Boot starter
+         * sets it. Ignored when a custom {@link #serializer} is configured, which resolves classes
+         * its own way. Without it the serializer uses each reading thread's context class loader.
+         */
         public Builder classLoader(ClassLoader classLoader) {
             this.classLoader = Objects.requireNonNull(classLoader, "classLoader");
             return this;
         }
 
-        /** How the cache keys become bytes; default
-         * {@link DefaultCacheKeyConverter}. */
+        /** How the cache keys become bytes; default {@link DefaultCacheKeyConverter}. */
         public Builder keyConverter(CacheKeyConverter keyConverter) {
             this.keyConverter = Objects.requireNonNull(keyConverter, "keyConverter");
             return this;
         }
 
-        /** TTL for caches without a per-cache override;
-         * {@link Duration#ZERO} (the default) = entries live until
-         * evicted or deleted. */
+        /**
+         * TTL for caches without a per-cache override; {@link Duration#ZERO} (the default) =
+         * entries live until evicted or deleted.
+         */
         public Builder defaultTtl(Duration ttl) {
             this.defaultTtl = requireNonNegative(ttl);
             return this;
@@ -138,22 +137,23 @@ public final class NanocachedCacheManager implements CacheManager {
 
         /** Per-cache TTL override. */
         public Builder ttl(String cacheName, Duration ttl) {
-            this.ttlByCache.put(
-                    Objects.requireNonNull(cacheName, "cacheName"), requireNonNegative(ttl));
+            this.ttlByCache.put(Objects.requireNonNull(cacheName, "cacheName"), requireNonNegative(ttl));
             return this;
         }
 
-        /** Whether {@code null} is a cacheable value (stored as Spring's
-         * {@code NullValue} marker). Default true, matching Spring's
-         * other cache implementations. */
+        /**
+         * Whether {@code null} is a cacheable value (stored as Spring's {@code NullValue} marker).
+         * Default true, matching Spring's other cache implementations.
+         */
         public Builder allowNullValues(boolean allowNullValues) {
             this.allowNullValues = allowNullValues;
             return this;
         }
 
-        /** Restricts the manager to exactly these cache names (created
-         * eagerly); {@link #getCache} answers {@code null} for any other
-         * name. Without this, caches are created on first use. */
+        /**
+         * Restricts the manager to exactly these cache names (created eagerly); {@link #getCache}
+         * answers {@code null} for any other name. Without this, caches are created on first use.
+         */
         public Builder cacheNames(Collection<String> names) {
             this.fixedCacheNames = new LinkedHashSet<>(Objects.requireNonNull(names, "names"));
             return this;
@@ -161,7 +161,8 @@ public final class NanocachedCacheManager implements CacheManager {
 
         public NanocachedCacheManager build() {
             if (serializer == null) {
-                serializer = classLoader == null ? new JdkCacheValueSerializer() : new JdkCacheValueSerializer(classLoader);
+                serializer =
+                        classLoader == null ? new JdkCacheValueSerializer() : new JdkCacheValueSerializer(classLoader);
             }
             return new NanocachedCacheManager(this);
         }

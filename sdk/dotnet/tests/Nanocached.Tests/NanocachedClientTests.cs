@@ -2132,7 +2132,7 @@ public class NanocachedClientTests
 
         int totalStored = cluster.Nodes.Values.Sum(node => node.Store.Count);
         Assert.Equal(20, totalStored);
-        Assert.All(cluster.Nodes.Values, node => Assert.True(node.Store.Count > 0));
+        Assert.All(cluster.Nodes.Values, node => Assert.False(node.Store.IsEmpty));
     }
 
     [Fact]
@@ -2893,7 +2893,7 @@ public class NanocachedClientTests
         using var node = new MockNode();
         using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port, 64));
 
-        string value = new string('x', 1000);
+        string value = new('x', 1000);
         await client.SetAsync("k", value);
 
         byte[] raw = node.Store[MockNode.KeyOf(Bytes("k"))];
@@ -3562,7 +3562,7 @@ public class NanocachedClientTests
         switch (op)
         {
             case "set":
-                await WaitForAsync(() => replica.Store.Count > 0, "the replica to receive the write");
+                await WaitForAsync(() => !replica.Store.IsEmpty, "the replica to receive the write");
                 Assert.True(replica.Store.TryGetValue(stored, out byte[]? got), "the replica holds the original key");
                 Assert.Equal(Bytes("v"), got);
                 break;
@@ -4572,7 +4572,7 @@ public class NanocachedClientTests
         using var node = new MockNode();
         using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port));
 
-        string value = new string('x', 2000);
+        string value = new('x', 2000);
         await client.SetAsync("k", value);
         Assert.Equal(
             new Dictionary<string, string> { ["k"] = value },
@@ -5147,7 +5147,7 @@ public class NanocachedClientTests
         using var node = new MockNode();
         using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
 
-        string value = new string('x', 1000);
+        string value = new('x', 1000);
         await client.SetAsync("k", value);
 
         Assert.Equal(Bytes(value), node.Store[MockNode.KeyOf(Bytes("k"))]);
@@ -5160,7 +5160,7 @@ public class NanocachedClientTests
         using var node = new MockNode();
         using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port, 64));
 
-        string value = new string('x', 1000);
+        string value = new('x', 1000);
         await client.SetAsync("k", value);
 
         byte[] stored = node.Store[MockNode.KeyOf(Bytes("k"))];
@@ -5636,7 +5636,7 @@ public class NanocachedClientTests
     // _hedgedReads is private; reached via reflection the same way
     // ReplaceMemberConnection above reaches _members — the only way to
     // assert, from outside, that a losing hedge leg was actually drained.
-    private static ICollection<Task> HedgedReads(NanocachedClient client)
+    private static List<Task> HedgedReads(NanocachedClient client)
     {
         FieldInfo field = typeof(NanocachedClient)
             .GetField("_hedgedReads", BindingFlags.NonPublic | BindingFlags.Instance)!;
@@ -6708,7 +6708,7 @@ public class NanocachedClientTests
 }
 
 /// <summary>
-/// Issue #67: <see cref="NanocachedClient.ConnectAsync(NanocachedClient.Options)"/>
+/// Issue #67: <see cref="NanocachedClient.ConnectAsync(NanocachedClient.Options, CancellationToken)"/>
 /// must tolerate a node that discovery still lists but that can't be
 /// reached (dead, not yet evicted) the same way steady-state requests
 /// already do — installing it as a member with no connection instead of
@@ -6752,7 +6752,7 @@ public class TolerantBootstrapTests
     /// <summary>Starts a 2-node cluster (replication 2); every name in
     /// <paramref name="dead"/> is instead listed by discovery at an
     /// address nobody listens on.</summary>
-    private static Cluster StartCluster(ISet<string> dead)
+    private static Cluster StartCluster(HashSet<string> dead)
     {
         var nodes = new Dictionary<string, MockNode>();
         var entries = new List<(string Name, string Address)>();

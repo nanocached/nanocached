@@ -100,7 +100,6 @@ function toBytes(value: string | Uint8Array): Uint8Array {
  * only so tests can shorten it, mirroring KEEPALIVE_TUNING. */
 export const REQUEST_TIMEOUT_TUNING = { timeoutMs: 30_000 };
 
-
 /** Thrown by get/set/delete when the node answers `W` (staged node join): per its
  * own current view of cluster membership, this node no longer (or not yet)
  * owns the key — the caller's routing table is stale. Carries no
@@ -382,7 +381,11 @@ export class Connection {
   /** `t ... G` — get-and-touch (issue #825): replaces the TTL and returns
    * the raw value, or `null` for a miss. The reply's own TTL field (the
    * TTL now in effect) is read and dropped: the caller just set it. */
-  async getAndTouch(key: string | Uint8Array, ttlSeconds: number | null, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<Buffer | null> {
+  async getAndTouch(
+    key: string | Uint8Array,
+    ttlSeconds: number | null,
+    namespace: Uint8Array = EMPTY_NAMESPACE,
+  ): Promise<Buffer | null> {
     const response = await this.send((tag) => encodeTouch(toBytes(key), ttlSeconds, true, tag, namespace));
     if (response.kind === "value") return response.value ?? Buffer.alloc(0);
     if (response.kind === "notFound") return null;
@@ -390,7 +393,12 @@ export class Connection {
     throw this.mismatch(response);
   }
 
-  async set(key: string | Uint8Array, value: string | Uint8Array, ttlSeconds = 0, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<void> {
+  async set(
+    key: string | Uint8Array,
+    value: string | Uint8Array,
+    ttlSeconds = 0,
+    namespace: Uint8Array = EMPTY_NAMESPACE,
+  ): Promise<void> {
     const response = await this.send((tag) => encodeSet(toBytes(key), toBytes(value), ttlSeconds, tag, namespace));
     if (response.kind === "wrongNode") throw new WrongNodeError();
     if (response.kind !== "stored") throw this.mismatch(response);
@@ -460,7 +468,13 @@ export class Connection {
    * by forwarding the literal new value to replicas as an ordinary `set`,
    * never replaying `k` there (see its own doc comment, mirroring
    * `incr`'s). */
-  async cas(key: string | Uint8Array, value: Uint8Array, cond: CasCondition, ttlSeconds = 0, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<boolean> {
+  async cas(
+    key: string | Uint8Array,
+    value: Uint8Array,
+    cond: CasCondition,
+    ttlSeconds = 0,
+    namespace: Uint8Array = EMPTY_NAMESPACE,
+  ): Promise<boolean> {
     const response = await this.send((tag) => encodeCas(toBytes(key), value, cond, ttlSeconds, tag, namespace));
     if (response.kind === "stored") return true;
     if (response.kind === "notFound") return false;
@@ -551,7 +565,11 @@ export class Connection {
    * request order: `touched`, `missing` (a touch never creates a key) or a
    * per-key `wrongNode` — see `multiGet` for the per-key independence
    * contract. */
-  async multiTouch(keys: readonly Uint8Array[], ttlSeconds: number | null, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<MultiTouchEntry[]> {
+  async multiTouch(
+    keys: readonly Uint8Array[],
+    ttlSeconds: number | null,
+    namespace: Uint8Array = EMPTY_NAMESPACE,
+  ): Promise<MultiTouchEntry[]> {
     const response = await this.send((tag) => encodeMultiTouch(keys, ttlSeconds, false, tag, namespace));
     if (response.kind !== "multiTouch" || response.touchEntries === undefined) throw this.mismatch(response);
     if (response.touchEntries.length !== keys.length) {
@@ -567,7 +585,11 @@ export class Connection {
    * carries the frame's TTL, a miss is `miss`, and a value the node had no
    * room for in its reply is also `miss` and left untouched. Unlike
    * `getAndTouch` the reply carries no per-key TTL. */
-  async multiGetAndTouch(keys: readonly Uint8Array[], ttlSeconds: number | null, namespace: Uint8Array = EMPTY_NAMESPACE): Promise<MultiEntry[]> {
+  async multiGetAndTouch(
+    keys: readonly Uint8Array[],
+    ttlSeconds: number | null,
+    namespace: Uint8Array = EMPTY_NAMESPACE,
+  ): Promise<MultiEntry[]> {
     const response = await this.send((tag) => encodeMultiTouch(keys, ttlSeconds, true, tag, namespace));
     if (response.kind !== "multi" || response.entries === undefined) throw this.mismatch(response);
     if (response.entries.length !== keys.length) {
@@ -734,7 +756,7 @@ export class Connection {
         try {
           frame = build(tag);
         } catch (error) {
-          reject(error as Error);
+          reject(error);
           return;
         }
         const waiter: Waiter = { resolve, reject, tag };
@@ -749,19 +771,19 @@ export class Connection {
         }
 
         this.socket.write(frame, (error) => {
-        if (error) {
-          // A write can fail (EPIPE, ECONNRESET, ...) after the frame
-          // went only partially onto the wire — desyncing every request
-          // pipelined behind this one, not just this one. Poison the
-          // whole connection like the other fatal paths instead of
-          // splicing out and rejecting just this waiter: that used to
-          // leave everything else pending until the 30s request timeout
-          // eventually noticed the socket was dead. Mirrors Python's
-          // `_poison()` on any write OSError (_connection.py:233-247);
-          // `waiter` (and every other still-pending waiter) is rejected
-          // by the 'close' handler this triggers.
-          this.poison(new ConnectionLostError(`nanocached: connection failed: ${error.message}`));
-        }
+          if (error) {
+            // A write can fail (EPIPE, ECONNRESET, ...) after the frame
+            // went only partially onto the wire — desyncing every request
+            // pipelined behind this one, not just this one. Poison the
+            // whole connection like the other fatal paths instead of
+            // splicing out and rejecting just this waiter: that used to
+            // leave everything else pending until the 30s request timeout
+            // eventually noticed the socket was dead. Mirrors Python's
+            // `_poison()` on any write OSError (_connection.py:233-247);
+            // `waiter` (and every other still-pending waiter) is rejected
+            // by the 'close' handler this triggers.
+            this.poison(new ConnectionLostError(`nanocached: connection failed: ${error.message}`));
+          }
         });
       };
 
@@ -877,7 +899,9 @@ export class Connection {
         // undefined for them).
         const expectedMultiLength = peekMultiFrameLength(buffer, this.tagged);
         const limit =
-          expectedMultiLength === undefined ? MAX_RESPONSE_FRAME_LENGTH : Math.max(MAX_RESPONSE_FRAME_LENGTH, expectedMultiLength);
+          expectedMultiLength === undefined
+            ? MAX_RESPONSE_FRAME_LENGTH
+            : Math.max(MAX_RESPONSE_FRAME_LENGTH, expectedMultiLength);
         if (buffer.length > limit) {
           // poison() (issue #187), not a direct destroy(): see the parse-
           // failure branch above for why isClosed() must flip synchronously.
@@ -931,9 +955,7 @@ export class Connection {
         // SDKs do. Nothing is pending, so there is no waiter to reject;
         // later requests see `lastError`.
         this.poison(
-          new ConnectionLostError(
-            `nanocached: unsolicited ${parsed.response.kind} response from server (connection desynced)`,
-          ),
+          new ConnectionLostError(`nanocached: unsolicited ${parsed.response.kind} response from server (connection desynced)`),
         );
         return;
       }

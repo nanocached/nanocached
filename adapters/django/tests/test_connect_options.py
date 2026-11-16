@@ -24,8 +24,10 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import support  # noqa: F401 - configures settings.CACHES / django.setup()
+
+from nanocached import NanocachedClient
+
 from nanocached_django import NanocachedCache
-from nanocached_django.backend import NanocachedClient
 
 
 class ConnectOptionsTests(unittest.TestCase):
@@ -36,9 +38,7 @@ class ConnectOptionsTests(unittest.TestCase):
         the network, and returns just the keyword arguments (positional
         ``addresses`` and the always-present ``auth_secret`` stripped,
         since this module only cares about the issue #231 options)."""
-        backend = NanocachedCache(
-            "127.0.0.1:1", {"OPTIONS": {"NAMESPACE": "django", **options}}
-        )
+        backend = NanocachedCache("127.0.0.1:1", {"OPTIONS": {"NAMESPACE": "django", **options}})
         self.addCleanup(backend.shutdown)
 
         fake_client = AsyncMock()
@@ -80,14 +80,10 @@ class ConnectOptionsTests(unittest.TestCase):
         self.assertEqual(self._connect_kwargs(READ_REPAIR=True), {"read_repair": True})
 
     def test_read_hedge_after(self) -> None:
-        self.assertEqual(
-            self._connect_kwargs(READ_HEDGE_AFTER=0.05), {"read_hedge_after": 0.05}
-        )
+        self.assertEqual(self._connect_kwargs(READ_HEDGE_AFTER=0.05), {"read_hedge_after": 0.05})
 
     def test_reconnect_cooldown(self) -> None:
-        self.assertEqual(
-            self._connect_kwargs(RECONNECT_COOLDOWN=2.5), {"reconnect_cooldown": 2.5}
-        )
+        self.assertEqual(self._connect_kwargs(RECONNECT_COOLDOWN=2.5), {"reconnect_cooldown": 2.5})
 
     def test_disable_reconnect_cooldown(self) -> None:
         # The SDK reads reconnect_cooldown=0 as the default, so this switch

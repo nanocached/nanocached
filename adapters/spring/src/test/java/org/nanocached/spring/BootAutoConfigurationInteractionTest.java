@@ -27,23 +27,19 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 /**
- * The setup story against real Spring Boot autoconfiguration, with the
- * Redis starter on the classpath as the competing backend — the exact
- * situation a Boot app migrating from Redis is in:
+ * The setup story against real Spring Boot autoconfiguration, with the Redis starter on the
+ * classpath as the competing backend — the exact situation a Boot app migrating from Redis is in:
  *
  * <ul>
- *   <li>without the adapter's beans, Boot picks its own manager (Redis,
- *       since the starter is present) — adding this module's dependency
- *       alone changes nothing;
- *   <li>with the two beans from the README, the explicit {@code
- *       CacheManager} wins with <em>zero</em> {@code spring.cache.*}
- *       configuration — Boot's {@code CacheAutoConfiguration} is
- *       {@code @ConditionalOnMissingBean(CacheManager)};
- *   <li>even a stray {@code spring.cache.type=redis} does not override
- *       the explicit bean (that key only steers Boot's own
- *       autoconfiguration, which has already backed off);
- *   <li>the README's {@code nanocached.*} property binding works: the
- *       address and TTL flow from properties to the wire.
+ *   <li>without the adapter's beans, Boot picks its own manager (Redis, since the starter is
+ *       present) — adding this module's dependency alone changes nothing;
+ *   <li>with the two beans from the README, the explicit {@code CacheManager} wins with
+ *       <em>zero</em> {@code spring.cache.*} configuration — Boot's {@code CacheAutoConfiguration}
+ *       is {@code @ConditionalOnMissingBean(CacheManager)};
+ *   <li>even a stray {@code spring.cache.type=redis} does not override the explicit bean (that key
+ *       only steers Boot's own autoconfiguration, which has already backed off);
+ *   <li>the README's {@code nanocached.*} property binding works: the address and TTL flow from
+ *       properties to the wire.
  * </ul>
  */
 class BootAutoConfigurationInteractionTest {
@@ -64,28 +60,26 @@ class BootAutoConfigurationInteractionTest {
         }
     }
 
-    /** The README's Boot setup, verbatim: two beans bound from
-     * {@code nanocached.*} properties, plus the service under test. */
+    /**
+     * The README's Boot setup, verbatim: two beans bound from {@code nanocached.*} properties, plus
+     * the service under test.
+     */
     @Configuration
     @EnableAutoConfiguration
     @EnableCaching
     static class NanocachedBootConfig {
 
         @Bean(destroyMethod = "close")
-        NanocachedClient nanocachedClient(
-                @Value("${nanocached.addresses}") List<String> addresses) {
+        NanocachedClient nanocachedClient(@Value("${nanocached.addresses}") List<String> addresses) {
             return NanocachedClient.connect(new NanocachedClient.Options()
                     .addresses(addresses.stream()
                             .map(address -> address.split(":", 2))
-                            .map(address -> new NanocachedClient.Address(
-                                    address[0], Integer.parseInt(address[1])))
+                            .map(address -> new NanocachedClient.Address(address[0], Integer.parseInt(address[1])))
                             .toList()));
         }
 
         @Bean
-        CacheManager cacheManager(
-                NanocachedClient client,
-                @Value("${nanocached.default-ttl:0s}") Duration defaultTtl) {
+        CacheManager cacheManager(NanocachedClient client, @Value("${nanocached.default-ttl:0s}") Duration defaultTtl) {
             return NanocachedCacheManager.builder(client).defaultTtl(defaultTtl).build();
         }
 
@@ -95,8 +89,10 @@ class BootAutoConfigurationInteractionTest {
         }
     }
 
-    /** No adapter beans: what a Boot app is like before this module's
-     * setup — only the service and whatever Boot autoconfigures. */
+    /**
+     * No adapter beans: what a Boot app is like before this module's setup — only the service and
+     * whatever Boot autoconfigures.
+     */
     @Configuration
     @EnableAutoConfiguration
     @EnableCaching
@@ -162,8 +158,7 @@ class BootAutoConfigurationInteractionTest {
         assertEquals(
                 1,
                 node.store("users").keySet().stream()
-                        .filter(key -> new String(key.array(), StandardCharsets.UTF_8)
-                                .equals("String:alice"))
+                        .filter(key -> new String(key.array(), StandardCharsets.UTF_8).equals("String:alice"))
                         .count());
     }
 
@@ -182,8 +177,7 @@ class BootAutoConfigurationInteractionTest {
 
         context.getBean(UserService.class).findUser("alice");
 
-        MockNode.Entry entry =
-                node.entry("users", "String:alice".getBytes(StandardCharsets.UTF_8));
+        MockNode.Entry entry = node.entry("users", "String:alice".getBytes(StandardCharsets.UTF_8));
         assertEquals(420, entry.ttlSeconds(), "the bound TTL must reach the wire");
     }
 }

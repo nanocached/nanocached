@@ -9,9 +9,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.lang.reflect.Field;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -38,16 +38,15 @@ import org.springframework.cache.annotation.Cacheable;
 import org.springframework.cache.annotation.EnableCaching;
 import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.StandardEnvironment;
 import org.springframework.core.env.SystemEnvironmentPropertySource;
-import org.springframework.context.annotation.Configuration;
 
 /**
- * The starter's whole point end to end, against real Boot autoconfiguration
- * (issue #119): unlike {@code nanocached-spring}'s own {@code
- * BootAutoConfigurationInteractionTest}, none of the configs here declare
- * a {@code NanocachedClient} or {@code CacheManager} bean by hand — the
- * starter is the thing under test, not a manual wiring against it.
+ * The starter's whole point end to end, against real Boot autoconfiguration (issue #119): unlike
+ * {@code nanocached-spring}'s own {@code BootAutoConfigurationInteractionTest}, none of the configs
+ * here declare a {@code NanocachedClient} or {@code CacheManager} bean by hand — the starter is the
+ * thing under test, not a manual wiring against it.
  */
 class NanocachedCacheAutoConfigurationTest {
 
@@ -71,8 +70,10 @@ class NanocachedCacheAutoConfigurationTest {
         }
     }
 
-    /** Yaml-only: nothing but the service and the two annotations the
-     * README asks Boot apps for. No client/manager bean anywhere. */
+    /**
+     * Yaml-only: nothing but the service and the two annotations the README asks Boot apps for. No
+     * client/manager bean anywhere.
+     */
     @Configuration
     @EnableAutoConfiguration
     @EnableCaching
@@ -83,8 +84,10 @@ class NanocachedCacheAutoConfigurationTest {
         }
     }
 
-    /** A service whose cache name contains dots, which {@code
-     * nanocached.cache.ttl.<name>} cannot spell without brackets. */
+    /**
+     * A service whose cache name contains dots, which {@code nanocached.cache.ttl.<name>} cannot
+     * spell without brackets.
+     */
     static class DottedNameService {
         @Cacheable("users.by.id")
         public String findUser(String name) {
@@ -102,8 +105,10 @@ class NanocachedCacheAutoConfigurationTest {
         }
     }
 
-    /** An app that wires its own client and manager: the starter must
-     * back off both beans and leave these in place. */
+    /**
+     * An app that wires its own client and manager: the starter must back off both beans and leave
+     * these in place.
+     */
     @Configuration
     @EnableAutoConfiguration
     @EnableCaching
@@ -112,8 +117,7 @@ class NanocachedCacheAutoConfigurationTest {
         NanocachedClient nanocachedClient(@Value("${nanocached.addresses}") String address) {
             String[] hostPort = address.split(":", 2);
             return NanocachedClient.connect(new NanocachedClient.Options()
-                    .addresses(List.of(
-                            new NanocachedClient.Address(hostPort[0], Integer.parseInt(hostPort[1])))));
+                    .addresses(List.of(new NanocachedClient.Address(hostPort[0], Integer.parseInt(hostPort[1])))));
         }
 
         @Bean
@@ -169,15 +173,14 @@ class NanocachedCacheAutoConfigurationTest {
         assertEquals(
                 1,
                 node.store("users").keySet().stream()
-                        .filter(key -> new String(key.array(), StandardCharsets.UTF_8)
-                                .equals("String:alice"))
+                        .filter(key -> new String(key.array(), StandardCharsets.UTF_8).equals("String:alice"))
                         .count());
     }
 
     @Test
     void withoutNanocachedAddressesTheStarterIsInert() {
-        SpringApplicationBuilder builder = new SpringApplicationBuilder(YamlOnlyConfig.class)
-                .web(WebApplicationType.NONE);
+        SpringApplicationBuilder builder =
+                new SpringApplicationBuilder(YamlOnlyConfig.class).web(WebApplicationType.NONE);
         context = builder.build().run();
 
         assertEquals(
@@ -188,9 +191,10 @@ class NanocachedCacheAutoConfigurationTest {
 
     @Test
     void malformedAddressesFailStartupWithAMessageNamingTheOffendingEntry() {
-        for (String bad : new String[] {"localhost", "localhost:", ":8357", "localhost:abc", "localhost:0",
-            "localhost:70000"}) {
-            Exception error = assertThrows(Exception.class, () -> boot(YamlOnlyConfig.class, "nanocached.addresses=" + bad), bad);
+        for (String bad :
+                new String[] {"localhost", "localhost:", ":8357", "localhost:abc", "localhost:0", "localhost:70000"}) {
+            Exception error =
+                    assertThrows(Exception.class, () -> boot(YamlOnlyConfig.class, "nanocached.addresses=" + bad), bad);
             Throwable cause = error;
             while (cause != null && !(cause instanceof IllegalArgumentException)) {
                 cause = cause.getCause();
@@ -232,8 +236,7 @@ class NanocachedCacheAutoConfigurationTest {
     void explicitClientAndManagerBeansAreRespected() {
         boot(ExplicitBeansConfig.class);
 
-        NanocachedClient appClient =
-                context.getBean(ExplicitBeansConfig.class).nanocachedClient("unused:0");
+        NanocachedClient appClient = context.getBean(ExplicitBeansConfig.class).nanocachedClient("unused:0");
         assertSame(
                 appClient,
                 context.getBean(NanocachedClient.class),
@@ -243,10 +246,7 @@ class NanocachedCacheAutoConfigurationTest {
 
     @Test
     void defaultTtlAndPerCacheTtlFlowFromPropertiesToTheWire() {
-        boot(
-                YamlOnlyConfig.class,
-                "nanocached.cache.default-ttl=7m",
-                "nanocached.cache.ttl.nullable=30s");
+        boot(YamlOnlyConfig.class, "nanocached.cache.default-ttl=7m", "nanocached.cache.ttl.nullable=30s");
 
         context.getBean(UserService.class).findUser("alice");
 
@@ -341,9 +341,7 @@ class NanocachedCacheAutoConfigurationTest {
 
         CacheManager manager = context.getBean(CacheManager.class);
         assertEquals(Set.of("users", "sessions"), Set.copyOf(manager.getCacheNames()));
-        assertNull(
-                manager.getCache("unlisted"),
-                "an unlisted name must fall through, not be created on demand");
+        assertNull(manager.getCache("unlisted"), "an unlisted name must fall through, not be created on demand");
     }
 
     @Test
@@ -532,8 +530,9 @@ class NanocachedCacheAutoConfigurationTest {
         // exact way the Boot 3 -> 4 package move would have gone unnoticed.
         // Boot only sorts alphabetically as a fallback, so a stale name
         // would not fail the context tests above; check it here.
-        String[] before =
-                NanocachedCacheAutoConfiguration.class.getAnnotation(AutoConfiguration.class).beforeName();
+        String[] before = NanocachedCacheAutoConfiguration.class
+                .getAnnotation(AutoConfiguration.class)
+                .beforeName();
 
         assertEquals(1, before.length);
         assertEquals(

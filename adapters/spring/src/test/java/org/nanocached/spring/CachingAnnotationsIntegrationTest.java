@@ -18,46 +18,46 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 import javax.tools.ToolProvider;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.cache.Cache;
-import org.springframework.cache.annotation.CachingConfigurer;
-import org.springframework.cache.interceptor.CacheErrorHandler;
-import org.springframework.context.annotation.Lazy;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.nanocached.NanocachedClient;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
 import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.CachePut;
 import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.CachingConfigurer;
 import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.cache.interceptor.CacheErrorHandler;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
 
 /**
- * The adapter driven the way applications actually use it: a real Spring
- * context with {@code @EnableCaching}, a proxied service bean, and the
- * caching annotations — not direct {@code Cache} calls. Every annotation
- * lands on the {@link NanocachedCacheManager} and from there on the wire
- * (asserted against {@link MockNode}'s stores where it matters).
+ * The adapter driven the way applications actually use it: a real Spring context with
+ * {@code @EnableCaching}, a proxied service bean, and the caching annotations — not direct {@code
+ * Cache} calls. Every annotation lands on the {@link NanocachedCacheManager} and from there on the
+ * wire (asserted against {@link MockNode}'s stores where it matters).
  */
 class CachingAnnotationsIntegrationTest {
 
     record User(String name, int age) implements Serializable {}
 
-    /** The "expensive" backend the annotations are supposed to shield:
-     * every real invocation is counted, so the tests can distinguish a
-     * cache hit (count unchanged) from a recomputation. */
+    /**
+     * The "expensive" backend the annotations are supposed to shield: every real invocation is
+     * counted, so the tests can distinguish a cache hit (count unchanged) from a recomputation.
+     */
     static class UserService {
         private final AtomicInteger dbCalls = new AtomicInteger();
 
-        /** Read through a method, not the field: the bean the tests hold
-         * is a CGLIB proxy, and only method calls delegate to the target
-         * instance that owns the real counter. */
+        /**
+         * Read through a method, not the field: the bean the tests hold is a CGLIB proxy, and only
+         * method calls delegate to the target instance that owns the real counter.
+         */
         public int dbCalls() {
             return dbCalls.get();
         }
@@ -86,16 +86,21 @@ class CachingAnnotationsIntegrationTest {
             return null;
         }
 
-        /** Nested sync loads: the loader of an "outer" key reads an
-         * "inner" key of the same cache through the proxy. A barrier
-         * shared by two threads makes both outer loaders hold their
-         * in-flight state before either nests, which is the deadlock
-         * choreography. */
-        @Autowired @Lazy UserService self;
+        /**
+         * Nested sync loads: the loader of an "outer" key reads an "inner" key of the same cache
+         * through the proxy. A barrier shared by two threads makes both outer loaders hold their
+         * in-flight state before either nests, which is the deadlock choreography.
+         */
+        @Autowired
+        @Lazy
+        UserService self;
+
         private volatile CyclicBarrier bothOuterLoadersStarted;
 
-        /** Through a method, not the field: the bean the tests hold is a
-         * CGLIB proxy whose fields are not the target's. */
+        /**
+         * Through a method, not the field: the bean the tests hold is a CGLIB proxy whose fields
+         * are not the target's.
+         */
         public void bothOuterLoadersStarted(CyclicBarrier barrier) {
             bothOuterLoadersStarted = barrier;
         }
@@ -116,16 +121,19 @@ class CachingAnnotationsIntegrationTest {
             return new User(key, key.length());
         }
 
-        /** A value over the server's 1 MiB limit: the load succeeds, the
-         * put that follows does not. */
+        /**
+         * A value over the server's 1 MiB limit: the load succeeds, the put that follows does not.
+         */
         @Cacheable(cacheNames = "users", sync = true)
         public byte[] loadOversizedSync(String name) {
             dbCalls.incrementAndGet();
             return new byte[1_200_000];
         }
 
-        /** The cached type lives in a class loader this adapter cannot
-         * see; the service creates it reflectively. */
+        /**
+         * The cached type lives in a class loader this adapter cannot see; the service creates it
+         * reflectively.
+         */
         private volatile Class<?> childClass;
 
         public void childClass(Class<?> type) {
@@ -161,9 +169,11 @@ class CachingAnnotationsIntegrationTest {
         public void deleteEveryUser() {}
     }
 
-    /** Records what the application's CacheErrorHandler is told and,
-     * when {@code swallow} is set, swallows it — the "degrade to the
-     * method" policy; otherwise rethrows like Spring's default handler. */
+    /**
+     * Records what the application's CacheErrorHandler is told and, when {@code swallow} is set,
+     * swallows it — the "degrade to the method" policy; otherwise rethrows like Spring's default
+     * handler.
+     */
     static class RecordingErrorHandler implements CacheErrorHandler {
         final List<RuntimeException> getErrors = new java.util.concurrent.CopyOnWriteArrayList<>();
         final List<RuntimeException> putErrors = new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -252,8 +262,7 @@ class CachingAnnotationsIntegrationTest {
         assertEquals(
                 1,
                 node.store("users").keySet().stream()
-                        .filter(key -> new String(key.array(), StandardCharsets.UTF_8)
-                                .equals("String:alice"))
+                        .filter(key -> new String(key.array(), StandardCharsets.UTF_8).equals("String:alice"))
                         .count());
     }
 
@@ -349,8 +358,10 @@ class CachingAnnotationsIntegrationTest {
         return Math.floorMod(springKey.hashCode(), 64);
     }
 
-    /** An outer key whose Spring cache key {@code SimpleKey(outer,
-     * inner)} hashes onto {@code stripe} of a 64-stripe lock. */
+    /**
+     * An outer key whose Spring cache key {@code SimpleKey(outer, inner)} hashes onto {@code
+     * stripe} of a 64-stripe lock.
+     */
     private static String outerKeyOnStripe(String prefix, String inner, int stripe) {
         for (int i = 0; ; i++) {
             String candidate = prefix + "-" + i;
@@ -372,7 +383,8 @@ class CachingAnnotationsIntegrationTest {
         String key = "self";
         RuntimeException error = assertThrows(RuntimeException.class, () -> service.loadSync(key, key));
         Throwable cause = error;
-        while (cause != null && !(cause.getMessage() != null && cause.getMessage().contains("re-entered"))) {
+        while (cause != null
+                && !(cause.getMessage() != null && cause.getMessage().contains("re-entered"))) {
             cause = cause.getCause();
         }
         assertNotNull(cause, "want the re-entrance report in the cause chain, got " + error);
@@ -404,8 +416,8 @@ class CachingAnnotationsIntegrationTest {
             }
         });
         assertTrue(firstLoaderStarted.await(5, TimeUnit.SECONDS));
-        CompletableFuture<User> second = CompletableFuture.supplyAsync(
-                () -> cache.get(key, () -> new User(key, key.length())));
+        CompletableFuture<User> second =
+                CompletableFuture.supplyAsync(() -> cache.get(key, () -> new User(key, key.length())));
         // The second caller is parked on the first run by now; let the
         // first loader fail.
         Thread.sleep(300);
@@ -428,7 +440,9 @@ class CachingAnnotationsIntegrationTest {
         CacheConfig.errorHandler.swallow = true;
         byte[] value = service.loadOversizedSync("big");
         assertEquals(1_200_000, value.length);
-        assertEquals(1, CacheConfig.errorHandler.getErrors.size() + CacheConfig.errorHandler.putErrors.size(),
+        assertEquals(
+                1,
+                CacheConfig.errorHandler.getErrors.size() + CacheConfig.errorHandler.putErrors.size(),
                 "the error handler must see the failed put exactly once");
         RuntimeException seen = CacheConfig.errorHandler.getErrors.isEmpty()
                 ? CacheConfig.errorHandler.putErrors.get(0)
@@ -448,11 +462,13 @@ class CachingAnnotationsIntegrationTest {
         Path dir = Files.createTempDirectory("nanocached-child-loader");
         Path source = dir.resolve("app").resolve("ChildUser.java");
         Files.createDirectories(source.getParent());
-        Files.writeString(source, "package app; public record ChildUser(String name) implements java.io.Serializable {}");
-        int compiled = ToolProvider.getSystemJavaCompiler().run(null, null, null, "-d", dir.toString(), source.toString());
+        Files.writeString(
+                source, "package app; public record ChildUser(String name) implements java.io.Serializable {}");
+        int compiled =
+                ToolProvider.getSystemJavaCompiler().run(null, null, null, "-d", dir.toString(), source.toString());
         assertEquals(0, compiled, "javac");
-        try (URLClassLoader child = new URLClassLoader(new java.net.URL[] {dir.toUri().toURL()},
-                CachingAnnotationsIntegrationTest.class.getClassLoader())) {
+        try (URLClassLoader child = new URLClassLoader(
+                new java.net.URL[] {dir.toUri().toURL()}, CachingAnnotationsIntegrationTest.class.getClassLoader())) {
             service.childClass(child.loadClass("app.ChildUser"));
             Object first = service.findChildObject("alice");
             ClassLoader original = Thread.currentThread().getContextClassLoader();
@@ -478,8 +494,10 @@ class CachingAnnotationsIntegrationTest {
         service.findUser("x?");
         service.findUser("x\uD800");
         assertEquals(2, service.dbCalls());
-        assertTrue(CacheConfig.errorHandler.getErrors.stream().anyMatch(
-                error -> error instanceof IllegalArgumentException && error.getMessage().contains("lone surrogate")),
+        assertTrue(
+                CacheConfig.errorHandler.getErrors.stream()
+                        .anyMatch(error -> error instanceof IllegalArgumentException
+                                && error.getMessage().contains("lone surrogate")),
                 "the lookup under the malformed key must have been rejected: " + CacheConfig.errorHandler.getErrors);
         service.findUser("x?");
         assertEquals(2, service.dbCalls(), "\"x?\" must still be a hit, untouched by the rejected key");

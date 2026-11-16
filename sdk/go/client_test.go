@@ -2033,6 +2033,7 @@ func TestConfigStringAndGoStringRedactAuthSecret(t *testing.T) {
 	}
 	for _, rendered := range []string{
 		fmt.Sprintf("%v", cfg),
+		//lint:ignore S1025 the %s verb itself is under test: it must not reach AuthSecret.
 		fmt.Sprintf("%s", cfg),
 		fmt.Sprintf("%#v", cfg),
 	} {
@@ -5372,7 +5373,7 @@ func TestAnUnreachableNodeIsRedialedOnceTheCooldownHasPassed(t *testing.T) {
 // spirit even when it's technically one-sided. Slack the lower bound by
 // this much rather than asserting on the boundary; still miles away from
 // the ~0ms an immediate return would show.
-const timingToleranceMs = 20 * time.Millisecond
+const timingTolerance = 20 * time.Millisecond
 
 func TestByDefaultAWriteStillWaitsForTheReplicaLeg(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)
@@ -5390,7 +5391,7 @@ func TestByDefaultAWriteStillWaitsForTheReplicaLeg(t *testing.T) {
 	if err := client.Set(key, "v", 0); err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(start); elapsed < 80*time.Millisecond-timingToleranceMs {
+	if elapsed := time.Since(start); elapsed < 80*time.Millisecond-timingTolerance {
 		t.Fatalf("Set returned after %v, want >= 80ms (should have waited for the replica)", elapsed)
 	}
 }
@@ -5460,7 +5461,7 @@ func TestFireAndForgetReplicasFallsBackToSynchronousPastTheCap(t *testing.T) {
 
 	fast, slow := 0, 0
 	for _, e := range elapsed {
-		if e >= 150*time.Millisecond-timingToleranceMs {
+		if e >= 150*time.Millisecond-timingTolerance {
 			slow++
 		} else {
 			fast++

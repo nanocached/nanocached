@@ -6,13 +6,11 @@ import java.util.zip.Deflater;
 import java.util.zip.Inflater;
 
 /**
- * Value compression: transparent, opt-in value compression. Values are
- * prefixed with a one-byte marker once {@code compress} is enabled on a
- * client — {@code 0x00} for stored-as-is (below threshold, or
- * compression didn't shrink it), {@code 0x01} for raw-DEFLATE-compressed
- * (RFC 1951, no zlib/gzip wrapper — {@link Deflater#Deflater(int,
- * boolean)}'s {@code nowrap=true}). Never present when {@code compress}
- * is off.
+ * Value compression: transparent, opt-in value compression. Values are prefixed with a one-byte
+ * marker once {@code compress} is enabled on a client — {@code 0x00} for stored-as-is (below
+ * threshold, or compression didn't shrink it), {@code 0x01} for raw-DEFLATE-compressed (RFC 1951,
+ * no zlib/gzip wrapper — {@link Deflater#Deflater(int, boolean)}'s {@code nowrap=true}). Never
+ * present when {@code compress} is off.
  */
 final class Compression {
 
@@ -60,8 +58,10 @@ final class Compression {
     // flat 256 MiB, 4 bytes short of four reservations, so only three ran.
     static volatile long maxInflightDecompressedBytes = 4 * INFLATE_RESERVATION;
 
-    /** {@link #maxInflightDecompressedBytes} as a counting semaphore of
-     * bytes, one per {@link NanocachedClient}. */
+    /**
+     * {@link #maxInflightDecompressedBytes} as a counting semaphore of bytes, one per {@link
+     * NanocachedClient}.
+     */
     static final class InflateBudget {
         private final long limit;
         private long available;
@@ -71,8 +71,10 @@ final class Compression {
             this.available = limit;
         }
 
-        /** Reserves {@code n} bytes (clamped to the whole budget, so a
-         * reservation can always be met), waiting until they are free. */
+        /**
+         * Reserves {@code n} bytes (clamped to the whole budget, so a reservation can always be
+         * met), waiting until they are free.
+         */
         long acquire(long n) {
             n = Math.min(n, limit);
             synchronized (this) {
@@ -98,27 +100,26 @@ final class Compression {
         }
     }
 
-    /** When set, called with {@code "start"} once a DEFLATE decompression
-     * holds its reservation and with {@code "end"} when it releases it —
-     * only so a test can observe how many decompressions run at once. */
+    /**
+     * When set, called with {@code "start"} once a DEFLATE decompression holds its reservation and
+     * with {@code "end"} when it releases it — only so a test can observe how many decompressions
+     * run at once.
+     */
     static volatile java.util.function.Consumer<String> inflateTestHook;
 
     private Compression() {}
 
     /**
-     * Below {@code threshold}, or when compressing doesn't actually
-     * shrink the value (incompressible data), the marker byte alone is
-     * added and the value is stored unchanged. Always returns a value
-     * with the marker byte prefixed.
+     * Below {@code threshold}, or when compressing doesn't actually shrink the value
+     * (incompressible data), the marker byte alone is added and the value is stored unchanged.
+     * Always returns a value with the marker byte prefixed.
      *
-     * <p>Every return path here goes through {@link #prefixed}, which
-     * always allocates a brand-new array — so the result never aliases
-     * {@code value} (the caller's own array), even on the
-     * marker-byte-only paths above. {@link NanocachedClient}'s
-     * fire-and-forget replica legs rely on this: a leg only needs its own
-     * defensive copy when {@code compress} is off (issue #326), since a
-     * compressed value here is already safe to hand to a background task
-     * without copying it again.
+     * <p>Every return path here goes through {@link #prefixed}, which always allocates a brand-new
+     * array — so the result never aliases {@code value} (the caller's own array), even on the
+     * marker-byte-only paths above. {@link NanocachedClient}'s fire-and-forget replica legs rely on
+     * this: a leg only needs its own defensive copy when {@code compress} is off (issue #326),
+     * since a compressed value here is already safe to hand to a background task without copying it
+     * again.
      */
     static byte[] compressValue(byte[] value, int threshold) {
         if (value.length < threshold) {
@@ -149,18 +150,18 @@ final class Compression {
     }
 
     /**
-     * The get/getBytes counterpart to {@link #compressValue}. Only ever
-     * called when {@code compress} is enabled on this client — see
-     * Value compression.
+     * The get/getBytes counterpart to {@link #compressValue}. Only ever called when {@code
+     * compress} is enabled on this client — see Value compression.
      */
     static byte[] decompressValue(byte[] value) {
         return decompressValue(value, null);
     }
 
-    /** As {@link #decompressValue(byte[])}, charging a DEFLATE value's
-     * expansion against {@code budget} ({@link
-     * #maxInflightDecompressedBytes}) for as long as it runs; a {@code
-     * null} budget skips the accounting (tests of the codec itself). */
+    /**
+     * As {@link #decompressValue(byte[])}, charging a DEFLATE value's expansion against {@code
+     * budget} ({@link #maxInflightDecompressedBytes}) for as long as it runs; a {@code null} budget
+     * skips the accounting (tests of the codec itself).
+     */
     static byte[] decompressValue(byte[] value, InflateBudget budget) {
         if (value.length == 0) {
             throw new NanocachedException.DecompressionFailed(
@@ -199,8 +200,8 @@ final class Compression {
                                     "nanocached: decompressed value exceeds the maximum size — "
                                             + "possible decompression bomb");
                         }
-                        buffer = Arrays.copyOf(buffer,
-                                (int) Math.min(2L * buffer.length, MAX_DECOMPRESSED_LENGTH + 1L));
+                        buffer =
+                                Arrays.copyOf(buffer, (int) Math.min(2L * buffer.length, MAX_DECOMPRESSED_LENGTH + 1L));
                     }
                     int produced = inflater.inflate(buffer, total, buffer.length - total);
                     if (produced == 0 && inflater.needsInput()) {
@@ -223,7 +224,8 @@ final class Compression {
                 throw new NanocachedException.DecompressionFailed(
                         "nanocached: failed to decompress a value marked as compressed — did every "
                                 + "client sharing this key enable compress (value compression)? ("
-                                + error.getMessage() + ")",
+                                + error.getMessage()
+                                + ")",
                         error);
             } finally {
                 inflater.end();
@@ -232,10 +234,10 @@ final class Compression {
             }
         }
 
-        throw new NanocachedException.DecompressionFailed(
-                "nanocached: unrecognized compression marker byte " + (marker & 0xFF)
-                        + " — was this value written by a client with compress disabled "
-                        + "(value compression)?");
+        throw new NanocachedException.DecompressionFailed("nanocached: unrecognized compression marker byte "
+                + (marker & 0xFF)
+                + " — was this value written by a client with compress disabled "
+                + "(value compression)?");
     }
 
     private static byte[] prefixed(byte marker, byte[] body) {

@@ -70,8 +70,8 @@ class HashRingTest {
         HashRing ring = new HashRing(NODES);
         assertEquals(List.of("node-a", "node-c", "node-b"), ring.owners(bytes("users"), bytes("alpha"), 3));
         assertEquals(List.of("node-b", "node-c", "node-a"), ring.owners(bytes("users"), bytes(""), 3));
-        assertEquals(List.of("node-b", "node-a", "node-c"),
-                ring.owners(new byte[] {(byte) 0xff, 0x00}, bytes("beta"), 3));
+        assertEquals(
+                List.of("node-b", "node-a", "node-c"), ring.owners(new byte[] {(byte) 0xff, 0x00}, bytes("beta"), 3));
     }
 
     @Test
@@ -89,12 +89,8 @@ class HashRingTest {
         // ("a","bc") apart, and a namespaced key never collides with the
         // un-namespaced concatenation.
         HashRing ring = new HashRing(NODES);
-        assertNotEquals(
-                ring.owners(bytes("ab"), bytes("c"), 3),
-                ring.owners(bytes("a"), bytes("bc"), 3));
-        assertNotEquals(
-                ring.owners(bytes("ab"), bytes("c"), 3),
-                ring.owners(bytes(""), bytes("abc"), 3));
+        assertNotEquals(ring.owners(bytes("ab"), bytes("c"), 3), ring.owners(bytes("a"), bytes("bc"), 3));
+        assertNotEquals(ring.owners(bytes("ab"), bytes("c"), 3), ring.owners(bytes(""), bytes("abc"), 3));
     }
 
     @Test
@@ -107,7 +103,8 @@ class HashRingTest {
         HashRing ring = new HashRing(nodes);
         Map<String, Integer> primaries = new HashMap<>();
         for (int i = 0; i < 64; i++) {
-            String primary = ring.owners(bytes("cache-" + i), bytes("config"), 1).get(0);
+            String primary =
+                    ring.owners(bytes("cache-" + i), bytes("config"), 1).get(0);
             primaries.merge(primary, 1, Integer::sum);
         }
         assertTrue(primaries.size() > 1);
@@ -183,7 +180,9 @@ class HashRingTest {
         for (int replicas : new int[] {0, 1, nodes.size() / 2, nodes.size(), nodes.size() + 1, nodes.size() + 10}) {
             for (int i = 0; i < 200; i++) {
                 byte[] key = bytes("fuzz-key-" + next.getAsLong());
-                assertEquals(naiveOwners(ring, nodes, key, replicas), ring.owners(key, replicas),
+                assertEquals(
+                        naiveOwners(ring, nodes, key, replicas),
+                        ring.owners(key, replicas),
                         "replicas=" + replicas + " key=" + new String(key, StandardCharsets.UTF_8));
             }
         }
@@ -203,7 +202,9 @@ class HashRingTest {
 
         for (int replicas = 0; replicas <= 5; replicas++) {
             List<String> owners = ring.owners(key, replicas);
-            assertEquals(owners.size(), new java.util.HashSet<>(owners).size(),
+            assertEquals(
+                    owners.size(),
+                    new java.util.HashSet<>(owners).size(),
                     "replicas=" + replicas + " owners=" + owners);
         }
 
@@ -226,7 +227,8 @@ class HashRingTest {
         }
         double fair = (double) total / NODES.size();
         for (Map.Entry<String, Integer> entry : counts.entrySet()) {
-            assertTrue(Math.abs(entry.getValue() - fair) / fair < 0.15,
+            assertTrue(
+                    Math.abs(entry.getValue() - fair) / fair < 0.15,
                     entry.getKey() + " got " + entry.getValue() + "/" + total);
         }
     }

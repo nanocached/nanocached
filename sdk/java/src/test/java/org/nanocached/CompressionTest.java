@@ -21,7 +21,7 @@ class CompressionTest {
     // produced, not merely that it round-trips its own output.
     private static final byte[] CROSS_LANGUAGE_PLAINTEXT =
             ("{\"user\":\"alice\",\"role\":\"admin\",\"tags\":[\"a\",\"b\",\"c\"],\"note\":\"the quick "
-                    + "brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog\"}")
+                            + "brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog\"}")
                     .getBytes(java.nio.charset.StandardCharsets.UTF_8);
     private static final String CROSS_LANGUAGE_DEFLATE_HEX =
             "958acb0d833010055b59bd3315d00ae2609bc531b1bdc41f9280d23b7609393ce98d662ed4cc0923"
@@ -81,14 +81,14 @@ class CompressionTest {
 
     @Test
     void unrecognizedMarkerByteThrows() {
-        assertThrows(NanocachedException.DecompressionFailed.class,
+        assertThrows(
+                NanocachedException.DecompressionFailed.class,
                 () -> Compression.decompressValue(new byte[] {0x02, 1, 2, 3}));
     }
 
     @Test
     void emptyValueWithCompressEnabledThrows() {
-        assertThrows(NanocachedException.DecompressionFailed.class,
-                () -> Compression.decompressValue(new byte[0]));
+        assertThrows(NanocachedException.DecompressionFailed.class, () -> Compression.decompressValue(new byte[0]));
     }
 
     @Test
@@ -101,8 +101,7 @@ class CompressionTest {
         assertEquals(0x01, stored[0]);
         assertTrue(stored.length < 1024 * 1024); // small on the wire
         NanocachedException.DecompressionFailed error =
-                assertThrows(NanocachedException.DecompressionFailed.class,
-                        () -> Compression.decompressValue(stored));
+                assertThrows(NanocachedException.DecompressionFailed.class, () -> Compression.decompressValue(stored));
         assertTrue(error.getMessage().contains("decompression bomb"));
     }
 
@@ -116,8 +115,10 @@ class CompressionTest {
 
     @Test
     void corruptDeflateMarkedValueThrows() {
-        assertThrows(NanocachedException.DecompressionFailed.class,
-                () -> Compression.decompressValue(new byte[] {0x01, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF}));
+        assertThrows(
+                NanocachedException.DecompressionFailed.class,
+                () -> Compression.decompressValue(
+                        new byte[] {0x01, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF}));
     }
 
     @Test

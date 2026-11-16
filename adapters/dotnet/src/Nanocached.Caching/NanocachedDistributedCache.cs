@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics.CodeAnalysis;
 using System.Text;
 using Microsoft.Extensions.Caching.Distributed;
 
@@ -299,6 +300,8 @@ public sealed class NanocachedDistributedCache : IDistributedCache, IDisposable
         /// spec, made so neither field can silently widen a window the
         /// other one narrowed.
         /// </summary>
+        [SuppressMessage("Usage", "CA2208:Instantiate argument exceptions correctly",
+            Justification = "ParamName names the offending DistributedCacheEntryOptions property, as MemoryDistributedCache does.")]
         internal static Envelope FromOptions(DistributedCacheEntryOptions options, byte[] payload, DateTimeOffset now)
         {
             DateTimeOffset? absolute = options.AbsoluteExpiration;

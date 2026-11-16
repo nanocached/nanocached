@@ -23,7 +23,13 @@ import time
 from collections import deque
 from collections.abc import Callable, Sequence
 
-from ._errors import ConnectionLostError, NanocachedError, NotNumericError, RetryableError, WrongNodeError
+from ._errors import (
+    ConnectionLostError,
+    NanocachedError,
+    NotNumericError,
+    RetryableError,
+    WrongNodeError,
+)
 
 # The server's own request cap is 1 MiB; this constant doubles that as
 # headroom, so a claimed length beyond it is definitely a corrupt or
@@ -147,10 +153,23 @@ def _encode_set(
     if namespace:
         if ttl_seconds == 0:
             return b"s %d %d %d%b\n%b%b%b" % (
-                len(namespace), len(key), len(value), _tag_field(tag), namespace, key, value
+                len(namespace),
+                len(key),
+                len(value),
+                _tag_field(tag),
+                namespace,
+                key,
+                value,
             )
         return b"s %d %d %d %d%b\n%b%b%b" % (
-            len(namespace), len(key), len(value), ttl_seconds, _tag_field(tag), namespace, key, value
+            len(namespace),
+            len(key),
+            len(value),
+            ttl_seconds,
+            _tag_field(tag),
+            namespace,
+            key,
+            value,
         )
     if ttl_seconds == 0:
         return b"S %d %d%b\n%b%b" % (len(key), len(value), _tag_field(tag), key, value)
@@ -182,7 +201,14 @@ def _encode_clear_all(tag: int | None = None) -> bytes:
 # str(int) already produces the wire's canonical form: an optional
 # leading '-', no leading zeros, no '+' — %d formats it identically).
 def _encode_incr(key: bytes, delta: int, tag: int | None = None, namespace: bytes = b"") -> bytes:
-    return b"i %d %d %d%b\n%b%b" % (len(namespace), len(key), delta, _tag_field(tag), namespace, key)
+    return b"i %d %d %d%b\n%b%b" % (
+        len(namespace),
+        len(key),
+        delta,
+        _tag_field(tag),
+        namespace,
+        key,
+    )
 
 
 # Touch (issue #825): like i above, always namespaced (0 for the default
@@ -199,7 +225,13 @@ def _encode_touch(
     ttl_field = b"" if ttl_seconds is None else b" %d" % ttl_seconds
     get_field = b" G" if get else b""
     return b"t %d %d%b%b%b\n%b%b" % (
-        len(namespace), len(key), ttl_field, get_field, _tag_field(tag), namespace, key
+        len(namespace),
+        len(key),
+        ttl_field,
+        get_field,
+        _tag_field(tag),
+        namespace,
+        key,
     )
 
 
@@ -227,14 +259,31 @@ def _encode_cas_set(
     # own ttl_seconds field.
     if ttl_seconds == 0:
         return b"k %d %d %d %b%b\n%b%b%b" % (
-            len(namespace), len(key), len(value), cond, _tag_field(tag), namespace, key, value
+            len(namespace),
+            len(key),
+            len(value),
+            cond,
+            _tag_field(tag),
+            namespace,
+            key,
+            value,
         )
     return b"k %d %d %d %b %d%b\n%b%b%b" % (
-        len(namespace), len(key), len(value), cond, ttl_seconds, _tag_field(tag), namespace, key, value
+        len(namespace),
+        len(key),
+        len(value),
+        cond,
+        ttl_seconds,
+        _tag_field(tag),
+        namespace,
+        key,
+        value,
     )
 
 
-def _encode_cas_delete(key: bytes, cond: bytes, tag: int | None = None, namespace: bytes = b"") -> bytes:
+def _encode_cas_delete(
+    key: bytes, cond: bytes, tag: int | None = None, namespace: bytes = b""
+) -> bytes:
     # <cond> here is always a digest (never CAS_ABSENT/CAS_PRESENT) — an
     # absent- or present-only conditioned delete is already the plain,
     # unconditional D/d (docs/protocol.html "k / x").
@@ -265,7 +314,7 @@ def _encode_multi_set(
     namespace: bytes = b"",
 ) -> bytes:
     fields = [b"o", b"%d" % len(namespace), b"%d" % len(keys)]
-    for key, value in zip(keys, values):
+    for key, value in zip(keys, values, strict=True):
         fields.append(b"%d" % len(key))
         fields.append(b"%d" % len(value))
     # 0 means no expiry — omitted from the wire, exactly like
@@ -273,7 +322,7 @@ def _encode_multi_set(
     if ttl_seconds != 0:
         fields.append(b"%d" % ttl_seconds)
     header = b" ".join(fields) + _tag_field(tag) + b"\n"
-    body = namespace + b"".join(key + value for key, value in zip(keys, values))
+    body = namespace + b"".join(key + value for key, value in zip(keys, values, strict=True))
     return header + body
 
 
@@ -369,9 +418,9 @@ class _PendingSlot:
     have reached the server before the reply was lost" (``sent`` True —
     see Connection._error_for)."""
 
-    __slots__ = ("tag", "future", "sent")
+    __slots__ = ("future", "sent", "tag")
 
-    def __init__(self, future: "asyncio.Future[tuple[bytes, _ResponsePayload]]") -> None:
+    def __init__(self, future: asyncio.Future[tuple[bytes, _ResponsePayload]]) -> None:
         self.tag: int | None = None
         self.future = future
         self.sent = False
@@ -517,7 +566,9 @@ class Connection:
         raise self._mismatch(marker)
 
     async def set(self, key: bytes, value: bytes, ttl_seconds: int, namespace: bytes = b"") -> None:
-        marker, _ = await self._request(lambda tag: _encode_set(key, value, ttl_seconds, tag, namespace))
+        marker, _ = await self._request(
+            lambda tag: _encode_set(key, value, ttl_seconds, tag, namespace)
+        )
         if marker == b"W":
             raise WrongNodeError()
         if marker != b"S":
@@ -598,7 +649,7 @@ class Connection:
 
     async def multi_get(
         self, keys: Sequence[bytes], namespace: bytes = b""
-    ) -> list[bytes | None | _MultiWrongNode]:
+    ) -> list[bytes | _MultiWrongNode | None]:
         """Sends one ``m`` request for every key in ``keys`` (issues
         #128/#150/#151) and returns one roster entry per key, in request
         order: the hit's raw bytes, ``None`` for a clean miss, or
@@ -621,7 +672,11 @@ class Connection:
         raise self._mismatch(marker)
 
     async def multi_set(
-        self, keys: Sequence[bytes], values: Sequence[bytes], ttl_seconds: int, namespace: bytes = b""
+        self,
+        keys: Sequence[bytes],
+        values: Sequence[bytes],
+        ttl_seconds: int,
+        namespace: bytes = b"",
     ) -> list[bool | _MultiWrongNode]:
         """Sends one ``o`` request storing every (key, value) pair in
         ``keys``/``values`` under one shared TTL (issues
@@ -667,7 +722,7 @@ class Connection:
 
     async def multi_get_and_touch(
         self, keys: Sequence[bytes], ttl_seconds: int | None, namespace: bytes = b""
-    ) -> list[bytes | None | _MultiWrongNode]:
+    ) -> list[bytes | _MultiWrongNode | None]:
         """Sends one ``y ... G`` request to *this* node only (issue #871)
         and returns multi_get()'s roster for it: the hit's raw bytes (the
         key now has the frame's TTL), ``None`` for a miss or for a value
@@ -716,7 +771,8 @@ class Connection:
         # be replayed — issue #921).
         # Requests still pending behind this one may already have been
         # resolved with misaligned data by the time this runs — an
-        # inherent limitation of matching-by-order pipelining (documented once, for every SDK, at docs/protocol.html#untagged-desync) shared with
+        # inherent limitation of matching-by-order pipelining (documented
+        # once, for every SDK, at docs/protocol.html#untagged-desync) shared with
         # the TypeScript SDK's Connection (request pipelining), not
         # something this SDK introduces.
         return self._desync(
@@ -820,7 +876,8 @@ class Connection:
         # redials.
         self._poison(
             ConnectionError(
-                f"nanocached: no response from server within {_REQUEST_TIMEOUT}s (request timed out)"
+                f"nanocached: no response from server within {_REQUEST_TIMEOUT}s "
+                "(request timed out)"
             )
         )
 
@@ -868,9 +925,9 @@ class Connection:
         if self.closed:
             raise ConnectionError("nanocached: connection is closed")
 
-        future: asyncio.Future[
-            tuple[bytes, _ResponsePayload]
-        ] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[tuple[bytes, _ResponsePayload]] = (
+            asyncio.get_running_loop().create_future()
+        )
         async with self._write_lock:
             if self.closed:
                 raise ConnectionError("nanocached: connection is closed")
@@ -938,7 +995,9 @@ class Connection:
                     # on it ("Future exception was never retrieved"):
                     # cancel it first, which _poison() skips.
                     future.cancel()
-                    self._poison(ConnectionError("nanocached: connection failed: cancelled mid-write"))
+                    self._poison(
+                        ConnectionError("nanocached: connection failed: cancelled mid-write")
+                    )
                     raise
 
         # If cancelled here, the write already fully completed — the
@@ -1017,12 +1076,17 @@ class Connection:
             # (mirrors the TypeScript SDK's Connection.onData).
             if marker == b"B" and was_empty:
                 self._poison(
-                    ConnectionError("nanocached: server rejected the connection (connection limit reached)")
+                    ConnectionError(
+                        "nanocached: server rejected the connection (connection limit reached)"
+                    )
                 )
                 return
             if was_empty:
                 self._poison(
-                    ConnectionError(f"nanocached: unsolicited response {marker!r} from server (connection desynced)")
+                    ConnectionError(
+                        f"nanocached: unsolicited response {marker!r} from server "
+                        "(connection desynced)"
+                    )
                 )
                 return
 
@@ -1045,11 +1109,11 @@ class Connection:
             # (_mismatch), catching it here stops the misdelivery instead
             # of merely noticing it later.
             if self._tagged and tag != expected_tag:
-                error = ConnectionError(
+                desync = ConnectionError(
                     f"nanocached: response tag {tag} does not answer request tag {expected_tag} "
                     f"(connection desynced)"
                 )
-                self._poison(error)
+                self._poison(desync)
                 # The popped future is no longer in _pending, so _poison()
                 # didn't reject it — do that here; the rest drain via
                 # _poison()'s own rejection of what's left. Through
@@ -1058,7 +1122,7 @@ class Connection:
                 # so this request must surface as ConnectionLostError and
                 # never be replayed by incr/CAS or an expiring touch.
                 if not future.cancelled():
-                    future.set_exception(self._error_for(slot, error))
+                    future.set_exception(self._error_for(slot, desync))
                 return
 
             if not future.cancelled():
@@ -1186,7 +1250,9 @@ class Connection:
             if len(fields) != want_fields:
                 raise NanocachedError("nanocached: invalid multi-get header in response")
             tag = self._parse_tag(fields[1 + count]) if self._tagged else None
-            entries: list[bytes | None | _MultiWrongNode] = []
+            # list[object], like every other marker's entries: _ResponsePayload's
+            # list is invariant. Each is bytes, WRONG_NODE or None.
+            entries: list[object] = []
             # Cumulative-bytes bound (issue #207): each individual
             # length is already checked against _MAX_VALUE_LENGTH below,
             # but that alone doesn't bound the reply as a whole — track
@@ -1244,7 +1310,9 @@ class Connection:
                 # `<marker> <tag>\n` (echoed response tags).
                 header = await self._reader.readuntil(b"\n")
                 if len(header) < 2 or header[0:1] != b" ":
-                    raise NanocachedError("nanocached: response is missing its tag (connection desynced)")
+                    raise NanocachedError(
+                        "nanocached: response is missing its tag (connection desynced)"
+                    )
                 return marker, None, self._parse_tag(header[1:-1])
             trailer = await self._reader.readexactly(1)
             # The untagged form is always exactly `<marker>\n` — a byte
@@ -1279,7 +1347,9 @@ class Connection:
             except asyncio.IncompleteReadError as error:
                 rest = error.partial
             if rest.startswith(b"n"):
-                raise _ServerRejectedError(f"nanocached: unexpected response from server: {marker!r}")
+                raise _ServerRejectedError(
+                    f"nanocached: unexpected response from server: {marker!r}"
+                )
 
         raise NanocachedError(f"nanocached: unexpected response from server: {marker!r}")
 

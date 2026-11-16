@@ -215,6 +215,7 @@ export class NanocachedStore implements Store {
     return raw === null ? undefined : (parseStored(raw) as T | undefined);
   }
 
+  // oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- signature fixed by cache-manager's Store interface
   async set<T>(key: string, data: T, ttl?: Milliseconds): Promise<void> {
     // Rejected before anything else is looked at, the way the memory
     // store does it: a non-cacheable value is a caller error, not a

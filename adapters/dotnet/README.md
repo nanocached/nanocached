@@ -215,9 +215,17 @@ namespaces and the compare-and-set that sliding renewals use.
 
 ```sh
 cd adapters/dotnet
+dotnet format src/Nanocached.Caching && dotnet format tests/Nanocached.Caching.Tests   # format, fix style and analyzer findings
+dotnet format src/Nanocached.Caching --verify-no-changes && dotnet format tests/Nanocached.Caching.Tests --verify-no-changes   # check only, as CI does
+dotnet build tests/Nanocached.Caching.Tests   # compiler, analyzers and code style; warnings fail the build
 dotnet test tests/Nanocached.Caching.Tests
 dotnet pack src/Nanocached.Caching
 ```
+
+The toolchain and rules are the SDK's: the repository's `global.json`
+and `.editorconfig`, and `Directory.Build.props`, which imports
+`sdk/dotnet/Directory.Build.props` (see the SDK's
+[Build](../../sdk/dotnet/README.md#build) section).
 
 The build references the sibling `sdk/dotnet` sources directly (project
 reference), so a checkout needs no locally-installed SDK package.

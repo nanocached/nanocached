@@ -183,7 +183,7 @@ describe("HashRing", () => {
 
     for (let replicas = 0; replicas <= 5; replicas++) {
       const owners = ring.owners(key, replicas);
-      assert.equal(new Set(owners).size, owners.length, `replicas=${replicas}: duplicate in ${owners}`);
+      assert.equal(new Set(owners).size, owners.length, `replicas=${replicas}: duplicate in ${String(owners)}`);
     }
 
     // Construction order is otherwise unaffected: the first occurrence of
@@ -353,7 +353,10 @@ describe("HashRing.owners bounded top-R selection (audit finding)", () => {
     assert.ok(compareNodeNames("node", "node-a") < 0);
 
     // Through the ring: force every score to tie, in both construction orders.
-    for (const names of [[bmp, supplementary], [supplementary, bmp]]) {
+    for (const names of [
+      [bmp, supplementary],
+      [supplementary, bmp],
+    ]) {
       const ring = new HashRing(names);
       const internals = ring as unknown as { nodeHashHi: Uint32Array; nodeHashLo: Uint32Array };
       internals.nodeHashHi.fill(0x01234567);

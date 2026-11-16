@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Text;
 
@@ -45,6 +46,8 @@ namespace Nanocached;
 /// close or redial: it is not a connection error, not a <c>W</c>, not an
 /// <c>E</c>.</para>
 /// </summary>
+[SuppressMessage("Design", "CA1001:Types that own disposable fields should be disposable",
+    Justification = "Its lifetime ends in Close, which disposes the timer and stream; the SemaphoreSlim never allocates a wait handle.")]
 internal sealed class Connection
 {
     // The server's own request cap is 1 MiB; this constant doubles that
@@ -1490,11 +1493,8 @@ internal sealed class Connection
         var entries = new List<MultiEntry>(count);
         for (int i = 0; i < count; i++)
         {
-            MultiEntry? entry = entryOf(fields[1 + i]);
-            if (entry is null)
-            {
-                throw new ConnectionLostException($"nanocached: invalid {what} result token in response");
-            }
+            MultiEntry? entry = entryOf(fields[1 + i])
+                ?? throw new ConnectionLostException($"nanocached: invalid {what} result token in response");
             entries.Add(entry.Value);
         }
         uint? tag = _tagged ? ParseTag(fields[1 + count]) : null;

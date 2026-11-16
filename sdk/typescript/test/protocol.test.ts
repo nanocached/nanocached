@@ -87,10 +87,7 @@ describe("encodeSet", () => {
   });
 
   it("rejects a key+value combination beyond MAX_REQUEST_BYTES plus the compression marker byte synchronously", () => {
-    assert.throws(
-      () => encodeSet(Buffer.alloc(MAX_REQUEST_BYTES), Buffer.from("xx")),
-      RangeError,
-    );
+    assert.throws(() => encodeSet(Buffer.alloc(MAX_REQUEST_BYTES), Buffer.from("xx")), RangeError);
   });
 
   it("accepts one byte over MAX_REQUEST_BYTES: the compression marker added to a value at the cap", () => {
@@ -136,12 +133,18 @@ describe("encodeIncr (issue #129)", () => {
   });
 
   it("frames a named namespace ahead of the key, matching g/s/d's field order", () => {
-    assert.deepEqual(encodeIncr(Buffer.from("alpha"), 3, undefined, NS), Buffer.concat([Buffer.from("i 5 5 3\n"), NS, Buffer.from("alpha")]));
+    assert.deepEqual(
+      encodeIncr(Buffer.from("alpha"), 3, undefined, NS),
+      Buffer.concat([Buffer.from("i 5 5 3\n"), NS, Buffer.from("alpha")]),
+    );
   });
 
   it("appends the tag as the last header field", () => {
     assert.deepEqual(encodeIncr(Buffer.from("key"), 1, 7), Buffer.from("i 0 3 1 7\nkey"));
-    assert.deepEqual(encodeIncr(Buffer.from("key"), -1, 7, NS), Buffer.concat([Buffer.from("i 5 3 -1 7\n"), NS, Buffer.from("key")]));
+    assert.deepEqual(
+      encodeIncr(Buffer.from("key"), -1, 7, NS),
+      Buffer.concat([Buffer.from("i 5 3 -1 7\n"), NS, Buffer.from("key")]),
+    );
   });
 
   it("rejects an empty key synchronously", () => {
@@ -308,7 +311,10 @@ describe("encodeCas (issue #141)", () => {
   });
 
   it("frames a present condition with the bare `P` token", () => {
-    assert.deepEqual(encodeCas(Buffer.from("key"), Buffer.from("value"), { kind: "present" }), Buffer.from("k 0 3 5 P\nkeyvalue"));
+    assert.deepEqual(
+      encodeCas(Buffer.from("key"), Buffer.from("value"), { kind: "present" }),
+      Buffer.from("k 0 3 5 P\nkeyvalue"),
+    );
   });
 
   it("frames a digest condition with the raw digest string, not length-prefixed", () => {
@@ -340,7 +346,10 @@ describe("encodeCas (issue #141)", () => {
 
   it("appends the tag as the last header field, after the TTL when both are present", () => {
     assert.deepEqual(encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "present" }, 0, 7), Buffer.from("k 0 1 1 P 7\nkv"));
-    assert.deepEqual(encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "present" }, 60, 7), Buffer.from("k 0 1 1 P 60 7\nkv"));
+    assert.deepEqual(
+      encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "present" }, 60, 7),
+      Buffer.from("k 0 1 1 P 60 7\nkv"),
+    );
   });
 
   it("rejects an empty key synchronously", () => {
@@ -368,7 +377,16 @@ describe("encodeCas (issue #141)", () => {
   });
 
   it("rejects a digest condition that isn't a 32-character lowercase hex string", () => {
-    for (const bad of ["", "A", "P", "not-hex-at-all-not-hex-at-all!!", "0".repeat(31), "0".repeat(33), "0123456789abcdef0123456789abcdef".toUpperCase(), "abc def0123456789abcdef012345 "]) {
+    for (const bad of [
+      "",
+      "A",
+      "P",
+      "not-hex-at-all-not-hex-at-all!!",
+      "0".repeat(31),
+      "0".repeat(33),
+      "0123456789abcdef0123456789abcdef".toUpperCase(),
+      "abc def0123456789abcdef012345 ",
+    ]) {
       assert.throws(() => encodeCas(Buffer.from("k"), Buffer.from("v"), { kind: "digest", digest: bad }), RangeError);
     }
   });
@@ -474,13 +492,25 @@ describe("tryParseResponse of a get-and-touch reply (issue #825)", () => {
   });
 
   it("tells the node's En from other unexpected bytes", () => {
-    assert.throws(() => tryParseResponse(Buffer.from("En\n")), (error: Error) => error.name === "ServerRejectedError");
-    assert.throws(() => tryParseResponse(Buffer.from("Z\n")), (error: Error) => error.name === "NanocachedError");
+    assert.throws(
+      () => tryParseResponse(Buffer.from("En\n")),
+      (error: Error) => error.name === "ServerRejectedError",
+    );
+    assert.throws(
+      () => tryParseResponse(Buffer.from("Z\n")),
+      (error: Error) => error.name === "NanocachedError",
+    );
   });
 
   it("does not call the proxy's bare E a server rejection (issue #939)", () => {
-    for (const [bytes, tagged] of [["E\n", false], ["E 7\n", true]] as const) {
-      assert.throws(() => tryParseResponse(Buffer.from(bytes), tagged), (error: Error) => error.name === "NanocachedError");
+    for (const [bytes, tagged] of [
+      ["E\n", false],
+      ["E 7\n", true],
+    ] as const) {
+      assert.throws(
+        () => tryParseResponse(Buffer.from(bytes), tagged),
+        (error: Error) => error.name === "NanocachedError",
+      );
     }
     assert.equal(tryParseResponse(Buffer.from("E")), null);
   });
@@ -652,7 +682,7 @@ describe("tryParseResponse", () => {
     assert.deepEqual(first?.response.value, Buffer.from("hi"));
     assert.equal(first?.consumed, 6);
 
-    const second = tryParseResponse(buf.subarray(first!.consumed));
+    const second = tryParseResponse(buf.subarray(first.consumed));
     assert.equal(second?.response.kind, "stored");
   });
 
@@ -935,7 +965,11 @@ describe("tryParseResponse — batched get/set M/O (issues #128/#150/#151)", () 
   it("stores results are S/W, with no body — the reply completes the instant its header is read", () => {
     const parsed = tryParseResponse(Buffer.from("O 2 S W\nEXTRA"));
     assert.equal(parsed?.consumed, 8);
-    assert.deepEqual(parsed?.response, { kind: "multiAck", ackEntries: [{ kind: "stored" }, { kind: "wrongNode" }], tag: undefined });
+    assert.deepEqual(parsed?.response, {
+      kind: "multiAck",
+      ackEntries: [{ kind: "stored" }, { kind: "wrongNode" }],
+      tag: undefined,
+    });
   });
 
   it("parses a tagged multi-set response", () => {
@@ -1095,11 +1129,17 @@ describe("namespaced encoders (first-class namespaces, issue #105)", () => {
   });
 
   it("encodeGet frames the namespace length ahead of the key length", () => {
-    assert.deepEqual(encodeGet(Buffer.from("alpha"), undefined, NS), Buffer.concat([Buffer.from("g 5 5\n"), NS, Buffer.from("alpha")]));
+    assert.deepEqual(
+      encodeGet(Buffer.from("alpha"), undefined, NS),
+      Buffer.concat([Buffer.from("g 5 5\n"), NS, Buffer.from("alpha")]),
+    );
   });
 
   it("encodeDelete frames the namespace length ahead of the key length", () => {
-    assert.deepEqual(encodeDelete(Buffer.from("alpha"), undefined, NS), Buffer.concat([Buffer.from("d 5 5\n"), NS, Buffer.from("alpha")]));
+    assert.deepEqual(
+      encodeDelete(Buffer.from("alpha"), undefined, NS),
+      Buffer.concat([Buffer.from("d 5 5\n"), NS, Buffer.from("alpha")]),
+    );
   });
 
   it("encodeSet frames the namespace length first, with no TTL by default", () => {
@@ -1118,7 +1158,10 @@ describe("namespaced encoders (first-class namespaces, issue #105)", () => {
 
   it("keeps the tag as the last header field, with and without a TTL", () => {
     assert.deepEqual(encodeGet(Buffer.from("alpha"), 7, NS), Buffer.concat([Buffer.from("g 5 5 7\n"), NS, Buffer.from("alpha")]));
-    assert.deepEqual(encodeDelete(Buffer.from("alpha"), 8, NS), Buffer.concat([Buffer.from("d 5 5 8\n"), NS, Buffer.from("alpha")]));
+    assert.deepEqual(
+      encodeDelete(Buffer.from("alpha"), 8, NS),
+      Buffer.concat([Buffer.from("d 5 5 8\n"), NS, Buffer.from("alpha")]),
+    );
     assert.deepEqual(
       encodeSet(Buffer.from("k"), Buffer.from("v"), 0, 9, NS),
       Buffer.concat([Buffer.from("s 5 1 1 9\n"), NS, Buffer.from("kv")]),

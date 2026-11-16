@@ -32,7 +32,14 @@ import {
 import { Connection, REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
 import { MAX_REQUEST_BYTES, MULTI_GET_TUNING } from "../src/protocol.js";
 import { maxMultiGetDecompressedBytes, setMaxMultiGetDecompressedBytesForTest } from "../src/compression.js";
-import { revivablePort, startMockDiscovery, startMockNode, unreachablePort, type MockDiscovery, type MockNode } from "./mockServers.js";
+import {
+  revivablePort,
+  startMockDiscovery,
+  startMockNode,
+  unreachablePort,
+  type MockDiscovery,
+  type MockNode,
+} from "./mockServers.js";
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -267,16 +274,14 @@ describe("NanocachedClient against a single node", () => {
       // item 5), not just by message.
       await assert.rejects(
         NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] }),
-        (error: unknown) =>
-          error instanceof AuthenticationError && /requires authentication/.test(error.message),
+        (error: unknown) => error instanceof AuthenticationError && /requires authentication/.test(error.message),
       );
       await assert.rejects(
         NanocachedClient.connect({
           addresses: [{ host: "127.0.0.1", port: node.port }],
           authSecret: "wrong",
         }),
-        (error: unknown) =>
-          error instanceof AuthenticationError && /authentication failed/.test(error.message),
+        (error: unknown) => error instanceof AuthenticationError && /authentication failed/.test(error.message),
       );
     } finally {
       await node.close();
@@ -322,9 +327,7 @@ describe("NanocachedClient against a single node", () => {
       await client.close();
 
       const messages = warn.mock.calls.map((call) => String(call.arguments[0]));
-      const closeWarnings = messages.filter((message) =>
-        message.includes("close() called again on an already-closed client"),
-      );
+      const closeWarnings = messages.filter((message) => message.includes("close() called again on an already-closed client"));
       assert.equal(closeWarnings.length, 2, JSON.stringify(messages));
       assert.equal(client.isClosed(), true);
     } finally {
@@ -454,16 +457,16 @@ describe("NanocachedClient value compression (value compression)", () => {
         const result = await client.getWithToken("k");
         assert.ok(result !== null);
         // The returned value is the ordinary decompressed one...
-        assert.deepEqual(result!.value, Buffer.from(value, "utf8"));
+        assert.deepEqual(result.value, Buffer.from(value, "utf8"));
         // ...but the token must hash the raw wire bytes (marker included),
         // exactly what the mock server's own `k`/`x` digest evaluation
         // hashes — never the decompressed value.
-        assert.equal(result!.token, contentDigest(stored));
-        assert.notEqual(result!.token, contentDigest(Buffer.from(value, "utf8")), "must not hash the decompressed value");
+        assert.equal(result.token, contentDigest(stored));
+        assert.notEqual(result.token, contentDigest(Buffer.from(value, "utf8")), "must not hash the decompressed value");
 
         // And a replace() using that token must actually succeed against
         // the (compression-aware) mock server, proving the two agree.
-        assert.equal(await client.replace("k", result!.token, "replacement"), true);
+        assert.equal(await client.replace("k", result.token, "replacement"), true);
         assert.equal(await client.get("k"), "replacement");
       } finally {
         await client.close();
@@ -544,7 +547,7 @@ describe("NanocachedClient value compression (value compression)", () => {
       try {
         const atCap = randomBytes(MAX_REQUEST_BYTES - 1); // key "z" + value = MAX_REQUEST_BYTES; incompressible
         await client.set("z", atCap);
-        assert.deepEqual(Buffer.from(await client.getBytes("z") as Uint8Array), atCap);
+        assert.deepEqual(Buffer.from((await client.getBytes("z")) as Uint8Array), atCap);
 
         // One byte more is still refused, before any I/O.
         await assert.rejects(client.set("y", Buffer.concat([atCap, Buffer.from([0])])), RangeError);
@@ -568,9 +571,9 @@ describe("NanocachedClient value compression (value compression)", () => {
       try {
         const atCap = randomBytes(MAX_REQUEST_BYTES - 1);
         await client.setManyBytes({ a: Buffer.from("1"), b: Buffer.from("2"), z: atCap });
-        assert.deepEqual(Buffer.from(await client.getBytes("a") as Uint8Array), Buffer.from("1"));
-        assert.deepEqual(Buffer.from(await client.getBytes("b") as Uint8Array), Buffer.from("2"));
-        assert.deepEqual(Buffer.from(await client.getBytes("z") as Uint8Array), atCap);
+        assert.deepEqual(Buffer.from((await client.getBytes("a")) as Uint8Array), Buffer.from("1"));
+        assert.deepEqual(Buffer.from((await client.getBytes("b")) as Uint8Array), Buffer.from("2"));
+        assert.deepEqual(Buffer.from((await client.getBytes("z")) as Uint8Array), atCap);
 
         // A pair over the cap fails the eager check, with nothing of the batch stored.
         node.store.clear();
@@ -1259,9 +1262,7 @@ describe("NanocachedClient reconnect-on-use", () => {
     // node-list refresh — a freshly dialed socket installed afterwards
     // would leak with nothing left to close it.
     const node = await startMockNode();
-    const discovery = await startMockDiscovery([
-      { name: "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", address: node.address },
-    ]);
+    const discovery = await startMockDiscovery([{ name: "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", address: node.address }]);
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
       const before = node.connectionCount();
@@ -1576,8 +1577,7 @@ describe("NanocachedError base class (issue #44)", () => {
           addresses: [{ host: "127.0.0.1", port: node.port }],
           authSecret: "wrong",
         }),
-        (error: unknown) =>
-          error instanceof NanocachedError && /authentication failed/.test((error as Error).message),
+        (error: unknown) => error instanceof NanocachedError && /authentication failed/.test(error.message),
       );
     } finally {
       await node.close();
@@ -1622,11 +1622,7 @@ describe("unsolicited busy response (issue #45)", () => {
 
 describe("a forced node-list refresh and one already in flight (issue #1227)", () => {
   async function withStubbedRefresh(
-    run: (ctx: {
-      client: NanocachedClient;
-      starts: () => number;
-      release: (index: number) => void;
-    }) => Promise<void>,
+    run: (ctx: { client: NanocachedClient; starts: () => number; release: (index: number) => void }) => Promise<void>,
   ): Promise<void> {
     const node = await startMockNode();
     const discovery = await startMockDiscovery([{ name: "n1", address: node.address }]);
@@ -1781,9 +1777,7 @@ describe("a redial finishing after close() (issue #1216)", () => {
   async function closeRightAfterRedial(mode: "single" | "cluster" | "proxy"): Promise<void> {
     const node = await startMockNode();
     const discovery =
-      mode === "single"
-        ? null
-        : await startMockDiscovery(mode === "cluster" ? [{ name: "n1", address: node.address }] : []);
+      mode === "single" ? null : await startMockDiscovery(mode === "cluster" ? [{ name: "n1", address: node.address }] : []);
     if (discovery !== null && mode === "proxy") discovery.setProxies([{ name: "p1", address: node.address }]);
     let redialed: Connection | null = null;
     try {
@@ -1899,7 +1893,12 @@ describe("a node-list refresh that is still dialing new nodes (issue #1615)", ()
         }
       } finally {
         for (const socket of heldSockets) socket.destroy();
-        await Promise.all([nodeA.close(), nodeB.close(), discovery.close(), new Promise<void>((resolve) => held.close(() => resolve()))]);
+        await Promise.all([
+          nodeA.close(),
+          nodeB.close(),
+          discovery.close(),
+          new Promise<void>((resolve) => held.close(() => resolve())),
+        ]);
       }
     });
   }
@@ -1913,9 +1912,7 @@ describe("a request that needs a redial after close() does not dial (issue #1613
   async function redialAfterClose(mode: "single" | "cluster" | "proxy"): Promise<void> {
     const node = await startMockNode();
     const discovery =
-      mode === "single"
-        ? null
-        : await startMockDiscovery(mode === "cluster" ? [{ name: "n1", address: node.address }] : []);
+      mode === "single" ? null : await startMockDiscovery(mode === "cluster" ? [{ name: "n1", address: node.address }] : []);
     if (discovery !== null && mode === "proxy") discovery.setProxies([{ name: "p1", address: node.address }]);
     try {
       const client = await NanocachedClient.connect(
@@ -2172,14 +2169,10 @@ describe("a failed write poisons the connection (audit finding)", () => {
       // Stub the next write to fail, the way a dead peer (EPIPE,
       // ECONNRESET) would, without actually breaking the socket —
       // deterministic, and doesn't depend on OS-level timing.
-      const writeMock = mock.method(
-        socket,
-        "write",
-        ((_data: unknown, cb?: (error?: Error) => void) => {
-          if (typeof cb === "function") cb(Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
-          return true;
-        }) as typeof socket.write,
-      );
+      const writeMock = mock.method(socket, "write", ((_data: unknown, cb?: (error?: Error) => void) => {
+        if (typeof cb === "function") cb(Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+        return true;
+      }) as typeof socket.write);
 
       try {
         const started = Date.now();
@@ -2187,10 +2180,7 @@ describe("a failed write poisons the connection (audit finding)", () => {
         assert.equal(connection.isClosed(), true);
         assert.ok(socket.destroyed, "the client must destroy the socket itself");
         await assert.rejects(secondRequest, /connection failed/);
-        assert.ok(
-          Date.now() - started < 2_000,
-          "other in-flight requests must not wait for the 30s request timeout",
-        );
+        assert.ok(Date.now() - started < 2_000, "other in-flight requests must not wait for the 30s request timeout");
       } finally {
         writeMock.mock.restore();
       }
@@ -2227,8 +2217,7 @@ describe("NanocachedClient request timeout (issue #42)", () => {
         // first timeout (see the tests below); single mode does not.
         await assert.rejects(
           client.get("k"),
-          (error: unknown) =>
-            error instanceof Error && /request timed out/.test(error.message),
+          (error: unknown) => error instanceof Error && /request timed out/.test(error.message),
         );
         assert.ok(Date.now() - started < 2_000, "get() should fail well under 2s");
       } finally {
@@ -2328,8 +2317,7 @@ describe("NanocachedClient request timeout (issue #42)", () => {
           const started = Date.now();
           await assert.rejects(
             client.get("k"),
-            (error: unknown) =>
-              error instanceof Error && /request timed out/.test(error.message),
+            (error: unknown) => error instanceof Error && /request timed out/.test(error.message),
           );
           assert.ok(Date.now() - started < 2_000, "get() should fail well under 2s");
         } finally {
@@ -2627,7 +2615,7 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         // Fresh token from an actual read.
         const fresh = await client.getWithToken("k");
         assert.ok(fresh !== null);
-        assert.equal(await client.replace("k", fresh!.token, "v2"), true);
+        assert.equal(await client.replace("k", fresh.token, "v2"), true);
         assert.equal(await client.get("k"), "v2");
       } finally {
         await client.close();
@@ -2712,8 +2700,8 @@ describe("NanocachedClient compare-and-set against a single node (issue #141)", 
         await client.set("k", "hello world");
         const result = await client.getWithToken("k");
         assert.ok(result !== null);
-        assert.deepEqual(result!.value, Buffer.from("hello world", "utf8"));
-        assert.equal(result!.token, contentDigest(Buffer.from("hello world", "utf8")));
+        assert.deepEqual(result.value, Buffer.from("hello world", "utf8"));
+        assert.equal(result.token, contentDigest(Buffer.from("hello world", "utf8")));
       } finally {
         await client.close();
       }
@@ -3412,16 +3400,13 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
         await client.set("bin", new Uint8Array([0xff, 0xfe, 0x80]));
         await client.set("c", "3");
 
-        for (const read of [
-          () => client.getMany(["a", "bin", "c"]),
-          () => client.getManyAndTouch(["a", "bin", "c"], 60),
-        ]) {
+        for (const read of [() => client.getMany(["a", "bin", "c"]), () => client.getManyAndTouch(["a", "bin", "c"], 60)]) {
           node.answerMultiWrongNodeTimes("a", 1);
           try {
             await read();
             assert.fail("expected the read to reject");
           } catch (error) {
-            assert.ok(error instanceof PartialWrongNodeError, `expected PartialWrongNodeError, got ${error}`);
+            assert.ok(error instanceof PartialWrongNodeError, `expected PartialWrongNodeError, got ${String(error)}`);
             const partial = (error as PartialWrongNodeError<Map<string, string>>).partialValues;
             assert.equal(partial.get("c"), "3");
             assert.ok(!partial.has("bin"), "the non-UTF-8 value must be left out, not decoded lossily");
@@ -3463,7 +3448,7 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes against a s
           await client.getMany(keys);
           assert.fail("expected getMany to reject");
         } catch (error) {
-          assert.ok(error instanceof PartialConnectionLostError, `expected PartialConnectionLostError, got ${error}`);
+          assert.ok(error instanceof PartialConnectionLostError, `expected PartialConnectionLostError, got ${String(error)}`);
           const partial = (error as PartialConnectionLostError<Map<string, string>>).partialValues;
           assert.ok(partial.size > 0 && partial.size < count);
           assert.ok(!partial.has(keys[0]), "the non-UTF-8 value must be left out");
@@ -3669,10 +3654,16 @@ describe("NanocachedClient batch chunking cumulative byte bound (issue #222)", (
           values[key] = Buffer.alloc(valueSize, i % 256);
           rawTotal += Buffer.byteLength(key, "utf8") + valueSize;
         }
-        assert.ok(rawTotal <= MAX_REQUEST_BYTES, "raw namespace+key+value bytes alone must still fit — the header is what pushes this over");
+        assert.ok(
+          rawTotal <= MAX_REQUEST_BYTES,
+          "raw namespace+key+value bytes alone must still fit — the header is what pushes this over",
+        );
 
         await client.setManyBytes(values);
-        assert.ok(node.multiSetCount() > 1, "expected more than one o sub-frame despite fitting MAX_BATCH_KEYS and raw MAX_REQUEST_BYTES");
+        assert.ok(
+          node.multiSetCount() > 1,
+          "expected more than one o sub-frame despite fitting MAX_BATCH_KEYS and raw MAX_REQUEST_BYTES",
+        );
         for (const frameBytes of node.multiSetFrameBytes()) {
           assert.ok(frameBytes < 1024 * 1024, `sub-frame of ${frameBytes} bytes exceeds the server's 1 MiB request cap`);
         }
@@ -3706,7 +3697,10 @@ describe("NanocachedClient o/y chunks stay under the 64 MiB namespace x keys lim
       try {
         await client.namespace(namespace).setMany(Object.fromEntries(keys.map((k) => [k, "v"])));
         const counts = node.multiSetKeyCounts();
-        assert.equal(counts.reduce((a, b) => a + b, 0), 400);
+        assert.equal(
+          counts.reduce((a, b) => a + b, 0),
+          400,
+        );
         for (const count of counts) assert.ok(count * 170_000 <= LIMIT, `o frame of ${count} keys passes the limit`);
       } finally {
         await client.close();
@@ -3723,8 +3717,12 @@ describe("NanocachedClient o/y chunks stay under the 64 MiB namespace x keys lim
       try {
         await client.namespace(namespace).touchMany(keys, 60);
         const frames = node.multiTouchFrames();
-        assert.equal(frames.reduce((a, f) => a + f.keys.length, 0), 400);
-        for (const frame of frames) assert.ok(frame.keys.length * 170_000 <= LIMIT, `y frame of ${frame.keys.length} keys passes the limit`);
+        assert.equal(
+          frames.reduce((a, f) => a + f.keys.length, 0),
+          400,
+        );
+        for (const frame of frames)
+          assert.ok(frame.keys.length * 170_000 <= LIMIT, `y frame of ${frame.keys.length} keys passes the limit`);
       } finally {
         await client.close();
       }
@@ -3780,7 +3778,7 @@ describe("NanocachedClient chunked batch partial success on connection loss (iss
           await client.setManyBytes(values);
           assert.fail("expected setManyBytes to reject");
         } catch (error) {
-          assert.ok(error instanceof PartialConnectionLostError, `expected PartialConnectionLostError, got ${error}`);
+          assert.ok(error instanceof PartialConnectionLostError, `expected PartialConnectionLostError, got ${String(error)}`);
           assert.ok(error instanceof ConnectionLostError);
           const stored = (error as PartialConnectionLostError<string[]>).partialValues;
           assert.ok(stored.length > 0, "expected chunk 1's keys to be preserved");
@@ -3828,7 +3826,7 @@ describe("NanocachedClient chunked batch partial success on connection loss (iss
           await client.getManyBytes(keys);
           assert.fail("expected getManyBytes to reject");
         } catch (error) {
-          assert.ok(error instanceof PartialConnectionLostError, `expected PartialConnectionLostError, got ${error}`);
+          assert.ok(error instanceof PartialConnectionLostError, `expected PartialConnectionLostError, got ${String(error)}`);
           assert.ok(error instanceof ConnectionLostError);
           const partial = (error as PartialConnectionLostError<Map<string, Buffer>>).partialValues;
           assert.ok(partial.size > 0, "expected chunk 1's values to be preserved");
@@ -4159,7 +4157,11 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
       assert.deepEqual(Object.fromEntries(got), values);
     } finally {
       await client.close();
-      await Promise.all([cluster.discovery.close(), cluster.nodes[1].mock.close(), deadClosed ? Promise.resolve() : cluster.nodes[0].mock.close()]);
+      await Promise.all([
+        cluster.discovery.close(),
+        cluster.nodes[1].mock.close(),
+        deadClosed ? Promise.resolve() : cluster.nodes[0].mock.close(),
+      ]);
     }
   });
 
@@ -4202,7 +4204,11 @@ describe("NanocachedClient getMany/getManyBytes/setMany/setManyBytes cluster rep
       }
     } finally {
       await client.close();
-      await Promise.all([cluster.discovery.close(), cluster.nodes[1].mock.close(), deadClosed ? Promise.resolve() : cluster.nodes[0].mock.close()]);
+      await Promise.all([
+        cluster.discovery.close(),
+        cluster.nodes[1].mock.close(),
+        deadClosed ? Promise.resolve() : cluster.nodes[0].mock.close(),
+      ]);
     }
   });
 
@@ -4798,7 +4804,9 @@ describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
       await client.set("k", "v");
       const connection = (client as any).target.members.get(primary.name).connection;
       const listsBefore = cluster.discovery.listCount();
-      mock.method(connection, "set", () => Promise.reject(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })), { times: 1 });
+      mock.method(connection, "set", () => Promise.reject(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })), {
+        times: 1,
+      });
 
       await client.set("k", "v2");
       assert.ok(cluster.discovery.listCount() > listsBefore, "a connection error must still force a refresh");
@@ -5087,7 +5095,13 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
       await client.touchMany(["a", "b"], null);
       assert.equal(node.ttlOf("a"), undefined);
       assert.equal(node.multiTouchFrames()[0].ttl, null);
-      assert.deepEqual(await client.touchMany(["a", "b"], 0), new Map([["a", true], ["b", true]]));
+      assert.deepEqual(
+        await client.touchMany(["a", "b"], 0),
+        new Map([
+          ["a", true],
+          ["b", true],
+        ]),
+      );
       assert.deepEqual(await client.getMany(["a", "b"]), new Map());
     });
   });
@@ -5096,18 +5110,36 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
     await withClient(async (client) => {
       await client.setMany({ a: "1", b: "2" });
       await client.touchMany(["a", "b"], 30);
-      assert.deepEqual(await client.getMany(["a", "b"]), new Map([["a", "1"], ["b", "2"]]));
+      assert.deepEqual(
+        await client.getMany(["a", "b"]),
+        new Map([
+          ["a", "1"],
+          ["b", "2"],
+        ]),
+      );
     });
   });
 
   it("getManyAndTouch returns the hits and sets the TTL", async () => {
     await withClient(async (client, node) => {
       await client.setMany({ a: "1", b: "2" }, 10);
-      assert.deepEqual(await client.getManyAndTouch(["a", "missing", "b"], 60), new Map([["a", "1"], ["b", "2"]]));
+      assert.deepEqual(
+        await client.getManyAndTouch(["a", "missing", "b"], 60),
+        new Map([
+          ["a", "1"],
+          ["b", "2"],
+        ]),
+      );
       assert.equal(node.ttlOf("a"), 60);
       assert.equal(node.ttlOf("b"), 60);
       assert.deepEqual(node.multiTouchFrames(), [{ namespace: "", keys: ["a", "missing", "b"], ttl: 60, get: true }]);
-      assert.deepEqual(await client.getManyAndTouchBytes(["a", "b"], null), new Map([["a", Buffer.from("1")], ["b", Buffer.from("2")]]));
+      assert.deepEqual(
+        await client.getManyAndTouchBytes(["a", "b"], null),
+        new Map([
+          ["a", Buffer.from("1")],
+          ["b", Buffer.from("2")],
+        ]),
+      );
       assert.equal(node.ttlOf("a"), undefined);
       assert.deepEqual(await client.getManyAndTouch(["missing"], 5), new Map());
     });
@@ -5116,7 +5148,13 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
   it("getManyAndTouch with 0 returns the values then expires them", async () => {
     await withClient(async (client) => {
       await client.setMany({ a: "1", b: "2" });
-      assert.deepEqual(await client.getManyAndTouch(["a", "b"], 0), new Map([["a", "1"], ["b", "2"]]));
+      assert.deepEqual(
+        await client.getManyAndTouch(["a", "b"], 0),
+        new Map([
+          ["a", "1"],
+          ["b", "2"],
+        ]),
+      );
       assert.deepEqual(await client.getMany(["a", "b"]), new Map());
     });
   });
@@ -5126,7 +5164,10 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
       await client.set("a", "1");
       assert.deepEqual(await client.touchMany(["a", "a", "a"], 30), new Map([["a", true]]));
       assert.deepEqual(await client.getManyAndTouch(["a", "a"], 30), new Map([["a", "1"]]));
-      assert.deepEqual(node.multiTouchFrames().map((frame) => frame.keys), [["a"], ["a"]]);
+      assert.deepEqual(
+        node.multiTouchFrames().map((frame) => frame.keys),
+        [["a"], ["a"]],
+      );
     });
   });
 
@@ -5135,8 +5176,20 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
       const users = client.namespace("users");
       await users.setMany({ a: "1", b: "2" });
       assert.deepEqual(await client.touchMany(["a"], 30), new Map([["a", false]]));
-      assert.deepEqual(await users.touchMany(["a", "b"], 30), new Map([["a", true], ["b", true]]));
-      assert.deepEqual(await users.getManyAndTouch(["a", "b"], 40), new Map([["a", "1"], ["b", "2"]]));
+      assert.deepEqual(
+        await users.touchMany(["a", "b"], 30),
+        new Map([
+          ["a", true],
+          ["b", true],
+        ]),
+      );
+      assert.deepEqual(
+        await users.getManyAndTouch(["a", "b"], 40),
+        new Map([
+          ["a", "1"],
+          ["b", "2"],
+        ]),
+      );
       assert.deepEqual(await users.getManyAndTouchBytes(["a"], 40), new Map([["a", Buffer.from("1")]]));
       assert.equal(node.ttlOf("a", "users"), 40);
       assert.deepEqual(new Set(node.multiTouchFrames().map((frame) => frame.namespace)), new Set(["", "users"]));
@@ -5147,9 +5200,21 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
     await withClient(
       async (client) => {
         await client.setMany({ a: "x".repeat(200), b: "short" });
-        assert.deepEqual(await client.getManyAndTouch(["a", "b"], 30), new Map([["a", "x".repeat(200)], ["b", "short"]]));
+        assert.deepEqual(
+          await client.getManyAndTouch(["a", "b"], 30),
+          new Map([
+            ["a", "x".repeat(200)],
+            ["b", "short"],
+          ]),
+        );
         // A plain touch never reads a value, so compression is moot.
-        assert.deepEqual(await client.touchMany(["a", "b"], 30), new Map([["a", true], ["b", true]]));
+        assert.deepEqual(
+          await client.touchMany(["a", "b"], 30),
+          new Map([
+            ["a", true],
+            ["b", true],
+          ]),
+        );
       },
       {},
       { compress: true, compressionThreshold: 16 },
@@ -5162,7 +5227,10 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
       for (let i = 0; i < MAX_BATCH_KEYS * 2 + 5; i++) values[`k${i}`] = `v${i}`;
       await client.setMany(values);
       assert.deepEqual(await client.getManyAndTouch(Object.keys(values), 30), new Map(Object.entries(values)));
-      assert.deepEqual(node.multiTouchFrames().map((frame) => frame.keys.length), [MAX_BATCH_KEYS, MAX_BATCH_KEYS, 5]);
+      assert.deepEqual(
+        node.multiTouchFrames().map((frame) => frame.keys.length),
+        [MAX_BATCH_KEYS, MAX_BATCH_KEYS, 5],
+      );
       const result = await client.touchMany([...Object.keys(values), "missing"], 30);
       assert.equal(result.size, Object.keys(values).length + 1);
       assert.equal(result.get("missing"), false);
@@ -5193,8 +5261,20 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
     await withClient(
       async (client, node) => {
         await client.setMany({ a: "1", b: "2" });
-        assert.deepEqual(await client.touchMany(["a", "nope"], 30), new Map([["a", true], ["nope", false]]));
-        assert.deepEqual(await client.getManyAndTouch(["a", "b", "nope"], 60), new Map([["a", "1"], ["b", "2"]]));
+        assert.deepEqual(
+          await client.touchMany(["a", "nope"], 30),
+          new Map([
+            ["a", true],
+            ["nope", false],
+          ]),
+        );
+        assert.deepEqual(
+          await client.getManyAndTouch(["a", "b", "nope"], 60),
+          new Map([
+            ["a", "1"],
+            ["b", "2"],
+          ]),
+        );
         assert.deepEqual(node.multiTouchFrames().at(-1), { namespace: "", keys: ["a", "b", "nope"], ttl: 60, get: true });
       },
       { supportTags: true },
@@ -5205,12 +5285,15 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
     for (const options of [{ withoutMultiTouch: true }, { withoutTouch: true }]) {
       await withClient(async (client) => {
         await client.setMany({ a: "1" });
-        await assert.rejects(() => client.touchMany(["a"], 30), (error: unknown) => {
-          assert.ok(error instanceof ServerTooOldError);
-          assert.equal(error.command, "y");
-          assert.match(error.message, /\(y\)/);
-          return true;
-        });
+        await assert.rejects(
+          () => client.touchMany(["a"], 30),
+          (error: unknown) => {
+            assert.ok(error instanceof ServerTooOldError);
+            assert.equal(error.command, "y");
+            assert.match(error.message, /\(y\)/);
+            return true;
+          },
+        );
         await assert.rejects(() => client.getManyAndTouch(["a"], 30), ServerTooOldError);
         // Other commands are untouched: the client redials and works.
         assert.equal(await client.get("a"), "1");
@@ -5221,12 +5304,15 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
   it("a single touch still names its own command when too old", async () => {
     await withClient(
       async (client) => {
-        await assert.rejects(() => client.touch("k", 30), (error: unknown) => {
-          assert.ok(error instanceof ServerTooOldError);
-          assert.equal(error.command, "t");
-          assert.match(error.message, /\(t\)/);
-          return true;
-        });
+        await assert.rejects(
+          () => client.touch("k", 30),
+          (error: unknown) => {
+            assert.ok(error instanceof ServerTooOldError);
+            assert.equal(error.command, "t");
+            assert.match(error.message, /\(t\)/);
+            return true;
+          },
+        );
       },
       { withoutTouch: true },
     );
@@ -5264,19 +5350,25 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
       const keys = Object.keys(values);
 
       node.failMultiTouchAfter(1);
-      await assert.rejects(() => client.getManyAndTouch(keys, 30), (error: unknown) => {
-        assert.ok(error instanceof PartialConnectionLostError);
-        const partial = error.partialValues as Map<string, string>;
-        assert.deepEqual([...partial.keys()], keys.slice(0, MAX_BATCH_KEYS));
-        return true;
-      });
+      await assert.rejects(
+        () => client.getManyAndTouch(keys, 30),
+        (error: unknown) => {
+          assert.ok(error instanceof PartialConnectionLostError);
+          const partial = error.partialValues as Map<string, string>;
+          assert.deepEqual([...partial.keys()], keys.slice(0, MAX_BATCH_KEYS));
+          return true;
+        },
+      );
 
       node.failMultiTouchAfter(1);
-      await assert.rejects(() => client.touchMany(keys, 30), (error: unknown) => {
-        assert.ok(error instanceof ConnectionLostError);
-        assert.ok(!(error instanceof PartialConnectionLostError));
-        return true;
-      });
+      await assert.rejects(
+        () => client.touchMany(keys, 30),
+        (error: unknown) => {
+          assert.ok(error instanceof ConnectionLostError);
+          assert.ok(!(error instanceof PartialConnectionLostError));
+          return true;
+        },
+      );
       // The connection was poisoned, not left desynced.
       assert.equal((await client.getManyAndTouch(keys, 30)).size, keys.length);
     });
@@ -5286,16 +5378,22 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
     await withClient(async (client, node) => {
       await client.setMany({ a: "1", b: "2" });
       node.answerMultiWrongNodeTimes("a", 2);
-      await assert.rejects(() => client.touchMany(["a", "b"], 30), (error: unknown) => {
-        assert.ok(error instanceof WrongNodeError);
-        assert.ok(!(error instanceof PartialWrongNodeError));
-        return true;
-      });
-      await assert.rejects(() => client.getManyAndTouch(["a", "b"], 30), (error: unknown) => {
-        assert.ok(error instanceof PartialWrongNodeError);
-        assert.deepEqual(error.partialValues, new Map([["b", "2"]]));
-        return true;
-      });
+      await assert.rejects(
+        () => client.touchMany(["a", "b"], 30),
+        (error: unknown) => {
+          assert.ok(error instanceof WrongNodeError);
+          assert.ok(!(error instanceof PartialWrongNodeError));
+          return true;
+        },
+      );
+      await assert.rejects(
+        () => client.getManyAndTouch(["a", "b"], 30),
+        (error: unknown) => {
+          assert.ok(error instanceof PartialWrongNodeError);
+          assert.deepEqual(error.partialValues, new Map([["b", "2"]]));
+          return true;
+        },
+      );
     });
   });
 
@@ -5310,14 +5408,23 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
       ];
       for (const call of calls) {
         node.answerMultiTouchBadCountOnce(1);
-        await assert.rejects(() => call(["a", "b"], 30), (error: unknown) => {
-          assert.ok(error instanceof ConnectionLostError);
-          assert.match((error as Error).message, /roster length 1 does not match request key count 2/);
-          return true;
-        });
+        await assert.rejects(
+          () => call(["a", "b"], 30),
+          (error: unknown) => {
+            assert.ok(error instanceof ConnectionLostError);
+            assert.match((error as Error).message, /roster length 1 does not match request key count 2/);
+            return true;
+          },
+        );
       }
       // The connection was poisoned, not left desynced.
-      assert.deepEqual(await client.touchMany(["a", "b"], 30), new Map([["a", true], ["b", true]]));
+      assert.deepEqual(
+        await client.touchMany(["a", "b"], 30),
+        new Map([
+          ["a", true],
+          ["b", true],
+        ]),
+      );
     });
   });
 });
@@ -5354,7 +5461,10 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
     clientOptions: { fireAndForgetReplicas?: boolean } = {},
   ): Promise<void> {
     const cluster = await startCluster(nodeOptions, replication);
-    const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }], ...clientOptions });
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      ...clientOptions,
+    });
     try {
       await run(client, cluster);
     } finally {
@@ -5363,7 +5473,12 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
     }
   }
 
-  function keysWithPrimary(cluster: Awaited<ReturnType<typeof startCluster>>, name: string, count: number, prefix = "mt"): string[] {
+  function keysWithPrimary(
+    cluster: Awaited<ReturnType<typeof startCluster>>,
+    name: string,
+    count: number,
+    prefix = "mt",
+  ): string[] {
     const keys: string[] = [];
     for (let i = 0; keys.length < count; i++) {
       const key = `${prefix}-${i}`;
@@ -5447,17 +5562,23 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
       await client.setMany({ [key]: "v", "other-key": "v2" });
       const owner = cluster.nodes.find((node) => node.name === cluster.owners(key)[0])!;
       owner.mock.answerMultiWrongNodeTimes(key, 10);
-      await assert.rejects(() => client.getManyAndTouch([key, "other-key"], 30), (error: unknown) => {
-        assert.ok(error instanceof PartialWrongNodeError);
-        assert.deepEqual(error.partialValues, new Map([["other-key", "v2"]]));
-        return true;
-      });
+      await assert.rejects(
+        () => client.getManyAndTouch([key, "other-key"], 30),
+        (error: unknown) => {
+          assert.ok(error instanceof PartialWrongNodeError);
+          assert.deepEqual(error.partialValues, new Map([["other-key", "v2"]]));
+          return true;
+        },
+      );
       owner.mock.answerMultiWrongNodeTimes(key, 10);
-      await assert.rejects(() => client.touchMany([key, "other-key"], 30), (error: unknown) => {
-        assert.ok(error instanceof WrongNodeError);
-        assert.ok(!(error instanceof PartialWrongNodeError));
-        return true;
-      });
+      await assert.rejects(
+        () => client.touchMany([key, "other-key"], 30),
+        (error: unknown) => {
+          assert.ok(error instanceof WrongNodeError);
+          assert.ok(!(error instanceof PartialWrongNodeError));
+          return true;
+        },
+      );
     });
   });
 
@@ -5547,7 +5668,10 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
       await client.setMany(Object.fromEntries(keys.map((key) => [key, "v"])));
       cluster.nodes[0].mock.setTouchReplyDelay(300);
       const call = client.touchMany(keys, 30);
-      await waitFor(() => cluster.nodes[1].mock.multiTouchFrames().length === 1, "the replica to see the frame before the primary answers");
+      await waitFor(
+        () => cluster.nodes[1].mock.multiTouchFrames().length === 1,
+        "the replica to see the frame before the primary answers",
+      );
       assert.deepEqual(await call, new Map(keys.map((key) => [key, true])));
     });
   });
@@ -5564,12 +5688,15 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
         await client.setMany(Object.fromEntries(keys.map((key) => [key, `v-${key}`])));
         const primary = cluster.nodes[0].mock;
         primary.dropAfterTouchOnce();
-        await assert.rejects(() => client.touchMany(keys, 0), (error: unknown) => {
-          assert.ok(error instanceof ConnectionLostError);
-          assert.ok(!(error instanceof WrongNodeError));
-          assert.equal(error.requestWasSent, true);
-          return true;
-        });
+        await assert.rejects(
+          () => client.touchMany(keys, 0),
+          (error: unknown) => {
+            assert.ok(error instanceof ConnectionLostError);
+            assert.ok(!(error instanceof WrongNodeError));
+            assert.equal(error.requestWasSent, true);
+            return true;
+          },
+        );
         assert.equal(primary.multiTouchFrames().filter((frame) => frame.ttl === 0).length, 1);
       },
       undefined,
@@ -5586,14 +5713,17 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
         await client.setMany(Object.fromEntries(keys.map((key) => [key, `v-${key}`])));
         const primary = cluster.nodes[0].mock;
         primary.dropAfterTouchOnce();
-        await assert.rejects(() => client.getManyAndTouch(keys, 0), (error: unknown) => {
-          assert.ok(error instanceof PartialConnectionLostError);
-          assert.ok(!(error instanceof WrongNodeError));
-          assert.equal(error.requestWasSent, true);
-          assert.match(error.message, /could not reach the primary of 4 of 8 keys/);
-          assert.deepEqual(sorted([...(error.partialValues as Map<string, string>).keys()]), sorted(liveKeys));
-          return true;
-        });
+        await assert.rejects(
+          () => client.getManyAndTouch(keys, 0),
+          (error: unknown) => {
+            assert.ok(error instanceof PartialConnectionLostError);
+            assert.ok(!(error instanceof WrongNodeError));
+            assert.equal(error.requestWasSent, true);
+            assert.match(error.message, /could not reach the primary of 4 of 8 keys/);
+            assert.deepEqual(sorted([...(error.partialValues as Map<string, string>).keys()]), sorted(liveKeys));
+            return true;
+          },
+        );
         assert.equal(primary.multiTouchFrames().filter((frame) => frame.ttl === 0).length, 1);
       },
       undefined,
@@ -5629,13 +5759,16 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
         await cluster.nodes[0].mock.close();
         await waitFor(() => memberConnectionClosed(client, names[0]), "the client to see the FIN");
         const liveFramesBefore = cluster.nodes[1].mock.multiTouchFrames().length;
-        await assert.rejects(() => client.getManyAndTouch(keys, 0), (error: unknown) => {
-          assert.ok(error instanceof PartialConnectionLostError);
-          assert.equal(error.requestWasSent, false);
-          assert.match(error.message, /could not reach the primary of 3 of 6 keys/);
-          assert.deepEqual(sorted([...(error.partialValues as Map<string, string>).keys()]), sorted(liveKeys));
-          return true;
-        });
+        await assert.rejects(
+          () => client.getManyAndTouch(keys, 0),
+          (error: unknown) => {
+            assert.ok(error instanceof PartialConnectionLostError);
+            assert.equal(error.requestWasSent, false);
+            assert.match(error.message, /could not reach the primary of 3 of 6 keys/);
+            assert.deepEqual(sorted([...(error.partialValues as Map<string, string>).keys()]), sorted(liveKeys));
+            return true;
+          },
+        );
         // The second pass sent the dead keys only, never the live ones again.
         assert.equal(cluster.nodes[1].mock.multiTouchFrames().length, liveFramesBefore + 1);
       },
@@ -5645,102 +5778,132 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
   });
 
   it("a replica that fails does not fail the primary's answer", async () => {
-    await withCluster(async (client, cluster) => {
-      const keys = keysWithPrimary(cluster, names[0], 3);
-      const values = Object.fromEntries(keys.map((key) => [key, `v-${key}`]));
-      await client.setMany(values);
-      // names[1] is the replica of all three, and only a replica.
-      // Counted per key, as setMany counts a failed replica leg.
-      assert.deepEqual(await client.getManyAndTouch(keys, 30), new Map(Object.entries(values)));
-      assert.equal(client.stats().replicaWriteFailures, 3);
-      assert.equal([...(await client.touchMany(keys, 30)).values()].every(Boolean), true);
-      assert.equal(client.stats().replicaWriteFailures, 6);
-    }, [{}, { withoutMultiTouch: true }]);
+    await withCluster(
+      async (client, cluster) => {
+        const keys = keysWithPrimary(cluster, names[0], 3);
+        const values = Object.fromEntries(keys.map((key) => [key, `v-${key}`]));
+        await client.setMany(values);
+        // names[1] is the replica of all three, and only a replica.
+        // Counted per key, as setMany counts a failed replica leg.
+        assert.deepEqual(await client.getManyAndTouch(keys, 30), new Map(Object.entries(values)));
+        assert.equal(client.stats().replicaWriteFailures, 3);
+        assert.equal([...(await client.touchMany(keys, 30)).values()].every(Boolean), true);
+        assert.equal(client.stats().replicaWriteFailures, 6);
+      },
+      [{}, { withoutMultiTouch: true }],
+    );
   });
 
   it("a primary that predates y throws ServerTooOldError, not a connection loss", async () => {
     // A release that knows `t` but not `y`: its `En` closes the connection,
     // and the batch code sees it as a failed leg, not as a thrown error — it
     // must still come out as ServerTooOldError.
-    await withCluster(async (client, cluster) => {
-      const keys = keysWithPrimary(cluster, names[0], 3);
-      await client.setMany(Object.fromEntries(keys.map((key) => [key, "v"])));
-      await assert.rejects(() => client.getManyAndTouch(keys, 30), ServerTooOldError);
-      await assert.rejects(() => client.touchMany(keys, 30), ServerTooOldError);
-      // The single-key touch is untouched: that node knows `t`.
-      assert.equal(await client.touch(keys[0], 30), true);
-    }, [{ withoutMultiTouch: true }, {}]);
+    await withCluster(
+      async (client, cluster) => {
+        const keys = keysWithPrimary(cluster, names[0], 3);
+        await client.setMany(Object.fromEntries(keys.map((key) => [key, "v"])));
+        await assert.rejects(() => client.getManyAndTouch(keys, 30), ServerTooOldError);
+        await assert.rejects(() => client.touchMany(keys, 30), ServerTooOldError);
+        // The single-key touch is untouched: that node knows `t`.
+        assert.equal(await client.touch(keys[0], 30), true);
+      },
+      [{ withoutMultiTouch: true }, {}],
+    );
   });
 
   it("a primary that predates y hands back the hits other primaries returned (issue #924)", async () => {
     // getManyAndTouch(ttl=0) consumes the values the other primaries
     // return, so an `En` from one primary must not throw them away.
-    await withCluster(async (client, cluster) => {
-      const oldKeys = keysWithPrimary(cluster, names[0], 2, "old");
-      const newKeys = keysWithPrimary(cluster, names[1], 2, "new");
-      const values = Object.fromEntries([...oldKeys, ...newKeys].map((key) => [key, `v-${key}`]));
-      await client.setMany(values);
-      await assert.rejects(() => client.getManyAndTouch([...oldKeys, ...newKeys], 0), (error: unknown) => {
-        assert.ok(error instanceof PartialServerTooOldError);
-        assert.ok(error instanceof ServerTooOldError);
-        assert.equal(error.command, "y");
-        assert.deepEqual(error.partialValues, new Map(newKeys.map((key) => [key, `v-${key}`])));
-        return true;
-      });
-      // The ttl=0 call above consumed them: this is the loss.
-      assert.equal((await client.getMany(newKeys)).size, 0);
-      await client.setMany(values);
-      await assert.rejects(() => client.getManyAndTouchBytes([...oldKeys, ...newKeys], 30), (error: unknown) => {
-        assert.ok(error instanceof PartialServerTooOldError);
-        assert.deepEqual(error.partialValues, new Map(newKeys.map((key) => [key, Buffer.from(`v-${key}`)])));
-        return true;
-      });
-      // A plain touch has nothing partial worth attaching.
-      await assert.rejects(() => client.touchMany([...oldKeys, ...newKeys], 30), (error: unknown) => {
-        assert.ok(error instanceof ServerTooOldError);
-        assert.ok(!(error instanceof PartialServerTooOldError));
-        return true;
-      });
-      // Nothing resolved elsewhere: the bare error, as before.
-      await assert.rejects(() => client.getManyAndTouch(oldKeys, 30), (error: unknown) => {
-        assert.ok(error instanceof ServerTooOldError);
-        assert.ok(!(error instanceof PartialServerTooOldError));
-        return true;
-      });
-    }, [{ withoutMultiTouch: true }, {}]);
+    await withCluster(
+      async (client, cluster) => {
+        const oldKeys = keysWithPrimary(cluster, names[0], 2, "old");
+        const newKeys = keysWithPrimary(cluster, names[1], 2, "new");
+        const values = Object.fromEntries([...oldKeys, ...newKeys].map((key) => [key, `v-${key}`]));
+        await client.setMany(values);
+        await assert.rejects(
+          () => client.getManyAndTouch([...oldKeys, ...newKeys], 0),
+          (error: unknown) => {
+            assert.ok(error instanceof PartialServerTooOldError);
+            assert.ok(error instanceof ServerTooOldError);
+            assert.equal(error.command, "y");
+            assert.deepEqual(error.partialValues, new Map(newKeys.map((key) => [key, `v-${key}`])));
+            return true;
+          },
+        );
+        // The ttl=0 call above consumed them: this is the loss.
+        assert.equal((await client.getMany(newKeys)).size, 0);
+        await client.setMany(values);
+        await assert.rejects(
+          () => client.getManyAndTouchBytes([...oldKeys, ...newKeys], 30),
+          (error: unknown) => {
+            assert.ok(error instanceof PartialServerTooOldError);
+            assert.deepEqual(error.partialValues, new Map(newKeys.map((key) => [key, Buffer.from(`v-${key}`)])));
+            return true;
+          },
+        );
+        // A plain touch has nothing partial worth attaching.
+        await assert.rejects(
+          () => client.touchMany([...oldKeys, ...newKeys], 30),
+          (error: unknown) => {
+            assert.ok(error instanceof ServerTooOldError);
+            assert.ok(!(error instanceof PartialServerTooOldError));
+            return true;
+          },
+        );
+        // Nothing resolved elsewhere: the bare error, as before.
+        await assert.rejects(
+          () => client.getManyAndTouch(oldKeys, 30),
+          (error: unknown) => {
+            assert.ok(error instanceof ServerTooOldError);
+            assert.ok(!(error instanceof PartialServerTooOldError));
+            return true;
+          },
+        );
+      },
+      [{ withoutMultiTouch: true }, {}],
+    );
   });
 
   it("a primary that predates y is not redialed or resent: one frame, then ServerTooOldError", async () => {
     // `En` is the node's final answer: a second pass would dial the same
     // node again and be refused the same way.
     for (const get of [false, true]) {
-      await withCluster(async (client, cluster) => {
-        const keys = keysWithPrimary(cluster, names[0], 3);
-        await client.setMany(Object.fromEntries(keys.map((key) => [key, "v"])));
-        const old = cluster.nodes[0].mock;
-        const connectionsBefore = old.connectionCount();
-        await assert.rejects(() => (get ? client.getManyAndTouch(keys, 30) : client.touchMany(keys, 30)), (error: unknown) => {
-          assert.ok(error instanceof ServerTooOldError);
-          assert.equal(error.command, "y");
-          return true;
-        });
-        assert.equal(old.multiTouchFrames().length, 1);
-        assert.equal(old.connectionCount(), connectionsBefore);
-      }, [{ withoutMultiTouch: true }, {}]);
+      await withCluster(
+        async (client, cluster) => {
+          const keys = keysWithPrimary(cluster, names[0], 3);
+          await client.setMany(Object.fromEntries(keys.map((key) => [key, "v"])));
+          const old = cluster.nodes[0].mock;
+          const connectionsBefore = old.connectionCount();
+          await assert.rejects(
+            () => (get ? client.getManyAndTouch(keys, 30) : client.touchMany(keys, 30)),
+            (error: unknown) => {
+              assert.ok(error instanceof ServerTooOldError);
+              assert.equal(error.command, "y");
+              return true;
+            },
+          );
+          assert.equal(old.multiTouchFrames().length, 1);
+          assert.equal(old.connectionCount(), connectionsBefore);
+        },
+        [{ withoutMultiTouch: true }, {}],
+      );
     }
   });
 
   it("a primary that predates t is asked once by a single-key call", async () => {
     // Issue #902: `En` is final, so no redial and resend.
     for (const get of [false, true]) {
-      await withCluster(async (client, cluster) => {
-        const key = keysWithPrimary(cluster, names[0], 1)[0];
-        await client.set(key, "v");
-        const old = cluster.nodes[0].mock;
-        const before = old.touches().filter((touch) => touch.key === key).length;
-        await assert.rejects(() => (get ? client.getAndTouch(key, 30) : client.touch(key, 30)), ServerTooOldError);
-        assert.equal(old.touches().filter((touch) => touch.key === key).length - before, 1);
-      }, [{ withoutTouch: true }, {}]);
+      await withCluster(
+        async (client, cluster) => {
+          const key = keysWithPrimary(cluster, names[0], 1)[0];
+          await client.set(key, "v");
+          const old = cluster.nodes[0].mock;
+          const before = old.touches().filter((touch) => touch.key === key).length;
+          await assert.rejects(() => (get ? client.getAndTouch(key, 30) : client.touch(key, 30)), ServerTooOldError);
+          assert.equal(old.touches().filter((touch) => touch.key === key).length - before, 1);
+        },
+        [{ withoutTouch: true }, {}],
+      );
     }
   });
 
@@ -5755,17 +5918,23 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
         assert.ok(liveKeys.length > 0 && liveKeys.length < keys.length);
         await cluster.nodes[0].mock.close();
         await waitFor(() => memberConnectionClosed(client, names[0]), "the client to see the FIN");
-        await assert.rejects(() => client.getManyAndTouch(keys, 30), (error: unknown) => {
-          assert.ok(error instanceof PartialConnectionLostError);
-          assert.ok(!(error instanceof WrongNodeError));
-          assert.deepEqual(sorted([...(error.partialValues as Map<string, string>).keys()]), sorted(liveKeys));
-          return true;
-        });
-        await assert.rejects(() => client.touchMany(keys, 30), (error: unknown) => {
-          assert.ok(error instanceof Error);
-          assert.ok(!(error instanceof WrongNodeError) && !(error instanceof PartialConnectionLostError));
-          return true;
-        });
+        await assert.rejects(
+          () => client.getManyAndTouch(keys, 30),
+          (error: unknown) => {
+            assert.ok(error instanceof PartialConnectionLostError);
+            assert.ok(!(error instanceof WrongNodeError));
+            assert.deepEqual(sorted([...(error.partialValues as Map<string, string>).keys()]), sorted(liveKeys));
+            return true;
+          },
+        );
+        await assert.rejects(
+          () => client.touchMany(keys, 30),
+          (error: unknown) => {
+            assert.ok(error instanceof Error);
+            assert.ok(!(error instanceof WrongNodeError) && !(error instanceof PartialConnectionLostError));
+            return true;
+          },
+        );
       },
       undefined,
       1,
@@ -5784,8 +5953,15 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
       // Chunk 1 answered; chunk 2 (the last 50) died once and was sent
       // again alone — chunk 1's keys were not resent.
       assert.deepEqual(
-        primary.multiTouchFrames().slice(before).map((frame) => [frame.keys.length, frame.get]),
-        [[MAX_BATCH_KEYS, true], [50, true], [50, true]],
+        primary
+          .multiTouchFrames()
+          .slice(before)
+          .map((frame) => [frame.keys.length, frame.get]),
+        [
+          [MAX_BATCH_KEYS, true],
+          [50, true],
+          [50, true],
+        ],
       );
     });
   });
@@ -5806,13 +5982,17 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
           assert.equal(error.requestWasSent, true);
           // Only chunk 2 is reported as lost, not the unsent chunk 3 as well
           // (a plain touchMany rethrows the connection's own error).
-          if (get) assert.match(error.message, new RegExp(`could not reach the primary of ${MAX_BATCH_KEYS} of ${keys.length} keys`));
+          if (get)
+            assert.match(error.message, new RegExp(`could not reach the primary of ${MAX_BATCH_KEYS} of ${keys.length} keys`));
           return true;
         });
         // Chunk 3 went to the retry pass instead of being given up on: its
         // frame reaches the node and the keys are expired there.
         const frames = primary.multiTouchFrames().slice(before);
-        assert.deepEqual(frames.map((frame) => frame.keys.length), [MAX_BATCH_KEYS, MAX_BATCH_KEYS, MAX_BATCH_KEYS]);
+        assert.deepEqual(
+          frames.map((frame) => frame.keys.length),
+          [MAX_BATCH_KEYS, MAX_BATCH_KEYS, MAX_BATCH_KEYS],
+        );
         assert.deepEqual(frames[2].keys, keys.slice(2 * MAX_BATCH_KEYS));
         for (const key of keys.slice(2 * MAX_BATCH_KEYS)) assert.equal(primary.store.has(key), false);
       });
@@ -5823,8 +6003,20 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
     await withCluster(async (client, cluster) => {
       const users = client.namespace("users");
       await users.setMany({ a: "1", b: "2" });
-      assert.deepEqual(await client.touchMany(["a", "b"], 30), new Map([["a", false], ["b", false]]));
-      assert.deepEqual(await users.getManyAndTouch(["a", "b"], 30), new Map([["a", "1"], ["b", "2"]]));
+      assert.deepEqual(
+        await client.touchMany(["a", "b"], 30),
+        new Map([
+          ["a", false],
+          ["b", false],
+        ]),
+      );
+      assert.deepEqual(
+        await users.getManyAndTouch(["a", "b"], 30),
+        new Map([
+          ["a", "1"],
+          ["b", "2"],
+        ]),
+      );
       for (const node of cluster.nodes) {
         assert.deepEqual(new Set(node.mock.multiTouchFrames().map((frame) => frame.namespace)), new Set(["", "users"]));
       }
@@ -6066,10 +6258,7 @@ describe("NanocachedClient fire-and-forget replica writes (fire-and-forget repli
 
       const start = Date.now();
       await client.set("k", "v");
-      assert.ok(
-        Date.now() - start >= 80 - TIMING_TOLERANCE_MS,
-        "set() should have waited for the replica",
-      );
+      assert.ok(Date.now() - start >= 80 - TIMING_TOLERANCE_MS, "set() should have waited for the replica");
     } finally {
       await client.close();
       await cluster.close();
@@ -6119,11 +6308,11 @@ describe("NanocachedClient fire-and-forget replica writes (fire-and-forget repli
 
       assert.ok(
         elapsed.some((ms) => ms >= 150 - TIMING_TOLERANCE_MS),
-        `expected at least one call to fall back to synchronous, got ${elapsed}`,
+        `expected at least one call to fall back to synchronous, got ${String(elapsed)}`,
       );
       assert.ok(
         elapsed.some((ms) => ms < 150),
-        `expected at least one call to return fast, got ${elapsed}`,
+        `expected at least one call to return fast, got ${String(elapsed)}`,
       );
     } finally {
       await client.close();
@@ -6215,10 +6404,10 @@ describe("NanocachedClient fire-and-forget replica writes (fire-and-forget repli
           secondLegDone = true;
         });
         backgroundWrites.add(secondLeg);
-        secondLeg.finally(() => backgroundWrites.delete(secondLeg));
+        void secondLeg.finally(() => backgroundWrites.delete(secondLeg));
       });
       backgroundWrites.add(firstLeg);
-      firstLeg.finally(() => backgroundWrites.delete(firstLeg));
+      void firstLeg.finally(() => backgroundWrites.delete(firstLeg));
 
       await client.close();
 
@@ -6342,7 +6531,8 @@ describe("NanocachedClient fire-and-forget replica writes (fire-and-forget repli
       },
     ];
 
-    const storeOf = (node: MockNode): [string, string][] => [...node.store.entries()].map(([key, value]) => [key, value.toString()]);
+    const storeOf = (node: MockNode): [string, string][] =>
+      [...node.store.entries()].map(([key, value]) => [key, value.toString()]);
 
     for (const { name, seed, call, check } of cases) {
       it(name, async () => {
@@ -6522,7 +6712,7 @@ describe("fire-and-forget replica leg errors surface when the primary also fails
       });
 
       await assert.rejects(client.set(key, "v2"), (error: unknown) => {
-        assert.ok(error instanceof TypeError, `expected the replica leg's TypeError to surface, got ${error}`);
+        assert.ok(error instanceof TypeError, `expected the replica leg's TypeError to surface, got ${String(error)}`);
         return true;
       });
     } finally {
@@ -6555,7 +6745,7 @@ describe("fire-and-forget replica leg errors surface when the primary also fails
       const outcome = await Promise.race([
         client.set(key, "v2").then(
           () => "resolved",
-          (error: unknown) => (error instanceof ConnectionLostError ? "ConnectionLostError" : `other: ${error}`),
+          (error: unknown) => (error instanceof ConnectionLostError ? "ConnectionLostError" : `other: ${String(error)}`),
         ),
         delay(2_000).then(() => "still waiting after 2s"),
       ]);
@@ -6595,7 +6785,7 @@ describe("fire-and-forget replica leg errors surface when the primary also fails
       await assert.rejects(client.set(key, "v2"), (error: unknown) => {
         assert.ok(
           error instanceof NanocachedError && /primary connection lost/.test(error.message),
-          `expected the primary's own error, got ${error}`,
+          `expected the primary's own error, got ${String(error)}`,
         );
         return true;
       });
@@ -6645,7 +6835,7 @@ describe("fire-and-forget replica leg errors surface when the primary also fails
       });
 
       await assert.rejects(client.setMany({ [key]: "v2" }), (error: unknown) => {
-        assert.ok(error instanceof TypeError, `expected the pure-replica leg's TypeError to surface, got ${error}`);
+        assert.ok(error instanceof TypeError, `expected the pure-replica leg's TypeError to surface, got ${String(error)}`);
         return true;
       });
     } finally {
@@ -6764,11 +6954,14 @@ describe("NanocachedClient read repair (read repair)", () => {
         const key = Buffer.from("k");
         const value = await client.getBytes(key);
         assert.equal(value?.toString(), "hello");
-        (reused === "key" ? key : value!).fill("Z".charCodeAt(0));
+        (reused === "key" ? key : value).fill("Z".charCodeAt(0));
         release();
         await client.close(); // drains the write-back
 
-        assert.deepEqual([...primary.mock.store.entries()].map(([k, v]) => [k, v.toString()]), [["k", "hello"]]);
+        assert.deepEqual(
+          [...primary.mock.store.entries()].map(([k, v]) => [k, v.toString()]),
+          [["k", "hello"]],
+        );
       } finally {
         await client.close();
         await cluster.close();
@@ -6902,11 +7095,11 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
 
       assert.ok(
         elapsed.some((ms) => ms >= 150 - TIMING_TOLERANCE_MS),
-        `expected at least one call to fall back to synchronous, got ${elapsed}`,
+        `expected at least one call to fall back to synchronous, got ${String(elapsed)}`,
       );
       assert.ok(
         elapsed.some((ms) => ms < 150),
-        `expected at least one call to return fast, got ${elapsed}`,
+        `expected at least one call to return fast, got ${String(elapsed)}`,
       );
       assert.equal(replica.mock.getCount(), 3, "every call should have hedged to the replica");
 
@@ -6947,7 +7140,10 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
       );
 
       for (const ms of elapsed) {
-        assert.ok(ms < 300 - TIMING_TOLERANCE_MS, `expected every call to return with the replica's answer, got ${elapsed}`);
+        assert.ok(
+          ms < 300 - TIMING_TOLERANCE_MS,
+          `expected every call to return with the replica's answer, got ${String(elapsed)}`,
+        );
       }
       assert.equal(replica.mock.getCount(), 3);
       assert.equal((client as any).detachedHedgeLegs, 3, "the three primary legs were left running");
@@ -7019,11 +7215,7 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
       assert.equal(value, "v");
       assert.ok(elapsed < 100, `elapsed was ${elapsed}: the replica should have been tried first`);
       assert.equal(replica.mock.getCount(), 3);
-      assert.equal(
-        primary.mock.getCount(),
-        primaryGetsBefore,
-        "the third read must not add a leg to the silent primary",
-      );
+      assert.equal(primary.mock.getCount(), primaryGetsBefore, "the third read must not add a leg to the silent primary");
 
       const deadline = Date.now() + 5000;
       while ((client as any).lateHedgeLegs.size > 0 && Date.now() < deadline) {
@@ -7133,10 +7325,7 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
       const op = async () => {
         throw new Error("the leg must never be dialed after close() began");
       };
-      await assert.rejects(
-        (client as any).readHedged("k", op, ["a", "b"]),
-        AlreadyClosedError,
-      );
+      await assert.rejects((client as any).readHedged("k", op, ["a", "b"]), AlreadyClosedError);
       assert.equal((client as any).hedgedReads.size, 0, "no hedge leg may be registered after close() began");
 
       // Restore so close() runs its real teardown rather than the
@@ -7276,7 +7465,12 @@ describe("NanocachedClient.stats() (observability for by-design swallows)", () =
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
       try {
-        assert.deepEqual(client.stats(), { replicaWriteFailures: 0, readRepairFailures: 0, refreshFailures: 0, transientRetries: 0 });
+        assert.deepEqual(client.stats(), {
+          replicaWriteFailures: 0,
+          readRepairFailures: 0,
+          refreshFailures: 0,
+          transientRetries: 0,
+        });
       } finally {
         await client.close();
       }
@@ -7916,16 +8110,14 @@ describe("NanocachedClient tolerant bootstrap (issue #67)", () => {
   it("connect() fails only when every listed node is unreachable", async () => {
     const cluster = await startCluster(new Set(names));
     try {
-      await assert.rejects(
-        NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] }),
-      );
+      await assert.rejects(NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] }));
     } finally {
       await cluster.close();
     }
   });
 
   it("redials an unreachable node once the cooldown has passed", async () => {
-    const [dead, live] = names;
+    const [dead] = names;
     const cluster = await startCluster(new Set([dead]), { revive: true });
     try {
       const client = await NanocachedClient.connect({
@@ -8017,7 +8209,7 @@ describe("NanocachedClient dedupes discovery's duplicated node names (issue #461
           const ring = (client as any).target.ring;
           for (let replicas = 0; replicas <= 3; replicas++) {
             const owners: string[] = ring.owners(Buffer.from("some-key"), replicas);
-            assert.equal(new Set(owners).size, owners.length, `replicas=${replicas}: duplicate in ${owners}`);
+            assert.equal(new Set(owners).size, owners.length, `replicas=${replicas}: duplicate in ${String(owners)}`);
           }
         } finally {
           await client.close();
@@ -8125,7 +8317,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
     }
   });
 
-  it("namespace(\"\") is not rejected and behaves exactly like the root client, using legacy frames", async () => {
+  it('namespace("") is not rejected and behaves exactly like the root client, using legacy frames', async () => {
     const node = await startMockNode();
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
@@ -8135,7 +8327,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
 
         await root.set("k", "v");
         assert.equal(node.lastCommand(), "S", "the empty namespace must send the legacy S frame, not s");
-        assert.equal(await client.get("k"), "v", "namespace(\"\") shares storage with the root client");
+        assert.equal(await client.get("k"), "v", 'namespace("") shares storage with the root client');
 
         assert.equal(await root.get("k"), "v");
         assert.equal(node.lastCommand(), "G", "the empty namespace must send the legacy G frame, not g");
@@ -8295,7 +8487,7 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
     }
   });
 
-  it("namespace(\"\").clear() clears the default namespace (c 0), same as clearAll's default-namespace half", async () => {
+  it('namespace("").clear() clears the default namespace (c 0), same as clearAll\'s default-namespace half', async () => {
     const node = await startMockNode();
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
@@ -8365,7 +8557,11 @@ describe("NanocachedClient namespaces (first-class namespaces, issue #105)", () 
 });
 
 describe("NanocachedClient clear/clearAll fan-out (issue #106)", () => {
-  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47", "b2e6a1c4-3f9d-4a7b-8e5c-1d0f6a2b9c3e"];
+  const names = [
+    "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6",
+    "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47",
+    "b2e6a1c4-3f9d-4a7b-8e5c-1d0f6a2b9c3e",
+  ];
 
   async function startCluster() {
     const mocks = await Promise.all([startMockNode(), startMockNode(), startMockNode()]);
@@ -8520,8 +8716,8 @@ describe("NanocachedClient clear/clearAll fan-out (issue #106)", () => {
 
         await assert.rejects(client.clearAll(), (error: unknown) => {
           assert.ok(error instanceof NanocachedError);
-          assert.match((error as Error).message, /clear failed on node\(s\)/);
-          assert.match((error as Error).message, new RegExp(names[0]));
+          assert.match(error.message, /clear failed on node\(s\)/);
+          assert.match(error.message, new RegExp(names[0]));
           return true;
         });
       } finally {
@@ -8537,7 +8733,7 @@ describe("NanocachedClient clear/clearAll fan-out (issue #106)", () => {
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }] });
       try {
-        await Promise.all(cluster.nodes.map(({ mock }) => mock.namespacedStore("users").set("k", Buffer.from("v"))));
+        for (const { mock } of cluster.nodes) mock.namespacedStore("users").set("k", Buffer.from("v"));
 
         const stubborn = cluster.nodes[0].mock;
         stubborn.failClearOnce();
@@ -8621,7 +8817,7 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
         assert.ok(proxyB.connectionCount() > 0, "proxy B was never picked");
         assert.equal(proxyA.connectionCount() + proxyB.connectionCount(), 20);
       } finally {
-        for (const client of clients) client.close();
+        for (const client of clients) void client.close();
       }
     } finally {
       await Promise.all([discovery.close(), proxyA.close(), proxyB.close()]);
@@ -8840,7 +9036,13 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
       try {
         await client.setMany({ a: "1", b: "2" });
         const values = await client.getMany(["a", "a", "b", "a", "b"]);
-        assert.deepEqual([...values.entries()], [["a", "1"], ["b", "2"]]);
+        assert.deepEqual(
+          [...values.entries()],
+          [
+            ["a", "1"],
+            ["b", "2"],
+          ],
+        );
         assert.equal(node.multiGetCount(), 1);
 
         const copies = await client.getMany(Array(20_000).fill("a"));
@@ -8896,9 +9098,7 @@ describe("NanocachedClient refreshNodeList dials new nodes concurrently (issue #
     const discovery = await startMockDiscovery([{ name: "boot", address: bootNode.address }]);
     const authDelayMs = 200;
     const newNodeCount = 4;
-    const newNodes = await Promise.all(
-      Array.from({ length: newNodeCount }, () => startMockNode({ authDelayMs })),
-    );
+    const newNodes = await Promise.all(Array.from({ length: newNodeCount }, () => startMockNode({ authDelayMs })));
     try {
       const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
       try {
@@ -9043,11 +9243,7 @@ describe("a Connection built over a socket that already closed (issue #574)", ()
         }),
       ]);
     } finally {
-      await Promise.all([
-        discovery.close(),
-        new Promise<void>((resolve) => resetting.close(() => resolve())),
-        slow.close(),
-      ]);
+      await Promise.all([discovery.close(), new Promise<void>((resolve) => resetting.close(() => resolve())), slow.close()]);
     }
   });
 });
@@ -9106,7 +9302,10 @@ describe("identified sockets waiting on sibling dials survive a peer RST (orphan
         const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
         await client.close();
       });
-      assert.deepEqual(uncaught.map((error) => error.message), []);
+      assert.deepEqual(
+        uncaught.map((error) => error.message),
+        [],
+      );
     } finally {
       await Promise.all([discovery.close(), resetting.close(), slow.close()]);
     }
@@ -9128,7 +9327,10 @@ describe("identified sockets waiting on sibling dials survive a peer RST (orphan
         const uncaught = await collectingUncaught(async () => {
           await (client as any).refreshNodeList();
         });
-        assert.deepEqual(uncaught.map((error) => error.message), []);
+        assert.deepEqual(
+          uncaught.map((error) => error.message),
+          [],
+        );
       } finally {
         await client.close();
       }
@@ -9475,7 +9677,9 @@ describe("a listed address that does not complete the A handshake", () => {
 
   type ListenerMode = "garbage" | "closeAtOnce" | "closeAfterA";
 
-  async function startBrokenHandshakeListener(mode: ListenerMode): Promise<{ address: string; connections(): number; close(): Promise<void> }> {
+  async function startBrokenHandshakeListener(
+    mode: ListenerMode,
+  ): Promise<{ address: string; connections(): number; close(): Promise<void> }> {
     const sockets = new Set<Socket>();
     let connections = 0;
     const server = createServer((socket) => {
@@ -9509,7 +9713,11 @@ describe("a listed address that does not complete the A handshake", () => {
     }
   }
 
-  type Operation = [string, (client: NanocachedClient, key: string) => Promise<unknown>, (node: MockNode, key: string) => boolean];
+  type Operation = [
+    string,
+    (client: NanocachedClient, key: string) => Promise<unknown>,
+    (node: MockNode, key: string) => boolean,
+  ];
   const writes: Operation[] = [
     ["set", (client, key) => client.set(key, "v"), (node, key) => node.store.has(key)],
     ["incr", (client, key) => client.incr(key), (node) => node.incrCount() === 1],
@@ -9517,14 +9725,32 @@ describe("a listed address that does not complete the A handshake", () => {
   // A ttl-0 batch touch sends to the primaries only, and must treat the
   // chunk whose dial failed as never sent: it reroutes instead of failing.
   const touches: Operation[] = [
-    ["touchMany(ttl 0)", (client, key) => client.touchMany([key], 0), (node, key) => node.multiTouchFrames().some((frame) => frame.keys.includes(key))],
-    ["getManyAndTouch(ttl 0)", (client, key) => client.getManyAndTouch([key], 0), (node, key) => node.multiTouchFrames().some((frame) => frame.keys.includes(key))],
+    [
+      "touchMany(ttl 0)",
+      (client, key) => client.touchMany([key], 0),
+      (node, key) => node.multiTouchFrames().some((frame) => frame.keys.includes(key)),
+    ],
+    [
+      "getManyAndTouch(ttl 0)",
+      (client, key) => client.getManyAndTouch([key], 0),
+      (node, key) => node.multiTouchFrames().some((frame) => frame.keys.includes(key)),
+    ],
   ];
 
   const kinds: Array<{ mode: ListenerMode; what: string; message: RegExp; operations: Operation[] }> = [
     { mode: "garbage", what: "answers garbage to A", message: /unexpected response to A/, operations: [...writes, ...touches] },
-    { mode: "closeAtOnce", what: "accepts the connection and closes it at once", message: /connection closed before the expected response arrived/, operations: writes },
-    { mode: "closeAfterA", what: "reads A and closes the connection", message: /connection closed before the expected response arrived/, operations: writes },
+    {
+      mode: "closeAtOnce",
+      what: "accepts the connection and closes it at once",
+      message: /connection closed before the expected response arrived/,
+      operations: writes,
+    },
+    {
+      mode: "closeAfterA",
+      what: "reads A and closes the connection",
+      message: /connection closed before the expected response arrived/,
+      operations: writes,
+    },
   ];
 
   for (const { mode, what, message, operations } of kinds) {
@@ -9605,7 +9831,8 @@ describe("a listed address that does not complete the A handshake", () => {
         try {
           await assert.rejects(
             (client as any).openNodeConnection(broken.address),
-            (error: unknown) => error instanceof ConnectionLostError && error.requestWasSent === false && message.test(error.message),
+            (error: unknown) =>
+              error instanceof ConnectionLostError && error.requestWasSent === false && message.test(error.message),
           );
         } finally {
           await client.close();
@@ -9672,7 +9899,11 @@ describe("a request in flight when close() runs does not wait for a discovery di
         assert.ok(at - closedAt < 1000, `the request failed ${at - closedAt} ms after close(), expected it at once`);
       } finally {
         for (const socket of sockets) socket.destroy();
-        await Promise.all([node.close(), discovery.close(), new Promise<void>((resolve) => silentDiscovery.close(() => resolve()))]);
+        await Promise.all([
+          node.close(),
+          discovery.close(),
+          new Promise<void>((resolve) => silentDiscovery.close(() => resolve())),
+        ]);
       }
     });
   }

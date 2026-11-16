@@ -123,7 +123,9 @@ async def connect_and_identify(
     auth_secret: bytes | None,
     ssl_context: ssl_module.SSLContext | None,
 ) -> NodeTarget | ClusterTarget:
-    return await _connect_and_identify_generic(host, port, auth_secret, ssl_context, _fetch_node_list)
+    return await _connect_and_identify_generic(
+        host, port, auth_secret, ssl_context, _fetch_node_list
+    )
 
 
 async def connect_and_identify_proxy(
@@ -140,7 +142,9 @@ async def connect_and_identify_proxy(
     entry shape with no replication field, since a proxy roster carries
     no replication factor of its own (see nanocached-discovery.rs's
     ``ListProxies`` handler)."""
-    return await _connect_and_identify_generic(host, port, auth_secret, ssl_context, _fetch_proxy_list)
+    return await _connect_and_identify_generic(
+        host, port, auth_secret, ssl_context, _fetch_proxy_list
+    )
 
 
 async def _connect_and_identify_generic(
@@ -218,7 +222,13 @@ async def _connect_and_identify_with_deadline(
     try:
         return await asyncio.wait_for(
             _connect_and_identify(
-                host, port, auth_secret, ssl_context, request_tags, request_retryable, fetch_discovery
+                host,
+                port,
+                auth_secret,
+                ssl_context,
+                request_tags,
+                request_retryable,
+                fetch_discovery,
             ),
             CONNECT_DEADLINE,
         )
@@ -229,8 +239,9 @@ async def _connect_and_identify_with_deadline(
     except NanocachedError:
         raise
     except OSError as error:
-        raise ConnectFailedError(f"nanocached: could not connect to {host}:{port}: {error}") from error
-
+        raise ConnectFailedError(
+            f"nanocached: could not connect to {host}:{port}: {error}"
+        ) from error
 
 
 async def _connect_and_identify(
@@ -320,7 +331,8 @@ async def _connect_and_identify(
         if ack[0:1] == b"E":
             if auth_secret is None:
                 raise AuthenticationError(
-                    f"nanocached: {host}:{port} requires authentication, but no auth_secret was given"
+                    f"nanocached: {host}:{port} requires authentication, "
+                    "but no auth_secret was given"
                 )
             raise AuthenticationError("nanocached: authentication failed")
 
@@ -347,7 +359,9 @@ async def _connect_and_identify(
         raise
 
 
-async def _fetch_node_list(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> ClusterTarget:
+async def _fetch_node_list(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> ClusterTarget:
     writer.write(b"L\n")
     await writer.drain()
     return await _read_node_list(reader)
@@ -389,7 +403,9 @@ async def _read_list_header(reader: asyncio.StreamReader, kind: str) -> bytes:
     except asyncio.IncompleteReadError as error:
         # EOF before the terminator — an EOFError, not an OSError, so the
         # same escape hatch applies.
-        raise HandshakeProtocolError(f"nanocached: truncated {kind} header in discovery response") from error
+        raise HandshakeProtocolError(
+            f"nanocached: truncated {kind} header in discovery response"
+        ) from error
 
     if header.startswith(b"B"):
         raise DiscoveryBusyError()
@@ -417,7 +433,9 @@ async def _read_node_list(reader: asyncio.StreamReader) -> ClusterTarget:
         # client.py's _SWALLOWABLE_ERRORS contract ("try next address
         # silently", "refresh swallows failures") only covers
         # NanocachedError/ConnectionError/OSError.
-        raise HandshakeProtocolError("nanocached: invalid node-list header in discovery response") from error
+        raise HandshakeProtocolError(
+            "nanocached: invalid node-list header in discovery response"
+        ) from error
     if replication < 1:
         raise HandshakeProtocolError("nanocached: invalid replication factor in discovery response")
     if count < 0 or count > _MAX_NODE_COUNT:
@@ -441,7 +459,9 @@ async def _read_proxy_list(reader: asyncio.StreamReader) -> list[DiscoveredNode]
     try:
         count = _parse_strict_uint(fields[0])
     except ValueError as error:
-        raise HandshakeProtocolError("nanocached: invalid proxy-list header in discovery response") from error
+        raise HandshakeProtocolError(
+            "nanocached: invalid proxy-list header in discovery response"
+        ) from error
     if count < 0 or count > _MAX_NODE_COUNT:
         raise HandshakeProtocolError("nanocached: invalid proxy count in discovery response")
 
@@ -469,7 +489,8 @@ async def _read_entries(
             entry_header = await reader.readuntil(b"\n")
         except asyncio.LimitOverrunError as error:
             raise HandshakeProtocolError(
-                f"nanocached: invalid {kind} entry header in discovery response (missing header terminator)"
+                f"nanocached: invalid {kind} entry header in discovery response "
+                "(missing header terminator)"
             ) from error
         except asyncio.IncompleteReadError as error:
             raise HandshakeProtocolError(
@@ -478,9 +499,14 @@ async def _read_entries(
         total_bytes += len(entry_header)
         lengths = entry_header[:-1].split(b" ")
         if len(lengths) != 2:
-            raise HandshakeProtocolError(f"nanocached: invalid {kind} entry header in discovery response")
+            raise HandshakeProtocolError(
+                f"nanocached: invalid {kind} entry header in discovery response"
+            )
         try:
-            name_length, addr_length = _parse_strict_uint(lengths[0]), _parse_strict_uint(lengths[1])
+            name_length, addr_length = (
+                _parse_strict_uint(lengths[0]),
+                _parse_strict_uint(lengths[1]),
+            )
         except ValueError as error:
             raise HandshakeProtocolError(
                 f"nanocached: invalid {kind} entry header in discovery response"
@@ -496,7 +522,9 @@ async def _read_entries(
             or name_length > _MAX_NODE_FIELD_LENGTH
             or addr_length > _MAX_NODE_FIELD_LENGTH
         ):
-            raise HandshakeProtocolError(f"nanocached: invalid {kind} entry lengths in discovery response")
+            raise HandshakeProtocolError(
+                f"nanocached: invalid {kind} entry lengths in discovery response"
+            )
 
         total_bytes += name_length + addr_length + 1
         if total_bytes > _MAX_NODE_LIST_RESPONSE_LENGTH:
@@ -512,7 +540,9 @@ async def _read_entries(
                 f"nanocached: truncated {kind} entry in discovery response"
             ) from error
         if body[-1:] != b"\n":
-            raise HandshakeProtocolError(f"nanocached: malformed {kind} entry in discovery response")
+            raise HandshakeProtocolError(
+                f"nanocached: malformed {kind} entry in discovery response"
+            )
         try:
             entries.append(
                 DiscoveredNode(

@@ -1,0 +1,12 @@
+{
+  // Kept identical in sdk/typescript, adapters/cache-manager and adapters/keyv.
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  // The width the existing code was written to (the adapters needed no
+  // reformat at 130); everything else is oxfmt's Prettier-compatible default.
+  "printWidth": 130,
+  // Keep package.json in its hand-written key order.
+  "sortPackageJson": false,
+  // Prose is shared in style with every other SDK's docs, which no
+  // formatter touches.
+  "ignorePatterns": ["*.md"]
+}

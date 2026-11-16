@@ -2249,11 +2249,11 @@ func (c *Client) incrNS(namespace []byte, key string, delta int64) (value int64,
 }
 
 // incr drives Incr/Decr's routing (issue #129) — deliberately NOT
-// write()'s "run the same op against every owner" pattern. INCR runs
+// writeWith()'s "run the same op against every owner" pattern. INCR runs
 // against the primary owner ONLY; only once that succeeds is the
 // primary's literal resulting value (+ TTL) fanned out to the remaining
 // owners as an ordinary Set (fanReplicas — the same best-effort,
-// fire-and-forget-aware machinery write() itself uses for its replica
+// fire-and-forget-aware machinery writeWith() itself uses for its replica
 // legs). Replaying `i` on a replica instead would let it drift from the
 // primary — e.g. an earlier replica-leg write silently dropped (client-side
 // replication swallows replica failures by design), or the replica
@@ -2950,7 +2950,7 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 	// immediately before the Add — Close() flips closed under the same
 	// lock before it ever calls hedgedReadsWG.Wait(), so this guarantees
 	// every Add happens-before that Wait (mirrors the identical guard on
-	// backgroundReplicaWG in write() and tryReadRepair()); without it, a
+	// backgroundReplicaWG in writeWithValue() and tryReadRepair()); without it, a
 	// leg starting exactly as Close() observes the counter at zero could
 	// race sync.WaitGroup's Add/Wait and panic. A refused start needs no
 	// fallback (issue #486): for the primary leg the caller below returns
@@ -3169,15 +3169,7 @@ func (c *Client) releaseLateHedgeLeg(name string) {
 	c.lateHedgeTotal.Add(-1)
 }
 
-// write runs op against every owner of the key; op's second argument
-// reports whether this leg is the primary, whose outcome alone decides
-// the operation's result — replica legs run on their own goroutines, so
-// an op that captures outer variables must only write them when primary.
-func (c *Client) write(namespace, key []byte, op func(conn *connection, primary bool) error) error {
-	return c.writeWith(namespace, key, op, c.applyReconnecting, false)
-}
-
-// writeValue is write for an op that sends the caller's own value bytes
+// writeValue is writeWith, under applyReconnecting, for an op that sends the caller's own value bytes
 // (callerValue, nil when the op builds its own): op's third argument is what
 // the leg must send in place of them, a private copy for a replica leg that
 // may outlive this call — see fanReplicasValue. It is nil when op should use
@@ -3186,8 +3178,12 @@ func (c *Client) writeValue(namespace, key, callerValue []byte, op func(conn *co
 	return c.writeWithValue(namespace, key, callerValue, op, c.applyReconnecting, false)
 }
 
-// writeWith is write with the primary leg's send policy chosen by the
-// caller: applyReconnecting (resend after a connection loss, for an
+// writeWith runs op against every owner of the key; op's second argument
+// reports whether this leg is the primary, whose outcome alone decides
+// the operation's result — replica legs run on their own goroutines, so
+// an op that captures outer variables must only write them when primary.
+// The caller chooses the primary leg's send policy:
+// applyReconnecting (resend after a connection loss, for an
 // idempotent op) or applyExpiring (resend only a request that was never
 // sent, for a touch that expires the entry — issue #901). The replica legs
 // always keep applyReconnecting: a replica's outcome never decides the
@@ -3281,7 +3277,7 @@ func (c *Client) ownersExcept(namespace, key []byte, answered string) []string {
 // falls back to the synchronous path below, exactly as with the option
 // off.
 //
-// Shared by write() (issue #105's replicated Set/Delete, which runs op
+// Shared by writeWith() (issue #105's replicated Set/Delete, which runs op
 // concurrently with the primary leg) and incr()'s post-success result
 // fan-out (issue #129's Incr/Decr, which calls this only after the primary
 // already succeeded — see incr's own doc comment for why it fans out the
@@ -3351,7 +3347,7 @@ func (c *Client) fanReplicasValue(replicas []string, callerValue []byte, op func
 // ── 遅延再接続 ────────────────────────────────────────────────────
 
 func (c *Client) slotConnection(slot string) (*connection, error) {
-	address, current, err := c.snapshotSlot(slot)
+	_, current, err := c.snapshotSlot(slot)
 	if err != nil {
 		return nil, err
 	}
@@ -3372,7 +3368,7 @@ func (c *Client) slotConnection(slot string) (*connection, error) {
 	gate.Lock()
 	defer gate.Unlock()
 
-	address, current, err = c.snapshotSlot(slot)
+	address, current, err := c.snapshotSlot(slot)
 	if err != nil {
 		return nil, err
 	}
@@ -3455,7 +3451,7 @@ func (c *Client) snapshotSlot(slot string) (string, *connection, error) {
 // chosen other one instead of simply propagating the dial error (issue
 // #122's reconnect-on-loss: "first retry the same proxy ... if that
 // fails, re-fetch Q from discovery and pick another"). Cluster-mode slots
-// need no such fallback — the per-key owner walk in read()/write()
+// need no such fallback — the per-key owner walk in read()/writeWith()
 // already fails over to a different member when one is dead; proxy mode
 // has no such second member to fall over to on its own, hence this.
 // Returns the address actually dialed, which the caller installs as the

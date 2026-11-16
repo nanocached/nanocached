@@ -1,0 +1,20 @@
+<Project>
+
+  <!-- Shared by every .NET project here and, through the import in
+       adapters/dotnet/Directory.Build.props, by the adapter's projects.
+       Code-style and naming rules live in the repository's .editorconfig. -->
+  <PropertyGroup>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- Pinned to the .NET 10 rule set rather than `latest`, so a newer SDK
+         (global.json rolls forward to one) enables no extra rules. -->
+    <AnalysisLevel>10.0-recommended</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <!-- The packages ship their XML docs; the build also needs the file
+         for IDE0005 (unnecessary usings) to run, tests included. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <!-- Doc comments live on the types and the members that need them;
+         requiring one on every trivial constructor is noise. -->
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+</Project>

@@ -17,10 +17,11 @@ for delete_many."""
 from __future__ import annotations
 
 import unittest
+from typing import cast
 
 import support  # noqa: F401 - configures settings.CACHES / django.setup()
-from django.core.cache import caches
 
+from django.core.cache import caches
 from nanocached import (
     PartialConnectionLostError,
     PartialSetConnectionLostError,
@@ -28,10 +29,12 @@ from nanocached import (
     WrongNodeError,
 )
 
+from nanocached_django import NanocachedCache
+
 
 class GetManyPartialFailureTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.cache = caches["default"]
+        self.cache = cast(NanocachedCache, caches["default"])
         self.cache.clear()
         # A round trip through set_many forces a connect, so
         # _namespace_handle is populated by the time a test patches it.
@@ -110,7 +113,7 @@ class GetManyPartialFailureTests(unittest.TestCase):
 
 class SetManyPartialFailureTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.cache = caches["default"]
+        self.cache = cast(NanocachedCache, caches["default"])
         self.cache.clear()
         # Force a connect so _namespace_handle is populated before a test
         # patches it.

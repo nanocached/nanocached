@@ -12,13 +12,11 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * A minimal in-process nanocached node speaking just the slice of the
- * wire protocol the starter's client traffic produces: the {@code A ...}
- * handshake and the namespaced {@code g}/{@code s}/{@code d}/{@code c}
- * commands. A trimmed re-implementation of {@code
- * nanocached-spring}'s own test double (package-private to that module,
- * see the shared adapters spec) built without response tags — this
- * module's tests never configure anything that would request them.
+ * A minimal in-process nanocached node speaking just the slice of the wire protocol the starter's
+ * client traffic produces: the {@code A ...} handshake and the namespaced {@code g}/{@code
+ * s}/{@code d}/{@code c} commands. A trimmed re-implementation of {@code nanocached-spring}'s own
+ * test double (package-private to that module, see the shared adapters spec) built without response
+ * tags — this module's tests never configure anything that would request them.
  */
 final class MockNode implements AutoCloseable {
 
@@ -26,8 +24,10 @@ final class MockNode implements AutoCloseable {
 
     private final ServerSocket server;
     private final Thread acceptLoop;
+
     /** namespace (UTF-8-ish, raw bytes wrapped) → key → entry. */
     final Map<ByteBuffer, Map<ByteBuffer, Entry>> stores = new ConcurrentHashMap<>();
+
     final AtomicInteger clearCount = new AtomicInteger();
 
     MockNode() throws IOException {
@@ -54,8 +54,7 @@ final class MockNode implements AutoCloseable {
 
     Map<ByteBuffer, Entry> store(String namespace) {
         return stores.computeIfAbsent(
-                ByteBuffer.wrap(namespace.getBytes(StandardCharsets.UTF_8)),
-                unused -> new ConcurrentHashMap<>());
+                ByteBuffer.wrap(namespace.getBytes(StandardCharsets.UTF_8)), unused -> new ConcurrentHashMap<>());
     }
 
     Entry entry(String namespace, byte[] key) {
@@ -108,8 +107,7 @@ final class MockNode implements AutoCloseable {
         }
     }
 
-    private void get(InputStream in, OutputStream out, String namespace, int keyLength)
-            throws IOException {
+    private void get(InputStream in, OutputStream out, String namespace, int keyLength) throws IOException {
         byte[] key = in.readNBytes(keyLength);
         Entry entry = entry(namespace, key);
         if (entry == null) {
@@ -121,8 +119,7 @@ final class MockNode implements AutoCloseable {
         out.flush();
     }
 
-    private void set(InputStream in, OutputStream out, String namespace, String[] parts)
-            throws IOException {
+    private void set(InputStream in, OutputStream out, String namespace, String[] parts) throws IOException {
         int keyLength = Integer.parseInt(parts[2]);
         int valueLength = Integer.parseInt(parts[3]);
         long ttlSeconds = parts.length > 4 ? Long.parseLong(parts[4]) : 0;
@@ -132,8 +129,7 @@ final class MockNode implements AutoCloseable {
         reply(out, "S\n");
     }
 
-    private void delete(InputStream in, OutputStream out, String namespace, int keyLength)
-            throws IOException {
+    private void delete(InputStream in, OutputStream out, String namespace, int keyLength) throws IOException {
         byte[] key = in.readNBytes(keyLength);
         boolean existed = store(namespace).remove(ByteBuffer.wrap(key)) != null;
         reply(out, (existed ? "D" : "N") + "\n");

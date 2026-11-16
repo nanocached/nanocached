@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import Keyv from "keyv";
-import KeyvV5 from "keyv5";
+import { Keyv } from "keyv";
+import { Keyv as KeyvV5 } from "keyv5";
 import { ConnectionLostError } from "nanocached";
 import { nanocachedKeyvStore, type NanocachedKeyvStore } from "../src/index.js";
 import { startMockNode, type MockNode } from "./mockNode.js";
@@ -221,7 +221,7 @@ describe("nanocached-keyv under keyv 6", () => {
         await keyv.clear();
         assert.equal(node.clearCount(), 0);
         assert.equal(seen.length, 1);
-        assert.match(String((seen[0] as Error).message), /Can't clear namespace "users"/);
+        assert.match((seen[0] as Error).message, /Can't clear namespace "users"/);
         assert.equal(await keyv.get("foo"), "bar"); // still there
 
         // With nothing listening, the same failure rejects instead.

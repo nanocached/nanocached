@@ -10,9 +10,11 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import support  # noqa: F401 - configures settings.CACHES / django.setup()
+
 from django.core.exceptions import ImproperlyConfigured
+from nanocached import NanocachedClient
+
 from nanocached_django import NanocachedCache
-from nanocached_django.backend import NanocachedClient
 
 
 class LocationTests(unittest.TestCase):
@@ -51,7 +53,16 @@ class LocationTests(unittest.TestCase):
         self.assertEqual(self._addresses(["a:1", "b:2"]), [("a", 1), ("b", 2)])
 
     def test_invalid_entries_are_rejected_at_construction(self) -> None:
-        for bad in ("no-port", "host:", "host:abc", "[::1]", "", None, []):
+        bad_locations: tuple[str | list[str] | None, ...] = (
+            "no-port",
+            "host:",
+            "host:abc",
+            "[::1]",
+            "",
+            None,
+            [],
+        )
+        for bad in bad_locations:
             with self.subTest(location=bad), self.assertRaises(ImproperlyConfigured):
                 NanocachedCache(bad, {"OPTIONS": {"NAMESPACE": "django"}})
 

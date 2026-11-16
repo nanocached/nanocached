@@ -46,8 +46,8 @@ class IdentifyDnsTest {
         Identify.connectTimeoutMillis = 300;
 
         long start = System.nanoTime();
-        IOException error = assertThrows(IOException.class,
-                () -> Identify.connectAndIdentify("stalled-dns.test", 9, null, null));
+        IOException error =
+                assertThrows(IOException.class, () -> Identify.connectAndIdentify("stalled-dns.test", 9, null, null));
         long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
 
         assertInstanceOf(SocketTimeoutException.class, error);
@@ -88,7 +88,7 @@ class IdentifyDnsTest {
         Identify.hostResolver = host -> {
             throw new java.net.UnknownHostException(host);
         };
-        assertThrows(java.net.UnknownHostException.class,
-                () -> Identify.connectAndIdentify("nope.invalid", 9, null, null));
+        assertThrows(
+                java.net.UnknownHostException.class, () -> Identify.connectAndIdentify("nope.invalid", 9, null, null));
     }
 }

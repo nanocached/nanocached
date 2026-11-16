@@ -9,11 +9,12 @@ from __future__ import annotations
 import unittest
 
 from support import PAGE_NODE
+
 from django.http import HttpResponse
 from django.test import RequestFactory
 from django.views.decorators.cache import cache_page
 
-_view_calls = []
+_view_calls: list[int] = []
 
 
 def _counting_view(request):

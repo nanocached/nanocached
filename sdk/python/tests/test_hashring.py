@@ -1,4 +1,5 @@
 import unittest
+from typing import ClassVar
 
 from nanocached._hashring import HashRing, fmix64, fnv1a
 
@@ -64,7 +65,7 @@ class NamespaceStateTests(unittest.TestCase):
 
 
 class HashRingTests(unittest.TestCase):
-    NODES = ["node-a", "node-b", "node-c"]
+    NODES: ClassVar[list[str]] = ["node-a", "node-b", "node-c"]
 
     def test_owners_are_distinct_and_capped(self):
         ring = HashRing(self.NODES)
@@ -82,7 +83,7 @@ class HashRingTests(unittest.TestCase):
 
     def test_adding_a_node_never_reorders_existing_nodes(self):
         before = HashRing(self.NODES)
-        after = HashRing(self.NODES + ["node-d"])
+        after = HashRing([*self.NODES, "node-d"])
         for i in range(500):
             key = f"key-{i}".encode()
             new_order = [n for n in after.owners(key, 4) if n != "node-d"]
@@ -90,7 +91,7 @@ class HashRingTests(unittest.TestCase):
 
     def test_spreads_keys_evenly(self):
         ring = HashRing(self.NODES)
-        counts = {node: 0 for node in self.NODES}
+        counts = dict.fromkeys(self.NODES, 0)
         total = 3000
         for i in range(total):
             counts[ring.route(f"key-{i}".encode())] += 1
@@ -117,9 +118,7 @@ class HashRingTests(unittest.TestCase):
         self.assertEqual(ring.owners(b"some-key", 0), [])
         for replicas in range(6):
             owners = ring.owners(b"some-key", replicas)
-            self.assertEqual(
-                len(set(owners)), len(owners), f"replicas={replicas} owners={owners}"
-            )
+            self.assertEqual(len(set(owners)), len(owners), f"replicas={replicas} owners={owners}")
 
         # Construction order is otherwise unaffected: the first
         # occurrence of a repeated name is kept in place.
@@ -134,7 +133,7 @@ class NamespaceCrossLanguageVectorTests(unittest.TestCase):
     # and the resulting top-3 owners over node-a/node-b/node-c — the Rust
     # server (src/hash_ring.rs) and every other SDK assert these exact
     # same vectors, next to the pre-namespace alpha/beta/"" vectors above.
-    NODES = ["node-a", "node-b", "node-c"]
+    NODES: ClassVar[list[str]] = ["node-a", "node-b", "node-c"]
 
     def test_matches_the_cross_language_namespace_vectors(self):
         from nanocached._hashring import key_hash
@@ -149,9 +148,7 @@ class NamespaceCrossLanguageVectorTests(unittest.TestCase):
         self.assertEqual(
             ring.owners(b"alpha", 3, namespace=b"users"), ["node-a", "node-c", "node-b"]
         )
-        self.assertEqual(
-            ring.owners(b"", 3, namespace=b"users"), ["node-b", "node-c", "node-a"]
-        )
+        self.assertEqual(ring.owners(b"", 3, namespace=b"users"), ["node-b", "node-c", "node-a"])
         self.assertEqual(
             ring.owners(b"beta", 3, namespace=b"\xff\x00"), ["node-b", "node-a", "node-c"]
         )
@@ -186,7 +183,7 @@ class BoundedSelectionTests(unittest.TestCase):
         hashed_key = key_hash(namespace, key)
         scored = [
             (fmix64(node_hash ^ hashed_key), node)
-            for node_hash, node in zip(ring._node_hashes, ring._nodes)
+            for node_hash, node in zip(ring._node_hashes, ring._nodes, strict=True)
         ]
         scored.sort(key=lambda pair: (-pair[0], pair[1]))
         return [node for _, node in scored[:replicas]]

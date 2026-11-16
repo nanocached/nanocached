@@ -117,7 +117,7 @@ jobs:
 
       - name: Publish to Maven Central
         working-directory: sdk/java
-        run: gradle publishToMavenCentral --no-daemon
+        run: ./gradlew publishToMavenCentral --no-daemon
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
@@ -174,7 +174,7 @@ jobs:
 
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
-          dotnet-version: "10.0.x"
+          global-json-file: global.json
 
       - name: Verify tag matches manifest version
         run: |
@@ -317,7 +317,7 @@ jobs:
 
       - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
-          dotnet-version: "10.0.x"
+          global-json-file: global.json
 
       - name: Verify tag matches manifest version
         run: |
@@ -398,7 +398,7 @@ jobs:
       # coordinates at this version.
       - name: Publish to Maven Central
         working-directory: adapters/${{ steps.tag.outputs.name }}
-        run: gradle publishToMavenCentral --no-daemon
+        run: ./gradlew publishToMavenCentral --no-daemon
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}

@@ -3,6 +3,8 @@ catch the SDK's failures with one clause when they don't care which."""
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class NanocachedError(Exception):
     """Base class for every error this SDK raises on its own behalf."""
@@ -40,7 +42,7 @@ class PartialWrongNodeError(WrongNodeError):
     worth attaching on this condition and raises a plain WrongNodeError
     instead."""
 
-    def __init__(self, partial_values: dict) -> None:
+    def __init__(self, partial_values: dict[str | bytes, Any]) -> None:
         super().__init__()
         self.partial_values = partial_values
 
@@ -58,7 +60,10 @@ class DiscoveryBusyError(NanocachedError):
     another address, or retry shortly."""
 
     def __init__(self) -> None:
-        super().__init__("nanocached: the discovery server is busy: warming up after a restart, or its replication factor disagrees with the cluster's")
+        super().__init__(
+            "nanocached: the discovery server is busy: warming up after a restart, "
+            "or its replication factor disagrees with the cluster's"
+        )
 
 
 class NotNumericError(NanocachedError):
@@ -105,7 +110,7 @@ class PartialServerTooOldError(ServerTooOldError):
     get_many_and_touch_bytes() the raw bytes. touch_many has nothing
     partial worth attaching and raises a plain ServerTooOldError."""
 
-    def __init__(self, partial_values: dict) -> None:
+    def __init__(self, partial_values: dict[str | bytes, Any]) -> None:
         super().__init__("y")
         self.partial_values = partial_values
 
@@ -205,7 +210,7 @@ class PartialConnectionLostError(NanocachedError, ConnectionError):
     this fix. get_many()'s own PartialConnectionLostError carries str
     values (UTF-8 decoded); get_many_bytes() carries the raw bytes."""
 
-    def __init__(self, partial_values: dict, message: str) -> None:
+    def __init__(self, partial_values: dict[str | bytes, Any], message: str) -> None:
         super().__init__(message)
         self.partial_values = partial_values
 
@@ -226,7 +231,7 @@ class PartialSetConnectionLostError(NanocachedError, ConnectionError):
     still raises the original exception unwrapped; the original error is
     always reachable via ``__cause__``."""
 
-    def __init__(self, partial_keys: set, message: str) -> None:
+    def __init__(self, partial_keys: set[str | bytes], message: str) -> None:
         super().__init__(message)
         self.partial_keys = partial_keys
 

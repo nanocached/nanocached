@@ -19,18 +19,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * A minimal in-process nanocached node speaking just the slice of the
- * wire protocol this adapter's traffic produces: the {@code A ... T}
- * handshake (the SDK always negotiates tagged mode), namespaced {@code
- * g}/{@code s}/{@code d}/{@code c}, and the compare-and-set {@code k}/
- * {@code x} (issue #141) this adapter's {@code putIfAbsent}/{@code
- * replace}/{@code deleteIfMatches}/{@code getWithToken} rely on, and the
- * batched {@code m} (issue #152) this adapter's {@code getAll} uses for
- * its bulk-safe keys, and the batched touch {@code y} (issue #871) it uses
- * instead when the cache has an access-based expiry policy. A
- * trimmed, independent reimplementation — see the adapters' shared
- * "duplicate per module rather than share a test double" convention
- * (e.g. {@code nanocached-spring}'s own {@code MockNode}).
+ * A minimal in-process nanocached node speaking just the slice of the wire protocol this adapter's
+ * traffic produces: the {@code A ... T} handshake (the SDK always negotiates tagged mode),
+ * namespaced {@code g}/{@code s}/{@code d}/{@code c}, and the compare-and-set {@code k}/ {@code x}
+ * (issue #141) this adapter's {@code putIfAbsent}/{@code replace}/{@code deleteIfMatches}/{@code
+ * getWithToken} rely on, and the batched {@code m} (issue #152) this adapter's {@code getAll} uses
+ * for its bulk-safe keys, and the batched touch {@code y} (issue #871) it uses instead when the
+ * cache has an access-based expiry policy. A trimmed, independent reimplementation — see the
+ * adapters' shared "duplicate per module rather than share a test double" convention (e.g. {@code
+ * nanocached-spring}'s own {@code MockNode}).
  */
 final class MockNode implements AutoCloseable {
 
@@ -40,84 +37,111 @@ final class MockNode implements AutoCloseable {
     private final Thread acceptLoop;
     final Map<ByteBuffer, Map<ByteBuffer, Entry>> stores = new ConcurrentHashMap<>();
     final AtomicInteger clearCount = new AtomicInteger();
-    /** Plain, unconditional {@code s} (set) frames — a compare-and-set
-     * loop that gave up and overwrote would show up here. */
+
+    /**
+     * Plain, unconditional {@code s} (set) frames — a compare-and-set loop that gave up and
+     * overwrote would show up here.
+     */
     final AtomicInteger setCount = new AtomicInteger();
+
     /** Plain, unconditional {@code d} (delete) frames — likewise. */
     final AtomicInteger deleteCount = new AtomicInteger();
+
     final AtomicInteger casSetCount = new AtomicInteger();
     final AtomicInteger casDeleteCount = new AtomicInteger();
     final AtomicInteger multiGetCount = new AtomicInteger();
     final AtomicInteger multiSetCount = new AtomicInteger();
-    /** Every {@code t} (touch, issue #825) header line received
-     * verbatim, e.g. {@code "t 7 1 30 G 0"} — lets a test assert the exact
-     * frame the adapter sent. */
+
+    /**
+     * Every {@code t} (touch, issue #825) header line received verbatim, e.g. {@code "t 7 1 30 G
+     * 0"} — lets a test assert the exact frame the adapter sent.
+     */
     final java.util.List<String> touchFrames = new java.util.concurrent.CopyOnWriteArrayList<>();
-    /** Every {@code y} (batched touch, issue #871) header line received
-     * verbatim, e.g. {@code "y 7 2 1 1 30 G 0"}. */
+
+    /**
+     * Every {@code y} (batched touch, issue #871) header line received verbatim, e.g. {@code "y 7 2
+     * 1 1 30 G 0"}.
+     */
     final java.util.List<String> multiTouchFrames = new java.util.concurrent.CopyOnWriteArrayList<>();
-    /** When set, every {@code y} is answered like a node that knows {@code
-     * t} but predates {@code y}: {@code En}, then the connection closes. */
+
+    /**
+     * When set, every {@code y} is answered like a node that knows {@code t} but predates {@code
+     * y}: {@code En}, then the connection closes.
+     */
     volatile boolean rejectMultiTouch = false;
+
     /** Plain {@code g} (get) frames received. */
     final AtomicInteger getCount = new AtomicInteger();
-    /** Runs when a {@code g} has looked its value up (not yet answered) or
-     * a {@code t} has been read (not yet applied), with no lock held — lets
-     * a test land a concurrent write in the gap between a read (or a
-     * touch) and whatever the client does next with it. */
+
+    /**
+     * Runs when a {@code g} has looked its value up (not yet answered) or a {@code t} has been read
+     * (not yet applied), with no lock held — lets a test land a concurrent write in the gap between
+     * a read (or a touch) and whatever the client does next with it.
+     */
     volatile Runnable beforeAccessApplies;
-    /** Every accepted TCP connection, whether or not it goes on to
-     * authenticate (issue #192: used to prove a raced getCacheManager's
-     * "loser" client actually dialed in, rather than the race being
-     * decided before any connect happened at all). */
+
+    /**
+     * Every accepted TCP connection, whether or not it goes on to authenticate (issue #192: used to
+     * prove a raced getCacheManager's "loser" client actually dialed in, rather than the race being
+     * decided before any connect happened at all).
+     */
     final AtomicInteger connectionCount = new AtomicInteger();
-    /** Connections currently open (issue #192): connectionCount minus
-     * however many have since closed — used to prove a raced
-     * getCacheManager's losing client is actually closed, not leaked. */
+
+    /**
+     * Connections currently open (issue #192): connectionCount minus however many have since closed
+     * — used to prove a raced getCacheManager's losing client is actually closed, not leaked.
+     */
     final AtomicInteger liveConnectionCount = new AtomicInteger();
-    /** When set, the next {@code k}/{@code x} request answers a
-     * mismatch ({@code N}) regardless of whether the condition actually
-     * holds — a one-shot fault, cleared on use. Exists purely to prove
-     * the adapter's {@code getAnd*} CAS retry loops actually retry
-     * instead of only ever exercising the happy path. */
+
+    /**
+     * When set, the next {@code k}/{@code x} request answers a mismatch ({@code N}) regardless of
+     * whether the condition actually holds — a one-shot fault, cleared on use. Exists purely to
+     * prove the adapter's {@code getAnd*} CAS retry loops actually retry instead of only ever
+     * exercising the happy path.
+     */
     final AtomicBoolean forceCasMismatchOnce = new AtomicBoolean(false);
-    /** When positive, every {@code k}/{@code x} request forces a mismatch
-     * ({@code N}) and decrements this counter — sustained contention,
-     * unlike {@link #forceCasMismatchOnce}'s single fault. Set this to
-     * more than {@code MAX_CAS_RETRIES} to exhaust the adapter's CAS retry
-     * budget and exercise {@code getAndPut}/{@code getAndReplace}'s
-     * {@code fallbackOverwrite} (issue #331). */
+
+    /**
+     * When positive, every {@code k}/{@code x} request forces a mismatch ({@code N}) and decrements
+     * this counter — sustained contention, unlike {@link #forceCasMismatchOnce}'s single fault. Set
+     * this to more than {@code MAX_CAS_RETRIES} to exhaust the adapter's CAS retry budget and
+     * exercise {@code getAndPut}/{@code getAndReplace}'s {@code fallbackOverwrite} (issue #331).
+     */
     final AtomicInteger forceCasMismatchCount = new AtomicInteger(0);
-    /** Wire keys (the {@link KeyCodec#toKeyBytes} output, not the JCache
-     * key itself) mapped to how many more times {@code m}'s {@link
-     * #multiGet} must answer {@code W} for that key before answering
-     * normally again — each hit decrements the counter, mirroring {@link
-     * #forceCasMismatchCount}'s "sustained contention" shape. Set to 1 for
-     * a one-shot mid-batch ring change ({@code getAll}'s issue #415
-     * partial-wrong-node regression tests); set higher than the adapter's
-     * retry budget to exhaust it. Separate from {@link
-     * #forceWrongNodeCountsForSet} so a {@code putAll}'s own preceding
-     * existence-check {@code getManyBytes} call can't consume a fault
-     * meant for its {@code setManyBytes} call (they're different wire
-     * requests, sharing only the key). A plain single-node mock never
-     * emits {@code W} on its own, so this is the only way these tests can
-     * produce one. */
+
+    /**
+     * Wire keys (the {@link KeyCodec#toKeyBytes} output, not the JCache key itself) mapped to how
+     * many more times {@code m}'s {@link #multiGet} must answer {@code W} for that key before
+     * answering normally again — each hit decrements the counter, mirroring {@link
+     * #forceCasMismatchCount}'s "sustained contention" shape. Set to 1 for a one-shot mid-batch
+     * ring change ({@code getAll}'s issue #415 partial-wrong-node regression tests); set higher
+     * than the adapter's retry budget to exhaust it. Separate from {@link
+     * #forceWrongNodeCountsForSet} so a {@code putAll}'s own preceding existence-check {@code
+     * getManyBytes} call can't consume a fault meant for its {@code setManyBytes} call (they're
+     * different wire requests, sharing only the key). A plain single-node mock never emits {@code
+     * W} on its own, so this is the only way these tests can produce one.
+     */
     final Map<ByteBuffer, AtomicInteger> forceWrongNodeCountsForGet = new ConcurrentHashMap<>();
-    /** As {@link #forceWrongNodeCountsForGet}, but for {@code o}'s {@link
-     * #multiSet} ({@code putAll}'s issue #415 regression tests). */
+
+    /**
+     * As {@link #forceWrongNodeCountsForGet}, but for {@code o}'s {@link #multiSet} ({@code
+     * putAll}'s issue #415 regression tests).
+     */
     final Map<ByteBuffer, AtomicInteger> forceWrongNodeCountsForSet = new ConcurrentHashMap<>();
+
     private final AtomicInteger multiGetOkCountdown = new AtomicInteger(0);
     private final AtomicInteger multiGetDropRemaining = new AtomicInteger(0);
     private final AtomicInteger multiSetOkCountdown = new AtomicInteger(0);
     private final AtomicInteger multiSetDropRemaining = new AtomicInteger(0);
     private final AtomicInteger multiTouchOkCountdown = new AtomicInteger(0);
     private final AtomicInteger multiTouchDropRemaining = new AtomicInteger(0);
-    /** Milliseconds every single-key {@code d} (delete) sleeps before
-     * answering — 0 (the default) is no delay. Used to prove {@code
-     * removeAll(Set)} fans its deletes out concurrently rather than one
-     * after another (issue #415), the same shape as
-     * nanocached-django's {@code test_delete_many_fans_out_concurrently}
-     * (issue #233). */
+
+    /**
+     * Milliseconds every single-key {@code d} (delete) sleeps before answering — 0 (the default) is
+     * no delay. Used to prove {@code removeAll(Set)} fans its deletes out concurrently rather than
+     * one after another (issue #415), the same shape as nanocached-django's {@code
+     * test_delete_many_fans_out_concurrently} (issue #233).
+     */
     volatile long deleteDelayMillis = 0;
 
     MockNode() throws IOException {
@@ -160,41 +184,42 @@ final class MockNode implements AutoCloseable {
 
     Map<ByteBuffer, Entry> store(String namespace) {
         return stores.computeIfAbsent(
-                ByteBuffer.wrap(namespace.getBytes(StandardCharsets.UTF_8)),
-                unused -> new ConcurrentHashMap<>());
+                ByteBuffer.wrap(namespace.getBytes(StandardCharsets.UTF_8)), unused -> new ConcurrentHashMap<>());
     }
 
     Entry entry(String namespace, byte[] key) {
         return store(namespace).get(ByteBuffer.wrap(key));
     }
 
-    /** Guards {@link #closed}'s transition, {@link #accepted} and {@link
-     * #serveThreads}: a connection is either registered here before {@link
-     * #close()} takes its snapshot (and closed by it) or sees {@code closed}
-     * and is dropped by the accept loop — never accepted but unregistered. */
+    /**
+     * Guards {@link #closed}'s transition, {@link #accepted} and {@link #serveThreads}: a
+     * connection is either registered here before {@link #close()} takes its snapshot (and closed
+     * by it) or sees {@code closed} and is dropped by the accept loop — never accepted but
+     * unregistered.
+     */
     private final Object lifecycle = new Object();
+
     private volatile boolean closed;
-    /** Every accepted socket, so {@link #close()} can sever live
-     * connections too — a stopped node, not just one that accepts
-     * nothing new. */
+
+    /**
+     * Every accepted socket, so {@link #close()} can sever live connections too — a stopped node,
+     * not just one that accepts nothing new.
+     */
     private final java.util.List<Socket> accepted = new java.util.ArrayList<>();
+
     private final java.util.List<Thread> serveThreads = new java.util.ArrayList<>();
 
     /**
-     * Stops the node and returns only once it is completely stopped: the
-     * listener is released, every connection is closed and no thread is
-     * still serving one. Idempotent.
+     * Stops the node and returns only once it is completely stopped: the listener is released,
+     * every connection is closed and no thread is still serving one. Idempotent.
      *
-     * <p>{@code ServerSocket.close()} alone is not enough. On Linux it
-     * returns while the accept thread is still inside {@code accept(2)}, and
-     * the kernel keeps the listening socket alive until that thread leaves
-     * the call; a client that connects in that window completes its
-     * handshake, and the accept loop hands it a fresh serve thread that
-     * answers from {@link #stores} as if the node were still up (issue
-     * #1519: a {@code get} right after {@code close()} returned a value
-     * instead of failing). So this also waits for the accept loop to end,
-     * and the accept loop drops anything it accepts once {@link #closed}
-     * is set.
+     * <p>{@code ServerSocket.close()} alone is not enough. On Linux it returns while the accept
+     * thread is still inside {@code accept(2)}, and the kernel keeps the listening socket alive
+     * until that thread leaves the call; a client that connects in that window completes its
+     * handshake, and the accept loop hands it a fresh serve thread that answers from {@link
+     * #stores} as if the node were still up (issue #1519: a {@code get} right after {@code close()}
+     * returned a value instead of failing). So this also waits for the accept loop to end, and the
+     * accept loop drops anything it accepts once {@link #closed} is set.
      */
     @Override
     public void close() throws IOException {
@@ -313,11 +338,12 @@ final class MockNode implements AutoCloseable {
         }
     }
 
-    /** See {@link #serve}'s doc: drains {@code replies} strictly in the
-     * order {@link #delete} enqueued them, blocking on each future before
-     * writing it and moving to the next — so replies stay in request
-     * order on the wire even though every delayed delete's own wait runs
-     * concurrently with every other one's. */
+    /**
+     * See {@link #serve}'s doc: drains {@code replies} strictly in the order {@link #delete}
+     * enqueued them, blocking on each future before writing it and moving to the next — so replies
+     * stay in request order on the wire even though every delayed delete's own wait runs
+     * concurrently with every other one's.
+     */
     private Thread startDeleteReplyWriter(OutputStream out, BlockingQueue<CompletableFuture<byte[]>> replies) {
         Thread writer = new Thread(() -> {
             try {
@@ -364,11 +390,12 @@ final class MockNode implements AutoCloseable {
         }
     }
 
-    /** {@code t <ns-len> <key-len> [<ttl>] [G] [<tag>]} (issue #825): a miss
-     * answers {@code N} and never creates the key; ttl 0 expires the entry
-     * at once; no ttl field removes the TTL (stored as 0, like a set
-     * without one). Without {@code G} the reply is {@code S}; with it
-     * {@code V <len> [<ttl-now-in-effect>] [<tag>]}. */
+    /**
+     * {@code t <ns-len> <key-len> [<ttl>] [G] [<tag>]} (issue #825): a miss answers {@code N} and
+     * never creates the key; ttl 0 expires the entry at once; no ttl field removes the TTL (stored
+     * as 0, like a set without one). Without {@code G} the reply is {@code S}; with it {@code V
+     * <len> [<ttl-now-in-effect>] [<tag>]}.
+     */
     private void touch(
             InputStream in, OutputStream out, String namespace, String[] parts, boolean tagged, String tagSuffix)
             throws IOException {
@@ -404,8 +431,8 @@ final class MockNode implements AutoCloseable {
         }
         String ttlField = ttl != null && ttl > 0 ? " " + ttl : "";
         synchronized (out) {
-            out.write(("V " + existing.value().length + ttlField + tagSuffix + "\n")
-                    .getBytes(StandardCharsets.US_ASCII));
+            out.write(
+                    ("V " + existing.value().length + ttlField + tagSuffix + "\n").getBytes(StandardCharsets.US_ASCII));
             out.write(existing.value());
             out.flush();
         }
@@ -424,18 +451,17 @@ final class MockNode implements AutoCloseable {
         reply(out, "S" + tagSuffix + "\n");
     }
 
-    /** Issue #415: when {@link #deleteDelayMillis} is set, the mutation
-     * and reply are computed on a throwaway daemon thread instead of
-     * blocking this connection's one read loop with {@code Thread.sleep}
-     * — blocking the read loop would serialize every delete's delay one
-     * after another regardless of how many requests the client had
-     * already pipelined onto the wire, masking the exact difference a
-     * concurrent {@code removeAll(Set)} is supposed to make over the old
-     * one-RPC-at-a-time loop. The reply itself is hop through {@code
-     * replies} rather than written directly — see {@link #serve}'s doc —
-     * so N deletes submitted together still answer in request order, in
-     * roughly one {@link #deleteDelayMillis} altogether rather than N of
-     * them back to back. */
+    /**
+     * Issue #415: when {@link #deleteDelayMillis} is set, the mutation and reply are computed on a
+     * throwaway daemon thread instead of blocking this connection's one read loop with {@code
+     * Thread.sleep} — blocking the read loop would serialize every delete's delay one after another
+     * regardless of how many requests the client had already pipelined onto the wire, masking the
+     * exact difference a concurrent {@code removeAll(Set)} is supposed to make over the old
+     * one-RPC-at-a-time loop. The reply itself is hop through {@code replies} rather than written
+     * directly — see {@link #serve}'s doc — so N deletes submitted together still answer in request
+     * order, in roughly one {@link #deleteDelayMillis} altogether rather than N of them back to
+     * back.
+     */
     private void delete(
             InputStream in,
             String namespace,
@@ -468,12 +494,13 @@ final class MockNode implements AutoCloseable {
         worker.start();
     }
 
-    /** {@code m <ns-len> <n> <key-len-1> ... <key-len-n> [tag]}, docs/protocol.html
-     * "m / o". Reply: {@code M <n> <result-1> ... <result-n> [tag]\n<hit values>},
-     * each result a decimal byte length (hit), {@code -} (miss), or {@code W}
-     * (wrong node) — this single-node mock only ever answers {@code W} for a key
-     * in {@link #forceWrongNodeCountsForGet} (issue #415's regression tests),
-     * never on its own. */
+    /**
+     * {@code m <ns-len> <n> <key-len-1> ... <key-len-n> [tag]}, docs/protocol.html "m / o". Reply:
+     * {@code M <n> <result-1> ... <result-n> [tag]\n<hit values>}, each result a decimal byte
+     * length (hit), {@code -} (miss), or {@code W} (wrong node) — this single-node mock only ever
+     * answers {@code W} for a key in {@link #forceWrongNodeCountsForGet} (issue #415's regression
+     * tests), never on its own.
+     */
     private void multiGet(InputStream in, OutputStream out, String namespace, String[] parts, String tagSuffix)
             throws IOException {
         int n = Integer.parseInt(parts[2]);
@@ -516,12 +543,13 @@ final class MockNode implements AutoCloseable {
         }
     }
 
-    /** {@code y <ns-len> <n> <key-len-1> ... <key-len-n> [<ttl>] [G] [<tag>]}
-     * (issue #871): one TTL for the whole batch — no ttl field removes the TTL
-     * (stored as 0, like a set without one), 0 expires the keys at once, a miss
-     * is never created. Without {@code G} the reply is {@code Y <n> S|N ...};
-     * with it {@code M}'s roster for the keys touched. A key in {@link
-     * #forceWrongNodeCountsForGet} answers {@code W}, like {@link #multiGet}. */
+    /**
+     * {@code y <ns-len> <n> <key-len-1> ... <key-len-n> [<ttl>] [G] [<tag>]} (issue #871): one TTL
+     * for the whole batch — no ttl field removes the TTL (stored as 0, like a set without one), 0
+     * expires the keys at once, a miss is never created. Without {@code G} the reply is {@code Y
+     * <n> S|N ...}; with it {@code M}'s roster for the keys touched. A key in {@link
+     * #forceWrongNodeCountsForGet} answers {@code W}, like {@link #multiGet}.
+     */
     private void multiTouch(
             InputStream in, OutputStream out, String namespace, String[] parts, boolean tagged, String tagSuffix)
             throws IOException {
@@ -593,12 +621,13 @@ final class MockNode implements AutoCloseable {
         }
     }
 
-    /** {@code o <ns-len> <n> <key-len-1> <val-len-1> ... <key-len-n> <val-len-n>
-     * [ttl] [tag]}, docs/protocol.html "m / o" — one shared TTL for the whole
-     * batch, omitted from the wire when 0. Reply: {@code O <n> <result-1> ...
-     * <result-n> [tag]\n}, every result {@code S} unless the key is in {@link
-     * #forceWrongNodeCountsForSet} (issue #415's regression tests, {@code W} then)
-     * — this single-node mock never answers {@code W} on its own. */
+    /**
+     * {@code o <ns-len> <n> <key-len-1> <val-len-1> ... <key-len-n> <val-len-n> [ttl] [tag]},
+     * docs/protocol.html "m / o" — one shared TTL for the whole batch, omitted from the wire when
+     * 0. Reply: {@code O <n> <result-1> ... <result-n> [tag]\n}, every result {@code S} unless the
+     * key is in {@link #forceWrongNodeCountsForSet} (issue #415's regression tests, {@code W} then)
+     * — this single-node mock never answers {@code W} on its own.
+     */
     private void multiSet(
             InputStream in, OutputStream out, String namespace, String[] parts, boolean tagged, String tagSuffix)
             throws IOException {
@@ -636,10 +665,11 @@ final class MockNode implements AutoCloseable {
         }
     }
 
-    /** {@code k <ns-len> <key-len> <val-len> <cond> [ttl] [tag]}. {@code
-     * <cond>} always sits right after the three lengths; the optional
-     * {@code <ttl>} then the tag (on a tagged connection) follow, mirroring
-     * {@code s}'s own trailing-field layout. */
+    /**
+     * {@code k <ns-len> <key-len> <val-len> <cond> [ttl] [tag]}. {@code <cond>} always sits right
+     * after the three lengths; the optional {@code <ttl>} then the tag (on a tagged connection)
+     * follow, mirroring {@code s}'s own trailing-field layout.
+     */
     private void casSet(InputStream in, OutputStream out, String[] parts, boolean tagged, String tagSuffix)
             throws IOException {
         byte[] namespace = in.readNBytes(Integer.parseInt(parts[1]));
@@ -699,20 +729,22 @@ final class MockNode implements AutoCloseable {
         return remaining != null && remaining.getAndUpdate(count -> count > 0 ? count - 1 : count) > 0;
     }
 
-    /** Issue #439: simulates a connection dying mid-batch (as opposed to the
-     * #415 forced-W fault above, which simulates a stale routing table) —
-     * after {@code okCount} more m requests are answered normally, the next
-     * {@code dropCount} m requests each abort the connection (no reply
-     * written at all, exactly like a dead socket) instead of being
-     * processed; every m request once both budgets are exhausted is
-     * answered normally again. */
+    /**
+     * Issue #439: simulates a connection dying mid-batch (as opposed to the #415 forced-W fault
+     * above, which simulates a stale routing table) — after {@code okCount} more m requests are
+     * answered normally, the next {@code dropCount} m requests each abort the connection (no reply
+     * written at all, exactly like a dead socket) instead of being processed; every m request once
+     * both budgets are exhausted is answered normally again.
+     */
     void armMultiGetDrop(int okCount, int dropCount) {
         multiGetOkCountdown.set(okCount);
         multiGetDropRemaining.set(dropCount);
     }
 
-    /** As {@link #armMultiGetDrop}, for {@code y} (batched touch): the frame
-     * is read in full before the connection drops. */
+    /**
+     * As {@link #armMultiGetDrop}, for {@code y} (batched touch): the frame is read in full before
+     * the connection drops.
+     */
     void armMultiTouchDrop(int okCount, int dropCount) {
         multiTouchOkCountdown.set(okCount);
         multiTouchDropRemaining.set(dropCount);
@@ -736,9 +768,10 @@ final class MockNode implements AutoCloseable {
         }
     }
 
-    /** Same algorithm as {@code NanocachedClient.contentDigest} —
-     * SHA-256 truncated to 16 bytes, lowercase hex — reimplemented
-     * independently so a bug in one isn't masked by the other. */
+    /**
+     * Same algorithm as {@code NanocachedClient.contentDigest} — SHA-256 truncated to 16 bytes,
+     * lowercase hex — reimplemented independently so a bug in one isn't masked by the other.
+     */
     private static String digestOf(byte[] value) {
         try {
             MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
@@ -757,11 +790,12 @@ final class MockNode implements AutoCloseable {
         return new String(namespace, StandardCharsets.UTF_8);
     }
 
-    /** Synchronized on {@code out} (issue #415): {@link #delete}'s delayed
-     * responder thread can answer while the main read loop is mid-write
-     * for an unrelated request on the same connection, so every write
-     * site in this class serializes on the same monitor to keep replies
-     * from interleaving on the wire. */
+    /**
+     * Synchronized on {@code out} (issue #415): {@link #delete}'s delayed responder thread can
+     * answer while the main read loop is mid-write for an unrelated request on the same connection,
+     * so every write site in this class serializes on the same monitor to keep replies from
+     * interleaving on the wire.
+     */
     private void reply(OutputStream out, String line) throws IOException {
         synchronized (out) {
             out.write(line.getBytes(StandardCharsets.US_ASCII));

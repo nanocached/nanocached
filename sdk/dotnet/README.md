@@ -811,9 +811,18 @@ regardless.
 ## Build
 
 ```sh
+dotnet format src/Nanocached && dotnet format tests/Nanocached.Tests   # format, fix style and analyzer findings
+dotnet format src/Nanocached --verify-no-changes && dotnet format tests/Nanocached.Tests --verify-no-changes   # check only, as CI does
+dotnet build tests/Nanocached.Tests   # compiler, analyzers and code style; warnings fail the build
 dotnet test tests/Nanocached.Tests    # unit tests against in-process mock servers
 dotnet pack src/Nanocached
 ```
+
+The repository's `global.json` asks for a .NET 10 SDK (10.0.404 or newer)
+and rolls forward to a newer major one when no .NET 10 SDK is installed;
+running the tests needs the .NET 10 runtime. Code-style and
+naming rules live in the repository's `.editorconfig`; analyzer settings in
+[`Directory.Build.props`](Directory.Build.props).
 
 This SDK speaks the current wire protocol (rendezvous hashing,
 replication-aware `L`/`W`); it requires an up-to-date server. Against a server that predates response tags it falls back to an untagged connection, where replies are matched to requests by order alone — see [docs/protocol.html#untagged-desync](../../docs/protocol.html#untagged-desync) for what that cannot promise. The hash
