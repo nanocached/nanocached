@@ -15156,6 +15156,142 @@ mod tests {
         peer_task.abort();
     }
 
+    #[test]
+    fn a_failure_recorded_for_one_target_keeps_another_targets_fresh_failure() {
+        // `record_forward_failure` prunes the expired entries on every
+        // insert. A still-recent failure of another target is not expired:
+        // that target keeps failing fast (or, after an `R`, not dialling).
+        let (addr_a, addr_b) = ("record-forward-failure-a:1", "record-forward-failure-b:1");
+        record_forward_failure(addr_a, "tok-a", false);
+        record_forward_failure(addr_b, "tok-b", true);
+        assert_eq!(forward_attempts_for(addr_a, "tok-a"), 1);
+        assert_eq!(forward_attempts_for(addr_b, "tok-b"), 0);
+
+        record_forward_failure(addr_b, "tok-b-restarted", false);
+        assert_eq!(forward_attempts_for(addr_a, "tok-a"), 1);
+        assert_eq!(forward_attempts_for(addr_b, "tok-b"), 0);
+        assert_eq!(forward_attempts_for(addr_b, "tok-b-restarted"), 1);
+
+        clear_forward_failure(addr_a, "tok-a");
+        clear_forward_failure(addr_b, "tok-b");
+        clear_forward_failure(addr_b, "tok-b-restarted");
+        assert_eq!(forward_attempts_for(addr_a, "tok-a"), KEY_TRANSFER_ATTEMPTS);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_join_transfer_stops_at_an_r_and_retries_any_other_failure() {
+        // `transfer_with_retries` spends its `KEY_TRANSFER_ATTEMPTS` on a
+        // joiner it cannot reach, but an `R` (another process answers at
+        // the address) is final: every further attempt meets the same
+        // answer.
+        let node_context = test_node_context(
+            "node-a",
+            "tok-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let name = key(b"name");
+        let write = || ForwardedWrite::HandoffSet {
+            key: &name,
+            value: b"v",
+            ttl: None,
+            if_absent: true,
+            token: "tok-joiner",
+        };
+
+        let refusing_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refusing_addr = refusing_listener.local_addr().unwrap().to_string();
+        let (refused_frames, refusing_task) =
+            spawn_recording_peer_refusing(refusing_listener, PeerRefusal::TokenMismatch);
+        let mut stream = None;
+        assert!(!transfer_with_retries(&node_context, &refusing_addr, &mut stream, write()).await);
+        assert_eq!(
+            refused_frames.lock().unwrap().len(),
+            1,
+            "an `R` is not retried"
+        );
+
+        // A peer that accepts and closes: every attempt fails, and the
+        // accepts count the dials.
+        let closing_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closing_addr = closing_listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let closing_task = tokio::spawn({
+            let accepts = Arc::clone(&accepts);
+            async move {
+                while let Ok((connection, _)) = closing_listener.accept().await {
+                    accepts.fetch_add(1, Ordering::SeqCst);
+                    drop(connection);
+                }
+            }
+        });
+        let mut stream = None;
+        assert!(!transfer_with_retries(&node_context, &closing_addr, &mut stream, write()).await);
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            KEY_TRANSFER_ATTEMPTS as usize,
+            "a failure to reach the joiner uses up every attempt"
+        );
+
+        refusing_task.abort();
+        closing_task.abort();
+    }
+
+    #[test]
+    fn a_handoff_rejection_says_which_refusal_it_was() {
+        assert_eq!(
+            HandoffRejected::Address.to_string(),
+            "peer refused the handoff (membership token mismatch)"
+        );
+        assert_eq!(
+            HandoffRejected::Entry.to_string(),
+            "peer did not acknowledge the handed-off entry"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_forwarded_handoff_delete_accepts_only_d_or_n() {
+        // `D` (deleted there) and `N` (not there: the delete raced ahead of
+        // the key's own transfer) both leave the entrant without a stale
+        // copy. Any other answer is a failure, and an `R` is the address
+        // refusing every frame.
+        async fn answered(ack: &'static [u8]) -> io::Result<()> {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let peer = tokio::spawn(async move {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let mut buffer = [0u8; 256];
+                let _ = connection.read(&mut buffer).await;
+                let _ = connection.write_all(ack).await;
+            });
+            let mut stream: ClientStream =
+                infra::MaybeTls::Plain(TcpStream::connect(addr).await.unwrap());
+            let name = key(b"name");
+            let result = ForwardedWrite::HandoffDelete {
+                key: &name,
+                token: "tok-entrant",
+            }
+            .send(&mut stream)
+            .await;
+            peer.await.unwrap();
+            result
+        }
+
+        assert!(answered(b"D\n").await.is_ok());
+        assert!(answered(b"N\n").await.is_ok());
+        let other = answered(b"E\n").await.unwrap_err();
+        assert_eq!(other.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            classify_handoff_failure(&other),
+            HandoffFailure::Unreachable
+        );
+        let refused = answered(b"R\n").await.unwrap_err();
+        assert_eq!(
+            classify_handoff_failure(&refused),
+            HandoffFailure::AddressRefused
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn forwards_to_a_dead_target_log_a_bounded_number_of_warnings() {
         // Issue #1161: against a target that stays unreachable, every
@@ -25838,6 +25974,76 @@ mod tests {
         cache_task.await.unwrap();
     }
 
+    /// An entrant that accepts every connection and closes it before the
+    /// ack is as unreachable as one that refuses the dial: the key that used
+    /// up every attempt on it writes the address off, and the keys after it
+    /// are left behind without a dial.
+    #[tokio::test(flavor = "current_thread")]
+    async fn decommission_drain_writes_off_an_entrant_whose_every_send_fails() {
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let peer_task = tokio::spawn({
+            let accepts = Arc::clone(&accepts);
+            async move {
+                while let Ok((connection, _)) = peer_listener.accept().await {
+                    accepts.fetch_add(1, Ordering::SeqCst);
+                    drop(connection);
+                }
+            }
+        });
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let (_left, discovery_task) = spawn_mock_discovery(discovery_listener, peer_addr, None);
+        let node_context = drain_test_context(&discovery_addr, &request_tx);
+
+        let before = HashRing::new(vec!["leaver".into(), "peer".into()]);
+        let mut owned = 0usize;
+        for index in 0..40u32 {
+            let k = key(format!("key-{index}").as_bytes());
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: k.clone(),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+            if before.is_owner(&k, "leaver", 1) {
+                owned += 1;
+            }
+        }
+        assert!(owned > 5, "{owned}");
+
+        run_decommission(
+            node_context.clone(),
+            vec![discovery_addr],
+            Duration::from_secs(3),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            KEY_TRANSFER_ATTEMPTS as usize,
+            "only the first key bound for the entrant may dial it"
+        );
+        assert_eq!(
+            node_context.gates.drain_left_behind.load(Ordering::SeqCst),
+            owned,
+            "every key bound for the unreachable entrant is left behind"
+        );
+
+        discovery_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
     /// A key that is gone by its turn (here a dead copy: marked since a
     /// join took it) is not an entry the drain failed to hand off, even
     /// when its entrant has been written off. It used to be counted as left
@@ -31419,6 +31625,58 @@ mod tests {
         cache_task.await.unwrap();
     }
 
+    /// `run_rereplication`'s result tells a successor whether this run's
+    /// ring change is covered: true for a pass that ran to the end, false
+    /// for one an abort or a shutdown cut short.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_rereplication_reports_whether_the_pass_ran_to_the_end() {
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let before_ring = HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ]);
+        let after_ring = HashRing::new(vec!["node-a".to_string(), "node-b".to_string()]);
+        let mut node_context = test_node_context(
+            "node-a",
+            "tok-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        let addresses: HashMap<String, String> = HashMap::new();
+        let tokens: HashMap<String, String> = HashMap::new();
+
+        for (aborted, shut_down, finished) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let abort_requested = AtomicBool::new(aborted);
+            let (_shutdown_tx, mut shutdown_rx) = watch::channel(shut_down);
+            assert_eq!(
+                run_rereplication(
+                    &node_context,
+                    &plain_baselines(&before_ring),
+                    &after_ring,
+                    2,
+                    &addresses,
+                    &tokens,
+                    &abort_requested,
+                    &mut shutdown_rx,
+                )
+                .await,
+                finished,
+                "aborted {aborted}, shut down {shut_down}"
+            );
+        }
+
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn join_heartbeat_task_aborts_a_task_that_outlives_the_wait() {
         let stuck = tokio::spawn(std::future::pending::<()>());
@@ -33076,6 +33334,110 @@ mod tests {
             checked += wanted.len();
         }
         assert!(checked > 100, "only {checked} targets to compare");
+    }
+
+    /// Issue #1606: a folded baseline and a plain one with the same member
+    /// set are kept once, as the folded one, whichever came first: its
+    /// targets are a superset of the plain one's.
+    #[test]
+    fn a_folded_baseline_absorbs_a_plain_one_with_the_same_members() {
+        let folded = |names: &[&str]| RereplicationBaseline {
+            ring: ring_of_members(names),
+            every_other_owner: true,
+        };
+        for baselines in [
+            vec![
+                RereplicationBaseline::plain(ring_of_members(&["a", "b", "c"])),
+                folded(&["c", "b", "a"]),
+            ],
+            vec![
+                folded(&["a", "b", "c"]),
+                RereplicationBaseline::plain(ring_of_members(&["c", "b", "a"])),
+            ],
+        ] {
+            let kept = fold_unfinished_baselines(baselines, "a");
+            assert_eq!(kept.len(), 1);
+            assert!(kept[0].every_other_owner, "the fold must survive the dedup");
+        }
+    }
+
+    /// Issue #1606: up to `MAX_UNFINISHED_BASELINES` distinct baselines are
+    /// kept as they are; one more folds the two oldest into one over their
+    /// common members plus this node, even when the older ring lacked it.
+    #[test]
+    fn unfinished_baselines_fold_only_past_the_bound() {
+        let ring = |names: &[&str]| RereplicationBaseline::plain(ring_of_members(names));
+        let newer: Vec<String> = (0..MAX_UNFINISHED_BASELINES - 1)
+            .map(|index| format!("n{index}"))
+            .collect();
+        let newer_rings: Vec<RereplicationBaseline> = newer
+            .iter()
+            .map(|name| ring(&["a", name.as_str()]))
+            .collect();
+
+        let mut at_bound = vec![ring(&["a", "b"])];
+        at_bound.extend(newer_rings.iter().cloned());
+        let kept = fold_unfinished_baselines(at_bound, "a");
+        assert_eq!(
+            kept.len(),
+            MAX_UNFINISHED_BASELINES,
+            "nothing to fold at the bound"
+        );
+        assert!(kept.iter().all(|baseline| !baseline.every_other_owner));
+
+        // The oldest ring is one from before this node joined.
+        let mut past_bound = vec![ring(&["b", "c", "x"]), ring(&["b", "c", "d"])];
+        past_bound.extend(newer_rings.iter().cloned());
+        let kept = fold_unfinished_baselines(past_bound, "a");
+        assert_eq!(kept.len(), MAX_UNFINISHED_BASELINES);
+        assert!(kept[0].every_other_owner);
+        assert_eq!(kept[0].sorted_members(), ["a", "b", "c"]);
+        for (baseline, name) in kept[1..].iter().zip(&newer) {
+            assert!(!baseline.every_other_owner);
+            assert_eq!(baseline.sorted_members(), ["a", name.as_str()]);
+        }
+    }
+
+    /// Issue #1606: a folded baseline sends a key only where this node owned
+    /// it under the folded ring and is still a member of the final one, and
+    /// then to every other owner under the final ring.
+    #[test]
+    fn a_folded_baseline_targets_every_other_owner_only_for_keys_this_node_held() {
+        let replication = 2;
+        let folded = [RereplicationBaseline {
+            ring: ring_of_members(&["a", "b", "c"]),
+            every_other_owner: true,
+        }];
+        let after = ring_of_members(&["a", "b", "c", "d"]);
+        let without_self = ring_of_members(&["b", "c", "d"]);
+        let (mut held, mut not_held) = (0usize, 0usize);
+        for index in 0..200u32 {
+            let hash = KeyHash::of(&key(format!("key-{index}").as_bytes()));
+            let owned = folded[0].ring.is_owner_hashed(hash, "a", replication);
+            let wanted: Vec<String> = if owned {
+                held += 1;
+                after
+                    .owners_hashed(hash, replication)
+                    .into_iter()
+                    .filter(|owner| *owner != "a")
+                    .map(str::to_string)
+                    .collect()
+            } else {
+                not_held += 1;
+                Vec::new()
+            };
+            assert_eq!(
+                rereplication_targets_since(&folded, &after, hash, replication, "a"),
+                wanted,
+                "key-{index}"
+            );
+            assert!(
+                rereplication_targets_since(&folded, &without_self, hash, replication, "a")
+                    .is_empty(),
+                "key-{index}: this node is no longer a member, so it sends nothing"
+            );
+        }
+        assert!(held > 10 && not_held > 10, "{held} {not_held}");
     }
 
     /// Issue #1606: a pass superseded again and again before any of them

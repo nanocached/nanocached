@@ -113,3 +113,69 @@ fn a_node_whose_stderr_nobody_reads_keeps_serving_and_reports_what_it_dropped() 
         "the lines that did not fit were not reported"
     );
 }
+
+#[test]
+fn only_keys_under_the_listed_prefix_are_traced() {
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nanocached-node"))
+        .args(["--host", "127.0.0.1", "--port", &port.to_string()])
+        .args(["--drain-timeout", "0"])
+        .env_remove("NANOCACHED_AUTH_SECRET")
+        .env("NANOCACHED_TRACE_PREFIX", "t")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the node binary starts");
+    let mut stderr = child.stderr.take().unwrap();
+    let reader = thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = stderr.read_to_end(&mut text);
+        String::from_utf8_lossy(&text).into_owned()
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut stream = loop {
+        match TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    panic!("the node never listened: {error}");
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    // The untraced key first: its line, had it been traced, would be queued
+    // ahead of the traced one, so the traced line showing up proves it was
+    // not merely dropped.
+    set(&mut stream, "u1").unwrap();
+    set(&mut stream, "t1").unwrap();
+
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let status = child.wait().unwrap();
+    assert!(status.success(), "{status}");
+    let text = reader.join().unwrap();
+    assert!(
+        text.contains("TRACE set_request key=t1 "),
+        "the key under the prefix was not traced:\n{text}"
+    );
+    assert!(
+        !text.contains("key=u1"),
+        "a key outside the prefix was traced:\n{text}"
+    );
+}
