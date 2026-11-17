@@ -8094,6 +8094,77 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn t_cache_is_invalidated_by_a_duplicate_j_only_when_it_moves_the_address() {
+        // Issue #356: a duplicate `J` re-addressing a `Waiting` node changes
+        // `T`'s roster; one from the same address changes nothing and keeps
+        // the cached buffer.
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "unrelated-joiner".to_string(),
+            expected: HashMap::new(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
+            generation: 1,
+        })));
+        start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "waiter",
+            "127.0.0.1:9001".to_string(),
+            "tk-waiter".to_string(),
+            1,
+        )
+        .await
+        .expect("the registration must be admitted");
+        let primed = cached_node_roster(&registry, 2);
+        start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "waiter",
+            "127.0.0.1:9001".to_string(),
+            "tk-waiter".to_string(),
+            3,
+        )
+        .await
+        .expect("a duplicate J must be admitted");
+        assert!(
+            Arc::ptr_eq(&primed, &cached_node_roster(&registry, 2)),
+            "a duplicate J that changes nothing invalidated the cache"
+        );
+
+        start_join(
+            &registry,
+            &current_join,
+            &None,
+            &None,
+            2,
+            Instant::now(),
+            "waiter",
+            "127.0.0.1:9002".to_string(),
+            "tk-waiter".to_string(),
+            4,
+        )
+        .await
+        .expect("a duplicate J must be admitted");
+        assert_eq!(
+            &*cached_node_roster(&registry, 2),
+            b"N 1 2\n6 14 9\nwaiter127.0.0.1:9002tk-waiter\n",
+            "the re-addressed Waiting entry must invalidate the cache"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn t_cache_is_invalidated_by_a_waiting_eviction() {
         // Issue #356's other half: `sweep_expired` reaping a `Waiting`
@@ -8884,6 +8955,24 @@ mod tests {
     }
 
     #[test]
+    fn a_contact_break_that_ended_exactly_the_retention_ago_is_pruned() {
+        let start = Instant::now();
+        let mut info = NodeInfo::new(
+            "127.0.0.1:3333".to_string(),
+            NodeState::Joined,
+            "tk".to_string(),
+        );
+        info.contact_breaks = vec![(start, start + Duration::from_secs(1))];
+        let heard_again = start + Duration::from_secs(1) + DEPARTED_RETENTION;
+        info.last_heartbeat = heard_again - CONTACT_BREAK;
+        note_contact(&mut info, "node", heard_again);
+        assert_eq!(
+            info.contact_breaks,
+            vec![(heard_again - CONTACT_BREAK, heard_again)]
+        );
+    }
+
+    #[test]
     fn a_survivor_that_loses_a_heartbeat_after_the_eviction_still_makes_the_evicted_node_start_over()
      {
         // node-b was served the roster without node-a (its heartbeat after
@@ -9035,6 +9124,27 @@ mod tests {
                 "silent for {silent_for:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_survivor_heard_from_at_the_eviction_instant_vetoes_and_one_joined_then_does_not() {
+        // Last contact at the very instant of the eviction, then silent
+        // for longer than the break: that contact was not before the
+        // departure, so node-b is not cut off since and still vetoes.
+        let now = Instant::now();
+        let evicted = now - Duration::from_secs(12);
+        let registry: Registry = Arc::new(RegistryState::default());
+        insert_member(&registry, "node-b", now, evicted);
+        depart_at(&registry, "node-a", evicted);
+        assert!(announce_needs_rejoin_at(&registry, "node-a", now));
+
+        // A member whose membership began at the eviction instant was not
+        // a member before it and took nothing of node-a's over.
+        let registry: Registry = Arc::new(RegistryState::default());
+        insert_member(&registry, "node-b", now, now);
+        lock(&registry).get_mut("node-b").unwrap().joined_at = evicted;
+        depart_at(&registry, "node-a", evicted);
+        assert!(!announce_needs_rejoin_at(&registry, "node-a", now));
     }
 
     #[test]
@@ -9906,6 +10016,93 @@ mod tests {
         .await;
         assert!(fx.state_of("node-old").is_some());
         fx.finish().await;
+    }
+
+    /// A `Joined` old name and a `Waiting` entry held on it, at `since`,
+    /// for the `settle_address_holds` tests below.
+    fn held_registry(old_state: NodeState, old_heard_at: Instant, since: Instant) -> Registry {
+        let registry: Registry = Arc::new(RegistryState::default());
+        let mut old = NodeInfo::new(
+            "127.0.0.1:4444".to_string(),
+            old_state,
+            "tk-node-old".to_string(),
+        );
+        old.last_heartbeat = old_heard_at;
+        old.last_contact = old_heard_at;
+        let mut new = NodeInfo::with_queue_position(
+            "127.0.0.1:4444".to_string(),
+            NodeState::Waiting,
+            "tk-node-new".to_string(),
+            1,
+        );
+        new.address_hold = Some(AddressHold {
+            since,
+            old_names: vec!["node-old".to_string()],
+        });
+        let mut guard = lock(&registry);
+        guard.insert("node-old".to_string(), old);
+        guard.insert("node-new".to_string(), new);
+        drop(guard);
+        registry
+    }
+
+    /// Issue #1663: only a contact after the `J` proves the old name
+    /// alive. One heard at the very instant of the `J`, then silent for
+    /// `CONTACT_BREAK`, is replaced, and `T`'s roster moves with it.
+    #[test]
+    fn settle_address_holds_replaces_an_old_name_last_heard_at_the_hold_instant() {
+        let since = Instant::now();
+        let registry = held_registry(NodeState::Joined, since, since);
+        let before = cached_node_roster(&registry, 2);
+        let outcome = settle_address_holds(&registry, since + CONTACT_BREAK);
+        assert_eq!(outcome.replaced, ["node-old"]);
+        assert!(outcome.decided);
+        assert!(!outcome.holds_remain);
+        assert!(!lock(&registry).contains_key("node-old"));
+        assert!(lock(&registry)["node-new"].address_hold.is_none());
+        let after = cached_node_roster(&registry, 2);
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "the replacement left T stale"
+        );
+        assert!(after.starts_with(b"N 1 2\n"));
+    }
+
+    /// Issue #1663: a hold decided without replacing anything (the old name
+    /// spoke after the `J`) changes no roster, so `T`'s cache stays.
+    #[test]
+    fn settle_address_holds_that_replaces_nothing_keeps_the_t_cache() {
+        let since = Instant::now();
+        let registry = held_registry(NodeState::Joined, since + Duration::from_secs(1), since);
+        let before = cached_node_roster(&registry, 2);
+        let outcome = settle_address_holds(&registry, since + CONTACT_BREAK * 2);
+        assert!(outcome.replaced.is_empty());
+        assert!(outcome.decided);
+        assert!(lock(&registry).contains_key("node-old"));
+        assert!(Arc::ptr_eq(&before, &cached_node_roster(&registry, 2)));
+    }
+
+    /// Issue #1663: an old name that is no longer `Joined` (it left and
+    /// registered again, and is waiting) is not a member whose address was
+    /// taken: the hold ends and it is not removed, however long it was
+    /// silent.
+    #[test]
+    fn settle_address_holds_never_replaces_an_old_name_that_is_no_longer_joined() {
+        let since = Instant::now();
+        let registry = held_registry(NodeState::Waiting, since, since);
+        let outcome = settle_address_holds(&registry, since + CONTACT_BREAK * 2);
+        assert!(outcome.replaced.is_empty());
+        assert!(outcome.decided);
+        assert!(!outcome.holds_remain);
+        assert!(lock(&registry).contains_key("node-old"));
+        assert!(
+            registry
+                .departed
+                .lock()
+                .unwrap()
+                .departed_at("node-old")
+                .is_none()
+        );
     }
 
     /// Issue #1663: a `J` from the address of a member that is still
@@ -10935,6 +11132,16 @@ mod tests {
             .filter(|_| log_dissent(&log, &snapshot, 2))
             .count();
         assert_eq!(written, 1);
+    }
+
+    #[test]
+    fn dissenter_names_lists_exactly_the_listed_count_without_a_remainder() {
+        let five: Vec<String> = (0..DISSENT_NAMES_LISTED).map(|i| format!("n{i}")).collect();
+        assert_eq!(dissenter_names(&five), "n0, n1, n2, n3, n4");
+        let six: Vec<String> = (0..=DISSENT_NAMES_LISTED)
+            .map(|i| format!("n{i}"))
+            .collect();
+        assert_eq!(dissenter_names(&six), "n0, n1, n2, n3, n4 and 1 more");
     }
 
     #[test]
@@ -13961,6 +14168,32 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
+    /// The drain after a rejected request is bounded by a request's worth
+    /// of bytes, not only by its window: a client that keeps writing
+    /// without ever closing is cut off once that much has been read, and
+    /// its writes start failing long before it could push 16 MiB.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_client_that_keeps_writing_after_a_rejected_request_is_cut_off() {
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, connection_task) = spawn_size_limit_connection(server, None);
+        client.write_all(b"J 999 1 1\n").await.unwrap();
+        let chunk = vec![b'x'; 64 * 1024];
+        let cap = 16 * 1024 * 1024;
+        let mut written = 0;
+        while written < cap {
+            match client.write(&chunk).await {
+                Ok(n) => written += n,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            written < cap,
+            "the server kept reading {written} bytes after the Ed"
+        );
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
     /// Issue #1890: `handle_connection` on a fresh connection for the
     /// size-limit tests below.
     fn spawn_size_limit_connection(
@@ -14032,6 +14265,43 @@ mod tests {
             let error = connection_task.await.unwrap().unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
+    }
+
+    /// Issue #1890: the limit is inclusive. A frame of exactly
+    /// `MAX_REQUEST_SIZE` bytes is answered; an unfinished one holding
+    /// exactly that many is not yet over it, so a client that closes there
+    /// gets no `Ed`, only the end of the connection.
+    #[tokio::test(flavor = "current_thread")]
+    async fn handle_connection_takes_a_frame_of_exactly_the_size_limit() {
+        let header = format!("A {}\n", MAX_REQUEST_SIZE - 7);
+        assert_eq!(header.len(), 7);
+        let mut frame = header.into_bytes();
+        frame.resize(MAX_REQUEST_SIZE, b'x');
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, connection_task) = spawn_size_limit_connection(server, None);
+        client.write_all(&frame).await.unwrap();
+        let mut response = [0u8; 3];
+        client.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"Od\n");
+        drop(client);
+        connection_task.await.unwrap().unwrap();
+
+        // One byte short of a frame that declares one more secret byte.
+        let mut unfinished = format!("A {}\n", MAX_REQUEST_SIZE - 6).into_bytes();
+        unfinished.resize(MAX_REQUEST_SIZE, b'x');
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, connection_task) = spawn_size_limit_connection(server, None);
+        client.write_all(&unfinished).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(
+            response, b"",
+            "an unfinished frame at the limit was rejected"
+        );
+        let error = connection_task.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
@@ -15391,6 +15661,38 @@ mod tests {
         assert_eq!(
             join_status(&current_join, "node-j", 4, &promoted),
             JoinStatus::Promoted
+        );
+    }
+
+    /// Issue #1870: a join is the current one only if both its name and
+    /// its generation match. The same name under an earlier generation (an
+    /// abandoned incarnation's retried `M`) is not, and must cancel.
+    #[test]
+    fn join_status_is_current_only_for_the_same_name_and_generation() {
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
+            joining_name: "node-j".to_string(),
+            expected: HashMap::new(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            generation: 4,
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
+        })));
+        let promoted = AtomicBool::new(false);
+        assert_eq!(
+            join_status(&current_join, "node-j", 4, &promoted),
+            JoinStatus::Current
+        );
+        assert_eq!(
+            join_status(&current_join, "node-j", 3, &promoted),
+            JoinStatus::Ended,
+            "an earlier generation under the same name"
+        );
+        assert_eq!(
+            join_status(&current_join, "node-k", 4, &promoted),
+            JoinStatus::Ended,
+            "another name under the same generation"
         );
     }
 

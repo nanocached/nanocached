@@ -300,6 +300,39 @@ mod tests {
     }
 
     #[test]
+    fn finish_waits_for_an_output_that_comes_back_before_the_deadline() {
+        let output = StuckOutput::default();
+        let sink = Sink::new(output.clone(), 4);
+        for index in 0..100 {
+            sink.emit(format!("TRACE line {index}"));
+        }
+        let opener = output.clone();
+        let reopened = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            opener.open();
+        });
+        sink.finish(Duration::from_secs(10));
+        // Read before joining: once finish returns, what it waited for is
+        // already written.
+        let text = output.text();
+        reopened.join().unwrap();
+        let written = text
+            .lines()
+            .filter(|line| line.starts_with("TRACE line "))
+            .count();
+        let reported: usize = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("TRACE dropped lines="))
+            .map(|count| count.parse::<usize>().unwrap())
+            .sum();
+        assert_eq!(
+            written + reported,
+            100,
+            "finish returned before the queue was written:\n{text}"
+        );
+    }
+
+    #[test]
     fn lines_that_fit_the_queue_are_all_written_in_order() {
         let output = StuckOutput::default();
         output.open();

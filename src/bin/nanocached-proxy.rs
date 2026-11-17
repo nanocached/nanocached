@@ -9558,6 +9558,43 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_key_frame_exactly_at_the_namespace_bound_is_parsed() {
+        // 524,288 x 128 is `MAX_MULTI_NAMESPACE_KEY_BYTES` exactly: within
+        // the bound, as on the node; one namespace byte more is over it.
+        let keys = 128;
+        let namespace_len = MAX_MULTI_NAMESPACE_KEY_BYTES / keys;
+        for touch in [false, true] {
+            let frame = |namespace_len| {
+                if touch {
+                    big_namespace_multi_touch(namespace_len, keys, 30)
+                } else {
+                    big_namespace_multi_set(namespace_len, keys)
+                }
+            };
+            let mut input = BytesMut::from(&frame(namespace_len)[..]);
+            match parse_request(&mut input, false, &mut RequestScanState::default()) {
+                Ok(ParseOutcome::Ready(
+                    Request::MultiSet { keys: parsed, .. }
+                    | Request::MultiTouch { keys: parsed, .. },
+                    None,
+                )) => assert_eq!(parsed.len(), keys, "touch: {touch}"),
+                Ok(_) => panic!("touch: {touch}: not the multi-key request"),
+                Err(error) => panic!("touch: {touch}: refused at the bound: {error}"),
+            }
+
+            let mut input = BytesMut::from(&frame(namespace_len + 1)[..]);
+            let error = match parse_request(&mut input, false, &mut RequestScanState::default()) {
+                Ok(_) => panic!("touch: {touch}: accepted over the bound"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("exceed the limit"),
+                "touch: {touch}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn parse_request_trickled_multi_frames_match_one_shot_parse() {
         for frame in [
             &b"m 2 3 1 1 1\nnsabc"[..],
@@ -10890,6 +10927,18 @@ mod tests {
         assert_eq!(started.elapsed(), REJECTED_REQUEST_DRAIN_WINDOW);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn the_rejected_request_drain_reads_a_requests_worth_of_bytes_and_no_more() {
+        // A client that keeps writing: the drain discards up to
+        // `MAX_REQUEST_SIZE` (a whole number of reads) and stops there,
+        // leaving the rest unread rather than draining until EOF.
+        let extra = 3 * 8192;
+        let data = vec![0_u8; MAX_REQUEST_SIZE + extra];
+        let mut read_half = &data[..];
+        drain_rejected_request(&mut read_half, &mut tokio::io::sink()).await;
+        assert_eq!(read_half.len(), extra);
+    }
+
     #[test]
     fn a_client_frame_at_the_bound_is_still_within_the_nodes_limit_once_re_headed() {
         // The largest `S` the proxy accepts from an untagged client: header
@@ -11666,6 +11715,33 @@ mod tests {
         // And the IP starts over, whole.
         let third = shares.acquire(ip);
         assert_eq!(third.budgets.in_flight.permits.available_permits(), 1024);
+    }
+
+    #[test]
+    fn a_parked_charge_keeps_its_source_ips_share_registered() {
+        let shares = IpInFlightShares::new(1024);
+        let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let first = shares.acquire(ip);
+        let parked = first.budgets.parked.try_charge(1000).unwrap();
+        drop(first);
+        assert_eq!(shares.budgets.lock().unwrap().len(), 1, "still parked");
+
+        // A new connection finds the parked bytes on the same share.
+        let second = shares.acquire(ip);
+        assert_eq!(second.budgets.parked.permits.available_permits(), 24);
+        drop(second);
+        drop(parked);
+        assert!(shares.budgets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_merged_permit_holds_both_charges_until_it_is_dropped() {
+        let budget = InFlightBudget::new(10);
+        let mut held = budget.try_charge(4).unwrap();
+        held.merge(budget.try_charge(3).unwrap());
+        assert_eq!(budget.permits.available_permits(), 3);
+        drop(held);
+        assert_eq!(budget.permits.available_permits(), 10);
     }
 
     #[test]
@@ -15657,6 +15733,41 @@ mod tests {
     }
 
     #[test]
+    fn an_exit_log_summary_is_taken_only_for_lines_that_were_counted() {
+        let log = BackendExitLog::new();
+        let addr = "10.0.0.1:8356";
+        let start = tokio::time::Instant::now();
+        assert_eq!(log.take_summary(addr), None);
+        for _ in 0..BACKEND_EXIT_LOG_LINES {
+            backend_exit_lines(&log, addr, "INFO exit".to_string(), false, start);
+        }
+        assert_eq!(log.take_summary(addr), None, "every line was written");
+        backend_exit_lines(&log, addr, "INFO exit".to_string(), false, start);
+        assert_eq!(
+            log.take_summary(addr),
+            Some(format!(
+                "WARN 1 more backend connection lines for {addr} (not logged individually)"
+            ))
+        );
+        assert_eq!(log.take_summary(addr), None, "the count was taken");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn logging_a_backend_exit_spends_the_addresss_budget() {
+        let log = BackendExitLog::new();
+        let addr = "10.0.0.1:8356";
+        for _ in 0..BACKEND_EXIT_LOG_LINES + 2 {
+            log_backend_exit(&log, addr, "INFO exit".to_string(), false);
+        }
+        assert_eq!(
+            log.take_summary(addr),
+            Some(format!(
+                "WARN 2 more backend connection lines for {addr} (not logged individually)"
+            ))
+        );
+    }
+
+    #[test]
     fn the_last_suppressed_count_is_written_when_the_address_leaves_the_live_set() {
         // Issue #1824: the summary used to go out only ahead of the next
         // admitted line, so when the flapping stopped the final count
@@ -16922,6 +17033,137 @@ mod tests {
             "{entries} released entries were kept"
         );
         assert!(held.signal.is_some());
+    }
+
+    #[test]
+    fn a_multi_key_request_of_exactly_the_per_key_bound_is_registered_per_key() {
+        let keys = |count: usize| {
+            (0..count)
+                .map(|index| Bytes::from(format!("key-{index}")))
+                .collect::<Vec<_>>()
+        };
+        let mut order = ConnectionOrder::new();
+        let (_signal, wait) = order_signal();
+        order.register(
+            &Request::MultiGet {
+                namespace: Bytes::new(),
+                keys: keys(ORDER_MULTI_KEYS_MAX),
+            },
+            wait,
+            false,
+        );
+        let namespace = &order.namespaces[&order_hash(b"")];
+        assert_eq!(namespace.keys.len(), ORDER_MULTI_KEYS_MAX);
+        assert!(namespace.wide.is_none());
+        // The request and each key it registers count toward the next sweep.
+        assert_eq!(order.registered, ORDER_MULTI_KEYS_MAX + 1);
+
+        let mut order = ConnectionOrder::new();
+        let (_signal, wait) = order_signal();
+        order.register(
+            &Request::MultiGet {
+                namespace: Bytes::new(),
+                keys: keys(ORDER_MULTI_KEYS_MAX + 1),
+            },
+            wait,
+            false,
+        );
+        let namespace = &order.namespaces[&order_hash(b"")];
+        assert!(namespace.keys.is_empty());
+        assert!(namespace.wide.is_some());
+        assert_eq!(order.registered, 1);
+    }
+
+    #[test]
+    fn released_entries_stay_until_the_registrations_reach_the_sweep_threshold() {
+        let mut order = ConnectionOrder::new();
+        let register_released = |order: &mut ConnectionOrder, key: &str| {
+            let (signal, wait) = order_signal();
+            order.register(&order_request("incr", key), wait, false);
+            drop(signal);
+        };
+        for index in 0..10 {
+            register_released(&mut order, &format!("key-{index}"));
+        }
+        assert_eq!(order.registered, 10);
+        assert_eq!(order.namespaces[&order_hash(b"")].keys.len(), 10);
+
+        // The registration that reaches the threshold sweeps them; only its
+        // own entry, still pending during the sweep, is left.
+        order.sweep_after = 11;
+        register_released(&mut order, "key-10");
+        assert_eq!(order.namespaces[&order_hash(b"")].keys.len(), 1);
+        assert_eq!(order.registered, 0);
+    }
+
+    #[test]
+    fn a_sweep_keeps_exactly_the_registrations_still_pending() {
+        let mut order = ConnectionOrder::new();
+        let get = |namespace: &'static [u8], key: String| Request::Get {
+            namespace: Bytes::from_static(namespace),
+            key: Bytes::from(key),
+        };
+        let wide = |namespace: &'static [u8]| Request::MultiGet {
+            namespace: Bytes::from_static(namespace),
+            keys: (0..=ORDER_MULTI_KEYS_MAX)
+                .map(|index| Bytes::from(format!("key-{index}")))
+                .collect(),
+        };
+        let clear = |namespace: &'static [u8]| Request::Clear {
+            namespace: Bytes::from_static(namespace),
+        };
+
+        // First, as it empties the namespaces.
+        let (everything, wait) = order_signal();
+        order.register(&Request::ClearAll, wait, false);
+        // More live keys than half of `ORDER_SWEEP_MIN`: they set the next
+        // threshold.
+        let live = ORDER_SWEEP_MIN / 2 + 88;
+        let (keys_signal, keys_wait) = order_signal();
+        for index in 0..live {
+            order.register(
+                &get(b"keys", format!("key-{index}")),
+                keys_wait.clone(),
+                false,
+            );
+        }
+        let (released, wait) = order_signal();
+        order.register(&get(b"keys", "released".to_string()), wait, false);
+        drop(released);
+        let (clear_signal, wait) = order_signal();
+        order.register(&clear(b"clear-only"), wait, false);
+        let (wide_signal, wait) = order_signal();
+        order.register(&wide(b"wide-only"), wait, false);
+        let (released, wait) = order_signal();
+        order.register(&clear(b"released-clear"), wait, false);
+        drop(released);
+        let (released, wait) = order_signal();
+        order.register(&wide(b"released-wide"), wait, false);
+        drop(released);
+        assert_eq!(order.namespaces.len(), 5, "no sweep yet");
+
+        order.sweep();
+        let kept: std::collections::HashSet<u64> = order.namespaces.keys().copied().collect();
+        let expected: std::collections::HashSet<u64> = [&b"keys"[..], b"clear-only", b"wide-only"]
+            .into_iter()
+            .map(order_hash)
+            .collect();
+        assert_eq!(kept, expected);
+        let keys = &order.namespaces[&order_hash(b"keys")];
+        assert_eq!(keys.keys.len(), live);
+        assert!(!keys.keys.contains_key(&order_hash(b"released")));
+        assert!(order.namespaces[&order_hash(b"clear-only")].clear.is_some());
+        assert!(order.namespaces[&order_hash(b"wide-only")].wide.is_some());
+        assert!(order.everything.is_some());
+        assert_eq!(order.registered, 0);
+        assert_eq!(order.sweep_after, 2 * live);
+
+        // Once all of it is released, nothing is kept.
+        drop((everything, keys_signal, clear_signal, wide_signal));
+        order.sweep();
+        assert!(order.namespaces.is_empty());
+        assert!(order.everything.is_none());
+        assert_eq!(order.sweep_after, ORDER_SWEEP_MIN);
     }
 
     #[test]
@@ -20351,5 +20593,22 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    }
+
+    #[tokio::test]
+    async fn fetch_roster_accepts_a_roster_of_exactly_65536_nodes() {
+        let roster: Vec<(String, String)> = (0..MAX_ROSTER_ENTRIES)
+            .map(|i| {
+                (
+                    format!("node-{i}"),
+                    format!("10.{}.{}.1:8356", i / 256, i % 256),
+                )
+            })
+            .collect();
+        let discovery = start_mock_discovery(roster, 1).await;
+        let ring = fetch_roster_from(&discovery, &None, &None)
+            .await
+            .expect("a roster of exactly 65,536 entries is within the bound");
+        assert_eq!(ring.nodes.len(), MAX_ROSTER_ENTRIES);
     }
 }
