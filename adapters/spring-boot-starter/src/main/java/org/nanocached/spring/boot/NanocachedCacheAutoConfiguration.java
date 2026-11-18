@@ -115,7 +115,11 @@ public class NanocachedCacheAutoConfiguration {
             builder.classLoader(resourceLoader.getClassLoader());
         }
         cache.getTtl().forEach(builder::ttl);
-        if (cache.getCacheNames() != null) {
+        // An empty list (`cache-names=${CACHE_NAMES:}` with the variable
+        // unset) means "not configured", as in Boot's own cache
+        // configurations: fixing the manager to zero names would make
+        // every @Cacheable fail with "Cannot find cache named".
+        if (cache.getCacheNames() != null && !cache.getCacheNames().isEmpty()) {
             builder.cacheNames(cache.getCacheNames());
         }
         return builder.build();

@@ -86,7 +86,8 @@ All under the `nanocached` prefix, passed straight to
 
 `cache.cache-names` is aligned with Boot's own `spring.cache.cache-names`:
 restricts the manager to a closed, eagerly-created set instead of creating
-a cache on first use.
+a cache on first use. An empty value (e.g. `${CACHE_NAMES:}` with the
+variable unset) counts as unset, as it does for Boot's own cache providers.
 
 Every `Duration` property above accepts Spring Boot's usual unit-suffixed
 form (`2s`, `500ms`, `10m`, ...); a bare number falls back to the unit
