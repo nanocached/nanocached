@@ -4580,6 +4580,49 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task GetManyAndTouchWithTtlZeroLeavesOutAnUndecompressableHit()
+    {
+        // issue #1947: a TTL of 0 consumed every hit, so one value that
+        // fails to decompress must not throw the others away.
+        using var node = new MockNode();
+        using NanocachedClient plain = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(CompressingOptions(node.Port));
+        await client.SetAsync("b", "x");
+        await client.SetAsync("c", "y");
+        await plain.SetAsync(Bytes("a"), Array.Empty<byte>()); // no compression marker
+
+        Assert.Equal(
+            new Dictionary<string, string> { ["b"] = "x", ["c"] = "y" },
+            await client.GetManyAndTouchAsync(new[] { "a", "b", "c" }, 0));
+
+        await client.SetAsync("b", "x");
+        await plain.SetAsync(Bytes("a"), Array.Empty<byte>());
+        Dictionary<string, byte[]> raw = await client.GetManyAndTouchBytesAsync(new[] { "a", "b" }, 0);
+        Assert.Equal(new[] { "b" }, raw.Keys);
+
+        // Any other TTL keeps the strict behavior.
+        await plain.SetAsync(Bytes("a"), Array.Empty<byte>());
+        await Assert.ThrowsAsync<DecompressionException>(() => client.GetManyAndTouchAsync(new[] { "a" }, 30));
+    }
+
+    [Fact]
+    public async Task GetManyAndTouchWithTtlZeroLeavesOutANonUtf8Hit()
+    {
+        // issue #1947: as above, for a value the strict UTF-8 decoder rejects.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+        await client.SetAsync("b", "x");
+        await client.SetAsync(Bytes("a"), new byte[] { 0xff, 0xfe });
+
+        Assert.Equal(
+            new Dictionary<string, string> { ["b"] = "x" },
+            await client.GetManyAndTouchAsync(new[] { "a", "b" }, 0));
+
+        await client.SetAsync(Bytes("a"), new byte[] { 0xff, 0xfe });
+        await Assert.ThrowsAsync<DecoderFallbackException>(() => client.GetManyAndTouchAsync(new[] { "a" }, 30));
+    }
+
+    [Fact]
     public async Task BatchTouchRejectsBadArgumentsBeforeAnyIo()
     {
         using var node = new MockNode();

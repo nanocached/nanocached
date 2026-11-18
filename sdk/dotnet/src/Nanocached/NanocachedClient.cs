@@ -2347,7 +2347,11 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     {
         try
         {
-            return DecodeMany(await GetManyAndTouchBytesAsync(namespaceBytes, keys, ttlSeconds).ConfigureAwait(false));
+            Dictionary<string, byte[]> raw = await GetManyAndTouchBytesAsync(namespaceBytes, keys, ttlSeconds).ConfigureAwait(false);
+            // issue #1947: a TTL of 0 has already consumed every hit, so a
+            // value that is not valid UTF-8 is left out (as DecodePartial
+            // does) rather than throwing away the rest with it.
+            return ttlSeconds == 0 ? DecodePartial(raw) : DecodeMany(raw);
         }
         catch (PartialWrongNodeException<Dictionary<string, byte[]>> partial)
         {
@@ -2395,7 +2399,21 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             Connection.MultiEntry? answer = outcome.Answers[i];
             if (answer is { Ok: true })
             {
-                values[distinct[i]] = DecompressForBatch(answer.Value.Value!, budget);
+                if (ttlSeconds != 0)
+                {
+                    values[distinct[i]] = DecompressForBatch(answer.Value.Value!, budget);
+                    continue;
+                }
+                // issue #1947: a TTL of 0 has already expired every hit on
+                // all owners, so one that fails to decompress (or exceeds
+                // the budget) is left out and the rest still returned.
+                try
+                {
+                    values[distinct[i]] = DecompressForBatch(answer.Value.Value!, budget);
+                }
+                catch (DecompressionException)
+                {
+                }
             }
         }
         if (outcome.Unresolved.Count == 0) return values;

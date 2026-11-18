@@ -1805,13 +1805,26 @@ export class NanocachedClient {
    * instead of reading as misses. Throws `ServerTooOldError` against a
    * node that predates the command, at once, as `touchMany` does — in a
    * cluster, when other primaries had already answered, its subclass
-   * `PartialServerTooOldError` carrying their hits in `.partialValues`. */
+   * `PartialServerTooOldError` carrying their hits in `.partialValues`.
+   *
+   * Decoding follows `getMany` — one value that is not valid UTF-8 (or,
+   * with `compress`, fails to decompress) fails the whole call — except
+   * with `ttlSeconds === 0`. By then every hit has already expired on all
+   * its owners, so an error would lose every value the call consumed: such
+   * a value is left out instead, as the `Partial*` errors leave it out of
+   * their maps, and the rest are returned. */
   async getManyAndTouch(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, string>> {
-    return this.decodeBatch(this.getManyAndTouchBytesInNamespace(EMPTY_NAMESPACE, keys, ttlSeconds));
+    return this.decodeBatch(this.getManyAndTouchBytesInNamespace(EMPTY_NAMESPACE, keys, ttlSeconds), ttlSeconds === 0);
   }
 
   /** The raw-bytes companion to `getManyAndTouch`: no decoding.
-   * Transparently decompresses when `compress` is enabled. */
+   * Transparently decompresses when `compress` is enabled. A hit that fails
+   * to decompress (a value with no or an unknown marker byte, or one past
+   * the cumulative decompressed budget of a response) fails the call with
+   * `DecompressionError`, as for `getManyBytes` — except with
+   * `ttlSeconds === 0`, which has already consumed every hit: it is left
+   * out and the other values are returned, or carried by the `Partial*`
+   * error. */
   async getManyAndTouchBytes(keys: readonly string[], ttlSeconds: number | null): Promise<Map<string, Buffer>> {
     return this.getManyAndTouchBytesInNamespace(EMPTY_NAMESPACE, keys, ttlSeconds);
   }
@@ -2003,7 +2016,9 @@ export class NanocachedClient {
                 expiring,
                 expiring,
               )
-            : this.connectionForSingleTarget().then((connection) => connection.touch(key, ttlSeconds, namespace)),
+            : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) =>
+                connection.touch(key, ttlSeconds, namespace),
+              ),
         { nonIdempotent: expiring, rejectionIsFinal: true },
       );
     } catch (error) {
@@ -2045,7 +2060,9 @@ export class NanocachedClient {
                 expiring,
                 expiring,
               )
-            : this.connectionForSingleTarget().then((connection) => connection.getAndTouch(key, ttlSeconds, namespace)),
+            : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) =>
+                connection.getAndTouch(key, ttlSeconds, namespace),
+              ),
         { nonIdempotent: expiring, rejectionIsFinal: true },
       );
     } catch (error) {
@@ -2114,13 +2131,27 @@ export class NanocachedClient {
     await this.maybeRefreshNodeList();
 
     // See getManyBytesInNamespace: one decompression budget for the response.
+    // A `ttlSeconds === 0` call has already expired every hit on all its
+    // owners, so a hit that fails to decompress is left out rather than
+    // failing the call: the error would lose every other value it consumed
+    // (and the `Partial*` result).
+    const consumed = ttlSeconds === 0;
     const budget = { decompressed: 0 };
     const collect = (results: ReadonlyMap<number, TouchAnswer>): Map<string, boolean | Buffer> => {
       const out = new Map<string, boolean | Buffer>();
       for (const index of [...results.keys()].sort((a, b) => a - b)) {
         const answer = results.get(index)!;
         if (!get) out.set(keys[index], answer.kind === "touched");
-        else if (answer.kind === "hit") out.set(keys[index], this.decompressForBatch(answer.value, budget));
+        else if (answer.kind === "hit") {
+          let value: Buffer;
+          try {
+            value = this.decompressForBatch(answer.value, budget);
+          } catch (error) {
+            if (consumed && error instanceof DecompressionError) continue;
+            throw error;
+          }
+          out.set(keys[index], value);
+        }
       }
       return out;
     };
@@ -2495,10 +2526,13 @@ export class NanocachedClient {
 
   /** Awaits a batched read's raw result and decodes its values, as
    * `getMany` and `getManyAndTouch` both do — including the values a
-   * partial-result error carries. */
-  private async decodeBatch(fetch: Promise<Map<string, Buffer>>): Promise<Map<string, string>> {
+   * partial-result error carries. `lenient` (an expiring getManyAndTouch,
+   * whose hits are already consumed) leaves out a value that is not valid
+   * UTF-8 on the success path too, as `decodePartial` does. */
+  private async decodeBatch(fetch: Promise<Map<string, Buffer>>, lenient = false): Promise<Map<string, string>> {
     try {
-      return this.decodeMany(await fetch);
+      const raw = await fetch;
+      return lenient ? this.decodePartial(raw) : this.decodeMany(raw);
     } catch (error) {
       if (error instanceof PartialWrongNodeError) {
         throw new PartialWrongNodeError(this.decodePartial(error.partialValues as Map<string, Buffer>));
@@ -3383,7 +3417,7 @@ export class NanocachedClient {
       getAndTouchBytes: (key, ttlSeconds) => this.getAndTouchBytesInNamespace(namespaceBytes, key, ttlSeconds),
       touchMany: (keys, ttlSeconds) => this.touchManyInNamespace(namespaceBytes, keys, ttlSeconds),
       getManyAndTouch: (keys, ttlSeconds) =>
-        this.decodeBatch(this.getManyAndTouchBytesInNamespace(namespaceBytes, keys, ttlSeconds)),
+        this.decodeBatch(this.getManyAndTouchBytesInNamespace(namespaceBytes, keys, ttlSeconds), ttlSeconds === 0),
       getManyAndTouchBytes: (keys, ttlSeconds) => this.getManyAndTouchBytesInNamespace(namespaceBytes, keys, ttlSeconds),
     });
   }

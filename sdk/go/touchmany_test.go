@@ -245,6 +245,29 @@ func TestGetManyAndTouchDecompressesOnACompressEnabledClient(t *testing.T) {
 	}
 }
 
+// With ttlSeconds == 0 every hit has already expired on all its owners, so
+// one value that fails to decompress must not fail the call and lose the
+// others it consumed (issue #1943). Any other TTL stays strict.
+func TestExpiringGetManyAndTouchKeepsTheValuesAroundOneThatFailsToDecompress(t *testing.T) {
+	node := startMockNode(t, nil)
+	plain := connectTo(t, node, Config{})
+	client := connectTo(t, node, Config{Compress: true})
+	if _, err := client.SetMany(map[string]string{"b": "two", "c": "three"}, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Written without compression: an empty value has no marker byte.
+	if err := plain.Set("a", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetManyAndTouch([]string{"a", "b", "c"}, 30); !errors.Is(err, ErrDecompression) {
+		t.Fatalf("GetManyAndTouch(30) err = %v, want ErrDecompression", err)
+	}
+	values, err := client.GetManyAndTouch([]string{"a", "b", "c"}, 0)
+	if err != nil || len(values) != 2 || values["b"] != "two" || values["c"] != "three" {
+		t.Fatalf("GetManyAndTouch(0) = %q, %v, want b and c", values, err)
+	}
+}
+
 func TestBatchTouchSplitsALargeBatchIntoSubFramesAndReassemblesIt(t *testing.T) {
 	node := startMockNode(t, nil)
 	client := connectTo(t, node, Config{})

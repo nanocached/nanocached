@@ -1797,10 +1797,14 @@ class NanocachedClient:
         return await self._decode_batch(self._get_many_bytes(namespace, keys))
 
     async def _decode_batch(
-        self, fetch: Awaitable[dict[str | bytes, bytes]]
+        self, fetch: Awaitable[dict[str | bytes, bytes]], *, lenient: bool = False
     ) -> dict[str | bytes, str]:
         """Awaits a batched read's raw result and decodes its values, the
-        way get_many() and get_many_and_touch() both do."""
+        way get_many() and get_many_and_touch() both do. ``lenient``
+        leaves a value that is not valid UTF-8 out of the success path's
+        result too, instead of raising — get_many_and_touch() with
+        ``ttl_seconds == 0`` (issue #1945), whose hits are already
+        consumed, so an error would lose every one of them."""
         try:
             raw = await fetch
         except (
@@ -1829,6 +1833,14 @@ class NanocachedClient:
                     continue
             error.partial_values = decoded
             raise
+        if lenient:
+            out: dict[str | bytes, str] = {}
+            for key, value in raw.items():
+                try:
+                    out[key] = value.decode()
+                except UnicodeDecodeError:
+                    continue
+            return out
         return {key: value.decode() for key, value in raw.items()}
 
     async def _multi_get_chunked(
@@ -2319,7 +2331,13 @@ class NanocachedClient:
         self, keys: Sequence[str | bytes], ttl_seconds: int | None
     ) -> dict[str | bytes, bytes]:
         """The raw companion to get_many_and_touch(): no UTF-8 decoding.
-        Transparently decompresses when ``compress`` is enabled."""
+        Transparently decompresses when ``compress`` is enabled. A hit
+        that fails to decompress (with ``compress``, a value with no or an
+        unknown marker byte, or one past the cumulative decompressed
+        budget of a response) raises DecompressionError, as for
+        get_many_bytes() — except with ``ttl_seconds == 0``, which has
+        already consumed every hit: it is left out and the other values
+        are returned, or carried by the partial error (issue #1945)."""
         return await self._get_many_and_touch_bytes(b"", keys, ttl_seconds)
 
     async def get_many_and_touch(
@@ -2331,7 +2349,12 @@ class NanocachedClient:
         the returned dict, creates nothing and is not an error. See
         touch_many() for ``ttl_seconds`` (one TTL for the whole batch; no
         default; ``None`` removes it, ``0`` expires the keys at once).
-        Strict UTF-8 decode like get().
+        Strict UTF-8 decode like get(), and a value that fails to
+        decompress raises DecompressionError like get_many() — except
+        with ``ttl_seconds == 0``: by then every hit has already expired
+        on all its owners, so such a value is left out instead, as the
+        partial errors leave it out of ``partial_values``, and the rest
+        are returned (issue #1945).
 
         A write-ish read, as get_and_touch() is: each key goes to its
         primary in the ``G`` form, with no hedging and no fallback to a
@@ -2359,7 +2382,9 @@ class NanocachedClient:
         already answered, the PartialServerTooOldError subclass carrying
         their hits in ``partial_values`` (with ``ttl_seconds == 0`` those
         values are consumed and would otherwise be lost)."""
-        return await self._decode_batch(self._get_many_and_touch_bytes(b"", keys, ttl_seconds))
+        return await self._decode_batch(
+            self._get_many_and_touch_bytes(b"", keys, ttl_seconds), lenient=ttl_seconds == 0
+        )
 
     async def _get_many_and_touch_bytes(
         self, namespace: bytes, keys: Sequence[str | bytes], ttl_seconds: int | None
@@ -2389,6 +2414,11 @@ class NanocachedClient:
 
         # See get_many_bytes(): one decompression budget for the response.
         budget = [0]
+        # With ttl_seconds 0 every hit has already expired on all its
+        # owners, so a hit that fails to decompress is left out rather
+        # than failing the call: the error would lose every other value
+        # it consumed, and any partial error being built (issue #1945).
+        consumed = ttl_seconds == 0
 
         def collect(results: dict[int, object]) -> dict[str | bytes, object]:
             out: dict[str | bytes, object] = {}
@@ -2397,7 +2427,12 @@ class NanocachedClient:
                 if not get:
                     value = entry
                 elif entry is not None:
-                    value = self._decompress_for_batch(entry, budget)  # type: ignore[arg-type]
+                    try:
+                        value = self._decompress_for_batch(entry, budget)  # type: ignore[arg-type]
+                    except DecompressionError:
+                        if not consumed:
+                            raise
+                        continue
                 else:
                     continue
                 for spelling in originals[idx]:
@@ -4284,7 +4319,8 @@ class Namespace:
         """Same as NanocachedClient.get_many_and_touch(), scoped to this
         namespace (issue #871)."""
         return await self._client._decode_batch(
-            self._client._get_many_and_touch_bytes(self._namespace, keys, ttl_seconds)
+            self._client._get_many_and_touch_bytes(self._namespace, keys, ttl_seconds),
+            lenient=ttl_seconds == 0,
         )
 
     async def incr(self, key: str | bytes, delta: int = 1) -> int | None:
