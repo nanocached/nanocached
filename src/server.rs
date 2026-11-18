@@ -8325,6 +8325,13 @@ async fn run_decommission(
         else {
             continue;
         };
+        // The peeked entry is good for one send with no wait before it.
+        // Any later send (after a backoff or a reconnect) re-peeks first: a
+        // client write landing on this node in between is forwarded to the
+        // entrant over the leave window's own connection, and resending the
+        // older value or TTL here would overwrite it there.
+        let mut peeked = Some((value, ttl));
+        let mut gone = false;
 
         // An entrant that has just used up every attempt on a key with
         // connection-level failures, or refused with `R`, is written off for
@@ -8362,6 +8369,7 @@ async fn run_decommission(
                         Some(result)
                     }
                 };
+                peeked = None;
                 match outcome {
                     None => {
                         overridden = true;
@@ -8378,6 +8386,20 @@ async fn run_decommission(
                 }
             }
             if connected && let Some(stream) = streams.get_mut(addr) {
+                let (value, ttl) = match peeked.take() {
+                    Some(entry) => entry,
+                    None => match peek_entry_for_handoff(&node_context.request_tx, &key, skip_dead)
+                        .await
+                    {
+                        Some((_, value, ttl)) => (value, ttl),
+                        None => {
+                            // Deleted or expired since: nothing left to hand
+                            // off, as for a key gone at the first peek.
+                            gone = true;
+                            break;
+                        }
+                    },
+                };
                 let outcome = tokio::select! {
                     biased;
                     _ = shutdown_requested(&mut shutdown_rx) => None,
@@ -8442,6 +8464,9 @@ async fn run_decommission(
                 })
                 .count();
             break;
+        }
+        if gone {
+            continue;
         }
         if delivered {
             sent += 1;
@@ -10686,14 +10711,25 @@ struct ForwardBatch {
 }
 
 impl ForwardBatch {
-    /// Adds `name`/`value` to the batch for `target`'s address, starting
-    /// one if this is the first key bound there. A frame's keys go to a
-    /// handful of distinct targets at most (one joiner, or the entrants
-    /// of a decommission), so the linear search is over a tiny list.
+    /// Adds `name`/`value` to the batch for `target`, starting one if this
+    /// is the first key bound for it. A frame's keys go to a handful of
+    /// distinct targets at most (one joiner, or the entrants of a
+    /// decommission), so the linear search is over a tiny list.
+    ///
+    /// Targets are told apart by their connection, not their address:
+    /// ordering is kept per connection (`ForwardQueues`), and two windows
+    /// open at once (a leave and a re-replication) each keep their own
+    /// connection to the same address. Merging by address sent one
+    /// window's keys on the other's connection, where a later single-key
+    /// forward on the right connection could overtake them and leave the
+    /// older value on the owner. The connection is enough: each one
+    /// belongs to a single window, which also supplies the target's token
+    /// and `as_handoff` (and its `revoked` flag, or a fresh never-set one
+    /// for a leave or re-replication window).
     fn add(batches: &mut Vec<ForwardBatch>, target: ForwardTarget, name: Bytes, value: Bytes) {
         match batches
             .iter_mut()
-            .find(|batch| batch.target.addr == target.addr)
+            .find(|batch| Arc::ptr_eq(&batch.target.connection, &target.connection))
         {
             Some(batch) => batch.items.push((name, value)),
             None => batches.push(ForwardBatch {
@@ -14373,9 +14409,10 @@ mod tests {
     #[test]
     fn the_forward_phase_keeps_what_the_batches_hold_and_nothing_when_there_are_none() {
         let namespace = Bytes::from_static(b"ns");
+        let connection = Arc::new(AsyncMutex::new(None));
         let target = || ForwardTarget {
             addr: "127.0.0.1:1".to_string(),
-            connection: Arc::new(AsyncMutex::new(None)),
+            connection: Arc::clone(&connection),
             token: String::new(),
             revoked: Arc::new(AtomicBool::new(false)),
             as_handoff: false,
@@ -14394,6 +14431,49 @@ mod tests {
             2 + 3 * (FORWARD_BATCH_ITEM_BYTES + 4 + 5)
         );
         assert_eq!(forward_batches_bytes(&namespace, &[&[], &[]]), 0);
+    }
+
+    #[test]
+    fn a_batch_holds_one_connections_keys_even_when_two_share_an_address() {
+        // A leave window and a re-replication window open at once each
+        // keep their own connection to the same survivor. Keys bound for
+        // the two must stay in separate batches, each on its own target's
+        // connection: merged by address, one window's keys rode the other's
+        // connection and a later single-key forward on the right one could
+        // overtake them.
+        let target =
+            |connection: &Arc<AsyncMutex<Option<ClientStream>>>, token: &str| ForwardTarget {
+                addr: "127.0.0.1:1".to_string(),
+                connection: Arc::clone(connection),
+                token: token.to_string(),
+                revoked: Arc::new(AtomicBool::new(false)),
+                as_handoff: false,
+            };
+        let leave = Arc::new(AsyncMutex::new(None));
+        let rereplication = Arc::new(AsyncMutex::new(None));
+        let mut batches = Vec::new();
+        for (connection, token, name) in [
+            (&leave, "leave", "a"),
+            (&rereplication, "rereplication", "b"),
+            (&leave, "leave", "c"),
+        ] {
+            ForwardBatch::add(
+                &mut batches,
+                target(connection, token),
+                Bytes::copy_from_slice(name.as_bytes()),
+                Bytes::from_static(b"value"),
+            );
+        }
+        assert_eq!(batches.len(), 2);
+        assert!(Arc::ptr_eq(&batches[0].target.connection, &leave));
+        assert_eq!(batches[0].target.token, "leave");
+        let names = |batch: &ForwardBatch| -> Vec<Bytes> {
+            batch.items.iter().map(|(name, _)| name.clone()).collect()
+        };
+        assert_eq!(names(&batches[0]), ["a", "c"]);
+        assert!(Arc::ptr_eq(&batches[1].target.connection, &rereplication));
+        assert_eq!(batches[1].target.token, "rereplication");
+        assert_eq!(names(&batches[1]), ["b"]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -25877,6 +25957,172 @@ mod tests {
             node_context.gates.drain_left_behind.load(Ordering::SeqCst),
             refused,
             "only the refused keys are left behind"
+        );
+
+        discovery_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// A retried transfer re-reads the entry it sends. The drain used to
+    /// peek a key's value once and resend it on every attempt; a client
+    /// write to this node during the backoff before a retry is forwarded
+    /// to the entrant over the leave window's own connection, and the
+    /// retry's unconditional `U` then overwrote it there with the older
+    /// value.
+    #[tokio::test(flavor = "current_thread")]
+    async fn decommission_drain_retry_does_not_resend_a_value_older_than_a_forwarded_write() {
+        let (request_tx, request_rx) = mpsc::channel(16);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+
+        // The entrant: applies every `U` in the order it processes them and
+        // refuses the very first one (`E`, an entry refusal, not a dead peer).
+        let applied: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let first_refused = Arc::new(tokio::sync::Notify::new());
+        let peer_task =
+            {
+                let applied = Arc::clone(&applied);
+                let first_refused = Arc::clone(&first_refused);
+                tokio::spawn(async move {
+                    let seen = Arc::new(AtomicUsize::new(0));
+                    loop {
+                        let Ok((mut connection, _)) = peer_listener.accept().await else {
+                            return;
+                        };
+                        let applied = Arc::clone(&applied);
+                        let first_refused = Arc::clone(&first_refused);
+                        let seen = Arc::clone(&seen);
+                        tokio::spawn(async move {
+                            let mut buffer = BytesMut::new();
+                            loop {
+                                let frame_end = buffer.iter().position(|b| *b == b'\n').and_then(
+                                    |header_end| {
+                                        let header =
+                                            String::from_utf8(buffer[..header_end].to_vec())
+                                                .unwrap();
+                                        assert!(header.starts_with("U "), "{header}");
+                                        let fields: Vec<usize> = header
+                                            .split(' ')
+                                            .skip(1)
+                                            .filter(|field| *field != "A")
+                                            .map(|field| field.parse().unwrap())
+                                            .collect();
+                                        let end = header_end
+                                            + 1
+                                            + fields[0]
+                                            + fields[1]
+                                            + fields[2]
+                                            + fields[3];
+                                        (buffer.len() >= end).then_some((end, fields[2]))
+                                    },
+                                );
+                                let Some((end, value_len)) = frame_end else {
+                                    let mut chunk = [0u8; 1024];
+                                    let n = connection.read(&mut chunk).await.unwrap_or(0);
+                                    if n == 0 {
+                                        return;
+                                    }
+                                    buffer.extend_from_slice(&chunk[..n]);
+                                    continue;
+                                };
+                                let frame = buffer.split_to(end);
+                                let value = frame[frame.len() - value_len..].to_vec();
+                                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    connection.write_all(b"E\n").await.unwrap();
+                                    first_refused.notify_one();
+                                    return;
+                                }
+                                applied.lock().unwrap().push(value);
+                                connection.write_all(b"S\n").await.unwrap();
+                            }
+                        });
+                    }
+                })
+            };
+
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let (_left, discovery_task) = spawn_mock_discovery(discovery_listener, peer_addr, None);
+        let mut node_context = drain_test_context(&discovery_addr, &request_tx);
+        // A live shutdown sender, as in production: with it dropped the
+        // drain's backoff between attempts is skipped and the race window
+        // with it.
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        node_context.shutdown_rx = shutdown_rx;
+
+        let before = HashRing::new(vec!["leaver".into(), "peer".into()]);
+        let hot = (0..)
+            .map(|index| key(format!("hot-{index}").as_bytes()))
+            .find(|k| before.is_owner(k, "leaver", 1))
+            .unwrap();
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: hot.clone(),
+                value: Bytes::from_static(b"v1-old"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        let drain = tokio::spawn(run_decommission(
+            node_context.clone(),
+            vec![discovery_addr],
+            Duration::from_secs(12),
+            None,
+        ));
+
+        // The drain's first attempt (v1) was refused; during its backoff a
+        // client writes v2 to this node, which (as the `S` arm does)
+        // applies it and forwards it to the entrant on the leave window's
+        // own connection.
+        first_refused.notified().await;
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: hot.clone(),
+                value: Bytes::from_static(b"v2-new"),
+                ttl: None,
+            },
+        )
+        .await;
+        let target = handoff_targets_for(&node_context, &hot)
+            .into_iter()
+            .next()
+            .expect("the leave window forwards the key to its entrant");
+        forward_with_retries(
+            node_context.clone(),
+            target,
+            OwnedForwardedWrite::Set {
+                key: hot.clone(),
+                value: Bytes::from_static(b"v2-new"),
+                ttl: None,
+            }
+            .into_handoff_frame(),
+        )
+        .await;
+
+        // The forward and the drain's retry; the drain itself then holds
+        // its forwarding window open, so it is not waited for.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while applied.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            sleep(Duration::from_millis(10)).await;
+        }
+        drain.abort();
+        let applied: Vec<String> = applied
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .collect();
+        assert_eq!(
+            applied,
+            ["v2-new", "v2-new"],
+            "the drain's retry must not overwrite the newer forwarded write"
         );
 
         discovery_task.abort();
