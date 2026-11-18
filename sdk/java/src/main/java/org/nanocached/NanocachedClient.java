@@ -3197,7 +3197,15 @@ public final class NanocachedClient implements AutoCloseable {
      * as misses, losing the values for good. The hits it carries are the only values this call will
      * ever return.
      *
-     * @throws UncheckedIOException if a stored value is not valid UTF-8
+     * <p>Also with {@code ttlSeconds == 0}, a hit that cannot be decompressed (or exceeds the
+     * response's decompression budget) or is not valid UTF-8 is left out of the result, or of the
+     * partial exception's, rather than throwing (issue #1946): the touch has already expired every
+     * hit, so an exception would lose all of them. Other TTLs throw as {@link #getMany(List)} does.
+     * The same holds for {@link #getManyAndTouchBytes(List, long)} and {@link
+     * #getManyAndTouchBytes(byte[][], long)}, minus the UTF-8 check.
+     *
+     * @throws UncheckedIOException if a stored value is not valid UTF-8 (not with {@code
+     *     ttlSeconds == 0})
      * @throws NanocachedException.ServerTooOld against a node that predates the command — in a
      *     cluster, when other primaries had already answered, its subclass {@link
      *     NanocachedException.PartialServerTooOldStrings} carrying their hits (with {@code
@@ -3213,7 +3221,9 @@ public final class NanocachedClient implements AutoCloseable {
      */
     private Map<String, String> getManyAndTouchDecoded(byte[] namespace, List<String> keys, long ttlSeconds) {
         try {
-            return decodeMany(getManyAndTouchBytes(namespace, keys, ttlSeconds));
+            Map<String, byte[]> raw = getManyAndTouchBytes(namespace, keys, ttlSeconds);
+            // With 0 the values are consumed already (issue #1946).
+            return ttlSeconds == 0 ? decodePartial(raw) : decodeMany(raw);
         } catch (NanocachedException.PartialWrongNode partial) {
             throw new NanocachedException.PartialWrongNodeStrings(decodePartial(partial.partialValues));
         } catch (NanocachedException.PartialServerTooOld partial) {
@@ -3325,7 +3335,15 @@ public final class NanocachedClient implements AutoCloseable {
         for (int i = 0; i < keys.length; i++) {
             Connection.MultiEntry answer = outcome.answers[i];
             if (answer != null && answer.ok()) {
-                values[i] = decompressForBatch(answer.value(), budget);
+                try {
+                    values[i] = decompressForBatch(answer.value(), budget);
+                } catch (NanocachedException.DecompressionFailed undecodable) {
+                    // With 0 the touch has already consumed every hit on
+                    // every owner (issue #1946): throwing would lose them
+                    // all, so this one is left out and the rest returned.
+                    if (ttlSeconds != 0) throw undecodable;
+                    continue;
+                }
                 anyHit = true;
             }
         }

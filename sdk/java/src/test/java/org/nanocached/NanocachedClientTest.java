@@ -1417,6 +1417,44 @@ class NanocachedClientTest {
     }
 
     @Test
+    void getManyAndTouchWithZeroTtlLeavesOutAnUndecompressableHit() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient plain = connect("127.0.0.1", node.port());
+                    NanocachedClient client = NanocachedClient.connect(
+                            single("127.0.0.1", node.port()).compress(true))) {
+                client.set("b", "x");
+                client.set("c", "y");
+                plain.set("a".getBytes(StandardCharsets.UTF_8), new byte[0]);
+                assertEquals(Map.of("b", "x", "c", "y"), client.getManyAndTouch(List.of("a", "b", "c"), 0));
+                client.set("b", "x");
+                plain.set("a".getBytes(StandardCharsets.UTF_8), new byte[0]);
+                byte[][] raw = client.getManyAndTouchBytes(utf8Keys("a", "b"), 0);
+                assertNull(raw[0]);
+                assertArrayEquals("x".getBytes(StandardCharsets.UTF_8), raw[1]);
+                client.set("b", "x");
+                plain.set("a".getBytes(StandardCharsets.UTF_8), new byte[0]);
+                assertThrows(
+                        NanocachedException.DecompressionFailed.class,
+                        () -> client.getManyAndTouch(List.of("a", "b"), 30));
+            }
+        }
+    }
+
+    @Test
+    void getManyAndTouchWithZeroTtlLeavesOutANonUtf8Hit() throws Exception {
+        try (MockNode node = new MockNode()) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                byte[] notUtf8 = {(byte) 0xff, (byte) 0xfe};
+                client.set("b", "x");
+                client.set("a".getBytes(StandardCharsets.UTF_8), notUtf8);
+                assertEquals(Map.of("b", "x"), client.getManyAndTouch(List.of("a", "b"), 0));
+                client.set("a".getBytes(StandardCharsets.UTF_8), notUtf8);
+                assertThrows(UncheckedIOException.class, () -> client.getManyAndTouch(List.of("a"), 30));
+            }
+        }
+    }
+
+    @Test
     void batchTouchRejectsBadArgumentsBeforeAnyIo() throws Exception {
         try (MockNode node = new MockNode()) {
             try (NanocachedClient client = connect("127.0.0.1", node.port())) {
