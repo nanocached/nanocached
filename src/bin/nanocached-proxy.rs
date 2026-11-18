@@ -196,8 +196,8 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use nanocached::infra::{
     ACCEPT_ERROR_BACKOFF, LogLimiter, METRICS_MAX_CONNECTIONS, PerIpConnections,
-    read_http_request_path, should_backoff_after_accept_error, shutdown_signal, try_acquire_per_ip,
-    write_http_response,
+    read_http_request_path, reject_over_limit, should_backoff_after_accept_error, shutdown_signal,
+    try_acquire_per_ip, write_http_response,
 };
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -8279,7 +8279,13 @@ async fn handle_client(
                         // A repeat `A` after the handshake is a protocol
                         // violation — answer `E` and close (the node's
                         // stance on any protocol error) rather than let it
-                        // re-negotiate tagging on a live connection.
+                        // re-negotiate tagging on a live connection. The
+                        // connection has authenticated by now, so the `E`
+                        // is followed by the same bounded drain as a
+                        // malformed frame's (#1941): closing with pipelined
+                        // frames still unread sends a reset, which can
+                        // discard the `E` before the client reads it.
+                        drain_rejected = true;
                         let _ = fifo_tx.send(ClientReply::protocol_error()).await;
                         break 'connection Ok(());
                     }
@@ -9055,28 +9061,6 @@ async fn serve_metrics_connection(
     write_http_response(&mut stream, status, &body).await
 }
 
-/// The accept loop, factored from `run` so tests can drive it against a
-/// listener they bound themselves.
-/// Best-effort `B` on an over-limit connection, off the accept loop (a
-/// peer that never reads it must not stall accepts). Tenth-pass audit
-/// (2026-09-02): a TLS-configured proxy has no plaintext channel to
-/// answer on before the handshake — the peer is expecting a ServerHello,
-/// so a plaintext `B\n` is meaningless (wrong-protocol) rather than
-/// merely unread. Mirrors the node's own `reject_over_limit`, which skips
-/// the busy write entirely once TLS is on and just closes. The write is
-/// bounded like every other client write — a peer with a zero receive
-/// window that never reads this reply must not leak the spawned task and
-/// socket forever.
-fn reply_busy_and_close(stream: TcpStream, tls_configured: bool) {
-    if tls_configured {
-        return;
-    }
-    tokio::spawn(async move {
-        let mut stream = stream;
-        let _ = infra::write_all_within(&mut stream, b"B\n", CLIENT_WRITE_TIMEOUT).await;
-    });
-}
-
 /// What `serve` admits a client connection against: the global and
 /// per-IP connection caps and the proxy-wide in-flight byte budget.
 #[derive(Clone)]
@@ -9115,6 +9099,33 @@ fn log_connection(line: std::fmt::Arguments<'_>) {
     eprintln!("{line}");
 }
 
+/// The node's own `reject_over_limit` on an over-limit connection, off the
+/// accept loop (a peer that never reads the `B` must not stall accepts):
+/// no plaintext reply once TLS is configured, otherwise `B` bounded by
+/// `TLS_HANDSHAKE_TIMEOUT`, then a half-close and a bounded drain, so a
+/// client whose `A` frame is already sitting unread sees the `B` and a
+/// FIN rather than a reset (#1940).
+fn spawn_reject_over_limit(
+    stream: TcpStream,
+    peer: std::net::SocketAddr,
+    tls_acceptor: &Option<TlsAcceptor>,
+) {
+    let tls_acceptor = tls_acceptor.clone();
+    tokio::spawn(async move {
+        reject_over_limit(
+            stream,
+            peer,
+            &tls_acceptor,
+            TLS_HANDSHAKE_TIMEOUT,
+            b"B\n",
+            log_connection,
+        )
+        .await;
+    });
+}
+
+/// The accept loop, factored from `run` so tests can drive it against a
+/// listener they bound themselves.
 async fn serve(
     listener: TcpListener,
     context: Arc<ProxyContext>,
@@ -9162,8 +9173,8 @@ async fn serve(
 
         let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
             // Over the connection budget: answer busy and move on, the
-            // node's own stance (see `reject_over_limit`).
-            reply_busy_and_close(stream, tls_acceptor.is_some());
+            // node's own stance.
+            spawn_reject_over_limit(stream, peer, &tls_acceptor);
             continue;
         };
 
@@ -9179,7 +9190,7 @@ async fn serve(
         let Some(per_ip_permit) =
             try_acquire_per_ip(&per_ip_connections, peer.ip(), max_connections_per_ip)
         else {
-            reply_busy_and_close(stream, tls_acceptor.is_some());
+            spawn_reject_over_limit(stream, peer, &tls_acceptor);
             continue;
         };
 
@@ -13943,6 +13954,30 @@ mod tests {
         assert_eq!(n, 0, "the proxy must close the connection after the E");
     }
 
+    /// Issue #1941: the repeat-`A` branch closed without the bounded drain
+    /// a malformed frame from an authenticated client gets, so frames
+    /// pipelined behind the second `A` were still unread at the close,
+    /// which sent a reset in place of a FIN (and could discard the `E`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_second_auth_with_frames_pipelined_behind_it_gets_e_then_eof() {
+        let (_nodes, proxy) = cluster(1).await;
+        let (mut stream, buf) = connect_and_auth(&proxy).await;
+        assert!(buf.is_empty());
+
+        let mut frames = b"A 1 T\nx".to_vec();
+        for tag in 1..=2000 {
+            frames.extend_from_slice(format!("G 1 {tag}\nk").as_bytes());
+        }
+        stream.write_all(&frames).await.unwrap();
+
+        let mut response = Vec::new();
+        timeout(UPSTREAM_IO_TIMEOUT, stream.read_to_end(&mut response))
+            .await
+            .expect("the proxy must close the connection after the E")
+            .expect("the close after the E must be a FIN, not a reset");
+        assert_eq!(response, b"E\n");
+    }
+
     /// Issue #1891: the `E` for the client's own protocol error (a request
     /// before `A`, a malformed frame, a second `A`) was counted in
     /// `upstream_failures_total`, so anyone who could reach the port raised
@@ -15349,6 +15384,32 @@ mod tests {
         let mut second = TcpStream::connect(&proxy).await.unwrap();
         let mut buf = BytesMut::new();
         assert_eq!(read_line(&mut second, &mut buf).await.unwrap(), "B");
+    }
+
+    /// Issue #1940: the busy reply dropped the socket right after the `B`,
+    /// with the client's `A` frame (every SDK sends it the moment it
+    /// connects) still unread, so the close was a reset rather than a FIN
+    /// and could discard the `B`. Several dials, since each one races the
+    /// client's `A` against the reply.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_over_budget_client_that_already_sent_its_auth_gets_busy_then_eof() {
+        let node = MockNode::start().await;
+        let roster = vec![("node-a".to_string(), node.addr.clone())];
+        let discovery = start_mock_discovery(roster, 1).await;
+        let proxy = start_proxy(&discovery, None, 1).await;
+
+        let (_held, _buf) = connect_and_auth(&proxy).await;
+
+        for dial in 0..10 {
+            let mut over_budget = TcpStream::connect(&proxy).await.unwrap();
+            over_budget.write_all(b"A 1 T R\nx").await.unwrap();
+            let mut response = Vec::new();
+            timeout(UPSTREAM_IO_TIMEOUT, over_budget.read_to_end(&mut response))
+                .await
+                .expect("the over-budget connection must close promptly")
+                .unwrap_or_else(|error| panic!("dial {dial}: reset after the B: {error}"));
+            assert_eq!(response, b"B\n", "dial {dial}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
