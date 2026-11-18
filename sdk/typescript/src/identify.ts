@@ -132,9 +132,11 @@ function readFrame<T>(
 
     // A server that accepts the connection but never answers (a
     // blackholed address behaves the same way) must not hang the caller.
+    // Only the handshake or a discovery query was written, never a
+    // caller's request, so `requestWasSent` is false (issue #1942).
     const timer = setTimeout(() => {
       cleanup();
-      reject(new ConnectionLostError(`nanocached: no response from server within ${deadlineMs}ms`));
+      reject(new ConnectionLostError(`nanocached: no response from server within ${deadlineMs}ms`, { requestWasSent: false }));
     }, deadlineMs);
 
     const cleanup = () => {

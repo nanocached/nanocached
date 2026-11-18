@@ -5427,6 +5427,53 @@ describe("NanocachedClient touchMany/getManyAndTouch against a single node (issu
       );
     });
   });
+
+  it("getManyAndTouch with 0 leaves out a hit that cannot be decoded and returns the rest (issue #1944)", async () => {
+    const node = await startMockNode();
+    const addresses = [{ host: "127.0.0.1", port: node.port }];
+    const plain = await NanocachedClient.connect({ addresses });
+    const compressed = await NanocachedClient.connect({ addresses, compress: true });
+    try {
+      // An empty value has no marker byte, so a compress client cannot decode it.
+      await compressed.setMany({ b: "x", c: "y" });
+      await plain.set("a", Buffer.alloc(0));
+      assert.deepEqual(
+        await compressed.getManyAndTouchBytes(["a", "b", "c"], 0),
+        new Map([
+          ["b", Buffer.from("x")],
+          ["c", Buffer.from("y")],
+        ]),
+      );
+      await compressed.setMany({ b: "x", c: "y" });
+      await plain.set("a", Buffer.alloc(0));
+      assert.deepEqual(
+        await compressed.getManyAndTouch(["a", "b", "c"], 0),
+        new Map([
+          ["b", "x"],
+          ["c", "y"],
+        ]),
+      );
+      await plain.setMany({ b: "x", c: "y" });
+      await plain.set("a", Buffer.from([0xff, 0xfe]));
+      assert.deepEqual(
+        await plain.getManyAndTouch(["a", "b", "c"], 0),
+        new Map([
+          ["b", "x"],
+          ["c", "y"],
+        ]),
+      );
+      // Any other TTL keeps getMany's strict decoding.
+      await compressed.set("b", "x");
+      await plain.set("a", Buffer.alloc(0));
+      await assert.rejects(() => compressed.getManyAndTouchBytes(["a", "b"], 30), DecompressionError);
+      await plain.set("a", Buffer.from([0xff, 0xfe]));
+      await assert.rejects(() => plain.getManyAndTouch(["a"], 30), TypeError);
+    } finally {
+      await plain.close();
+      await compressed.close();
+      await node.close();
+    }
+  });
 });
 
 describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)", () => {
@@ -9083,6 +9130,42 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
       await Promise.all([discovery.close(), proxy.close()]);
     }
   });
+
+  for (const op of ["touch", "getAndTouch"] as const) {
+    it(`an expiring ${op} whose redial to the old proxy times out fails over to the next proxy (issue #1942)`, async () => {
+      const port = await revivablePort();
+      const proxyA = await startMockNode({ port });
+      const proxyB = await startMockNode();
+      const discovery = await startMockDiscovery([]);
+      discovery.setProxies([{ name: "proxy-a", address: proxyA.address }]);
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }], viaProxy: true });
+      // proxy-a's address comes back accepting TCP but never answering the handshake.
+      const held: Socket[] = [];
+      const hole = createServer((socket) => {
+        held.push(socket);
+        socket.on("error", () => {});
+      });
+      try {
+        await proxyA.close();
+        const target = (client as any).target;
+        for (let i = 0; i < 200 && !target.connection.isClosed(); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+        await new Promise<void>((resolve) => hole.listen(port, "127.0.0.1", () => resolve()));
+        const seeder = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: proxyB.port }] });
+        await seeder.set("k", "5");
+        await seeder.close();
+        discovery.setProxies([{ name: "proxy-b", address: proxyB.address }]);
+        if (op === "touch") assert.equal(await client.touch("k", 0), true);
+        else assert.equal(await client.getAndTouch("k", 0), "5");
+        assert.equal(proxyB.touches().length, 1);
+        assert.equal(await client.get("k"), null);
+      } finally {
+        await client.close();
+        for (const socket of held) socket.destroy();
+        await new Promise<void>((resolve) => hole.close(() => resolve()));
+        await Promise.all([discovery.close(), proxyB.close()]);
+      }
+    });
+  }
 });
 
 describe("NanocachedClient refreshNodeList dials new nodes concurrently (issue #226)", () => {

@@ -59,7 +59,11 @@ export async function connectSocket(options: ConnectSocketOptions): Promise<Sock
     const deadline = options.connectDeadlineMs ?? CONNECT_DEADLINE_MS;
     const timer = setTimeout(() => {
       socket.destroy();
-      reject(new ConnectionLostError(`nanocached: connecting to ${options.host}:${options.port} timed out after ${deadline}ms`));
+      reject(
+        new ConnectionLostError(`nanocached: connecting to ${options.host}:${options.port} timed out after ${deadline}ms`, {
+          requestWasSent: false,
+        }),
+      );
     }, deadline);
     // A dial that fails — refused, unresolvable, reset, a TLS handshake
     // that does not complete — is this SDK's own `ConnectionLostError`,
