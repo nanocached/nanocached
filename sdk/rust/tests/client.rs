@@ -5114,6 +5114,74 @@ async fn get_many_and_touch_decompresses_when_compression_is_enabled() {
     node.stop();
 }
 
+// With `Some(0)` every hit has already expired on all its owners by the
+// time the reply is decoded, so one value that fails to decompress or
+// decode must not fail the call and lose every other value it consumed.
+// Any other TTL keeps `get_many`'s strict contract.
+
+#[cfg(feature = "compression")]
+#[tokio::test]
+async fn expiring_get_many_and_touch_keeps_the_values_around_one_that_fails_to_decompress() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port).compress(true))
+        .await
+        .unwrap();
+    // Written without compression: `p` is no marker byte this client knows.
+    let plain = NanocachedClient::connect(options(node.port)).await.unwrap();
+    let compressible = "compressible ".repeat(200);
+    client.set("a", &compressible, 0).await.unwrap();
+    plain.set("bad", "plain", 0).await.unwrap();
+    client.set("b", "two", 0).await.unwrap();
+    let keys = ["a", "bad", "b"];
+
+    assert!(matches!(
+        client.get_many_and_touch(&keys, Some(30)).await,
+        Err(Error::Decompression(_))
+    ));
+
+    let hits = client.get_many_and_touch(&keys, Some(0)).await.unwrap();
+    assert_eq!(
+        hits,
+        HashMap::from([
+            ("a".to_string(), compressible),
+            ("b".to_string(), "two".to_string())
+        ])
+    );
+    assert_eq!(plain.get_bytes("bad").await.unwrap(), None);
+
+    plain.close().await;
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn expiring_get_many_and_touch_keeps_the_values_around_one_that_is_not_utf8() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("a", "one", 0).await.unwrap();
+    client.set("bin", vec![0xff, 0xfe, 0x80], 0).await.unwrap();
+    client.set("b", "two", 0).await.unwrap();
+    let keys = ["a", "bin", "b"];
+
+    assert!(matches!(
+        client.get_many_and_touch(&keys, Some(30)).await,
+        Err(Error::InvalidUtf8(_))
+    ));
+
+    let hits = client.get_many_and_touch(&keys, Some(0)).await.unwrap();
+    assert_eq!(
+        hits,
+        HashMap::from([
+            ("a".to_string(), "one".to_string()),
+            ("b".to_string(), "two".to_string())
+        ])
+    );
+    assert_eq!(client.get_bytes("bin").await.unwrap(), None);
+
+    client.close().await;
+    node.stop();
+}
+
 #[tokio::test]
 async fn batch_touch_rejects_bad_arguments_before_any_io() {
     let node = MockNode::start().await;

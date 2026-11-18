@@ -2690,6 +2690,14 @@ impl NanocachedClient {
     /// already answered, [`Error::PartialServerTooOldText`] carrying their
     /// hits (with `Some(0)` those values are consumed and would otherwise
     /// be lost).
+    ///
+    /// Decoding follows [`Self::get_many`] — one value that is not valid
+    /// UTF-8 (or, with `compress`, fails to decompress) fails the whole
+    /// call with [`Error::InvalidUtf8`] (or [`Error::Decompression`]) —
+    /// except with `Some(0)`. By then every hit has already expired on
+    /// all its owners, so an error would lose every value the call
+    /// consumed: such a value is left out instead, as the `Partial*`
+    /// errors leave it out of their maps, and the rest are returned.
     pub async fn get_many_and_touch<K: AsRef<str>>(
         &self,
         keys: &[K],
@@ -2711,6 +2719,9 @@ impl NanocachedClient {
             .get_many_and_touch_bytes_in(namespace, keys, ttl_seconds)
             .await
         {
+            // `Some(0)` consumed every hit: an undecodable one must not
+            // take the others down with it (see `decode_partial`).
+            Ok(raw) if ttl_seconds == Some(0) => Ok(decode_partial(raw)),
             Ok(raw) => decode_many(raw),
             Err(Error::PartialWrongNode(partial)) => {
                 Err(Error::PartialWrongNodeText(decode_partial(partial)))
@@ -2732,6 +2743,12 @@ impl NanocachedClient {
     /// and [`Error::PartialServerTooOld`] for a primary that predates `y`
     /// while others had already answered; with `Some(0)` a connection lost
     /// after the write is not resent (see [`Self::get_many_and_touch`]).
+    /// A hit that fails to decompress (with `compress`, a value with no
+    /// or an unknown marker byte, or one past the 256 MiB cumulative
+    /// decompressed budget of a response) fails the call with
+    /// [`Error::Decompression`], as for `get_many_bytes` — except with
+    /// `Some(0)`, which has already consumed every hit: it is left out and
+    /// the other values are returned, or carried by the `Partial*` error.
     pub async fn get_many_and_touch_bytes<K: AsRef<str>>(
         &self,
         keys: &[K],
@@ -2756,20 +2773,27 @@ impl NanocachedClient {
             .await;
 
         // One decompression budget for the whole response — see
-        // `decompress_for_batch`.
+        // `decompress_for_batch`. A `Some(0)` call has already expired
+        // every hit on all its owners, so a hit that fails to decompress
+        // is left out rather than failing the call: the error would lose
+        // every other value it consumed (and the `Partial*` result).
+        let consumed = ttl_seconds == Some(0);
         let budget = AtomicU64::new(0);
         let mut values: HashMap<String, Vec<u8>> = HashMap::with_capacity(distinct.len());
         for (key, answer) in distinct.iter().zip(outcome.answers) {
             if let Some(MultiEntry::Hit(value)) = answer {
-                values.insert(
-                    key.clone(),
-                    Self::decompress_for_batch(
-                        self.inner.compress,
-                        value,
-                        &budget,
-                        MAX_MULTIGET_DECOMPRESSED_BYTES,
-                    )?,
-                );
+                match Self::decompress_for_batch(
+                    self.inner.compress,
+                    value,
+                    &budget,
+                    MAX_MULTIGET_DECOMPRESSED_BYTES,
+                ) {
+                    Ok(value) => {
+                        values.insert(key.clone(), value);
+                    }
+                    Err(_) if consumed => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
         if outcome.unresolved.is_empty() {
