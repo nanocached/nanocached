@@ -2144,15 +2144,24 @@ impl Cache {
     /// TTL'd entry lazily, on access — also proactively removes anything
     /// past its TTL, so an unread expired key doesn't sit in memory
     /// indefinitely. Removes at most `SWEEP_BUDGET` entries per call (the
-    /// caller should call again if the backlog isn't drained yet — see
-    /// `pending_removal`), so one call can't stall every other cache
+    /// caller should call again while `has_sweep_backlog` says the backlog
+    /// isn't drained yet), so one call can't stall every other cache
     /// command behind it for as long as a full pass over a large cache
     /// would take. Returns how many entries were actually removed this
-    /// call (a marked or expired key may already be gone, e.g. deleted by
-    /// a client in the meantime) — `< SWEEP_BUDGET` means the backlog is
-    /// now fully drained.
+    /// call. That says nothing about the backlog (issue #1939): a queued
+    /// candidate may not be removable any more — rewritten or deleted by a
+    /// client in the meantime, or a marked copy kept — so a call can
+    /// remove fewer than `SWEEP_BUDGET` with most of the queue still
+    /// pending.
     pub fn sweep(&mut self) -> usize {
         self.sweep_at(Instant::now(), true, None)
+    }
+
+    /// Whether the sweep's queue (`pending_removal`) still holds
+    /// candidates: the next `sweep`/`sweep_keeping`/`sweep_expired` call
+    /// continues this pass rather than starting a new one.
+    pub fn has_sweep_backlog(&self) -> bool {
+        !self.pending_removal.is_empty()
     }
 
     /// `sweep`, keeping — and unmarking — a marked copy of a key `owned`
@@ -4720,7 +4729,7 @@ mod tests {
         loop {
             let this_round = cache.sweep_at(later, true, None);
             removed += this_round;
-            if this_round < SWEEP_BUDGET {
+            if !cache.has_sweep_backlog() {
                 break;
             }
         }
@@ -4731,6 +4740,36 @@ mod tests {
             "a drained queue keeps room for {} keys",
             cache.pending_removal.capacity()
         );
+    }
+
+    #[test]
+    fn a_rewritten_queued_key_does_not_end_the_sweep_pass() {
+        // Issue #1939: `run_sweep` went on only while a call removed a
+        // full budget. A queued key rewritten between two calls is popped
+        // and kept, so its batch removed 1,999 and the pass stopped with
+        // 6,000 expired keys still queued for the next interval.
+        let mut cache = Cache::new(UNBOUNDED);
+        let total = 5 * SWEEP_BUDGET;
+        for i in 0..total {
+            cache.set_with_ttl(
+                Key::from(Bytes::from(format!("key-{i}"))),
+                Bytes::from_static(b"v"),
+                Duration::from_secs(1),
+            );
+        }
+        let later = Instant::now() + Duration::from_secs(60);
+        assert_eq!(cache.sweep_at(later, true, None), SWEEP_BUDGET);
+        assert!(cache.has_sweep_backlog());
+        let rewritten = cache.pending_removal.back().unwrap().clone();
+        cache.set(rewritten.clone(), Bytes::from_static(b"fresh"));
+
+        let mut calls = vec![SWEEP_BUDGET];
+        while cache.has_sweep_backlog() {
+            calls.push(cache.sweep_at(later, true, None));
+        }
+        assert_eq!(calls, [2_000, 2_000, 2_000, 2_000, 1_999]);
+        assert_eq!(cache.len(), 1, "every expired key is gone in one pass");
+        assert_eq!(cache.get(&rewritten), Some(Bytes::from_static(b"fresh")));
     }
 
     #[test]

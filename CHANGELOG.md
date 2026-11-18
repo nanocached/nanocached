@@ -14,6 +14,39 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node: `/metrics` gave distinct namespaces the same `namespace` label, so
+  the scrape held duplicate series: names that are not valid UTF-8 all
+  decoded to `�`, and a short name could be spelled like a long name's
+  elided label. A name the label cannot copy exactly (not valid UTF-8, or
+  containing `…[`) now gets the length-and-hash suffix whatever its length
+  (#1937).
+
+- Node: an `X` that arrived while a join source replayed the clears queued
+  during its last key was answered as cancelled, but the node still completed
+  the join and reported `C`; a replay that failed every attempt rolled back
+  the marks but left `known_ring` on the abandoned join's ring until the next
+  heartbeat. The replay now runs before the final abort check and before
+  `known_ring` moves (#1938).
+
+- Node: the background sweep ended a round as soon as one batch removed
+  fewer than 2,000 entries. A queued key a client had rewritten or deleted
+  meanwhile, or a marked copy kept, left the rest of the expired backlog for
+  the next round 5 s later, roughly 400 entries a second however large it
+  was. The sweep now continues while its queue still holds candidates
+  (#1939).
+
+- Proxy: a connection turned away by `--max-connections` or
+  `--max-connections-per-ip` was sent `B` and closed with the client's `A`
+  frame unread, which made the close a reset that can discard the `B`. The
+  proxy now refuses as the node and discovery do (#663): a bounded write, a
+  half-close and a short drain, under the shared cap on concurrent refusals,
+  and no plaintext reply once TLS is on (#1940).
+
+- Proxy: a repeated `A` on an authenticated connection with requests
+  pipelined behind it got `E` followed by a reset. The proxy now drains what
+  is still arriving after that `E`, as it already did after a malformed frame
+  (#1408, #1941).
+
 - Node: a decommission that retried a key's transfer after a refused or
   failed attempt resent the value and TTL it had read before the first try.
   A client write that landed during the backoff (or the reconnect) was
