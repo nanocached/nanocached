@@ -1282,7 +1282,8 @@ impl Default for LateHandoffs {
 }
 
 /// What `send_migrate_with_retry` finds when it checks, before every
-/// attempt, on the join its `M` is for (issue #1030, #1870).
+/// attempt and after an acked one, on the join its `M` is for (issue
+/// #1030, #1870).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum JoinStatus {
     /// Still the pending join: send (or retry) the `M`.
@@ -2866,8 +2867,9 @@ fn credit_migrate_send_result(
 /// reported back asynchronously via `C`, stays a separate, unretried
 /// concern (see `send_migrate`'s own docs). `status` says whether the
 /// join this `M` is for is still the pending one; checked before every
-/// attempt (issue #1030, see the loop). Returns `Ok(None)` if the join
-/// completed before an attempt went out (issue #1870).
+/// attempt (issue #1030, see the loop) and again once an attempt is
+/// acked. Returns `Ok(None)` if the join completed before an attempt went
+/// out (issue #1870).
 #[allow(clippy::too_many_arguments)]
 async fn send_migrate_with_retry(
     token: &str,
@@ -2885,6 +2887,24 @@ async fn send_migrate_with_retry(
     status: impl Fn() -> JoinStatus,
 ) -> io::Result<Option<usize>> {
     let mut last_error = None;
+    // An `X` of this send's own, for an `M` that may have landed or did.
+    let cancel = || async move {
+        if let Err(error) = send_cancel(
+            token,
+            address,
+            auth_secret,
+            tls_connector,
+            joining_name,
+            io_timeout,
+        )
+        .await
+        {
+            eprintln!(
+                "WARN failed to send X (cancel) to {ready_name} for the abandoned join of \
+                 {joining_name}: {error}"
+            );
+        }
+    };
 
     for attempt in 1..=MIGRATE_SEND_ATTEMPTS {
         // Issue #1030: an abandon (`abandon_current_join`, which sends `X`
@@ -2907,21 +2927,8 @@ async fn send_migrate_with_retry(
             return Ok(None);
         }
         if join_status == JoinStatus::Ended {
-            if attempt > 1
-                && let Err(error) = send_cancel(
-                    token,
-                    address,
-                    auth_secret,
-                    tls_connector,
-                    joining_name,
-                    io_timeout,
-                )
-                .await
-            {
-                eprintln!(
-                    "WARN failed to send X (cancel) to {ready_name} for the abandoned join of \
-                     {joining_name}: {error}"
-                );
+            if attempt > 1 {
+                cancel().await;
             }
             return Err(io::Error::other(format!(
                 "join of {joining_name} (generation {generation}) abandoned before attempt \
@@ -2943,7 +2950,26 @@ async fn send_migrate_with_retry(
         )
         .await
         {
-            Ok(entries) => return Ok(Some(entries)),
+            Ok(entries) => {
+                // The abandon can also land while this attempt is in flight.
+                // Its `X` goes out on a connection of its own, and if that
+                // one reaches the node while this `M` is still connecting or
+                // authenticating, the `X` finds nothing pending there and the
+                // `M` that follows starts a handoff to a joiner discovery has
+                // dropped — holding the node's one migration slot, so the
+                // next join's `M` is refused. The ack proves the node has
+                // taken this `M`, so an `X` sent now cannot overtake it. A
+                // join promoted in the meantime stays a success (issue #1870).
+                if status() == JoinStatus::Ended {
+                    cancel().await;
+                    return Err(io::Error::other(format!(
+                        "join of {joining_name} (generation {generation}) abandoned while \
+                         attempt {attempt}/{MIGRATE_SEND_ATTEMPTS} was in flight; cancelled \
+                         with X"
+                    )));
+                }
+                return Ok(Some(entries));
+            }
             Err(error) => {
                 eprintln!(
                     "WARN failed to send M to {ready_name} (attempt \
@@ -9876,6 +9902,14 @@ mod tests {
         .await;
         assert_eq!(fx.state_of("node-new"), Some(NodeState::Joined));
         assert_eq!(fx.joining_name().as_deref(), Some("node-z"));
+        // node-z's join may have been begun by a sweep tick on its own
+        // task, in which case the call above returned without waiting for
+        // its `M`s; the stand-in nodes count a connection only once their
+        // accept loop runs.
+        wait_until("node-z's M to both members", Duration::from_secs(5), || {
+            fx.b_accepted.load(Ordering::SeqCst) >= 2 && fx.old_accepted.load(Ordering::SeqCst) >= 1
+        })
+        .await;
         assert_eq!(
             fx.b_accepted.load(Ordering::SeqCst),
             2,
@@ -15513,6 +15547,117 @@ mod tests {
             frames[0].starts_with(b"X "),
             "the second frame must be an X (cancel), got {:?}",
             String::from_utf8_lossy(&frames[0])
+        );
+    }
+
+    /// The join is abandoned while attempt 1's `M` is still authenticating.
+    /// The abandon's `X` goes out on its own connection and reaches the
+    /// node first, where nothing is pending yet; the `M` is taken after
+    /// it. Once that `M` is acked, an `X` of the send's own must follow,
+    /// or the node keeps a handoff to a dropped joiner in its one
+    /// migration slot and refuses the next join's `M`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_migrate_with_retry_cancels_an_m_acked_after_the_join_was_abandoned() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(address, NodeState::Joined, "tk-node-a".to_string()),
+        );
+        lock(&registry).insert(
+            "node-b".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:9".to_string(),
+                NodeState::Waiting,
+                "tk-node-b".to_string(),
+            ),
+        );
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let secret = Some(Bytes::from_static(b"secret"));
+        let joins_ready_at = Instant::now();
+
+        let (authenticating_tx, authenticating_rx) = tokio::sync::oneshot::channel();
+        let (abandoned_tx, abandoned_rx) = tokio::sync::oneshot::channel::<()>();
+        let node_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 4096];
+            let mut frames = Vec::new();
+            // Attempt 1's `M`: its auth is read but not answered yet.
+            let (mut m_stream, _) = listener.accept().await.unwrap();
+            let _ = m_stream.read(&mut buffer).await.unwrap();
+            authenticating_tx.send(()).unwrap();
+            // The abandon's `X`, on a connection of its own.
+            let (mut x_stream, _) = listener.accept().await.unwrap();
+            let _ = x_stream.read(&mut buffer).await.unwrap();
+            x_stream.write_all(b"On\n").await.unwrap();
+            let bytes_read = x_stream.read(&mut buffer).await.unwrap();
+            frames.push(buffer[..bytes_read].to_vec());
+            x_stream.write_all(b"A\n").await.unwrap();
+            // Only after it is the `M` let through, and acked.
+            abandoned_rx.await.unwrap();
+            m_stream.write_all(b"On\n").await.unwrap();
+            let bytes_read = m_stream.read(&mut buffer).await.unwrap();
+            frames.push(buffer[..bytes_read].to_vec());
+            m_stream.write_all(b"A 7\n").await.unwrap();
+            // Record anything discovery sends after the ack.
+            while let Ok(Ok((mut stream, _))) =
+                timeout(Duration::from_millis(500), listener.accept()).await
+            {
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream.write_all(b"On\n").await;
+                let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+                frames.push(buffer[..bytes_read].to_vec());
+                let _ = stream.write_all(b"A\n").await;
+            }
+            frames
+        });
+
+        let begin = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            let current_join = Arc::clone(&current_join);
+            let secret = secret.clone();
+            async move {
+                try_begin_next_join(&registry, &current_join, &secret, &None, 2, joins_ready_at)
+                    .await;
+            }
+        });
+        authenticating_rx.await.unwrap();
+        let join = lock_current_join(&current_join)
+            .as_ref()
+            .expect("node-b's join is pending")
+            .identity();
+        abandon_current_join(
+            &registry,
+            &current_join,
+            &secret,
+            &None,
+            2,
+            joins_ready_at,
+            &join,
+            "joining node disconnected",
+        )
+        .await;
+        abandoned_tx.send(()).unwrap();
+        begin.await.unwrap();
+
+        let frames: Vec<String> = node_task
+            .await
+            .unwrap()
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).into_owned())
+            .collect();
+        assert_eq!(
+            frames.len(),
+            3,
+            "expected the abandon's X, the M, then a cancel: {frames:?}"
+        );
+        assert!(
+            frames[0].starts_with("X ") && frames[1].starts_with("M "),
+            "{frames:?}"
+        );
+        assert!(
+            frames[2].starts_with("X "),
+            "the M acked after the abandon must be cancelled, got {frames:?}"
         );
     }
 

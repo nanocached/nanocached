@@ -14,6 +14,30 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node: a decommission that retried a key's transfer after a refused or
+  failed attempt resent the value and TTL it had read before the first try.
+  A client write that landed during the backoff (or the reconnect) was
+  forwarded to the entrant first, and the retry's unconditional `U` then
+  overwrote it with the older value, losing the write at R=1. Each retry now
+  reads the entry again, and a key deleted or expired in the meantime is
+  skipped like one gone at the first read.
+
+- Node: a multi-key `o`/`y` forward grouped its keys by target address only.
+  With a leave window and a re-replication window open at once, keys for the
+  same survivor from both windows were sent on one window's connection and
+  token, where a later single-key forward on the other connection could
+  overtake them and leave an older value on the owner. Keys are now grouped
+  by forward connection.
+
+- Discovery: if a join was abandoned while a ready node's `M` was still
+  connecting or authenticating, the abandon's `X` (sent on its own
+  connection) could reach the node first and do nothing. The `M` then landed
+  and was acked, so the node started a handoff to a joiner discovery had
+  already dropped, which kept its only migration slot busy and could make the
+  next join's `M` be refused with a conflict. Discovery now checks the join
+  again once an `M` is acked and, if it was abandoned, sends that node an `X`
+  of its own; a join promoted in the meantime still counts as a success.
+
 - Proxy: in a cluster a `D`/`d` sent the other owners their delete at the
   same time as the primary. When the primary failed or answered `W`, the
   retry reached a replica that had already deleted its copy and answered the
