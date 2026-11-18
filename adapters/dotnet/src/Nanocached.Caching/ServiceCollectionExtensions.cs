@@ -47,7 +47,19 @@ public static class ServiceCollectionExtensions
             NanocachedCacheOptions options = provider.GetRequiredService<IOptions<NanocachedCacheOptions>>().Value;
             NanocachedClient client = NanocachedClient.ConnectAsync(BuildClientOptions(options))
                 .GetAwaiter().GetResult();
-            return new NanocachedDistributedCache(client, options.Namespace, ownsClient: true);
+            try
+            {
+                return new NanocachedDistributedCache(client, options.Namespace, ownsClient: true);
+            }
+            catch
+            {
+                // Issue #1955: an invalid namespace throws here, after the
+                // dial. The container gets no instance to dispose and does
+                // not cache the failed factory, so each later resolve would
+                // leak one more connected client.
+                client.Close();
+                throw;
+            }
         });
         return services;
     }

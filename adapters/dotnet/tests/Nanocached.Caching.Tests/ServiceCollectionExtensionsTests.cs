@@ -39,6 +39,31 @@ public sealed class ServiceCollectionExtensionsTests
         await Assert.ThrowsAsync<AlreadyClosedException>(() => cache.GetStringAsync("k"));
     }
 
+    // Issue #1955: the namespace is validated by the cache constructor,
+    // after the owning overload has already dialed. A failed resolve must
+    // close that client; the container caches no failed singleton, so each
+    // retry would otherwise leak one more connection.
+    [Fact]
+    public async Task Owning_overload_closes_its_client_when_the_namespace_is_invalid()
+    {
+        using var node = new MockNode();
+        var services = new ServiceCollection();
+        services.AddNanocachedDistributedCache(options =>
+        {
+            options.Addresses.Add($"127.0.0.1:{node.Port}");
+            options.Namespace = "bad\uD800";
+        });
+        await using ServiceProvider provider = services.BuildServiceProvider();
+
+        for (int i = 0; i < 3; i++)
+        {
+            Assert.Throws<ArgumentException>(() => provider.GetRequiredService<IDistributedCache>());
+        }
+
+        for (int i = 0; i < 100 && node.OpenConnections > 0; i++) await Task.Delay(20);
+        Assert.Equal(0, node.OpenConnections);
+    }
+
     [Fact]
     public async Task Reusing_overload_binds_to_an_already_registered_client_and_never_closes_it()
     {
