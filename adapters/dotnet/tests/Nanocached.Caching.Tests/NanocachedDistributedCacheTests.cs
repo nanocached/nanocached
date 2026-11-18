@@ -370,6 +370,40 @@ public sealed class NanocachedDistributedCacheTests
         Assert.Null(node.EntryFor(NanocachedCacheOptions.DefaultNamespace, key));
     }
 
+    // Issue #1956: the delete of an expired entry is cleanup only. A node
+    // that goes away right after serving the read must not fail the Get;
+    // the miss stands, as a failed sliding renewal's hit does (#1234).
+    [Fact]
+    public async Task A_failed_expired_entry_delete_still_returns_a_miss()
+    {
+        var node = new MockNode();
+        try
+        {
+            var services = new ServiceCollection();
+            services.AddNanocachedDistributedCache(options => options.Addresses.Add($"127.0.0.1:{node.Port}"));
+            await using ServiceProvider provider = services.BuildServiceProvider();
+            IDistributedCache cache = provider.GetRequiredService<IDistributedCache>();
+
+            await cache.SetAsync(
+                "stale", new byte[] { 1 },
+                new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = TimeSpan.FromMilliseconds(150) });
+            await Task.Delay(TimeSpan.FromMilliseconds(400));
+
+            node.AfterGet = (_, _) =>
+            {
+                node.AfterGet = null;
+                node.StopAccepting(); // no redial can succeed
+                throw new IOException("synthetic: the connection drops after the read was served");
+            };
+
+            Assert.Null(await cache.GetAsync("stale"));
+        }
+        finally
+        {
+            node.Dispose();
+        }
+    }
+
     [Fact]
     public async Task Refresh_treats_an_already_past_absolute_expiry_as_a_miss_and_deletes_it()
     {

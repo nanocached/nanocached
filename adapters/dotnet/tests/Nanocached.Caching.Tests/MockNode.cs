@@ -33,6 +33,7 @@ internal sealed class MockNode : IDisposable
     private int _flushCount;
     private int _setCount;
     private int _casCount;
+    private int _openConnections;
 
     // When set, every accepted connection is wrapped in an SslStream
     // presenting this certificate before the wire protocol starts.
@@ -65,6 +66,10 @@ internal sealed class MockNode : IDisposable
     /// received — the sliding-renewal counterpart to <see cref="SetCount"/>
     /// now that Get/Refresh renew conditionally (issue #391).</summary>
     internal int CasCount => Volatile.Read(ref _casCount);
+
+    /// <summary>How many client connections are open on this node right
+    /// now - lets a test prove a client was closed (issue #1955).</summary>
+    internal int OpenConnections => Volatile.Read(ref _openConnections);
 
     /// <summary>Test hook (issue #391): invoked synchronously right after a
     /// <c>G</c>/<c>g</c> reply is written, with the namespace and key just
@@ -134,6 +139,8 @@ internal sealed class MockNode : IDisposable
     private async Task ServeAsync(TcpClient client)
     {
         using TcpClient owned = client;
+        Interlocked.Increment(ref _openConnections);
+        using var counted = new Countdown(() => Interlocked.Decrement(ref _openConnections));
         Stream stream = owned.GetStream();
         bool tagged = false;
         try
@@ -335,5 +342,10 @@ internal sealed class MockNode : IDisposable
             if (one[0] == (byte)'\n') return line.ToString();
             line.Append((char)one[0]);
         }
+    }
+
+    private sealed class Countdown(Action onDispose) : IDisposable
+    {
+        public void Dispose() => onDispose();
     }
 }

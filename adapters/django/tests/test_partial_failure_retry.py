@@ -30,6 +30,7 @@ from nanocached import (
 )
 
 from nanocached_django import NanocachedCache
+from nanocached_django.backend import _encode_value
 
 
 class GetManyPartialFailureTests(unittest.TestCase):
@@ -125,28 +126,32 @@ class SetManyPartialFailureTests(unittest.TestCase):
     def _restore(self) -> None:
         self.handle.set_many = self.original_set_many
 
-    def test_wrong_node_failure_resends_the_whole_batch_once(self) -> None:
-        # set_many's WrongNodeError carries no partial payload (see the
-        # SDK's own docstring), so the fix resends the WHOLE batch once —
-        # safe, since every per-key write is idempotent.
+    def test_wrong_node_failure_propagates_without_resending_the_batch(self) -> None:
+        # Issue #1954: set_many's plain WrongNodeError arrives after the
+        # SDK's own refresh-and-retry, with every other key already
+        # stored. Resending the whole batch would re-store "a" with this
+        # call's value over the newer concurrent write below.
         original = self.original_set_many
+        a_key = self.cache.make_and_validate_key("a")
+        b_key = self.cache.make_and_validate_key("b")
         calls = []
 
         async def flaky(payload, *, ttl_seconds=0):
-            calls.append(dict(payload))
+            calls.append(list(payload))
+            landed = {key: value for key, value in payload.items() if key != b_key}
+            await original(landed, ttl_seconds=ttl_seconds)
             if len(calls) == 1:
-                raise WrongNodeError()
-            return await original(payload, ttl_seconds=ttl_seconds)
+                # A concurrent writer replaces "a" after this batch stored it.
+                await original({a_key: _encode_value("v2")}, ttl_seconds=0)
+            raise WrongNodeError()
 
         self.handle.set_many = flaky
 
-        failed = self.cache.set_many({"x": 1, "y": 2, "z": 3})
+        with self.assertRaises(WrongNodeError):
+            self.cache.set_many({"a": "v1", "b": "x"})
 
-        self.assertEqual(failed, [])
-        self.assertEqual(len(calls), 2)
-        # The retry resent every key, not just a remainder.
-        self.assertEqual(set(calls[1]), set(calls[0]))
-        self.assertEqual(self.cache.get_many(["x", "y", "z"]), {"x": 1, "y": 2, "z": 3})
+        self.assertEqual(calls, [[a_key, b_key]])
+        self.assertEqual(self.cache.get("a"), "v2")
 
     def test_wrong_node_failure_propagates_on_a_second_failure(self) -> None:
         async def always_fails(payload, *, ttl_seconds=0):

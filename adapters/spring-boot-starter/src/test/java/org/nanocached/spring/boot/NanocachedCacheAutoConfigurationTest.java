@@ -3,6 +3,7 @@ package org.nanocached.spring.boot;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -342,6 +343,23 @@ class NanocachedCacheAutoConfigurationTest {
         CacheManager manager = context.getBean(CacheManager.class);
         assertEquals(Set.of("users", "sessions"), Set.copyOf(manager.getCacheNames()));
         assertNull(manager.getCache("unlisted"), "an unlisted name must fall through, not be created on demand");
+    }
+
+    @Test
+    void anEmptyCacheNamesPropertyLeavesTheManagerCreatingCachesOnFirstUse() {
+        // `${CACHE_NAMES:}` with the variable unset binds an empty list, which
+        // Boot's own cache configurations ignore rather than fixing the
+        // manager to zero caches (#1951).
+        boot(YamlOnlyConfig.class, "nanocached.cache.cache-names=${NANOCACHED_TEST_UNSET_CACHE_NAMES:}");
+
+        assertEquals(
+                List.of(),
+                context.getBean(NanocachedProperties.class).getCache().getCacheNames());
+        assertNotNull(context.getBean(CacheManager.class).getCache("users"));
+        UserService service = context.getBean(UserService.class);
+        service.findUser("alice");
+        service.findUser("alice");
+        assertEquals(1, service.calls());
     }
 
     @Test

@@ -70,7 +70,7 @@ public final class NanocachedCacheManager implements CacheManager {
             throw new NullPointerException("configuration");
         }
 
-        CompleteConfiguration<K, V> complete = completeConfigurationOf(configuration);
+        MutableConfiguration<K, V> complete = completeConfigurationOf(configuration);
         validateSupported(complete);
 
         NanocachedCache<K, V> cache = new NanocachedCache<>(this, cacheName, client.namespace(cacheName), complete);
@@ -96,11 +96,16 @@ public final class NanocachedCacheManager implements CacheManager {
      * CompleteConfiguration}; a plain one is completed with {@link MutableConfiguration}'s own
      * defaults (eternal expiry, statistics/management off, no listeners) — mirroring what {@code
      * MutableConfiguration} itself defaults to.
+     *
+     * <p>Issue #1949: a {@link CompleteConfiguration} is copied, never kept, so a caller reusing
+     * its {@code MutableConfiguration} as a template cannot change the types {@code getCache}
+     * checks or the flags the cache reports. Management is forced off in the copy, since it is
+     * not implemented (see {@link #enableManagement}).
      */
     @SuppressWarnings("unchecked")
-    private static <K, V> CompleteConfiguration<K, V> completeConfigurationOf(Configuration<K, V> configuration) {
+    private static <K, V> MutableConfiguration<K, V> completeConfigurationOf(Configuration<K, V> configuration) {
         if (configuration instanceof CompleteConfiguration<K, V> complete) {
-            return complete;
+            return new MutableConfiguration<>(complete).setManagementEnabled(false);
         }
         return new MutableConfiguration<K, V>()
                 .setTypes(configuration.getKeyType(), configuration.getValueType())

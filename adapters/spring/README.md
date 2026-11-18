@@ -168,18 +168,25 @@ caching stays enabled.
 
 Keys: pluggable `CacheKeyConverter`. The default maps `byte[]` to its bytes
 behind a one-byte `0x00` marker; `String`, boxed numbers, `Boolean`, `Character` and `UUID` to a
-type-prefixed canonical string (so `"42"` and `42L` stay distinct); and
-everything else (Spring's `SimpleKey` included) through JDK serialization.
+type-prefixed canonical string (so `"42"` and `42L` stay distinct);
+Spring's multi-argument `SimpleKey` to a `0x01` marker followed by each
+argument, length-prefixed and encoded by these same rules, so the bytes
+depend only on the arguments' values; and everything else through JDK
+serialization.
 Key bytes must be canonical across every JVM sharing the cache — prefer
-simple keys, or plug in a converter that knows your key type. Two
-consequences of JDK serialization: a `String` key that is not well-formed
+simple keys, or plug in a converter that knows your key type. A `String`
+key (or `SimpleKey` argument) that is not well-formed
 UTF-16 (a lone surrogate) is rejected with `IllegalArgumentException`
 rather than being encoded as `?`, which would make it the same key as
-another; and equal collections of different classes (`ArrayList` versus
+another. Two consequences of JDK serialization: equal collections of different classes (`ArrayList` versus
 `List.of`, `HashSet` versus `TreeSet`) serialize differently and are
 therefore different keys, although Spring would consider them equal —
 use the same collection type for `@Cacheable` and `@CacheEvict`, or a
-converter that canonicalizes your key type.
+converter that canonicalizes your key type; and an object that holds one
+instance in two places (a key object whose two fields reference the same
+`String`) serializes the second as a back-reference, so it is a different
+key from an equal object holding two equal copies — a converter that knows
+your key type avoids this too.
 
 Values are deserialized with the class loader given to
 `classLoader(...)` on the builder (the Boot starter passes the

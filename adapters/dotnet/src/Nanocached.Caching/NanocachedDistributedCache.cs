@@ -155,7 +155,17 @@ public sealed class NanocachedDistributedCache : IDistributedCache, IDisposable
             // catches up. Conditional on the token (issue #391) so a
             // concurrent Set that just replaced the entry isn't deleted
             // along with the expired bytes this call actually read.
-            await _namespace.DeleteIfMatchesAsync(keyBytes, hit.Token, token).ConfigureAwait(false);
+            try
+            {
+                await _namespace.DeleteIfMatchesAsync(keyBytes, hit.Token, token).ConfigureAwait(false);
+            }
+            catch (NanocachedException)
+            {
+                // Issue #1956: the delete is only cleanup - the miss is
+                // already decided, and eviction reclaims the entry anyway.
+                // Like a failed sliding renewal (issue #1234), a node that
+                // went away after the read must not fail the Get.
+            }
             return null;
         }
         if (envelope.SlidingSeconds == 0) return envelope.Payload; // fixed TTL (or none) — nothing to renew

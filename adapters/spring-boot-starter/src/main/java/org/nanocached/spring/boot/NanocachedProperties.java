@@ -196,7 +196,7 @@ public class NanocachedProperties {
 
         /**
          * Restricts the manager to exactly these cache names, created eagerly. Unset (the default)
-         * creates caches on first use. Aligned with {@code spring.cache.cache-names}.
+         * or empty creates caches on first use. Aligned with {@code spring.cache.cache-names}.
          */
         private List<String> cacheNames;
 

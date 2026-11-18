@@ -402,6 +402,68 @@ class NanocachedCacheManagerTest {
     }
 
     @Test
+    void equalMultiArgumentKeysHaveTheSameBytesWhicheverInstancesTheyHold() {
+        // JDK serialization writes a repeated instance as a back-reference,
+        // so SimpleKey(x, x) and SimpleKey(x, copyOf(x)) — equal keys —
+        // used to serialize differently (#1952).
+        DefaultCacheKeyConverter converter = new DefaultCacheKeyConverter();
+        Long id = 1000L; // outside the Long box cache: Long.valueOf(1000) is another instance
+        String sku = "sku-1";
+        User user = new User("Alice", 30);
+        List<SimpleKey[]> equalPairs = List.of(
+                new SimpleKey[] {new SimpleKey(id, id), new SimpleKey(id, Long.valueOf(1000L))},
+                new SimpleKey[] {new SimpleKey(sku, sku), new SimpleKey(sku, new String("sku-1"))},
+                new SimpleKey[] {new SimpleKey(user, user), new SimpleKey(user, new User("Alice", 30))},
+                // A varargs method's key: SimpleKey compares nested arrays with deepEquals.
+                new SimpleKey[] {
+                    new SimpleKey((Object) new Long[] {id, id}),
+                    new SimpleKey((Object) new Long[] {id, Long.valueOf(1000L)})
+                });
+        for (SimpleKey[] pair : equalPairs) {
+            assertEquals(pair[0], pair[1]);
+            assertArrayEquals(converter.toKeyBytes(pair[0]), converter.toKeyBytes(pair[1]), pair[0].toString());
+        }
+    }
+
+    @Test
+    void evictWithAnEqualMultiArgumentKeyBuiltFromOtherInstancesRemovesTheEntry() {
+        Cache cache = manager().build().getCache("prices");
+        Long from = 1000L;
+        cache.put(new SimpleKey(from, from), new User("cached", 1)); // @Cacheable prices(from, from)
+
+        cache.evict(new SimpleKey(1000L, Long.valueOf("1000"))); // @CacheEvict with separately parsed arguments
+
+        assertNull(cache.get(new SimpleKey(from, from)));
+    }
+
+    @Test
+    void differentMultiArgumentKeysStayDistinct() {
+        DefaultCacheKeyConverter converter = new DefaultCacheKeyConverter();
+        List<Object> keys = List.of(
+                SimpleKey.EMPTY,
+                new SimpleKey((Object) null),
+                new SimpleKey(null, null),
+                new SimpleKey("a", "b"),
+                new SimpleKey("b", "a"),
+                new SimpleKey("ab"),
+                new SimpleKey("a", null),
+                new SimpleKey(null, "a"),
+                new SimpleKey(new SimpleKey("a", "b")),
+                new SimpleKey((Object) new String[] {"a", "b"}),
+                new SimpleKey((Object) new byte[] {1, 2}),
+                new SimpleKey(1L, 2L),
+                new SimpleKey(1, 2),
+                "a",
+                new byte[0]);
+        long distinct = keys.stream()
+                .map(converter::toKeyBytes)
+                .map(Arrays::toString)
+                .distinct()
+                .count();
+        assertEquals(keys.size(), distinct);
+    }
+
+    @Test
     void customSerializerIsUsedForValues() {
         CacheValueSerializer utf8 = new CacheValueSerializer() {
             @Override

@@ -17,6 +17,8 @@ changed. What 1.0.0 will promise is described on the
 ### Fixed
 
 - The README said the value size limit is measured after compression when `Compress` is on. The SDK checks the value before compressing it, so a value over the limit throws `ArgumentOutOfRangeException` even if it would compress to less; the README now says so. (#1603)
+- `GetAsync` on an entry past its absolute expiry threw `NanocachedException` when the conditional delete that cleans it up could not reach the node. The delete is cleanup only, so a failure is now ignored and the call returns the miss, as a failed sliding renewal returns the hit (#1234). (#1956)
+- `AddNanocachedDistributedCache(Action<NanocachedCacheOptions>)` leaked a connected client on every resolve when the namespace was invalid: the client was dialed before the cache constructor rejected the namespace, and nothing closed it. The client is now closed before the error is rethrown. (#1955)
 
 ## [0.6.2] - 2026-11-03
 
