@@ -59,7 +59,6 @@ from nanocached import (
     PartialConnectionLostError,
     PartialSetConnectionLostError,
     PartialWrongNodeError,
-    WrongNodeError,
 )
 
 _T = TypeVar("_T")
@@ -270,16 +269,17 @@ async def _set_many_resolved(
 
     A plain ``WrongNodeError`` (a ring reconfiguration left some keys'
     primaries still wrong-node after the SDK's own one bounded
-    refresh-and-retry) carries no partial payload worth attaching —
-    ``set_many`` has no value to report back beyond which keys landed —
-    so this resends the WHOLE batch once; safe, since every per-key
-    write is idempotent, so re-storing an already-landed key is just a
-    harmless duplicate of the same value/TTL. ``PartialSetConnectionLostError``
+    refresh-and-retry) propagates unchanged (issue #1954): every other
+    key already landed and the error doesn't say which ones failed, so
+    resending the whole batch would re-store already-landed keys with
+    this call's values, overwriting any newer write another process made
+    in between (the SDK dropped the same resend from its own retry pass
+    for this reason, #661). ``PartialSetConnectionLostError``
     (a later chunk's connection failure after an earlier one already
     stored its keys, single-node/proxy mode only) DOES carry
     ``partial_keys`` for what's already confirmed stored, so this
-    resends only the remainder. Either way, a second failure propagates
-    unchanged rather than being silently swallowed."""
+    resends only the remainder; a second failure propagates unchanged
+    rather than being silently swallowed."""
     try:
         await handle.set_many(payload, ttl_seconds=ttl_seconds)
     except PartialSetConnectionLostError as error:
@@ -290,10 +290,6 @@ async def _set_many_resolved(
         await handle.set_many(
             remaining, ttl_seconds=ttl_seconds
         )  # a second failure propagates as-is
-    except WrongNodeError:
-        await handle.set_many(
-            payload, ttl_seconds=ttl_seconds
-        )  # no partial payload — resend the whole batch
 
 
 def _split_host_port(address: str) -> tuple[str, int]:
@@ -915,13 +911,12 @@ class NanocachedCache(BaseCache):
         # uses) since a failure here raises instead of being collected
         # per-key. wire_ttl is resolved once for the whole call, matching
         # set_many's own single-timeout signature.
-        # Issue #439: a mid-batch partial failure (WrongNodeError/
-        # PartialSetConnectionLostError) is retried once — the whole
-        # batch, or just its still-unstored remainder — by
-        # _set_many_resolved instead of propagating raw and failing an
-        # otherwise-successful batch outright; see that helper's
-        # docstring, and the parity note in adapters/cache-manager's
-        # msetResolved / adapters/jcache's setManyBytesResolvingWrongNode.
+        # Issue #439: a mid-batch PartialSetConnectionLostError is retried
+        # once for its still-unstored remainder by _set_many_resolved
+        # instead of propagating raw and failing an otherwise-successful
+        # batch outright; a plain WrongNodeError propagates (issue #1954).
+        # See that helper's docstring, and the parity note in
+        # adapters/cache-manager's msetResolved.
         if not data:
             return []
         wire_ttl = self.get_backend_timeout(timeout)
