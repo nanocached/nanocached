@@ -2,7 +2,6 @@ import {
   NanocachedClient,
   PartialWrongNodeError,
   PartialConnectionLostError,
-  WrongNodeError,
   type NanocachedAddress,
   type NanocachedNamespace,
 } from "nanocached";
@@ -393,13 +392,13 @@ export class NanocachedStore implements Store {
    * propagates unchanged rather than being silently swallowed — a
    * connection loss is a genuine failure, not something to paper over.
    *
-   * `setMany`'s wrong-node case has no partial payload to retry a
-   * remainder from (see `PartialWrongNodeError`'s own doc comment: "no
-   * partial payload worth attaching" for the write side), so — mirroring
-   * `adapters/jcache`'s `setManyBytesResolvingWrongNode` — this resends
-   * the WHOLE batch once instead; safe because every per-key write is
-   * idempotent, so re-storing an already-landed key is just a harmless
-   * duplicate of the same value/TTL. */
+   * A plain `WrongNodeError` propagates unchanged (issue #1953). It
+   * arrives only after the SDK's own forced refresh and one retry, and
+   * means every other key in the batch was already stored; it carries no
+   * list of which keys failed. Resending the whole batch would re-store
+   * already-landed keys with this call's values, overwriting any newer
+   * write a concurrent client made in between (the SDK dropped the same
+   * resend from its own retry pass for this reason, #661). */
   private async msetResolved(values: Record<string, string>, ttlSeconds: number): Promise<void> {
     try {
       await this.ns.setMany(values, ttlSeconds);
@@ -412,10 +411,6 @@ export class NanocachedStore implements Store {
         }
         if (Object.keys(remaining).length === 0) return;
         await this.ns.setMany(remaining, ttlSeconds); // let a retry failure propagate as-is
-        return;
-      }
-      if (error instanceof WrongNodeError) {
-        await this.ns.setMany(values, ttlSeconds);
         return;
       }
       throw error;
