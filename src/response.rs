@@ -188,8 +188,14 @@ pub enum Response {
     /// Internal-only (staged node join), in answer to `Command::UnmarkMigratedMany`.
     Unmarked,
     /// Internal-only (staged node join), in answer to `Command::Sweep` — how many
-    /// entries the sweep actually removed.
-    Swept(usize),
+    /// entries the sweep actually removed, and whether its queue still holds
+    /// candidates (`Cache::has_sweep_backlog`, issue #1939): what `run_sweep`
+    /// loops on, since `removed` can fall short of a full budget with a
+    /// backlog left.
+    Swept {
+        removed: usize,
+        backlog: bool,
+    },
     /// Internal-only (issue #582), in answer to `Command::ReclaimUnowned`:
     /// how many entries the pass removed, or `paused` when the cache saw a
     /// handoff write too recently for any reclaim to be safe (see
@@ -344,7 +350,7 @@ impl Response {
             | Self::Keys(_)
             | Self::Marked
             | Self::Unmarked
-            | Self::Swept(_)
+            | Self::Swept { .. }
             | Self::Reclaimed { .. }
             | Self::Stats(_) => {
                 unreachable!(

@@ -826,10 +826,10 @@ pub async fn reject_over_limit(
 /// drain (so a client that had already sent its first frame may see a reset
 /// rather than the reply).
 ///
-/// The count is per process, not per source (node and discovery each have
-/// their own, shared by the global-cap and the per-IP rejections): a source
-/// that keeps this many rejected connections lingering (about 640 a second
-/// at the 200 ms drain, if it never closes them) makes every other
+/// The count is per process, not per source (node, discovery and proxy each
+/// have their own, shared by the global-cap and the per-IP rejections): a
+/// source that keeps this many rejected connections lingering (about 640 a
+/// second at the 200 ms drain, if it never closes them) makes every other
 /// connection being rejected at that moment take the no-drain path, and a
 /// client that had already sent its first frame sees a reset instead of
 /// `B`. Accepted connections are not affected, and neither is a TLS

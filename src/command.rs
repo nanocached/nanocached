@@ -768,26 +768,29 @@ impl Command {
                 Response::Stats(Box::new(cache.stats_top(largest_namespaces)))
             }
 
-            Self::Sweep {
-                marked: true,
-                owned,
-            } => Response::Swept(match owned {
-                Some(owned) => {
-                    // One namespace hash per run of marked keys sharing a
-                    // namespace allocation (the sweep queues them so), as
-                    // `ReclaimUnowned` does: hashing a client-chosen
-                    // namespace of hundreds of KB again for every marked
-                    // key stalled the cache thread for over a second per
-                    // chunk.
-                    let hasher = std::cell::RefCell::new(KeyHasher::default());
-                    cache.sweep_keeping(&|key: &Key| {
-                        let key_hash = hasher.borrow_mut().hash(key);
-                        owned.keeps_hashed(key_hash)
-                    })
+            Self::Sweep { marked, owned } => {
+                let removed = match (marked, owned) {
+                    (true, Some(owned)) => {
+                        // One namespace hash per run of marked keys sharing a
+                        // namespace allocation (the sweep queues them so), as
+                        // `ReclaimUnowned` does: hashing a client-chosen
+                        // namespace of hundreds of KB again for every marked
+                        // key stalled the cache thread for over a second per
+                        // chunk.
+                        let hasher = std::cell::RefCell::new(KeyHasher::default());
+                        cache.sweep_keeping(&|key: &Key| {
+                            let key_hash = hasher.borrow_mut().hash(key);
+                            owned.keeps_hashed(key_hash)
+                        })
+                    }
+                    (true, None) => cache.sweep(),
+                    (false, _) => cache.sweep_expired(),
+                };
+                Response::Swept {
+                    removed,
+                    backlog: cache.has_sweep_backlog(),
                 }
-                None => cache.sweep(),
-            }),
-            Self::Sweep { marked: false, .. } => Response::Swept(cache.sweep_expired()),
+            }
             Self::ReclaimUnowned {
                 keys,
                 checks,
@@ -2614,7 +2617,10 @@ mod tests {
                 owned: None
             }
             .execute(&mut cache),
-            Response::Swept(1)
+            Response::Swept {
+                removed: 1,
+                backlog: false
+            }
         );
     }
 
@@ -2647,7 +2653,10 @@ mod tests {
                 }),
             }
             .execute(&mut cache),
-            Response::Swept(1)
+            Response::Swept {
+                removed: 1,
+                backlog: false
+            }
         );
         assert_eq!(cache.get(&mine), Some(Bytes::from_static(b"v")));
         assert_eq!(cache.get(&theirs), None);
@@ -2853,7 +2862,7 @@ mod tests {
         }
         .execute(&mut cache);
         let elapsed = started.elapsed();
-        let Response::Swept(swept) = response else {
+        let Response::Swept { removed: swept, .. } = response else {
             panic!("unexpected response {response:?}");
         };
         // The keys "b" owns are swept, the keys "a" owns are kept.
@@ -2930,7 +2939,10 @@ mod tests {
                 owned: None
             }
             .execute(&mut cache),
-            Response::Swept(0)
+            Response::Swept {
+                removed: 0,
+                backlog: false
+            }
         );
         assert_eq!(cache.get(&key(b"name")), Some(Bytes::from_static(b"Alice")));
     }

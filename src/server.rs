@@ -2787,10 +2787,21 @@ const METRICS_MAX_NAMESPACE_SERIES: usize = 256;
 const METRICS_MAX_LABEL_BYTES: usize = 256;
 const METRICS_LABEL_KEEP_BYTES: usize = 128;
 
+/// What `metrics_namespace_label` puts between a cut name and its length
+/// and hash.
+const METRICS_LABEL_ELISION: &str = "…[";
+
 /// The `namespace` label for a name: escaped, and elided past
-/// `METRICS_MAX_LABEL_BYTES` (see the constant).
+/// `METRICS_MAX_LABEL_BYTES` (see the constant). Issue #1937: a name the
+/// label can't copy exactly — not valid UTF-8, which the lossy decoding
+/// turns into U+FFFD, or one already containing the elision marker, which
+/// any client can name a namespace after another's elided label — gets
+/// the length and hash too, whatever its length. Otherwise `\xff`, `\xfe`
+/// and `"\u{FFFD}"` all got the label `�`, and the scrape carried two
+/// samples of one series.
 fn metrics_namespace_label(name: &[u8]) -> String {
-    if name.len() <= METRICS_MAX_LABEL_BYTES {
+    let exact = std::str::from_utf8(name).is_ok_and(|text| !text.contains(METRICS_LABEL_ELISION));
+    if exact && name.len() <= METRICS_MAX_LABEL_BYTES {
         return metrics_label_escape(name);
     }
     // Cut on a char boundary of the lossy decoding, so the kept prefix
@@ -7579,6 +7590,30 @@ async fn run_migration(
         }
     }
 
+    // Issue #106: whatever clears queued up after the last key's drain
+    // go out before the slot flips to "completed" (see the stamp below).
+    // Issue #1938: replayed before the abort check and the `known_ring`
+    // switch, not after them. The replay is network I/O, up to
+    // `KEY_TRANSFER_ATTEMPTS` × `OUTBOUND_IO_TIMEOUT`: an `X` landing
+    // during it was otherwise never seen — `take_abandoned_slot` leaves a
+    // slot still in flight to this task, which went on to complete the
+    // join discovery had just dropped — and a replay failing every attempt
+    // returned with `known_ring` already on the abandoned join's ring.
+    // From the check below to the stamp nothing awaits.
+    if !migration_guard.abort_requested.load(Ordering::SeqCst)
+        && !drain_pending_clears(&node_context, &joining_addr, &mut stream).await
+    {
+        // One round trip for the lot: one per key kept the migration slot
+        // occupied for the whole restore.
+        let restore: Vec<Key> = marked_this_run
+            .into_iter()
+            .chain(migration_guard.take_join_marks())
+            .collect();
+        unmark_migrated_many(&node_context.request_tx, restore).await;
+
+        return;
+    }
+
     if migration_guard.abort_requested.load(Ordering::SeqCst) {
         // One round trip for the lot: one per key kept the migration slot
         // occupied for the whole restore.
@@ -7623,27 +7658,13 @@ async fn run_migration(
     // goes out (issue #62): discovery may start the next join the moment
     // this `C` lands and have its `M` here before this task gets past the
     // ack read — a slot still reading as in-flight would reject it.
-    // Issue #106: whatever clears queued up after the last key's drain
-    // go out before the slot flips to "completed" ...
-    if !drain_pending_clears(&node_context, &joining_addr, &mut stream).await {
-        // One round trip for the lot: one per key kept the migration slot
-        // occupied for the whole restore.
-        let restore: Vec<Key> = marked_this_run
-            .into_iter()
-            .chain(migration_guard.take_join_marks())
-            .collect();
-        unmark_migrated_many(&node_context.request_tx, restore).await;
-
-        return;
-    }
-
     // Cloned, not moved: this function's own join-flip re-replication
     // trigger (issue #266, below) needs `pre_completion_ring` again too.
     migration_guard.completed(sent_count, marked_this_run, pre_completion_ring.clone());
 
-    // ... and one more drain after the stamp catches a clear that slipped
-    // in between: `route_clear` queues only while `completed_at` is
-    // `None`, under the same lock `completed()` stamps it, so anything
+    // One more drain after the stamp catches a clear that slipped in
+    // since the one above: `route_clear` queues only while `completed_at`
+    // is `None`, under the same lock `completed()` stamps it, so anything
     // not in this drain was forwarded on the shared connection instead.
     // Too late to abandon the join here (it is already completed on this
     // node); a permanent failure is logged like a failed forward.
@@ -10174,9 +10195,13 @@ fn reclaim_checks(node_context: &NodeContext) -> Option<(Vec<OwnerCheck>, u64)> 
 /// cache commands queued behind it on the single-threaded actor for long
 /// (measured: ~500ns per removal, so a full-cache sweep over a backlog of
 /// hundreds of thousands of entries would otherwise block for 100ms+) — a
-/// call that hits that cap likely left more behind, so this loops back
-/// immediately (no `SWEEP_INTERVAL` wait) until a call reports less than a
-/// full budget removed, meaning the backlog is drained for now. Skips
+/// call that hits that cap may leave more behind, so this loops back
+/// immediately (no `SWEEP_INTERVAL` wait) for as long as the cache reports
+/// its sweep queue still holds candidates (`Cache::has_sweep_backlog`).
+/// Issue #1939: not on the removal count — a queued candidate a client
+/// has rewritten or deleted since, or a marked copy kept, isn't removed,
+/// so one such key in a batch ended the round with the rest of the queue
+/// left for `SWEEP_INTERVAL` later. Skips
 /// (and doesn't drain a backlog) while `active_migration` is `Some` — this
 /// node is the source for an in-progress handoff, so a marked-but-not-yet-
 /// swept key may still be needed as the authoritative source for a
@@ -10274,7 +10299,7 @@ async fn run_sweep(
             });
             tokio::select! {
                 result = sweep(&request_tx, !marks_held, owned) => match result {
-                    Some(removed) if removed >= SWEEP_BUDGET => continue,
+                    Some(true) => continue,
                     _ => break,
                 },
                 _ = shutdown_rx.changed() => return,
@@ -10287,7 +10312,7 @@ async fn sweep(
     request_tx: &mpsc::Sender<CacheRequest>,
     marked: bool,
     owned: Option<SweepOwnership>,
-) -> Option<usize> {
+) -> Option<bool> {
     let (response_tx, response_rx) = oneshot::channel();
 
     request_tx
@@ -10299,7 +10324,7 @@ async fn sweep(
         .ok()?;
 
     match response_rx.await.ok()? {
-        Response::Swept(removed) => Some(removed),
+        Response::Swept { backlog, .. } => Some(backlog),
         _ => None,
     }
 }
@@ -16076,6 +16101,41 @@ mod tests {
         let multibyte = "é".repeat(300);
         let label = metrics_namespace_label(multibyte.as_bytes());
         assert!(label.starts_with(&"é".repeat(64)));
+    }
+
+    #[test]
+    fn metrics_namespace_labels_stay_distinct_for_names_the_label_cannot_copy() {
+        // Issue #1937: two invalid-UTF-8 names and the valid name U+FFFD
+        // all decoded to `�`, and a short name spelled like a long name's
+        // elided label got that label, so the scrape carried two samples
+        // of one series.
+        let long = vec![b'n'; 300];
+        let long_label = metrics_namespace_label(&long);
+        let names = [
+            &b"\xff"[..],
+            &b"\xfe"[..],
+            "\u{FFFD}".as_bytes(),
+            long.as_slice(),
+            long_label.as_bytes(),
+        ];
+        let mut cache = Cache::new(usize::MAX);
+        for name in names {
+            cache.set(
+                Key::new(Bytes::copy_from_slice(name), Bytes::from_static(b"k")),
+                Bytes::from_static(b"v"),
+            );
+        }
+        let body = render_node_metrics(&cache.stats(), 0, 8);
+        let labels: Vec<&str> = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("nanocached_node_namespace_entries{namespace=\""))
+            .map(|rest| rest.split("\"}").next().unwrap())
+            .collect();
+        assert_eq!(labels.len(), names.len(), "{body}");
+        let distinct: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(distinct.len(), names.len(), "{labels:?}");
+        // A name the label can copy exactly still gets just that.
+        assert!(distinct.contains("\u{FFFD}"), "{labels:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -27256,7 +27316,10 @@ mod tests {
                 }
             )
             .await,
-            Response::Swept(1)
+            Response::Swept {
+                removed: 1,
+                backlog: false
+            }
         );
         match send_command(&request_tx, Command::PeekEntry { key: key(b"key-0") }).await {
             Response::Entries(entries) => {
@@ -30379,7 +30442,10 @@ mod tests {
                 }
             )
             .await,
-            Response::Swept(0)
+            Response::Swept {
+                removed: 0,
+                backlog: false
+            }
         );
 
         let mut cancel_message = format!("X {} {}\n", joining_name.len(), token.len()).into_bytes();
@@ -30402,7 +30468,10 @@ mod tests {
                 }
             )
             .await,
-            Response::Swept(0)
+            Response::Swept {
+                removed: 0,
+                backlog: false
+            }
         );
         assert_eq!(
             send_command(&request_tx, Command::Get { key: key(b"name") }).await,
@@ -30573,7 +30642,10 @@ mod tests {
                 }
             )
             .await,
-            Response::Swept(0)
+            Response::Swept {
+                removed: 0,
+                backlog: false
+            }
         );
 
         client.shutdown().await.unwrap();
@@ -30901,7 +30973,10 @@ mod tests {
                 }
             )
             .await,
-            Response::Swept(0)
+            Response::Swept {
+                removed: 0,
+                backlog: false
+            }
         );
 
         client.shutdown().await.unwrap();
@@ -34311,7 +34386,10 @@ mod tests {
                 }
             )
             .await,
-            Response::Swept(0)
+            Response::Swept {
+                removed: 0,
+                backlog: false
+            }
         );
         assert_eq!(
             send_command(&request_tx, Command::Get { key: key(b"key-3") }).await,
@@ -34622,7 +34700,10 @@ mod tests {
                 }
             )
             .await,
-            Response::Swept(0),
+            Response::Swept {
+                removed: 0,
+                backlog: false
+            },
             "{via:?}"
         );
 
@@ -34650,6 +34731,302 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_clear_replay_failure_after_the_last_key_restores_in_one_cache_command() {
         rollback_restores_in_one_cache_command(RollbackVia::ClearAfterLastKey).await;
+    }
+
+    /// What the joiner does when the clear queued during the last key's
+    /// transfer is replayed after the loop (issue #1938).
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum FinalClearReplay {
+        /// Discovery's `X` lands while the replay is in flight.
+        AbandonedDuringIt,
+        /// The joiner is gone: every attempt fails.
+        FailsEveryAttempt,
+    }
+
+    async fn the_final_clear_replay_leaves_no_trace_of_an_abandoned_join(replay: FinalClearReplay) {
+        // Issue #1938: the post-loop replay ran after the last abort check
+        // and the `known_ring` switch. An `X` during it was answered
+        // `MigrationCancelled` while this node completed the join anyway
+        // and reported `C`; a replay failing every attempt left
+        // `known_ring` on a ring with the joiner that never joined.
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let users = Bytes::from_static(b"users");
+        for index in 0..5u8 {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: Key::new(users.clone(), Bytes::from(format!("k{index}"))),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        let joining_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let joining_addr = joining_listener.local_addr().unwrap().to_string();
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let reported: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+        let discovery_reported = Arc::clone(&reported);
+        let discovery_task = tokio::spawn(async move {
+            let (mut connection, _) = discovery_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let read = connection.read(&mut buffer).await.unwrap();
+            discovery_reported
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..read]);
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        // One member with R=2: the joiner takes a copy of every key and
+        // displaces nobody.
+        let pre_join = Arc::new(HashRing::new(vec!["ready-node".to_string()]));
+        let node_context = NodeContext {
+            discovery_addr,
+            request_tx: request_tx.clone(),
+            ..test_node_context(
+                "ready-node",
+                "tk-ready-node",
+                Arc::new(Mutex::new(Some(Arc::new(Membership {
+                    ring: Arc::clone(&pre_join),
+                    replication: 2,
+                })))),
+                Arc::new(Mutex::new(None)),
+            )
+        };
+        let joined = vec![("ready-node".to_string(), "127.0.0.1:1".to_string())];
+        let (before_ring, after_ring) = migration_rings(&node_context, "joiner-0", &joined);
+        let after_ring = Arc::new(after_ring);
+        let migration_guard = MigrationGuard::new(
+            Arc::clone(&node_context.active_migration),
+            "joiner-0".to_string(),
+            joining_addr.clone(),
+            "tok-joiner-0".to_string(),
+            Arc::clone(&after_ring),
+            2,
+            None,
+            &joined,
+            &node_context.known_ring,
+            &node_context.ring_history,
+        )
+        .unwrap_new();
+        let keys = list_keys(&request_tx).await;
+        let key_count = keys.as_ref().unwrap().len();
+
+        let joiner_context = node_context.clone();
+        let joining_task = tokio::spawn(async move {
+            let (mut connection, _) = joining_listener.accept().await.unwrap();
+            let mut buffer = BytesMut::new();
+            let mut keys_seen = 0;
+            let mut x_answered_aborting = false;
+            loop {
+                let Some(header_end) = buffer.iter().position(|byte| *byte == b'\n') else {
+                    if connection.read_buf(&mut buffer).await.unwrap() == 0 {
+                        return x_answered_aborting;
+                    }
+                    continue;
+                };
+                let header = std::str::from_utf8(&buffer[..header_end])
+                    .unwrap()
+                    .to_string();
+                let lengths: Vec<usize> = header
+                    .split(' ')
+                    .skip(1)
+                    .filter(|field| *field != "A")
+                    .map(|field| field.parse().unwrap())
+                    .collect();
+                let (body_length, ack): (usize, &[u8]) = match header.as_bytes()[0] {
+                    b'U' => (lengths[..4].iter().sum(), b"S\n"),
+                    b'f' => (lengths[0] + lengths[1], b"C\n"),
+                    other => panic!("unexpected frame {}", other as char),
+                };
+                if buffer.len() < header_end + 1 + body_length {
+                    assert!(connection.read_buf(&mut buffer).await.unwrap() > 0);
+                    continue;
+                }
+                let _ = buffer.split_to(header_end + 1 + body_length);
+                if header.starts_with('U') {
+                    keys_seen += 1;
+                    if keys_seen == key_count {
+                        // A client `c` lands while the last key is in
+                        // flight: it is queued for the post-loop replay.
+                        assert!(matches!(
+                            route_clear(&joiner_context, &ClearScope::All),
+                            ClearRoute::Queued
+                        ));
+                    }
+                } else {
+                    match replay {
+                        FinalClearReplay::AbandonedDuringIt => {
+                            x_answered_aborting = matches!(
+                                abandon_migration(&joiner_context, "joiner-0"),
+                                AbandonOutcome::Aborting
+                            );
+                        }
+                        // Drops the connection and the listener.
+                        FinalClearReplay::FailsEveryAttempt => return false,
+                    }
+                }
+                connection.write_all(ack).await.unwrap();
+            }
+        });
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            run_migration(
+                node_context.clone(),
+                "joiner-0".to_string(),
+                joining_addr,
+                "tok-joiner-0".to_string(),
+                None,
+                2,
+                before_ring,
+                after_ring,
+                migration_guard,
+                keys,
+            ),
+        )
+        .await
+        .expect("the migration returns");
+
+        if replay == FinalClearReplay::AbandonedDuringIt {
+            assert!(joining_task.await.unwrap(), "the X found the run in flight");
+        } else {
+            joining_task.abort();
+        }
+        assert!(
+            node_context.active_migration.lock().unwrap().is_none(),
+            "{replay:?}: the slot went with the abandoned join"
+        );
+        let known_ring = node_context.known_ring.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            known_ring.ring.nodes(),
+            pre_join.nodes(),
+            "{replay:?}: known_ring is the pre-join ring"
+        );
+        assert!(
+            reported.lock().unwrap().is_empty(),
+            "{replay:?}: no C reported for an abandoned join"
+        );
+
+        discovery_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_abandon_during_the_final_clear_replay_rolls_the_join_back() {
+        the_final_clear_replay_leaves_no_trace_of_an_abandoned_join(
+            FinalClearReplay::AbandonedDuringIt,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_final_clear_replay_failing_every_attempt_restores_known_ring() {
+        the_final_clear_replay_leaves_no_trace_of_an_abandoned_join(
+            FinalClearReplay::FailsEveryAttempt,
+        )
+        .await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn one_sweep_round_drains_a_backlog_a_client_rewrote_part_of() {
+        // Issue #1939: `run_sweep` went on only while a call removed a
+        // full `SWEEP_BUDGET`. A queued key a client rewrote between two
+        // calls is popped but not removed, so its batch fell short and the
+        // round ended with most of the backlog left for `SWEEP_INTERVAL`.
+        const KEYS: usize = 5 * SWEEP_BUDGET;
+        fn name(index: usize) -> Key {
+            key(format!("key-{index}").as_bytes())
+        }
+        let (inner_tx, inner_rx) = mpsc::channel(8);
+        let cache_task = tokio::spawn(run_cache(inner_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        for index in 0..KEYS {
+            send_command(
+                &inner_tx,
+                Command::Set {
+                    key: name(index),
+                    value: Bytes::from_static(b"v"),
+                    ttl: Some(Duration::from_millis(1)),
+                },
+            )
+            .await;
+        }
+        // TTLs run on the wall clock, not on tokio's paused one.
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Between the round's first and second call a client rewrites
+        // every other key, some of them still queued. The first call of
+        // the next round ends the test.
+        let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(8);
+        let (round_tx, round_rx) = oneshot::channel();
+        let proxy_tx = inner_tx.clone();
+        let proxy_task = tokio::spawn(async move {
+            let mut round_started = None;
+            let mut calls = 0;
+            while let Some(request) = request_rx.recv().await {
+                if matches!(request.command, Command::Sweep { .. }) {
+                    let now = tokio::time::Instant::now();
+                    if *round_started.get_or_insert(now) < now {
+                        let _ = round_tx.send(calls);
+                        return;
+                    }
+                    calls += 1;
+                    if calls == 2 {
+                        for index in (0..KEYS).step_by(2) {
+                            send_command(
+                                &proxy_tx,
+                                Command::Set {
+                                    key: name(index),
+                                    value: Bytes::from_static(b"fresh"),
+                                    ttl: None,
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                }
+                if proxy_tx.send(request).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sweep_task = tokio::spawn(run_sweep(
+            request_tx,
+            Arc::new(Mutex::new(None)),
+            None,
+            shutdown_rx,
+        ));
+
+        let calls = round_rx.await.unwrap();
+        let Response::Stats(stats) = send_command(
+            &inner_tx,
+            Command::Stats {
+                largest_namespaces: 0,
+            },
+        )
+        .await
+        else {
+            panic!("unexpected response");
+        };
+        // Only the rewritten keys are left.
+        assert_eq!(
+            stats.entries,
+            KEYS / 2,
+            "after {calls} calls the first round left expired keys behind"
+        );
+
+        shutdown_tx.send(true).unwrap();
+        sweep_task.await.unwrap();
+        proxy_task.await.unwrap();
+        drop(inner_tx);
+        cache_task.await.unwrap();
     }
 
     #[test]
