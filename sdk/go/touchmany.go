@@ -98,7 +98,13 @@ func (c *Client) GetManyAndTouch(keys []string, ttlSeconds int64) (map[string]st
 }
 
 // GetManyAndTouchBytes is GetManyAndTouch's raw companion. Transparently
-// decompresses when Config.Compress is enabled.
+// decompresses when Config.Compress is enabled. A hit that fails to
+// decompress (a value with no or an unknown marker byte, or one past the
+// cumulative decompressed budget of a response) fails the call, as for
+// GetManyBytes — except with ttlSeconds == 0, which has already expired
+// every hit on all its owners: such a hit is left out and the other values
+// are returned, with the error the batch would otherwise return (issue
+// #1943). GetManyAndTouch decodes the same way.
 func (c *Client) GetManyAndTouchBytes(keys []string, ttlSeconds int64) (map[string][]byte, error) {
 	return c.getManyAndTouchNS(nil, keys, ttlSeconds)
 }
@@ -159,24 +165,32 @@ func (c *Client) getManyAndTouchNS(namespace []byte, keys []string, ttlSeconds i
 	// maxMultiGetDecompressedBytes. The budget only applies when
 	// compression is enabled, as in getManyNS.
 	var decompressed int64
+	// With ttlSeconds == 0 the touch has already expired every hit on all
+	// its owners, so a hit that fails to decompress is left out rather
+	// than failing the call: the error would lose every other value it
+	// consumed, and err with them (issue #1943).
+	consumed := ttlSeconds == 0
 	for _, idx := range indices {
 		entry := results[idx]
 		if !entry.ok {
 			continue
 		}
 		value, decErr := c.maybeDecompress(entry.value)
-		if decErr != nil {
-			return values, decErr
-		}
-		if c.compress {
+		if decErr == nil && c.compress {
 			// Charge the current entry before checking so the entry that
 			// actually crosses the cap is caught (and excluded).
 			decompressed += int64(len(value))
 			if decompressed > maxMultiGetDecompressedBytes {
-				return values, decompressionFailed(
+				decErr = decompressionFailed(
 					"cumulative decompressed size of this GetManyAndTouch response exceeds the " +
 						"maximum — possible decompression bomb across the batch")
 			}
+		}
+		if decErr != nil {
+			if consumed {
+				continue
+			}
+			return values, decErr
 		}
 		values[keys[idx]] = value
 	}
