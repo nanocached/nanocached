@@ -129,6 +129,13 @@ final class MockNode implements AutoCloseable {
      */
     final Map<ByteBuffer, AtomicInteger> forceWrongNodeCountsForSet = new ConcurrentHashMap<>();
 
+    /**
+     * Run on the namespace's store once a {@code multiSet} has answered a forced {@code W}, before
+     * the reply is written — another client's write landing between this attempt and any resend
+     * (issue #1950's regression test).
+     */
+    volatile java.util.function.Consumer<Map<ByteBuffer, Entry>> onWrongNodeMultiSet;
+
     private final AtomicInteger multiGetOkCountdown = new AtomicInteger(0);
     private final AtomicInteger multiGetDropRemaining = new AtomicInteger(0);
     private final AtomicInteger multiSetOkCountdown = new AtomicInteger(0);
@@ -653,6 +660,13 @@ final class MockNode implements AutoCloseable {
                 continue;
             }
             store(namespace).put(ByteBuffer.wrap(key), new Entry(value, ttlSeconds));
+        }
+        java.util.function.Consumer<Map<ByteBuffer, Entry>> hook = onWrongNodeMultiSet;
+        for (boolean w : wrongNode) {
+            if (w && hook != null) {
+                hook.accept(store(namespace));
+                break;
+            }
         }
         StringBuilder header = new StringBuilder("O ").append(n);
         for (int i = 0; i < n; i++) {

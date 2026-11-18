@@ -599,27 +599,26 @@ class NanocachedCacheTest {
     }
 
     @Test
-    void putAllRetriesTheGroupAndFiresEventsAfterAMidBatchWrongNode() {
-        // Same regression as getAll's above, but for putAll: setManyBytes
-        // has no per-key partial payload to retry a remainder from (see
-        // NanocachedException.PartialWrongNode's own doc), so putAll
-        // retries the whole TTL group instead — a mid-batch ring change
-        // must not abort the write and drop its listener events.
-        List<String> events = new CopyOnWriteArrayList<>();
-        RecordingListener<String, String> listener = new RecordingListener<>(events);
-        cache.registerCacheEntryListener(
-                new MutableCacheEntryListenerConfiguration<>(FactoryBuilder.factoryOf(listener), null, true, true));
+    void putAllPropagatesAMidBatchWrongNodeWithoutResendingTheKeysThatLanded() {
+        // Issue #1950: a plain WrongNode from setManyBytes comes after the
+        // SDK's own retry, with every other key already stored. Resending
+        // the whole group wrote "a" again over a newer write another
+        // client made in between; it now propagates instead.
         node.forceWrongNodeCountsForSet.put(java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("b")), new AtomicInteger(1));
+        node.onWrongNodeMultiSet = store -> store.put(
+                java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("a")),
+                new MockNode.Entry(ValueCodec.serialize("newer"), 0));
         node.multiSetCount.set(0);
+        Map<String, String> batch = new java.util.LinkedHashMap<>();
+        batch.put("a", "1");
+        batch.put("b", "2");
 
-        cache.putAll(Map.of("a", "1", "b", "2"));
+        javax.cache.CacheException error = assertThrows(javax.cache.CacheException.class, () -> cache.putAll(batch));
 
-        assertEquals("1", cache.get("a"));
-        assertEquals("2", cache.get("b"));
-        assertEquals(2, node.multiSetCount.get(), "the forced W costs exactly one extra retry round");
-        assertEquals(2, events.size());
-        assertTrue(events.contains("CREATED:a:1"));
-        assertTrue(events.contains("CREATED:b:2"));
+        assertTrue(error.getCause() instanceof NanocachedException.WrongNode, "cause: " + error.getCause());
+        assertEquals(1, node.multiSetCount.get(), "the group is not resent");
+        node.onWrongNodeMultiSet = null;
+        assertEquals("newer", cache.get("a"));
     }
 
     @Test
@@ -710,11 +709,12 @@ class NanocachedCacheTest {
     }
 
     @Test
-    void putAllKeepsResolvingWhenTheFollowUpAfterAConnectionDropMeetsARingChange() {
+    void putAllReportsAWrongNodeOnTheFollowUpAfterAConnectionDropAsCacheException() {
         // The set-side twin: the adapter's one follow-up for the
         // positions not yet confirmed stored meets a W, which used to
-        // escape putAll as the SDK's raw WrongNode with those keys never
-        // stored. It is resent through the wrong-node retry instead.
+        // escape putAll as the SDK's raw WrongNode. It is a CacheException,
+        // and, as for any plain WrongNode (issue #1950), the follow-up is
+        // not resent over keys that already landed.
         int keyCount = 401;
         Map<String, String> seed = new java.util.LinkedHashMap<>();
         for (int i = 0; i < keyCount; i++) {
@@ -723,12 +723,13 @@ class NanocachedCacheTest {
         node.armMultiSetDrop(1, 2);
         node.forceWrongNodeCountsForSet.put(
                 java.nio.ByteBuffer.wrap(KeyCodec.toKeyBytes("k400")), new AtomicInteger(1));
+        node.multiSetCount.set(0);
 
-        cache.putAll(seed);
+        javax.cache.CacheException error = assertThrows(javax.cache.CacheException.class, () -> cache.putAll(seed));
 
-        for (int i = 0; i < keyCount; i++) {
-            assertEquals("v" + i, cache.get("k" + i), "key k" + i + " must have landed");
-        }
+        assertTrue(error.getCause() instanceof NanocachedException.WrongNode, "cause: " + error.getCause());
+        assertEquals(4, node.multiSetCount.get(), "chunk 1, chunk 2 twice, then one follow-up");
+        assertEquals("v0", cache.get("k0"));
     }
 
     @Test
@@ -1396,6 +1397,53 @@ class NanocachedCacheTest {
     }
 
     @Test
+    void aThrowingListenerOrFilterDoesNotFailTheWriteOrStopLaterListeners() {
+        // Issue #1948: only CacheEntryListenerException was caught, and the
+        // filter ran outside the try, so any other RuntimeException made a
+        // put that had landed throw and skipped every later listener.
+        cache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(new ThrowingListener<String, String>()), null, false, true));
+        cache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(new RecordingListener<String, String>(new CopyOnWriteArrayList<>())),
+                FactoryBuilder.factoryOf(new ThrowingFilter<String, String>()),
+                false,
+                true));
+        List<String> events = new CopyOnWriteArrayList<>();
+        cache.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(new RecordingListener<String, String>(events)), null, true, true));
+
+        cache.put("a", "1");
+
+        assertEquals("1", cache.get("a"));
+        assertEquals(List.of("CREATED:a:1"), events);
+    }
+
+    @Test
+    void aThrowingListenerDoesNotStopPutAllsLaterExpiryGroups() {
+        // Issue #1948: the exception escaped putAll's per-group loop, so a
+        // later TTL group was never written.
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        config.setExpiryPolicyFactory(FactoryBuilder.factoryOf(new SplitExpiryPolicy()));
+        Cache<String, String> split = manager.createCache("throwing-split", config);
+        split.put("a", "old");
+        split.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(new ThrowingListener<String, String>()), null, false, true));
+        List<String> events = new CopyOnWriteArrayList<>();
+        split.registerCacheEntryListener(new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(new RecordingListener<String, String>(events)), null, true, true));
+        Map<String, String> batch = new java.util.LinkedHashMap<>();
+        batch.put("a", "new"); // update group (30 s)
+        batch.put("b", "2"); // create group (60 s)
+
+        split.putAll(batch);
+
+        assertEquals("new", split.get("a"));
+        assertEquals("2", split.get("b"));
+        assertEquals(List.of("UPDATED:a:new:old=old", "CREATED:b:2"), events);
+    }
+
+    @Test
     void deregisteringAListenerStopsFutureEvents() {
         List<String> events = new CopyOnWriteArrayList<>();
         RecordingListener<String, String> listener = new RecordingListener<>(events);
@@ -1686,6 +1734,26 @@ class NanocachedCacheTest {
         @Override
         public boolean evaluate(CacheEntryEvent<? extends K, ? extends V> event) {
             return event.getKey().equals("a");
+        }
+    }
+
+    private static final class ThrowingFilter<K, V> implements CacheEntryEventFilter<K, V>, java.io.Serializable {
+        @Override
+        public boolean evaluate(CacheEntryEvent<? extends K, ? extends V> event) {
+            throw new IllegalStateException("filter boom");
+        }
+    }
+
+    private static final class ThrowingListener<K, V>
+            implements CacheEntryCreatedListener<K, V>, CacheEntryUpdatedListener<K, V>, java.io.Serializable {
+        @Override
+        public void onCreated(Iterable<CacheEntryEvent<? extends K, ? extends V>> iterable) {
+            throw new IllegalStateException("created boom");
+        }
+
+        @Override
+        public void onUpdated(Iterable<CacheEntryEvent<? extends K, ? extends V>> iterable) {
+            throw new IllegalStateException("updated boom");
         }
     }
 

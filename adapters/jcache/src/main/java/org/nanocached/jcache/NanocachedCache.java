@@ -23,13 +23,12 @@ import javax.cache.Cache;
 import javax.cache.CacheException;
 import javax.cache.CacheManager;
 import javax.cache.configuration.CacheEntryListenerConfiguration;
-import javax.cache.configuration.CompleteConfiguration;
 import javax.cache.configuration.Configuration;
+import javax.cache.configuration.MutableConfiguration;
 import javax.cache.event.CacheEntryCreatedListener;
 import javax.cache.event.CacheEntryEvent;
 import javax.cache.event.CacheEntryEventFilter;
 import javax.cache.event.CacheEntryListener;
-import javax.cache.event.CacheEntryListenerException;
 import javax.cache.event.CacheEntryRemovedListener;
 import javax.cache.event.CacheEntryUpdatedListener;
 import javax.cache.event.EventType;
@@ -145,8 +144,8 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     }
 
     /**
-     * Bound on {@link #getAll}/{@link #putAll} retrying the remainder of a batch that is still
-     * wrong-node after the SDK's own {@code getManyBytes}/{@code setManyBytes} built-in one bounded
+     * Bound on {@link #getAll} retrying the remainder of a batch that is still wrong-node after the
+     * SDK's own {@code getManyBytes} built-in one bounded
      * refresh-and-retry (issue #415) — the same role {@link #casRetryDeadlineMillis} plays for the
      * CAS loops above: a ring that keeps moving under one batch for this long is pathological, so
      * this stays small and a batch still unresolved after it propagates instead of retrying
@@ -213,7 +212,13 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
      */
     private final ClassLoader classLoader;
 
-    private final CompleteConfiguration<K, V> configuration;
+    /**
+     * The cache's own copy (issue #1949), made by {@code createCache}: never handed out, only
+     * copied by {@link #getConfiguration}, and changed only by {@link #setStatisticsEnabled}.
+     * Guarded by {@code this}.
+     */
+    private final MutableConfiguration<K, V> configuration;
+
     private final ExpiryPolicy expiryPolicy;
     private final CopyOnWriteArrayList<RegisteredListener<K, V>> listeners = new CopyOnWriteArrayList<>();
     private final NanocachedCacheStatistics statistics = new NanocachedCacheStatistics();
@@ -224,7 +229,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
             NanocachedCacheManager manager,
             String name,
             NanocachedClient.Namespace namespace,
-            CompleteConfiguration<K, V> configuration) {
+            MutableConfiguration<K, V> configuration) {
         this.manager = manager;
         this.name = name;
         this.namespace = new Wire(namespace);
@@ -753,41 +758,33 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     }
 
     /**
-     * {@link NanocachedClient.Namespace#setManyBytes(byte[][], byte[][], long)}, but a ring change
-     * mid-batch (issue #415) no longer aborts the whole group and discards its listener events with
-     * it: {@code setManyBytes} has nothing per-key to retry a remainder from on a partial failure —
-     * see {@link NanocachedException.PartialWrongNode}'s own doc, "there's no partial payload worth
-     * attaching" — so, bounded by {@link #MAX_BULK_WRONG_NODE_RETRIES}, this retries the *whole*
-     * group instead. That's safe: {@code setManyBytes}' per-key writes are idempotent, so
-     * re-sending a key that already landed on a previous attempt (the ring simply hadn't caught up
-     * yet) is a harmless duplicate write of the exact same value/TTL this call was already going to
-     * make.
+     * {@link NanocachedClient.Namespace#setManyBytes(byte[][], byte[][], long)}, reporting a
+     * failure as the {@link CacheException} every operation declares.
      *
-     * <p>Issue #439: {@link NanocachedException.PartialConnectionLostSetRaw} gets a narrower retry
-     * than the wrong-node branch above, not the "resend the whole group" treatment — a connection
-     * failure mid-batch only reaches here after the SDK has already retried the failing chunk once
-     * internally (original attempt plus one reconnect-and-retry, see {@code applyReconnecting} in
-     * {@code NanocachedClient}), so a further bounded loop isn't expected to help. Unlike the get
-     * side, {@code succeededIndices} names what's already DONE rather than what's outstanding (a
-     * successful {@code setManyBytes} has no positional array of its own to splice an answer into —
-     * see the exception's own doc), so this builds the complement — the positions NOT yet confirmed
-     * stored — and makes exactly one follow-up {@code setManyBytes} call for just that remainder
-     * (safe to retry for the same idempotency reason as the whole-group resend above), reporting a
-     * genuine second failure as the {@link CacheException} every operation declares. The follow-up
-     * is one more round of the same loop (gated by {@code connectionRetried}), so a remainder that
-     * meets a ring change is resent through the wrong-node branch instead of escaping as the SDK's
-     * raw exception.
+     * <p>Issue #1950: a plain {@link NanocachedException.WrongNode} propagates; the group is not
+     * resent. It arrives after the SDK's own bounded refresh-and-retry, and every other key of the
+     * batch was already stored — resending them would write this call's values again over any
+     * newer write another client made in between.
+     *
+     * <p>Issue #439: {@link NanocachedException.PartialConnectionLostSetRaw} gets one follow-up —
+     * a connection failure mid-batch only reaches here after the SDK has already retried the
+     * failing chunk once internally (original attempt plus one reconnect-and-retry, see {@code
+     * applyReconnecting} in {@code NanocachedClient}), so a further bounded loop isn't expected to
+     * help. Unlike the get side, {@code succeededIndices} names what's already DONE rather than
+     * what's outstanding (a successful {@code setManyBytes} has no positional array of its own to
+     * splice an answer into — see the exception's own doc), so this builds the complement — the
+     * positions NOT yet confirmed stored — and makes exactly one follow-up {@code setManyBytes}
+     * call for just that remainder, never resending a key that landed. A genuine second failure
+     * of the follow-up, including a wrong-node one, is reported as a {@link CacheException}.
      */
     private void setManyBytesResolvingWrongNode(byte[][] keys, byte[][] values, long ttlSeconds) {
         boolean connectionRetried = false;
-        for (int attempt = 0; ; attempt++) {
+        for (; ; ) {
             try {
                 namespace.setManyBytes(keys, values, ttlSeconds);
                 return;
             } catch (NanocachedException.WrongNode error) {
-                if (attempt >= MAX_BULK_WRONG_NODE_RETRIES) {
-                    throw Wire.failure(error);
-                }
+                throw Wire.failure(error);
             } catch (NanocachedException.PartialConnectionLostSetRaw partial) {
                 if (connectionRetried) {
                     throw Wire.failure(partial);
@@ -994,9 +991,13 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
 
     @Override
     @SuppressWarnings("unchecked")
-    public <C extends Configuration<K, V>> C getConfiguration(Class<C> clazz) {
-        if (clazz.isInstance(configuration)) {
-            return (C) configuration;
+    public synchronized <C extends Configuration<K, V>> C getConfiguration(Class<C> clazz) {
+        // Issue #1949: a fresh copy each call — JSR-107 requires the
+        // returned configuration to be immutable, and changing a copy
+        // cannot reach this cache's own.
+        MutableConfiguration<K, V> copy = new MutableConfiguration<>(configuration);
+        if (clazz.isInstance(copy)) {
+            return (C) copy;
         }
         throw new IllegalArgumentException("nanocached-jcache: configuration cannot be represented as " + clazz);
     }
@@ -1168,10 +1169,10 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                 new NanocachedCacheEntryEvent<>(this, type, key, value, oldValue, oldValueAvailable);
         List<CacheEntryEvent<? extends K, ? extends V>> events = List.of(event);
         for (RegisteredListener<K, V> registered : listeners) {
-            if (registered.filter() != null && !registered.filter().evaluate(event)) {
-                continue;
-            }
             try {
+                if (registered.filter() != null && !registered.filter().evaluate(event)) {
+                    continue;
+                }
                 switch (type) {
                     case CREATED -> {
                         if (registered.listener() instanceof CacheEntryCreatedListener<?, ?> listener) {
@@ -1193,10 +1194,11 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
                         // isn't observable by this adapter (see the class doc).
                     }
                 }
-            } catch (CacheEntryListenerException e) {
-                // A misbehaving listener must not corrupt the write that
-                // already succeeded on this synchronous, local-mutation-only
-                // path — log and keep going.
+            } catch (RuntimeException e) {
+                // A misbehaving listener or filter must not corrupt the
+                // write that already succeeded on this synchronous,
+                // local-mutation-only path, nor stop later listeners or
+                // putAll's later groups (issue #1948) — log and keep going.
                 System.err.println("nanocached-jcache: listener threw for " + name + ": " + e);
             }
         }
@@ -1205,6 +1207,9 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     // ── statistics ──────────────────────────────────────────────────
 
     void setStatisticsEnabled(boolean enabled) {
+        synchronized (this) {
+            configuration.setStatisticsEnabled(enabled);
+        }
         if (enabled) {
             registerStatisticsMBean();
         } else {

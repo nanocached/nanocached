@@ -213,6 +213,36 @@ class NanocachedCacheManagerTest {
         assertThrows(IllegalStateException.class, () -> manager.getCache("anything"));
     }
 
+    @Test
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void theCacheKeepsItsOwnCopyOfTheConfiguration() {
+        // Issue #1949: the caller's configuration was stored and returned
+        // as is, so changing it later changed the types getCache checks
+        // and the flags the cache reports.
+        MutableConfiguration<String, String> config = new MutableConfiguration<String, String>()
+                .setTypes(String.class, String.class)
+                .setManagementEnabled(true);
+        javax.cache.Cache<String, String> cache = manager.createCache("copied", config);
+        ((MutableConfiguration) config).setTypes(Long.class, Long.class);
+        config.setStatisticsEnabled(true);
+
+        javax.cache.configuration.CompleteConfiguration<?, ?> reported =
+                cache.getConfiguration(javax.cache.configuration.CompleteConfiguration.class);
+        assertFalse(reported == config, "not the caller's object");
+        assertEquals(String.class, reported.getKeyType());
+        assertFalse(reported.isManagementEnabled(), "management is not implemented");
+        assertFalse(reported.isStatisticsEnabled());
+        assertEquals(cache, manager.getCache("copied", String.class, String.class));
+        assertThrows(ClassCastException.class, () -> manager.getCache("copied", Long.class, Long.class));
+
+        manager.enableStatistics("copied", true);
+        assertTrue(cache.getConfiguration(javax.cache.configuration.CompleteConfiguration.class)
+                .isStatisticsEnabled());
+        manager.enableStatistics("copied", false);
+        assertFalse(cache.getConfiguration(javax.cache.configuration.CompleteConfiguration.class)
+                .isStatisticsEnabled());
+    }
+
     static final class NoOpLoader implements CacheLoader<String, String>, Serializable {
         @Override
         public String load(String key) throws CacheLoaderException {
