@@ -3103,6 +3103,49 @@ class MultiTouchTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    # Issue #1945: with ttl_seconds 0 every hit has already expired on all
+    # its owners by the time the reply is decoded, so one value that fails
+    # to decompress or decode must not fail the call and lose the rest.
+    # Any other TTL keeps get_many()'s strict contract.
+
+    async def test_expiring_get_many_and_touch_keeps_the_values_around_one_that_fails_to_decompress(
+        self,
+    ):
+        client = await self.connect(compress=True, compression_threshold=16)
+        plain = await self.connect()
+        try:
+            await client.set_many({"a": "x" * 200, "b": "two"})
+            # Written without compression: b"" carries no marker byte.
+            await plain.set("bad", b"")
+            keys = ["a", "bad", "b"]
+            with self.assertRaises(DecompressionError):
+                await client.get_many_and_touch(keys, 30)
+            with self.assertRaises(DecompressionError):
+                await client.get_many_and_touch_bytes(keys, 30)
+            self.assertEqual(await client.get_many_and_touch(keys, 0), {"a": "x" * 200, "b": "two"})
+            self.assertEqual(await plain.get_many_bytes(keys), {})
+            await client.set_many({"a": "x" * 200, "b": "two"})
+            await plain.set("bad", b"")
+            self.assertEqual(
+                await client.namespace(b"").get_many_and_touch_bytes(keys, 0),
+                {"a": b"x" * 200, "b": b"two"},
+            )
+        finally:
+            await plain.close()
+            await client.close()
+
+    async def test_expiring_get_many_and_touch_keeps_the_values_around_one_that_is_not_utf8(self):
+        client = await self.connect()
+        try:
+            await client.set_many({"a": "one", "bin": b"\xff\xfe\x80", "b": "two"})
+            keys = ["a", "bin", "b"]
+            with self.assertRaises(UnicodeDecodeError):
+                await client.get_many_and_touch(keys, 30)
+            self.assertEqual(await client.get_many_and_touch(keys, 0), {"a": "one", "b": "two"})
+            self.assertEqual(await client.get_many_bytes(keys), {})
+        finally:
+            await client.close()
+
     async def test_touch_many_chunks_keep_namespace_length_times_keys_within_64_mib(self):
         # The node refuses an o/y frame whose namespace length x key count
         # exceeds 64 MiB (En and close). 170,000 B x 400 keys is over it.
