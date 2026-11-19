@@ -35,7 +35,7 @@
   "engines": {
     "node": ">=22"
   },
-  "packageManager": "pnpm@11.28.12",
+  "packageManager": "pnpm@11.28.13",
   "scripts": {
     "build:sdk": "pnpm --dir ../../sdk/typescript install --frozen-lockfile && pnpm --dir ../../sdk/typescript run build",
     "build": "pnpm run build:sdk && tsc",
