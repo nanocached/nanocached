@@ -50,7 +50,7 @@
     "@types/node": "^26.6.5",
     "oxfmt": "0.78.0",
     "oxlint": "1.93.0",
-    "oxlint-tsgolint": "7.0.2007",
+    "oxlint-tsgolint": "7.0.2008",
     "typescript": "^7.0.2"
   }
 }
