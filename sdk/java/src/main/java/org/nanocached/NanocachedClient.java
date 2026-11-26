@@ -3835,8 +3835,9 @@ public final class NanocachedClient implements AutoCloseable {
      * discovery dropped the primary the replica would be promoted holding it. A delete can be
      * applied at any time, so this cannot undo anything; the caller still gets the error, so what
      * {@code delete} reports is unchanged. A {@code W} is not a connection error and does not get
-     * here. The legs are the ordinary replica legs, bounded and drained like any other; their
-     * failures are counted and never replace {@code primaryFailure}.
+     * here. The legs run concurrently on the replica-writer pool and are always awaited, even with
+     * {@code fireAndForgetReplicas}; their failures are counted in {@code replicaWriteFailures} and
+     * never replace {@code primaryFailure}.
      */
     private void deleteOnOtherOwners(
             byte[] namespace, byte[] key, ConnectionOp<Boolean> op, NanocachedException.ConnectionLost primaryFailure) {
@@ -3847,8 +3848,20 @@ public final class NanocachedClient implements AutoCloseable {
         if (names.size() < 2) {
             return;
         }
-        for (CompletableFuture<Void> pending :
-                startReplicaWrites(names.subList(1, names.size()), op, null, null, false)) {
+        // Concurrent and always awaited, fireAndForgetReplicas or not: the
+        // caller's error must not arrive before the other owners have the
+        // delete (the same rule as the other SDKs).
+        List<CompletableFuture<Void>> legs = new ArrayList<>();
+        for (String owner : names.subList(1, names.size())) {
+            legs.add(submitReplicaWrite(() -> {
+                try {
+                    applyReconnecting(() -> memberConnection(owner), op);
+                } catch (NanocachedException failed) {
+                    replicaWriteFailures.incrementAndGet();
+                }
+            }));
+        }
+        for (CompletableFuture<Void> pending : legs) {
             try {
                 pending.join();
             } catch (CompletionException wrapped) {

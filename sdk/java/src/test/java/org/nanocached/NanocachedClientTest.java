@@ -1945,6 +1945,34 @@ class NanocachedClientTest {
         }
     }
 
+    // With fire-and-forget replicas the fallback deletes are still awaited:
+    // the caller's error must not arrive before the replicas are deleted.
+    // The background thread is held, so a detached leg could not have run.
+    @Test
+    void aDeleteWhosePrimaryStaysUnreachableAwaitsTheReplicaDeleteEvenWithFireAndForget() throws Exception {
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(
+                            List.of(new Address("127.0.0.1", cluster.discovery().port())))
+                    .fireAndForgetReplicas(true))) {
+                String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                client.set(key, "v");
+                MockNode replica = cluster.nodes().get(NAMES.get(1));
+                cluster.nodes().get(NAMES.get(0)).close();
+                Thread.sleep(100);
+
+                java.util.concurrent.CountDownLatch release = blockBackgroundLegs(client);
+                try {
+                    assertThrows(NanocachedException.ConnectionLost.class, () -> client.delete(key));
+                    assertEquals(1, replica.deleteFrames.get(), "the replica delete landed before the error");
+                } finally {
+                    release.countDown();
+                }
+            }
+        }
+    }
+
     @Test
     void aTouchThatDoesNotExpireStillGoesToEveryOwnerAtOnce() throws Exception {
         for (long ttl : new long[] {30, NanocachedClient.REMOVE_TTL}) {
