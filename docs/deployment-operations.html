@@ -120,7 +120,12 @@ otherwise wait for each other. A receive buffer whose next doubling the
 room cannot cover does the same: it grows under that slot without a charge
 until its frame has arrived and been answered, since connections each
 part-way through a large frame would otherwise wait for each other's
-buffers. That overshoots the budget by one frame or
+buffers. It keeps the slot only while its client keeps sending: each
+growth under the slot must fill within 2&nbsp;seconds plus 1&nbsp;second
+per MiB it grew by. A connection that falls behind is charged what it grew
+by and gives the slot up if the budget has that much free by then, and is
+closed otherwise, so a stalled or trickling client cannot keep the other
+large uploads waiting for its frame deadline. That overshoots the budget by one frame or
 reply, never more, and a connection with no buffer charged keeps waiting
 for the budget. A connection that cannot get its share in time is closed,
 like a stalled one.</p>
