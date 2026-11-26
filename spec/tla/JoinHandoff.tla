@@ -74,8 +74,8 @@ VARIABLES
     legs,     \* nodes the current op has yet to reach
     cur,      \* the current op: [kind |-> ..., val |-> ...]
     final,    \* what the last op left: its value, or Absent
-    raced     \* history: J took a direct client write while an older
-              \* forward was still queued for it
+    raced     \* history: J took a direct client write while a forward of
+              \* an older op was still queued for it
 
 vars == <<store, jsrc, tomb, xst, xval, marked, fwd, phase, ops, legs, cur, final, raced>>
 
@@ -91,6 +91,10 @@ TypeOK ==
     /\ \A s \in Sources : Len(fwd[s]) <= 1
     /\ phase \in {"transfer", "completed", "confirmed", "abandoned"}
     /\ legs \subseteq Nodes
+    /\ ops \in 0..MaxOps
+    /\ cur \in [kind : Kinds, val : Vals]
+    /\ final \in Vals \cup {Absent}
+    /\ raced \in BOOLEAN
 
 Init ==
     /\ store = [n \in Nodes |-> IF n = J THEN Absent ELSE Initial]
@@ -139,7 +143,8 @@ ApplyLeg(n) ==
     /\ IF n = J
          THEN /\ store' = [store EXCEPT ![J] = Result(cur)]
               /\ jsrc' = "client"
-              /\ raced' = (raced \/ \E s \in Sources : fwd[s] /= <<>>)
+              /\ raced' = (raced \/ \E s \in Sources :
+                                     fwd[s] /= <<>> /\ Head(fwd[s]) /= cur)
               /\ UNCHANGED <<fwd, marked>>
          ELSE /\ UNCHANGED raced
               /\ IF phase = "confirmed" /\ n \in Displaced

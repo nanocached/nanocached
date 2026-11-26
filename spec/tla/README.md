@@ -27,7 +27,7 @@ tree.
 
 | Config | Expected | What it checks |
 |---|---|---|
-| `fixed_r1`, `fixed_r2` | no violation | all fixes in, R = 1 and R = 2, writes only before the promotion |
+| `fixed_r1`, `fixed_r2` | no violation | all fixes in, R = 1 and R = 2, ops start only before the promotion (their legs may land after it) |
 | `post_confirm_r1`, `post_confirm_r2` | no violation | the same, with writes by the old or the new list after the promotion |
 | `bug_no_delete_tombstone` | `TransferCopyNotStale` violated | a transfer copy read before a delete lands after the forwarded delete |
 | `bug_no_expiry_tombstone` | `TransferCopyNotStale` violated | the same with a touch to TTL 0 |

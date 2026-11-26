@@ -637,7 +637,7 @@ mod verification {
         }
     }
 
-    /// `fmix64` is injective (the module docs call it bijective).
+    /// `fmix64` is injective (its doc comment calls it bijective).
     #[kani::proof]
     fn fmix64_is_injective() {
         let x: u64 = kani::any();

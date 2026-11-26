@@ -11,7 +11,8 @@ code that calls these functions.
 
 ## Running
 
-With Kani 0.68.0 (`cargo install --locked kani-verifier && cargo kani setup`),
+With Kani 0.68.0
+(`cargo install --locked kani-verifier --version 0.68.0 && cargo kani setup`),
 one harness at a time:
 
 ```sh
@@ -37,3 +38,7 @@ cargo kani --bin nanocached-node --exact \
 The frame parser as a whole (`parse_resumable`) is not checked. Harnesses
 over a `BytesMut` input did not finish within 300 s per harness, even for a
 fully concrete two-byte frame parsed with tagging on.
+
+`joined_entry_stays_inside_the_buffer` stays below `MAX_ROSTER_LINE_LEN`
+(64 bytes), so the rejection of an over-long roster entry header is not
+explored.
