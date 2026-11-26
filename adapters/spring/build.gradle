@@ -86,7 +86,7 @@ dependencies {
     api 'org.nanocached:nanocached:0.6.2'
     // Spring's cache SPI. `api` for the same reason: the whole point of
     // this module is implementing org.springframework.cache types.
-    api 'org.springframework:spring-context:7.0.10'
+    api 'org.springframework:spring-context:7.1.0'
 
     // The Boot-interaction tests (BootAutoConfigurationInteractionTest)
     // prove the setup story against real Spring Boot autoconfiguration,
