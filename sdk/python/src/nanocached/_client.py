@@ -278,13 +278,23 @@ _READ_REPAIR_TTL = 60
 
 # How long a read-repair write-back waits after the replica hit before it
 # re-probes the primary (must still miss) and that replica (must still
-# hold the same bytes). A delete sends its replica legs only after the
-# primary has answered, so for about one round trip the primary misses
-# while the replica still has the key; without the recheck a repair landing
-# in that window wrote the deleted value back to the primary. A fixed,
-# small bound rather than a measured round trip. Mutable only so tests can
-# change it.
-_READ_REPAIR_RECHECK_DELAY = 0.02
+# hold the same bytes): the elapsed time of the primary read that missed
+# (the whole retried read), clamped to these bounds. A delete sends its
+# replica legs only after the primary has answered, so for about one round
+# trip the primary misses while the replica still has the key; without the
+# recheck a repair landing in that window wrote the deleted value back to
+# the primary. The floor covers a writer farther from the primary than
+# this reader; the ceiling keeps the held background slot short. Same
+# bounds in every SDK. Mutable only so tests can change them.
+_READ_REPAIR_RECHECK_MIN = 0.005
+_READ_REPAIR_RECHECK_MAX = 0.05
+
+
+def _read_repair_recheck_wait(primary_read_seconds: float) -> float:
+    """The read-repair recheck wait: ``primary_read_seconds`` clamped to
+    _READ_REPAIR_RECHECK_MIN.._READ_REPAIR_RECHECK_MAX."""
+    return min(max(primary_read_seconds, _READ_REPAIR_RECHECK_MIN), _READ_REPAIR_RECHECK_MAX)
+
 
 # Reserved for keep-alive pings: 0x00 followed by the ASCII bytes of
 # "nanocached-keepalive" (21 bytes total) — not just a single NUL, which
@@ -1276,13 +1286,14 @@ class NanocachedClient:
         key_bytes = _to_bytes(key)
         _check_key(key_bytes, namespace)
         await self._before_operation()
+        started = time.monotonic()
         value = await self._with_wrong_node_retry(
             lambda: self._read(
                 namespace, key_bytes, lambda connection: connection.get(key_bytes, namespace)
             )
         )
         if value is None and self._read_repair and self._ring is not None:
-            value = await self._try_read_repair(namespace, key_bytes)
+            value = await self._try_read_repair(namespace, key_bytes, time.monotonic() - started)
         if value is None or not self._compress:
             return value
         return decompress_value(value)
@@ -1311,19 +1322,22 @@ class NanocachedClient:
         key_bytes = _to_bytes(key)
         _check_key(key_bytes, namespace)
         await self._before_operation()
+        started = time.monotonic()
         raw = await self._with_wrong_node_retry(
             lambda: self._read(
                 namespace, key_bytes, lambda connection: connection.get(key_bytes, namespace)
             )
         )
         if raw is None and self._read_repair and self._ring is not None:
-            raw = await self._try_read_repair(namespace, key_bytes)
+            raw = await self._try_read_repair(namespace, key_bytes, time.monotonic() - started)
         if raw is None:
             return None
         token = content_digest(raw)
         return (decompress_value(raw) if self._compress else raw), token
 
-    async def _try_read_repair(self, namespace: bytes, key: bytes) -> bytes | None:
+    async def _try_read_repair(
+        self, namespace: bytes, key: bytes, primary_read_seconds: float = 0.0
+    ) -> bytes | None:
         """read repair: probes the remaining owners of ``key`` —
         every owner but the primary, which the normal read path already
         probed and got a clean miss from (same as the Rust, Go, Java and
@@ -1333,9 +1347,11 @@ class NanocachedClient:
         value — that same value repairs the true primary in the
         background, with TTL _READ_REPAIR_TTL (the original TTL can't be
         recovered from a GET, and TTL 0 would permanently resurrect
-        already-expired data), but only if, after
-        _READ_REPAIR_RECHECK_DELAY, the primary still misses and that owner
-        still holds the same bytes. The write-back shares its admission check
+        already-expired data), but only if, after waiting
+        ``primary_read_seconds`` (the primary read that missed) clamped to
+        _READ_REPAIR_RECHECK_MIN.._READ_REPAIR_RECHECK_MAX, the client is
+        still open, the primary still misses and that owner still holds the
+        same bytes. The write-back shares its admission check
         and its tracking set (_background_replica_writes) with
         fire_and_forget_replicas writes in _write() — one combined pool of
         at most _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES in flight, exactly
@@ -1365,16 +1381,24 @@ class NanocachedClient:
             if names:
                 primary = names[0]
 
+                wait = _read_repair_recheck_wait(primary_read_seconds)
+
                 async def repair(
-                    primary: str = primary, replica: str = name, value: bytes = value
+                    primary: str = primary,
+                    replica: str = name,
+                    value: bytes = value,
+                    wait: float = wait,
                 ) -> None:
-                    # Recheck before writing (see _READ_REPAIR_RECHECK_DELAY):
+                    # Recheck before writing (see _READ_REPAIR_RECHECK_MIN):
                     # a delete racing this read removes the replica's copy
                     # about one round trip after the primary's, and a write
                     # racing it fills the primary. Either way nothing is
-                    # written. A failed re-probe skips the repair silently,
-                    # as a failed owner probe does.
-                    await asyncio.sleep(_READ_REPAIR_RECHECK_DELAY)
+                    # written. A failed re-probe, or close() during the
+                    # wait, skips the repair silently, as a failed owner
+                    # probe does.
+                    await asyncio.sleep(wait)
+                    if self._closed:
+                        return
                     try:
                         primary_connection = await self._member_connection(primary)
                         if await primary_connection.get(key, namespace) is not None:
