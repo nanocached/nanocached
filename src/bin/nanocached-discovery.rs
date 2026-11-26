@@ -1295,8 +1295,9 @@ enum JoinStatus {
     /// Abandoned (or replaced by a join of another name): stop, and
     /// cancel with `X` an `M` that may have landed.
     Ended,
-    /// Superseded by a newer generation of the same `joining_name`: stop
-    /// without an `X` (issue #1994). `X` names only the joiner, so the
+    /// Superseded by a newer generation of the same `joining_name`, still
+    /// pending or already promoted (the joiner is a member): stop without
+    /// an `X` (issue #1994). `X` names only the joiner, so the
     /// node would match it against whichever handoff for that name it
     /// holds — by now possibly the newer generation's — and abort that
     /// one, or, if it already completed, restore its handed-off copies
@@ -1310,6 +1311,7 @@ enum JoinStatus {
 /// `joining_name` and `generation`, whose `LateHandoffs::promoted` is
 /// `promoted` (issue #1870).
 fn join_status(
+    registry: &Registry,
     current_join: &CurrentJoin,
     joining_name: &str,
     generation: u64,
@@ -1326,6 +1328,15 @@ fn join_status(
         // Generations only grow within one discovery process
         // (`next_join_generation`).
         Some(pending_generation) if pending_generation > generation => JoinStatus::Superseded,
+        // Not pending and not promoted under this generation, yet a member:
+        // a newer generation of the same name completed (issue #1994). An
+        // `X` would make the node abandon that finished handoff.
+        _ if lock(registry)
+            .get(joining_name)
+            .is_some_and(|node| node.state == NodeState::Joined) =>
+        {
+            JoinStatus::Superseded
+        }
         _ => JoinStatus::Ended,
     }
 }
@@ -2774,6 +2785,7 @@ async fn try_begin_next_join(
         let ready_token = ready_tokens.get(&ready_name).cloned().unwrap_or_default();
         let fanout_limit = Arc::clone(&fanout_limit);
         let current_join = Arc::clone(current_join);
+        let registry = Arc::clone(registry);
         let promoted = Arc::clone(&promoted);
 
         sends.spawn(async move {
@@ -2794,7 +2806,15 @@ async fn try_begin_next_join(
                 replication,
                 generation,
                 OUTBOUND_IO_TIMEOUT,
-                || join_status(&current_join, &joining_name, generation, &promoted),
+                || {
+                    join_status(
+                        &registry,
+                        &current_join,
+                        &joining_name,
+                        generation,
+                        &promoted,
+                    )
+                },
             )
             .await;
 
@@ -3816,7 +3836,15 @@ fn hand_off_from_late_member(
             replication,
             generation,
             OUTBOUND_IO_TIMEOUT,
-            || join_status(&current_join, &joining_name, generation, &promoted),
+            || {
+                join_status(
+                    &registry,
+                    &current_join,
+                    &joining_name,
+                    generation,
+                    &promoted,
+                )
+            },
         )
         .await;
         match result {
@@ -15616,6 +15644,7 @@ mod tests {
             roster: Arc::new(Vec::new()),
             late: LateHandoffs::default(),
         };
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(pending(9))));
         let promoted = AtomicBool::new(false);
         let checks = std::sync::atomic::AtomicU32::new(0);
@@ -15633,10 +15662,96 @@ mod tests {
             9,
             OUTBOUND_IO_TIMEOUT,
             || {
-                let status = join_status(&current_join, "joining-node", 9, &promoted);
+                let status = join_status(&registry, &current_join, "joining-node", 9, &promoted);
                 if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                     // Generation 9 is abandoned and the joiner re-registers.
                     *lock_current_join(&current_join) = Some(pending(10));
+                }
+                status
+            },
+        )
+        .await;
+
+        let frames = node_task.await.unwrap();
+        assert!(
+            frames.is_empty(),
+            "nothing may follow attempt 1, got {:?}",
+            frames
+                .iter()
+                .map(|frame| String::from_utf8_lossy(frame).into_owned())
+                .collect::<Vec<_>>()
+        );
+        let error = result.expect_err("a superseded join's M is not retried");
+        assert!(error.to_string().contains("superseded"), "{error}");
+    }
+
+    /// Issue #1994: as above, but by the retry the newer generation has
+    /// already completed: nothing is pending and the joiner is a member.
+    /// An `X` would make the node abandon that finished handoff and
+    /// restore its handed-off copies under a member.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_migrate_with_retry_sends_no_cancel_once_a_newer_generation_is_promoted() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+
+        let node_task = tokio::spawn(async move {
+            // Attempt 1: accepted, then dropped without an ack.
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+            // Record anything discovery sends after that.
+            let mut frames = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                timeout(Duration::from_millis(500), listener.accept()).await
+            {
+                let mut buffer = [0u8; 256];
+                let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+                frames.push(buffer[..bytes_read].to_vec());
+                let _ = stream.write_all(b"A\n").await;
+            }
+            frames
+        });
+
+        let pending = |generation| PendingJoin {
+            joining_name: "joining-node".to_string(),
+            expected: HashMap::new(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            generation,
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
+        };
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(pending(9))));
+        let promoted = AtomicBool::new(false);
+        let checks = std::sync::atomic::AtomicU32::new(0);
+        let result = send_migrate_with_retry(
+            "ready-token",
+            "ready-node",
+            &address,
+            &None,
+            &None,
+            "joining-node",
+            "127.0.0.1:9",
+            "joiner-token",
+            &[],
+            2,
+            9,
+            OUTBOUND_IO_TIMEOUT,
+            || {
+                let status = join_status(&registry, &current_join, "joining-node", 9, &promoted);
+                if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    // Generation 9 is abandoned, and generation 10 runs and
+                    // promotes the joiner.
+                    *lock_current_join(&current_join) = None;
+                    lock(&registry).insert(
+                        "joining-node".to_string(),
+                        NodeInfo::new(
+                            "127.0.0.1:9".to_string(),
+                            NodeState::Joined,
+                            "joiner-token".to_string(),
+                        ),
+                    );
                 }
                 status
             },
@@ -15915,7 +16030,7 @@ mod tests {
             2,
             9,
             Duration::from_millis(200),
-            || join_status(&current_join, "node-b", 9, &promoted),
+            || join_status(&registry, &current_join, "node-b", 9, &promoted),
         )
         .await;
 
@@ -15972,7 +16087,7 @@ mod tests {
 
         assert_eq!(lock(&registry)["node-j"].state, NodeState::Joined);
         assert_eq!(
-            join_status(&current_join, "node-j", 4, &promoted),
+            join_status(&registry, &current_join, "node-j", 4, &promoted),
             JoinStatus::Promoted
         );
     }
@@ -15983,6 +16098,7 @@ mod tests {
     /// and must not cancel — its `X` would reach the newer generation.
     #[test]
     fn join_status_is_current_only_for_the_same_name_and_generation() {
+        let registry: Registry = Arc::new(RegistryState::default());
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
             joining_name: "node-j".to_string(),
             expected: HashMap::new(),
@@ -15995,18 +16111,37 @@ mod tests {
         })));
         let promoted = AtomicBool::new(false);
         assert_eq!(
-            join_status(&current_join, "node-j", 4, &promoted),
+            join_status(&registry, &current_join, "node-j", 4, &promoted),
             JoinStatus::Current
         );
         assert_eq!(
-            join_status(&current_join, "node-j", 3, &promoted),
+            join_status(&registry, &current_join, "node-j", 3, &promoted),
             JoinStatus::Superseded,
             "an earlier generation under the same name"
         );
         assert_eq!(
-            join_status(&current_join, "node-k", 4, &promoted),
+            join_status(&registry, &current_join, "node-k", 4, &promoted),
             JoinStatus::Ended,
             "another name under the same generation"
+        );
+        // Issue #1994: nothing pending, but a newer generation promoted it.
+        *lock_current_join(&current_join) = None;
+        lock(&registry).insert(
+            "node-j".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:9".to_string(),
+                NodeState::Joined,
+                "tk-node-j".to_string(),
+            ),
+        );
+        assert_eq!(
+            join_status(&registry, &current_join, "node-j", 3, &promoted),
+            JoinStatus::Superseded,
+            "an earlier generation of a joiner that is now a member"
+        );
+        assert_eq!(
+            join_status(&registry, &current_join, "node-k", 3, &promoted),
+            JoinStatus::Ended
         );
     }
 
