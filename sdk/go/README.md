@@ -133,7 +133,9 @@ hold: two more reads and a short wait per repair, none of them on the
 caller's read. This narrows the window without closing it. The read itself
 can still return a value that is being deleted, as any read racing a
 delete can, and a delete that lands between the recheck and the repair
-write is still written back to the primary for up to 60 seconds.
+write is still written back to the primary for up to 60 seconds. A
+`Close()` that starts during the wait skips the repair; `Close()` still
+waits for it to finish, at most 50 ms longer.
 
 ## Hedged reads
 

@@ -1245,11 +1245,15 @@ func (c *Client) tryReadRepair(namespace, key []byte, recheckAfter time.Duration
 // an error) and the replica must still return value. Anything else — a hit
 // or an error on the primary, a miss, an error or other bytes on the
 // replica — skips the repair. The replica is re-probed last: a racing delete
-// reaches it last. A Close() during the wait still waits for this (the task
-// is on backgroundReplicaWG), and the recheck runs on the connections Close()
-// has not torn down yet, so a pending repair is still drained.
+// reaches it last. A client that Close() has started closing during the wait
+// skips the repair, as in the Rust and Java SDKs; Close() still waits for
+// the task to exit (it is on backgroundReplicaWG), so the wait adds at most
+// readRepairRecheckMax to Close().
 func (c *Client) readRepairStillNeeded(namespace, key []byte, primary, replica string, value []byte, recheckAfter time.Duration) bool {
 	time.Sleep(recheckAfter)
+	if c.IsClosed() {
+		return false
+	}
 	if _, found, err := c.get(primary, namespace, key); err != nil || found {
 		return false
 	}

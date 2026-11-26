@@ -5624,7 +5624,14 @@ func TestReadRepairRechecksBeforeWritingAndSkipsAValueTheReplicaNoLongerHolds(t 
 				t.Fatalf("GetBytes = %q, %v, %v, want the replica's value", value, ok, err)
 			}
 			change(replica)
-			closeClient() // waits for the background repair
+			// Close only once the recheck has read the replica: a Close()
+			// during the wait would skip the repair on its own. Close()
+			// then waits for the task, which writes or skips without
+			// looking at the closed flag again.
+			if !waitUntil(t, 5*time.Second, func() bool { return replica.getCount.Load() == 2 }) {
+				t.Fatal("the recheck never read the replica")
+			}
+			closeClient()
 			if stored, ok := primary.store.Load(storeKey{"", "k"}); ok {
 				t.Fatalf("the primary was repaired with %q", stored)
 			}
@@ -5655,9 +5662,41 @@ func TestReadRepairSkipsAPrimaryThatNoLongerMisses(t *testing.T) {
 		t.Fatalf("GetBytes = %v, %v, want a hit", ok, err)
 	}
 	primary.store.Store(storeKey{"", "k"}, []byte("newer"))
+	if !waitUntil(t, 5*time.Second, func() bool { return primary.getCount.Load() == 2 }) {
+		t.Fatal("the recheck never read the primary")
+	}
 	closeClient()
 	if stored, _ := primary.store.Load(storeKey{"", "k"}); string(stored.([]byte)) != "newer" {
 		t.Fatalf("primary holds %q, want newer", stored)
+	}
+}
+
+// A Close() that starts while a repair waits for its recheck skips the
+// repair (no recheck, no write) but still waits for the task to exit.
+func TestReadRepairSkipsTheRepairWhenCloseStartsDuringTheRecheckWait(t *testing.T) {
+	lengthenReadRepairRecheck(t, 300*time.Millisecond)
+
+	nodes, discovery := startCluster(t, 2)
+	owners := ownersOf("k")
+	primary, replica := nodes[owners[0]], nodes[owners[1]]
+	replica.store.Store(storeKey{"", "k"}, []byte("from-replica"))
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}, ReadRepair: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := client.GetBytes("k"); err != nil || !ok {
+		t.Fatalf("GetBytes = %v, %v, want a hit", ok, err)
+	}
+	started := time.Now()
+	client.Close()
+	if elapsed := time.Since(started); elapsed < 200*time.Millisecond {
+		t.Fatalf("Close() returned after %v, before the repair task finished its wait", elapsed)
+	}
+	if primary.hasKey("k") {
+		t.Fatal("the primary was repaired after Close() started")
+	}
+	if got := primary.getCount.Load(); got != 1 {
+		t.Fatalf("primary getCount = %d, want 1 (no recheck after Close)", got)
 	}
 }
 
