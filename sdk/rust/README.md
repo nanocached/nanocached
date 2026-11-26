@@ -502,6 +502,18 @@ budget) and drained by `close()`. Past the cap the repair for that miss
 is simply skipped: it only fires on an already-rare clean miss, and
 losing one costs nothing beyond staying in the window for one more read.
 
+A delete reaches the key's primary first and its other owners about one
+round trip later, so a read that runs alongside a delete can find the
+primary already missing while a replica still holds the key. That read
+returns the deleted value. The repair is not written at once: the
+background task waits for the round trip of the primary read that missed
+(at least 5 ms, at most 50 ms), re-reads the primary, which must still
+miss, and then the replica, which must still return the same bytes; only
+then does it write. By then a racing delete has normally reached the
+replica, so its value is not written back. A delete whose replica leg
+takes longer than that wait can still be undone on the primary for the
+60-second repair TTL: the check narrows the window, it does not close it.
+
 ## Hedged reads
 
 Off by default. A read goes to the key's primary owner and moves on to

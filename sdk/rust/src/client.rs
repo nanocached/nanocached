@@ -61,6 +61,16 @@ const KEEPALIVE_KEY: &[u8] = b"\x00nanocached-keepalive";
 /// repaired past its true expiry simply gets re-repaired (or genuinely
 /// found missing) on a later miss.
 const READ_REPAIR_TTL: u64 = 60;
+/// The bounds on how long a read repair waits, after a replica hit, before
+/// it re-checks both owners (#2004). The wait is the round trip of the
+/// primary read that missed, clamped to this range: a delete is
+/// primary-first, so its replica legs land about one round trip after the
+/// primary stopped holding the key, and a repair written inside that gap
+/// would put the deleted value back on the primary. The floor covers a
+/// writer farther from the primary than this reader; the ceiling keeps the
+/// background permit the repair holds short.
+const READ_REPAIR_RECHECK_MIN: Duration = Duration::from_millis(5);
+const READ_REPAIR_RECHECK_MAX: Duration = Duration::from_millis(50);
 /// Internal keep-alive interval in milliseconds — see the comment at its
 /// use in `connect`. Public-but-hidden purely as a test hook.
 #[doc(hidden)]
@@ -2260,13 +2270,17 @@ impl NanocachedClient {
     /// for why hashing the *decompressed* value would never match the
     /// server's own digest).
     async fn read_raw_with_repair(&self, namespace: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let started = Instant::now();
         let mut value = self
             .with_cluster_retry(|| self.read(namespace, key))
             .await?;
         if value.is_none() && self.inner.read_repair {
             let clustered = matches!(self.inner.state.lock().await.target, Target::Cluster { .. });
             if clustered {
-                value = self.try_read_repair(namespace, key).await;
+                let recheck_after = started
+                    .elapsed()
+                    .clamp(READ_REPAIR_RECHECK_MIN, READ_REPAIR_RECHECK_MAX);
+                value = self.try_read_repair(namespace, key, recheck_after).await;
             }
         }
         Ok(value)
@@ -2324,7 +2338,21 @@ impl NanocachedClient {
     /// way (connection lost, WrongNode, another miss) is swallowed;
     /// nothing here may turn an already-accepted miss into an error. A
     /// failed repair write is counted in `stats().read_repair_failures`.
-    async fn try_read_repair(&self, namespace: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    ///
+    /// The repair is not written straight away (#2004). The background
+    /// task first waits `recheck_after` (the primary read's round trip,
+    /// clamped), then re-probes the primary, which must still answer a
+    /// clean miss, and then the replica that hit, which must still return
+    /// the same bytes. Only then is the repair written; any other outcome
+    /// (a hit or a different value, `W`, an error, `close()` meanwhile)
+    /// skips it without counting a failure. A delete that raced the read
+    /// has by then reached the replica, so its value is not written back.
+    async fn try_read_repair(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        recheck_after: Duration,
+    ) -> Option<Vec<u8>> {
         let owners = {
             let state = self.inner.state.lock().await;
             Self::owner_names(&state, namespace, key)
@@ -2355,11 +2383,33 @@ impl NanocachedClient {
                     if !self.inner.closed.load(Ordering::SeqCst) {
                         let client = self.clone();
                         let primary = primary.clone();
+                        let replica = name.clone();
                         let owned_namespace: Arc<[u8]> = Arc::from(namespace.to_vec());
                         let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
                         let owned_value: Arc<[u8]> = Arc::from(value.clone());
                         tokio::spawn(async move {
                             let _permit = permit; // held until this task finishes
+                            tokio::time::sleep(recheck_after).await;
+                            if client.inner.closed.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            let probe = |connection: Arc<Connection>| {
+                                let namespace = Arc::clone(&owned_namespace);
+                                let key = Arc::clone(&owned_key);
+                                async move { connection.get(&namespace, &key).await }
+                            };
+                            // The replica is re-probed last: a racing
+                            // delete reaches it last.
+                            if !matches!(
+                                client.apply_reconnecting(Some(&primary), &probe).await,
+                                Ok(None)
+                            ) {
+                                return;
+                            }
+                            match client.apply_reconnecting(Some(&replica), &probe).await {
+                                Ok(Some(again)) if again[..] == owned_value[..] => {}
+                                _ => return,
+                            }
                             let op = move |connection: Arc<Connection>| {
                                 let namespace = Arc::clone(&owned_namespace);
                                 let key = Arc::clone(&owned_key);
