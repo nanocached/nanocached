@@ -72,6 +72,46 @@ func TestDeleteWhosePrimaryStaysUnreachableStillDeletesTheReplicas(t *testing.T)
 	}
 }
 
+// The fallback deletes are awaited even with FireAndForgetReplicas: when
+// Delete returns its error, the replica has already applied the delete.
+func TestDeleteWhosePrimaryStaysUnreachableAwaitsTheReplicaDeletesWithFireAndForget(t *testing.T) {
+	nodes, discovery := startBatchTouchCluster(t, 2, [2]mockNodeOpts{})
+	client := connectCluster(t, discovery, Config{FireAndForgetReplicas: true})
+	owners := ownersOf("k")
+	primary, replica := nodes[owners[0]], nodes[owners[1]]
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return replica.hasKey("k") }, "the replica to store the value")
+	primary.close()
+	time.Sleep(100 * time.Millisecond) // the client's read loop sees the FIN
+	replica.deleteDelay.Store(int64(200 * time.Millisecond))
+	if _, err := client.Delete("k"); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Delete err = %v, want ErrConnectionLost", err)
+	}
+	if replica.hasKey("k") {
+		t.Fatal("Delete returned before the replica applied the fallback delete")
+	}
+}
+
+// A dead replica among the fallback deletes is counted as a replica write
+// failure; the caller still gets the primary's error.
+func TestAFailedFallbackDeleteCountsAReplicaWriteFailure(t *testing.T) {
+	pc := startPrimaryFirstCluster(t, "k")
+	if err := pc.client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	pc.primary.close()
+	pc.replica.close()
+	time.Sleep(100 * time.Millisecond)
+	if _, err := pc.client.Delete("k"); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Delete err = %v, want ErrConnectionLost", err)
+	}
+	if got := pc.client.Stats().ReplicaWriteFailures; got == 0 {
+		t.Fatal("ReplicaWriteFailures = 0, want the failed fallback delete counted")
+	}
+}
+
 // A primary that answers `W` on every attempt is not a lost connection: the
 // replicas are left alone, as before.
 func TestDeleteWhosePrimaryKeepsAnsweringWrongNodeDeletesNoReplica(t *testing.T) {

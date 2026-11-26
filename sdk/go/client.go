@@ -1325,15 +1325,29 @@ func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error
 // unchanged. A primary that answered `W` is not covered: it is reachable and
 // the retry already rerouted. The replicas are the owners on the ring in
 // force now, without its primary, which the retry just failed to reach.
+// They are sent concurrently and awaited before the error is returned, even
+// with FireAndForgetReplicas (as in the other SDKs): the caller learns of
+// the failure only once the delete has reached every owner it can. A failed
+// leg is counted in Stats().ReplicaWriteFailures.
 func (c *Client) deleteOtherOwnersAfterLostPrimary(namespace, key []byte) {
 	names := c.ownerNames(namespace, key)
 	if len(names) < 2 {
 		return
 	}
-	c.fanReplicas(names[1:], func(conn *connection) error {
-		_, err := conn.deleteNS(namespace, key)
-		return err
-	}).Wait()
+	var wg sync.WaitGroup
+	for _, name := range names[1:] {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := c.applyReconnecting(name, func(conn *connection) error {
+				_, err := conn.deleteNS(namespace, key)
+				return err
+			}); err != nil {
+				c.stats.replicaWriteFailures.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // ── バッチ操作 (issues #128/#150/#151) ───────────────────────────────
