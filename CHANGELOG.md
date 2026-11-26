@@ -14,6 +14,18 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node: a receive buffer that grew under the in-flight overdraft token kept
+  it until its frame arrived, which only the client decided, so a client
+  that stalled or trickled mid-frame made every other large upload that
+  needed the token wait up to its 60 s frame deadline, and some were closed
+  with "in-flight byte budget exhausted". Each growth under the token must
+  now fill within 2 s plus 1 s per MiB; a buffer that falls behind is
+  charged its growth and gives the token up if the budget has room, and its
+  connection is closed otherwise. A connection that got the token after the
+  pinned bytes had gone no longer gives it up to wait for bytes a larger
+  charge queued ahead is owed, which once left every waiter waiting for
+  bytes with the token free (#1995).
+
 - Node: `/metrics` gave distinct namespaces the same `namespace` label, so
   the scrape held duplicate series: names that are not valid UTF-8 all
   decoded to `�`, and a short name could be spelled like a long name's
