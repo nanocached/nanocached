@@ -47,6 +47,12 @@ framework adapters at one version, whether or not a component changed.
   is still arriving after that `E`, as it already did after a malformed frame
   (#1408, #1941).
 
+- Proxy: the `E` for an upstream failure (a backend that failed the request,
+  or an `i`/`k`/`x` whose outcome is unknown) closed the connection with the
+  requests pipelined behind it unread, which made the close a reset that can
+  discard the `E`. The proxy now drains what is still arriving after that
+  `E` too (#2002).
+
 - Node: a decommission that retried a key's transfer after a refused or
   failed attempt resent the value and TTL it had read before the first try.
   A client write that landed during the backoff (or the reconnect) was
