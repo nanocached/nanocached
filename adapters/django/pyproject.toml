@@ -40,7 +40,7 @@ where = ["src"]
 # (`pip install --group dev` / `uv pip install --group dev`). Not part of the
 # published package's metadata.
 [dependency-groups]
-dev = ["ruff==0.17.5", "mypy==2.4.1", "django-stubs==6.1.2", "django-stubs-ext==6.1.2"]
+dev = ["ruff==0.17.6", "mypy==2.4.1", "django-stubs==6.1.2", "django-stubs-ext==6.1.2"]
 
 [tool.ruff]
 target-version = "py311"
