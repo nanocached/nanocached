@@ -32,5 +32,9 @@ uuid = { version = "1", features = ["v4"] }
 rcgen = "0.14.9"
 tokio = { version = "1", features = ["test-util"] }
 
+[lints.rust]
+# Kani proof harnesses (`cargo kani`) live under `#[cfg(kani)]`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
 [lints.clippy]
 all = "deny"
