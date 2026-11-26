@@ -450,7 +450,8 @@ pipelined behind an <code>i</code> is therefore not undone by the
 reach each replica in the order of the requests. Only the request on the
 same key waits: other keys on the connection, and every other connection,
 are not held, and a connection that never sends a same-key request behind
-an <code>i</code>, <code>k</code> or <code>x</code> sees no added latency.
+an <code>i</code>, <code>k</code> or <code>x</code>, an expiring touch or a
+delete (below) sees no added latency.
 For one that does, a request that is not itself an <code>i</code>,
 <code>k</code> or <code>x</code> goes out after a round trip to the primary.
 An <code>i</code>, <code>k</code> or <code>x</code> behind another one is
@@ -478,6 +479,17 @@ so it waits until those replica frames are enqueued, as for an <code>i</code>
 frame at once. Like a <code>g</code> or <code>s</code>, such a touch is in the
 order only when it has to wait itself, and it releases the key once its frames
 are enqueued, not once the owners answer.</p>
+
+<p>A delete (<code>D</code> or <code>d</code>) is inside the order the same
+way. The proxy sends the key&rsquo;s other owners their delete only after the
+primary has answered, so that a primary that fails or answers <code>W</code>
+is retried while every other copy is still in place, and a later request on
+the same key from the same connection waits until those frames are enqueued.
+That request therefore goes out after a round trip to the primary. The
+delete&rsquo;s own reply comes after the primary&rsquo;s round trip and then
+the other owners&rsquo;, since the proxy awaits their answers before
+answering the client, as for any write. With one owner per key there are no
+other owners, and nothing waits.</p>
 
 <p>One case is wider than the key. A multi-key request (<code>m</code>,
 <code>o</code>, <code>y</code>) that has to wait, or an expiring
@@ -941,7 +953,7 @@ here.</p>
   <li>SDK production constants (timeouts, in-flight budgets) are mutable,
   documented-but-hidden test knobs so each SDK&rsquo;s own test suite can
   shrink them; not an API, and not a connect option.</li>
-  <li>A node or discovery server answers a connection turned away by a
+  <li>A node, proxy or discovery server answers a connection turned away by a
   connection cap (the global one or the per-IP one) with <code>B</code>
   and keeps it open for up to 200&nbsp;ms to read what the peer has already
   sent, so that closing does not reset the reply away. At most 128 rejected

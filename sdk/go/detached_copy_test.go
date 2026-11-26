@@ -191,11 +191,13 @@ func TestReadRepairWriteBackDoesNotReadTheCallersValueAfterTheReadReturns(t *tes
 				value[i] = 'B'
 			}
 			release()
-			closeClient() // waits for the background repair
-			stored, ok := primary.store.Load(storeKey{"", key})
-			if !ok {
+			// Wait for the repair itself: a Close() that started during
+			// the repair's recheck wait would skip the write.
+			if !waitUntil(t, 5*time.Second, func() bool { return primary.hasKey(key) }) {
 				t.Fatal("the primary was never repaired")
 			}
+			closeClient()
+			stored, _ := primary.store.Load(storeKey{"", key})
 			if got := stored.([]byte); !bytes.Equal(got, original) {
 				t.Fatalf("the primary was repaired with %d of %d bytes changed by the caller", bytes.Count(got, []byte("B")), len(got))
 			}

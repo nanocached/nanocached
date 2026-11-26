@@ -2497,7 +2497,9 @@ impl NanocachedClient {
     /// primary has answered, as for `touch` with `Some(0)` (issue #934):
     /// a primary that could not be reached or answered `W` is rerouted
     /// with no replica deleted yet, so the reroute's answer is not a
-    /// `false` from a replica this call had already emptied.
+    /// `false` from a replica this call had already emptied. When the
+    /// primary still cannot be reached after that retry, the other owners
+    /// are sent the delete before [`Error::ConnectionLost`] is returned.
     pub async fn delete(&self, key: impl AsRef<[u8]>) -> Result<bool> {
         self.delete_in(DEFAULT_NAMESPACE, key).await
     }
@@ -2508,12 +2510,47 @@ impl NanocachedClient {
         let key = key.as_ref();
         validate_key(namespace, key)?;
         self.before_operation().await?;
-        self.with_cluster_retry(|| {
-            self.write(namespace, key, WriteBody::Delete, |connection| async move {
-                connection.delete(namespace, key).await
+        let result = self
+            .with_cluster_retry(|| {
+                self.write(namespace, key, WriteBody::Delete, |connection| async move {
+                    connection.delete(namespace, key).await
+                })
             })
-        })
-        .await
+            .await;
+        // Issue #2005: a primary that is dead but still listed (until
+        // discovery's liveness timeout) fails the retry after the forced
+        // refresh too, so the primary-first fan-out in `write` never sent
+        // the other owners theirs. A read falling back to them would then
+        // return the deleted value, and one of them would be promoted with
+        // it. A delete is safe to apply at any time, so they get it now,
+        // before the error is raised; the caller still gets the error, so
+        // the `bool` keeps meaning what the primary answered. A `W` or any
+        // other error leaves them alone, as before. The legs run at once
+        // and are awaited even with `fire_and_forget_replicas`, so they
+        // have been answered when the error reaches the caller; a failed
+        // leg counts in `replica_write_failures`.
+        if let Err(Error::ConnectionLost(_)) = &result {
+            let others: Vec<String> = {
+                let state = self.inner.state.lock().await;
+                Self::owner_names(&state, namespace, key)
+                    .into_iter()
+                    .skip(1)
+                    .collect()
+            };
+            let legs = others.iter().map(|name| async move {
+                let op = |connection: Arc<Connection>| async move {
+                    connection.delete(namespace, key).await
+                };
+                if self.apply_reconnecting(Some(name), &op).await.is_err() {
+                    self.inner
+                        .stats
+                        .replica_write_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            futures_util::future::join_all(legs).await;
+        }
+        result
     }
 
     // ── touch (issue #825) ───────────────────────────────────────────
