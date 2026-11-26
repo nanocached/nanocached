@@ -128,7 +128,10 @@ type Config struct {
 	// ReadRepair probes the remaining owners on a clean primary miss and
 	// repairs the gap in the background if one still holds the value
 	// (read repair). Off by default. Costs extra reads only on the
-	// misses it actually applies to.
+	// misses it actually applies to. Before writing, the repair waits
+	// about one round trip (5 to 50 ms) and checks that the primary still misses
+	// and the replica still holds the same bytes, so a delete racing the
+	// read is not written back in the common case.
 	ReadRepair bool
 	// ReadHedgeAfter routes a Get/GetBytes around a slow — not dead —
 	// owner (hedged reads): if the primary hasn't answered within this
@@ -419,6 +422,21 @@ var keepAliveInterval = 30 * time.Second
 // repaired past its true expiry simply gets re-repaired (or genuinely
 // found missing) on a later miss.
 const readRepairTTL = 60
+
+// readRepairRecheckMin and readRepairRecheckMax bound how long a read repair
+// waits after a replica hit before it re-probes the primary and that
+// replica: the time the primary read took (about one round trip), clamped
+// to these. A delete reaches the replicas only after the primary answered,
+// so for about one round trip the primary misses a deleted key while a
+// replica still holds it; a repair written in that window would put the
+// deleted value back on the primary for readRepairTTL. The floor covers a
+// writer farther from the primary than this reader; the ceiling keeps the
+// background slot the repair holds short. Variables only so tests can
+// lengthen them.
+var (
+	readRepairRecheckMin = 5 * time.Millisecond
+	readRepairRecheckMax = 50 * time.Millisecond
+)
 
 type member struct {
 	address    string
@@ -1119,6 +1137,7 @@ func (c *Client) getRawNS(namespace []byte, key string) (raw []byte, ok bool, er
 		return nil, false, err
 	}
 	keyBytes := []byte(key)
+	started := time.Now()
 	err = c.withClusterRetry(func() error {
 		v, o, readErr := c.read(namespace, keyBytes, func(conn *connection) ([]byte, bool, error) {
 			return conn.getNS(namespace, keyBytes)
@@ -1127,7 +1146,8 @@ func (c *Client) getRawNS(namespace []byte, key string) (raw []byte, ok bool, er
 		return readErr
 	})
 	if err == nil && !ok && c.readRepair {
-		raw, ok = c.tryReadRepair(namespace, keyBytes)
+		recheckAfter := min(max(time.Since(started), readRepairRecheckMin), readRepairRecheckMax)
+		raw, ok = c.tryReadRepair(namespace, keyBytes, recheckAfter)
 	}
 	return raw, ok, err
 }
@@ -1136,7 +1156,15 @@ func (c *Client) getRawNS(namespace []byte, key string) (raw []byte, ok bool, er
 // primary, which the normal read path already probed and got a clean miss
 // from — in rank order, for a value. The first one that has it wins: its
 // value is returned, and a best-effort write repairs the primary in the
-// background (read repair) with readRepairTTL. The background write
+// background (read repair) with readRepairTTL. The background task first
+// waits recheckAfter (the primary read's time, clamped to
+// readRepairRecheckMin..readRepairRecheckMax) and re-probes the primary,
+// which must still miss, and then that replica, which must still return the same bytes; it
+// writes the repair only if both hold, so a delete whose replica legs were
+// still on their way (they follow the primary's answer) is not written back
+// in the common case. A delete landing between that recheck and the write is
+// still written back; the window narrows but does not close. A skipped
+// repair is not a failure and is not counted. The background task
 // is bounded and drained exactly like a fire-and-forget replica write: it
 // takes a backgroundReplicaSem slot and is tracked on backgroundReplicaWG
 // so Close() waits for it, and no more than
@@ -1147,7 +1175,7 @@ func (c *Client) getRawNS(namespace []byte, key string) (raw []byte, ok bool, er
 // (connection lost, WrongNode, another miss) is swallowed; nothing here may
 // turn an already-accepted miss into an error. A failed repair write is
 // counted in Stats().ReadRepairFailures.
-func (c *Client) tryReadRepair(namespace, key []byte) (value []byte, ok bool) {
+func (c *Client) tryReadRepair(namespace, key []byte, recheckAfter time.Duration) (value []byte, ok bool) {
 	names := c.ownerNames(namespace, key)
 	if len(names) == 0 {
 		return nil, false
@@ -1192,10 +1220,13 @@ func (c *Client) tryReadRepair(namespace, key []byte) (value []byte, ok bool) {
 					if !c.compress {
 						repairValue = bytes.Clone(v)
 					}
+					replica := name
 					go func() {
 						defer c.backgroundReplicaWG.Done()
 						defer func() { <-c.backgroundReplicaSem }()
-						repair(repairValue)
+						if c.readRepairStillNeeded(namespace, key, primary, replica, repairValue, recheckAfter) {
+							repair(repairValue)
+						}
 					}()
 				} else {
 					c.mu.Unlock()
@@ -1207,6 +1238,27 @@ func (c *Client) tryReadRepair(namespace, key []byte) (value []byte, ok bool) {
 		return v, true
 	}
 	return nil, false
+}
+
+// readRepairStillNeeded is the recheck tryReadRepair runs before writing a
+// repair: after recheckAfter the primary must still miss (a clean miss, not
+// an error) and the replica must still return value. Anything else — a hit
+// or an error on the primary, a miss, an error or other bytes on the
+// replica — skips the repair. The replica is re-probed last: a racing delete
+// reaches it last. A client that Close() has started closing during the wait
+// skips the repair, as in the Rust and Java SDKs; Close() still waits for
+// the task to exit (it is on backgroundReplicaWG), so the wait adds at most
+// readRepairRecheckMax to Close().
+func (c *Client) readRepairStillNeeded(namespace, key []byte, primary, replica string, value []byte, recheckAfter time.Duration) bool {
+	time.Sleep(recheckAfter)
+	if c.IsClosed() {
+		return false
+	}
+	if _, found, err := c.get(primary, namespace, key); err != nil || found {
+		return false
+	}
+	current, found, err := c.get(replica, namespace, key)
+	return err == nil && found && bytes.Equal(current, value)
 }
 
 func (c *Client) get(slot string, namespace, key []byte) (value []byte, ok bool, err error) {

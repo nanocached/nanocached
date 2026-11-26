@@ -829,7 +829,12 @@ func (c *connection) poison(err error) {
 // request is the one the node refused — responses are FIFO — so it alone
 // receives rejected; every other waiter poisoned alongside it merely
 // shares the dead connection and receives err, the plain connection-lost
-// error, which keeps their redial. rejected == nil is poison.
+// error, which keeps their redial. The node answers only the oldest
+// request with `En` and reads nothing after it (docs/protocol.html), so
+// those waiters are also marked errRequestNotSent: a non-idempotent
+// request among them (Incr, a CAS, an expiring touch) is redialed and
+// resent instead of failing as outcome unknown. rejected == nil is
+// poison.
 func (c *connection) poisonRejecting(err, rejected error) {
 	c.mu.Lock()
 	if c.closed {
@@ -846,12 +851,16 @@ func (c *connection) poisonRejecting(err, rejected error) {
 	if c.conn != nil {
 		_ = c.conn.Close()
 	}
+	behind := err
+	if rejected != nil {
+		behind = notSent(err)
+	}
 	for i, req := range pending {
 		if i == 0 && rejected != nil {
 			req.ch <- roundTripResult{err: rejected}
 			continue
 		}
-		req.ch <- roundTripResult{err: err}
+		req.ch <- roundTripResult{err: behind}
 	}
 	if onClose != nil {
 		onClose()
@@ -1001,8 +1010,8 @@ func (c *connection) readLoop() {
 			if errors.Is(err, errServerRejected) {
 				// A node's `En` refuses one request (issue #940): only
 				// that one carries the rejection; the others pipelined
-				// behind it merely lose the connection and keep their
-				// redial.
+				// behind it were never read, so they lose the connection
+				// as never sent and keep their redial (issue #2001).
 				c.poisonRejecting(connectionLost(
 					"the server closed the connection after rejecting a request", nil), err)
 			} else if errors.Is(err, ErrProtocol) || errors.Is(err, ErrConnectionLost) {
