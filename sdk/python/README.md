@@ -109,7 +109,10 @@ and `get` asks the primary, falling over to the next owner only when the
 holder is unreachable. `client.replication` exposes the factor in use.
 A `delete` goes to the primary first and to the other owners only once the
 primary has answered, so a reroute after a failed or wrong-node primary still
-finds the key and returns `True`.
+finds the key and returns `True`. If the primary is still unreachable after
+the retry (dead but still listed by discovery), the other owners are sent the
+delete anyway before the connection error is raised, so a read that falls
+back to a replica does not return the deleted value.
 
 ## Namespaces
 

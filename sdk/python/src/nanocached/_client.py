@@ -1489,7 +1489,8 @@ class NanocachedClient:
         deleted no replica's copy when the call is rerouted, so the reroute
         still finds the key. Those replica deletes run after the primary's
         answer, outside the pipelined-order guarantee, like the retry
-        paths."""
+        paths. A primary still unreachable after the retry raises, but
+        only once the other owners have been sent the delete."""
         return await self._delete(b"", key)
 
     async def _delete(self, namespace: bytes, key: str | bytes) -> bool:
@@ -1498,14 +1499,36 @@ class NanocachedClient:
         key_bytes = _to_bytes(key)
         _check_key(key_bytes, namespace)
         await self._before_operation()
-        return await self._with_wrong_node_retry(
-            lambda: self._write(
-                namespace,
-                key_bytes,
-                lambda connection: connection.delete(key_bytes, namespace),
-                primary_first=True,
-            ),
-        )
+
+        def op(connection: Connection) -> Awaitable[bool]:
+            return connection.delete(key_bytes, namespace)
+
+        try:
+            return await self._with_wrong_node_retry(
+                lambda: self._write(namespace, key_bytes, op, primary_first=True),
+            )
+        except (ConnectionError, OSError):
+            # The primary stayed unreachable through the retry (dead, but
+            # still listed until discovery's liveness timeout), so no
+            # replica was sent the delete, and a read falling back to one
+            # would return the deleted value. A delete is safe to apply at
+            # any time, so the other owners are sent it before the error
+            # is raised; the caller still gets the error, since whether
+            # the key existed is the primary's answer. The legs run
+            # concurrently and are awaited even with
+            # fire_and_forget_replicas, so a read after the error sees them.
+            # A `W` answer is not caught here and keeps its own path.
+            if self._ring is not None and not self._closed:
+                others = self._owner_names(namespace, key_bytes)[1:]
+                tasks = self._dispatch_replica_writes(others, op, synchronous=True)
+                if tasks:
+                    for outcome in await asyncio.gather(*tasks, return_exceptions=True):
+                        if isinstance(outcome, BaseException):
+                            _warn(
+                                "nanocached: a replica write raised an unexpected error: "
+                                f"{outcome!r}"
+                            )
+            raise
 
     # ── Touch (issue #825) ─────────────────────────────────────────────
 
@@ -3691,7 +3714,11 @@ class NanocachedClient:
         task.add_done_callback(release)
 
     def _dispatch_replica_writes(
-        self, names: list[str], op: Callable[[Connection], Awaitable[object]]
+        self,
+        names: list[str],
+        op: Callable[[Connection], Awaitable[object]],
+        *,
+        synchronous: bool = False,
     ) -> list[asyncio.Task[None]]:
         """Admits each name in ``names`` as a replica leg running ``op`` —
         the fan-out machinery shared by _write()'s own replica legs and
@@ -3703,7 +3730,8 @@ class NanocachedClient:
         synchronously. Every leg swallows _SWALLOWABLE_ERRORS internally
         and counts it in stats().replica_write_failures (client-side
         replication) — only a genuine programming error can still surface
-        in a returned task's result."""
+        in a returned task's result. ``synchronous`` returns every leg to be
+        awaited, even with fire_and_forget_replicas."""
 
         async def replica_write(name: str) -> None:
             try:
@@ -3736,6 +3764,7 @@ class NanocachedClient:
             # path exactly as with the option off.
             if (
                 self._fire_and_forget_replicas
+                and not synchronous
                 and not self._closed
                 and len(self._background_replica_writes) < _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
             ):
