@@ -304,6 +304,18 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     // policy decision, applied identically across all SDKs.
     private const long ReadRepairTtlSeconds = 60;
 
+    // Issue #2006: how long a read repair waits, after a replica hit,
+    // before it rechecks both owners. The wait is the round trip of the
+    // primary read that missed, clamped to this range: a delete is
+    // primary-first, so its replica legs land about one round trip after
+    // the primary stopped holding the key, and a repair written in that
+    // gap would put the deleted value back on the primary. The floor
+    // covers a writer farther from the primary than this reader; the
+    // ceiling keeps the background permit the repair holds short. Same
+    // rule in every SDK.
+    private static readonly TimeSpan ReadRepairRecheckMin = TimeSpan.FromMilliseconds(5);
+    private static readonly TimeSpan ReadRepairRecheckMax = TimeSpan.FromMilliseconds(50);
+
     private sealed class Member
     {
         internal Member(string address, Connection? connection)
@@ -1214,12 +1226,17 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     {
         ValidateKey(namespaceBytes, key);
         await BeforeOperationAsync().ConfigureAwait(false);
+        long started = System.Diagnostics.Stopwatch.GetTimestamp();
         byte[]? value = await WithClusterRetryAsync(
             () => ReadAsync(namespaceBytes, key, connection => connection.GetAsync(namespaceBytes, key)))
             .ConfigureAwait(false);
         if (value is null && _readRepair && _ring is not null)
         {
-            value = await TryReadRepairAsync(namespaceBytes, key).ConfigureAwait(false);
+            TimeSpan elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(started);
+            TimeSpan recheckAfter = elapsed < ReadRepairRecheckMin ? ReadRepairRecheckMin
+                : elapsed > ReadRepairRecheckMax ? ReadRepairRecheckMax
+                : elapsed;
+            value = await TryReadRepairAsync(namespaceBytes, key, recheckAfter).ConfigureAwait(false);
         }
         return value;
     }
@@ -1305,8 +1322,18 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// lost, WrongNode, another miss) is swallowed; nothing here may turn
     /// an already-accepted miss into an error. A failure repairing the
     /// primary specifically is counted via <see cref="Stats"/>'s
-    /// <c>ReadRepairFailures</c>.</summary>
-    private async Task<byte[]?> TryReadRepairAsync(byte[] namespaceBytes, byte[] key)
+    /// <c>ReadRepairFailures</c>.
+    ///
+    /// Issue #2006: the repair is not written straight away. The
+    /// background task first waits <paramref name="recheckAfter"/> (the
+    /// primary read's round trip, clamped), then re-reads the primary,
+    /// which must still answer a clean miss, and then the replica that hit,
+    /// which must still return the same bytes. Only then is the repair
+    /// written; any other outcome (a hit or a different value, <c>W</c>, an
+    /// error, <see cref="Close"/> meanwhile) skips it without counting a
+    /// failure. A delete that raced the read has by then reached the
+    /// replica, so its value is not written back.</summary>
+    private async Task<byte[]?> TryReadRepairAsync(byte[] namespaceBytes, byte[] key, TimeSpan recheckAfter)
     {
         IReadOnlyList<string> names = OwnerNames(namespaceBytes, key);
         if (names.Count == 0) return null;
@@ -1339,8 +1366,27 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 byte[] repairNamespace = (byte[])namespaceBytes.Clone();
                 byte[] repairKey = (byte[])key.Clone();
                 byte[] repairValue = (byte[])value.Clone();
+                string replica = name;
                 Task background = Task.Run(async () =>
                 {
+                    await Task.Delay(recheckAfter).ConfigureAwait(false);
+                    if (_closed) return;
+                    try
+                    {
+                        // The replica is re-read last: a racing delete
+                        // reaches it last.
+                        byte[]? primaryNow = await ApplyReconnectingAsync(
+                            primary, connection => connection.GetAsync(repairNamespace, repairKey)).ConfigureAwait(false);
+                        if (primaryNow is not null) return;
+                        byte[]? replicaNow = await ApplyReconnectingAsync(
+                            replica, connection => connection.GetAsync(repairNamespace, repairKey)).ConfigureAwait(false);
+                        if (replicaNow is null || !replicaNow.AsSpan().SequenceEqual(repairValue)) return;
+                    }
+                    catch (Exception error) when (error is NanocachedException or IOException
+                        or System.Net.Sockets.SocketException or ObjectDisposedException)
+                    {
+                        return; // the recheck failed: skip the repair, it is not a failed write
+                    }
                     try
                     {
                         await ApplyReconnectingAsync<object?>(primary, async connection =>
