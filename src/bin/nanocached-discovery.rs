@@ -1292,9 +1292,18 @@ enum JoinStatus {
     /// promoted. Stop without an `X` — the handoff it would cancel has
     /// already finished.
     Promoted,
-    /// Abandoned or superseded: stop, and cancel with `X` an `M` that
-    /// may have landed.
+    /// Abandoned (or replaced by a join of another name): stop, and
+    /// cancel with `X` an `M` that may have landed.
     Ended,
+    /// Superseded by a newer generation of the same `joining_name`: stop
+    /// without an `X` (issue #1994). `X` names only the joiner, so the
+    /// node would match it against whichever handoff for that name it
+    /// holds — by now possibly the newer generation's — and abort that
+    /// one, or, if it already completed, restore its handed-off copies
+    /// under a member. An `M` of this send's that did land needs no
+    /// cancel: the newer generation's own `M` aborts it on the node
+    /// (`MigrationGuard::new`'s generation check).
+    Superseded,
 }
 
 /// The `send_migrate_with_retry` check for the join identified by
@@ -1306,17 +1315,18 @@ fn join_status(
     generation: u64,
     promoted: &AtomicBool,
 ) -> JoinStatus {
-    let is_current = lock_current_join(current_join)
+    // The pending join's generation if it is for the same name.
+    let pending_generation = lock_current_join(current_join)
         .as_ref()
-        .is_some_and(|pending| {
-            pending.joining_name == joining_name && pending.generation == generation
-        });
-    if is_current {
-        JoinStatus::Current
-    } else if promoted.load(Ordering::Acquire) {
-        JoinStatus::Promoted
-    } else {
-        JoinStatus::Ended
+        .filter(|pending| pending.joining_name == joining_name)
+        .map(|pending| pending.generation);
+    match pending_generation {
+        Some(pending_generation) if pending_generation == generation => JoinStatus::Current,
+        _ if promoted.load(Ordering::Acquire) => JoinStatus::Promoted,
+        // Generations only grow within one discovery process
+        // (`next_join_generation`).
+        Some(pending_generation) if pending_generation > generation => JoinStatus::Superseded,
+        _ => JoinStatus::Ended,
     }
 }
 
@@ -2926,6 +2936,15 @@ async fn send_migrate_with_retry(
         if join_status == JoinStatus::Promoted {
             return Ok(None);
         }
+        // Issue #1994: superseded by a newer generation of the same name,
+        // an `X` would reach that generation's handoff instead (see
+        // `JoinStatus::Superseded`), so the send stops without one.
+        if join_status == JoinStatus::Superseded {
+            return Err(io::Error::other(format!(
+                "join of {joining_name} (generation {generation}) superseded by a newer \
+                 generation before attempt {attempt}/{MIGRATE_SEND_ATTEMPTS}"
+            )));
+        }
         if join_status == JoinStatus::Ended {
             if attempt > 1 {
                 cancel().await;
@@ -2959,8 +2978,18 @@ async fn send_migrate_with_retry(
                 // dropped — holding the node's one migration slot, so the
                 // next join's `M` is refused. The ack proves the node has
                 // taken this `M`, so an `X` sent now cannot overtake it. A
-                // join promoted in the meantime stays a success (issue #1870).
-                if status() == JoinStatus::Ended {
+                // join promoted in the meantime stays a success (issue #1870),
+                // and one superseded by a newer generation of the same name
+                // sends no `X` (issue #1994, `JoinStatus::Superseded`).
+                let after_ack = status();
+                if after_ack == JoinStatus::Superseded {
+                    return Err(io::Error::other(format!(
+                        "join of {joining_name} (generation {generation}) superseded by a \
+                         newer generation while attempt {attempt}/{MIGRATE_SEND_ATTEMPTS} was \
+                         in flight"
+                    )));
+                }
+                if after_ack == JoinStatus::Ended {
                     cancel().await;
                     return Err(io::Error::other(format!(
                         "join of {joining_name} (generation {generation}) abandoned while \
@@ -15550,6 +15579,145 @@ mod tests {
         );
     }
 
+    /// Issue #1994: attempt 1's `M` goes unacked, and before the retry the
+    /// joiner re-`J`s under the same name, so a newer generation is now
+    /// the pending join. The retry must not go out, and neither may an
+    /// `X`: it names only the joiner, so the node would match it against
+    /// the newer generation's handoff and abort that one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_migrate_with_retry_sends_no_cancel_once_a_newer_generation_supersedes_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+
+        let node_task = tokio::spawn(async move {
+            // Attempt 1: accepted, then dropped without an ack.
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+            // Record anything discovery sends after that.
+            let mut frames = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                timeout(Duration::from_millis(500), listener.accept()).await
+            {
+                let mut buffer = [0u8; 256];
+                let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+                frames.push(buffer[..bytes_read].to_vec());
+                let _ = stream.write_all(b"A\n").await;
+            }
+            frames
+        });
+
+        let pending = |generation| PendingJoin {
+            joining_name: "joining-node".to_string(),
+            expected: HashMap::new(),
+            completed: HashSet::new(),
+            started_at: Instant::now(),
+            max_entries: 0,
+            generation,
+            roster: Arc::new(Vec::new()),
+            late: LateHandoffs::default(),
+        };
+        let current_join: CurrentJoin = Arc::new(Mutex::new(Some(pending(9))));
+        let promoted = AtomicBool::new(false);
+        let checks = std::sync::atomic::AtomicU32::new(0);
+        let result = send_migrate_with_retry(
+            "ready-token",
+            "ready-node",
+            &address,
+            &None,
+            &None,
+            "joining-node",
+            "127.0.0.1:9",
+            "joiner-token",
+            &[],
+            2,
+            9,
+            OUTBOUND_IO_TIMEOUT,
+            || {
+                let status = join_status(&current_join, "joining-node", 9, &promoted);
+                if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    // Generation 9 is abandoned and the joiner re-registers.
+                    *lock_current_join(&current_join) = Some(pending(10));
+                }
+                status
+            },
+        )
+        .await;
+
+        let frames = node_task.await.unwrap();
+        assert!(
+            frames.is_empty(),
+            "nothing may follow attempt 1, got {:?}",
+            frames
+                .iter()
+                .map(|frame| String::from_utf8_lossy(frame).into_owned())
+                .collect::<Vec<_>>()
+        );
+        let error = result.expect_err("a superseded join's M is not retried");
+        assert!(error.to_string().contains("superseded"), "{error}");
+    }
+
+    /// Issue #1994: a newer generation of the same name becomes the pending
+    /// join while attempt 1's `M` is in flight, and that `M` is acked.
+    /// Unlike an abandon, no `X` may follow: the newer generation's own
+    /// `M` aborts this one on the node, and an `X` would abort that.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_migrate_with_retry_sends_no_cancel_after_an_ack_once_superseded() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+
+        let node_task = tokio::spawn(async move {
+            let mut buffer = [0u8; 256];
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = stream.read(&mut buffer).await.unwrap();
+            stream.write_all(b"A 3\n").await.unwrap();
+            let mut frames = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                timeout(Duration::from_millis(500), listener.accept()).await
+            {
+                let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+                frames.push(buffer[..bytes_read].to_vec());
+                let _ = stream.write_all(b"A\n").await;
+            }
+            frames
+        });
+
+        let checks = std::sync::atomic::AtomicU32::new(0);
+        let result = send_migrate_with_retry(
+            "ready-token",
+            "ready-node",
+            &address,
+            &None,
+            &None,
+            "joining-node",
+            "127.0.0.1:9",
+            "joiner-token",
+            &[],
+            2,
+            9,
+            OUTBOUND_IO_TIMEOUT,
+            || {
+                if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    JoinStatus::Current
+                } else {
+                    JoinStatus::Superseded
+                }
+            },
+        )
+        .await;
+
+        let frames = node_task.await.unwrap();
+        assert!(
+            frames.is_empty(),
+            "nothing may follow the acked M, got {:?}",
+            frames
+                .iter()
+                .map(|frame| String::from_utf8_lossy(frame).into_owned())
+                .collect::<Vec<_>>()
+        );
+        let error = result.expect_err("a superseded join's M is not a success");
+        assert!(error.to_string().contains("superseded"), "{error}");
+    }
+
     /// The join is abandoned while attempt 1's `M` is still authenticating.
     /// The abandon's `X` goes out on its own connection and reaches the
     /// node first, where nothing is pending yet; the `M` is taken after
@@ -15810,8 +15978,9 @@ mod tests {
     }
 
     /// Issue #1870: a join is the current one only if both its name and
-    /// its generation match. The same name under an earlier generation (an
-    /// abandoned incarnation's retried `M`) is not, and must cancel.
+    /// its generation match. Issue #1994: the same name under an earlier
+    /// generation (an abandoned incarnation's retried `M`) is superseded,
+    /// and must not cancel — its `X` would reach the newer generation.
     #[test]
     fn join_status_is_current_only_for_the_same_name_and_generation() {
         let current_join: CurrentJoin = Arc::new(Mutex::new(Some(PendingJoin {
@@ -15831,7 +16000,7 @@ mod tests {
         );
         assert_eq!(
             join_status(&current_join, "node-j", 3, &promoted),
-            JoinStatus::Ended,
+            JoinStatus::Superseded,
             "an earlier generation under the same name"
         );
         assert_eq!(
