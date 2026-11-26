@@ -3754,7 +3754,7 @@ public class NanocachedClientTests
     }
 
     [Fact]
-    public async Task ReadRepairProbesOnlyTheRemainingOwnersNotThePrimary()
+    public async Task ReadRepairRechecksEachOwnerOnceBeforeRepairing()
     {
         // Regression: TryReadRepairAsync used to re-probe every owner,
         // including the primary that the normal read path had already
@@ -3772,9 +3772,71 @@ public class NanocachedClientTests
 
         Assert.Equal(Bytes("from-replica"), await client.GetBytesAsync("k"));
 
-        // Exactly one GET on the primary: the normal read path's own
-        // clean-miss probe. Read repair itself must not probe it again.
-        Assert.Equal(1, cluster.Nodes[owners[0]].GetCount);
+        // Issue #2006: before writing, the background repair rechecks the
+        // primary once (still a miss) and the replica once (same bytes),
+        // so each owner ends with exactly two GETs: never a third.
+        string stored = MockNode.KeyOf(Bytes("k"));
+        await WaitForAsync(
+            () => cluster.Nodes[owners[0]].Store.ContainsKey(stored),
+            "the primary to be repaired");
+        Assert.Equal(2, cluster.Nodes[owners[0]].GetCount);
+        Assert.Equal(2, cluster.Nodes[owners[1]].GetCount);
+    }
+
+    // Issue #2006: a delete is primary-first, so for about one round trip
+    // the primary misses while the replica still has the key. A read-repair
+    // read in that window used to write the deleted value back to the
+    // primary for 60 s. The replica's copy now changes right after it
+    // answered the probe, before the background recheck.
+    [Theory]
+    [InlineData("deleted")]
+    [InlineData("changed")]
+    [InlineData("primary-has-it")]
+    public async Task AReadRepairIsNotWrittenWhenTheOwnersChangedBeforeTheRecheck(string change)
+    {
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        MockNode primary = cluster.Nodes[owners[0]];
+        MockNode replica = cluster.Nodes[owners[1]];
+        string stored = MockNode.KeyOf(Bytes("k"));
+        replica.Store[stored] = Bytes("from-replica");
+        replica.AfterNextGetHit(() =>
+        {
+            switch (change)
+            {
+                case "deleted": replica.Store.TryRemove(stored, out _); break;
+                case "changed": replica.Store[stored] = Bytes("newer"); break;
+                default: primary.Store[stored] = Bytes("fresh"); break;
+            }
+        });
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadRepair = true,
+        });
+
+        // The read itself still returns what the replica had.
+        Assert.Equal(Bytes("from-replica"), await client.GetBytesAsync("k"));
+        // The recheck has run once the primary saw its second GET (and, when
+        // the primary still misses, the replica its second); give the
+        // decision after it time to land.
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(2);
+        while (!(primary.GetCount >= 2 && (change == "primary-has-it" || replica.GetCount >= 2))
+            && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(5);
+        }
+        await Task.Delay(200);
+        if (change == "primary-has-it")
+        {
+            Assert.Equal(Bytes("fresh"), primary.Store[stored]);
+        }
+        else
+        {
+            Assert.False(primary.Store.ContainsKey(stored), "the repair was written anyway");
+        }
+        Assert.Equal(0, client.Stats().ReadRepairFailures);
     }
 
     [Fact]

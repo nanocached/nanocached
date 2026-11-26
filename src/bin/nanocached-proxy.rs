@@ -8193,7 +8193,7 @@ async fn handle_client(
                         // charges' shares; a request that is still being
                         // served keeps the share its driver holds
                         // (`DriverTx`) until the driver finishes.
-                        return write_half;
+                        return (write_half, false);
                     }
                     // Written and about to be dropped: the bytes this
                     // request was charged are free again, unless its
@@ -8207,11 +8207,15 @@ async fn handle_client(
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let _ = infra::write_all_within(&mut write_half, b"E\n", CLIENT_WRITE_TIMEOUT)
                         .await;
-                    return write_half;
+                    // Frames pipelined behind the failed request are still
+                    // arriving: the teardown drains them, as it does after
+                    // the client's own rejections, so the close is a FIN
+                    // and not a reset that can discard the `E`.
+                    return (write_half, true);
                 }
             }
         }
-        write_half
+        (write_half, false)
     });
 
     let mut buf = BytesMut::new();
@@ -8712,7 +8716,9 @@ async fn handle_client(
     // Closing the FIFO lets the writer drain what's pending, then stop.
     drop(fifo_tx);
     let writer_result = writer.await;
-    if drain_rejected && let Ok(mut write_half) = writer_result {
+    if let Ok((mut write_half, upstream_failed)) = writer_result
+        && (drain_rejected || upstream_failed)
+    {
         drain_rejected_request(&mut read_half, &mut write_half).await;
     }
     result
@@ -9047,7 +9053,7 @@ async fn serve_metrics_connection(
                  # HELP nanocached_proxy_requests_total Requests dispatched (all ops).\n\
                  # TYPE nanocached_proxy_requests_total counter\n\
                  nanocached_proxy_requests_total {requests}\n\
-                 # HELP nanocached_proxy_upstream_failures_total Requests that failed upstream after retries (answered E).\n\
+                 # HELP nanocached_proxy_upstream_failures_total Requests that failed upstream after retries (answered E, or R to a retry-capable client).\n\
                  # TYPE nanocached_proxy_upstream_failures_total counter\n\
                  nanocached_proxy_upstream_failures_total {failures}\n\
                  # HELP nanocached_proxy_replica_refusals_total Replica legs of a write a node answered W or E: the client saw success, but that replica's copy is missing or stale until the next write.\n\
@@ -18883,6 +18889,45 @@ mod tests {
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "I 2 3");
         read_exact_into(&mut stream, &mut buf, 2).await.unwrap();
         assert_eq!(&buf.split_to(2)[..], b"20");
+    }
+
+    /// Issue #2002: the `E` for an upstream failure closed the connection
+    /// without the bounded drain the client's own rejections get, so
+    /// frames pipelined behind the failed request were still unread at
+    /// the close, which sent a reset in place of a FIN (and could discard
+    /// the `E`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_upstream_failure_e_with_frames_pipelined_behind_it_gets_e_then_eof() {
+        let (nodes, proxy) = cluster(1).await;
+        let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+        stream.write_all(b"S 7 2 1\ncounter10").await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 1");
+        assert!(buf.is_empty());
+        nodes[0]
+            .close_after_incr_apply_once
+            .store(true, Ordering::SeqCst);
+
+        let mut frames = b"i 0 7 5 2\ncounter".to_vec();
+        for tag in 3..=60_000 {
+            frames.extend_from_slice(format!("G 1 {tag}\nk").as_bytes());
+        }
+        // Written while the replies are read: the proxy stops reading once
+        // its writer has sent the `E`, so the whole batch may not fit in
+        // the socket buffers.
+        let (mut read_half, mut write_half) = stream.split();
+        let write = async {
+            let _ = write_half.write_all(&frames).await;
+        };
+        let read = async {
+            let mut response = Vec::new();
+            let result = timeout(UPSTREAM_IO_TIMEOUT, read_half.read_to_end(&mut response))
+                .await
+                .expect("the proxy must close the connection after the E");
+            (result, response)
+        };
+        let ((), (result, response)) = tokio::join!(write, read);
+        result.expect("the close after the E must be a FIN, not a reset");
+        assert_eq!(response, b"E\n");
     }
 
     #[tokio::test(flavor = "current_thread")]

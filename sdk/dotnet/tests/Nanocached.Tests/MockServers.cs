@@ -256,6 +256,13 @@ public sealed class MockNode : IDisposable
     /// <summary>Reply <c>W</c> to the next S specifically (not G/D) — for
     /// tests that need a node to keep answering GET normally while a
     /// later SET against it (e.g. a read-repair write) fails.</summary>
+    /// <summary>Issue #2006: runs <paramref name="action"/> once, right
+    /// after the next plain <c>G</c> hit has been answered — a delete's
+    /// replica leg (or another write) landing just after a read-repair
+    /// probe, before the client's background recheck.</summary>
+    public void AfterNextGetHit(Action action) => Interlocked.Exchange(ref _afterNextGetHit, action);
+    private Action? _afterNextGetHit;
+
     public void AnswerWrongNodeOnSetOnce() => Interlocked.Increment(ref _wrongNodeOnSetReplies);
 
     /// <summary>Queue a one-off malformed reply to the next S on an
@@ -618,6 +625,7 @@ public sealed class MockNode : IDisposable
                         {
                             await Wire.WriteAsync(stream, $"V {value.Length}{tag}\n");
                             await stream.WriteAsync(value);
+                            Interlocked.Exchange(ref _afterNextGetHit, null)?.Invoke();
                         }
                         else
                         {
