@@ -5662,15 +5662,20 @@ class NanocachedClientTest {
                 // READ_REPAIR_TTL_SECONDS.
                 assertEquals(60, cluster.nodes().get(owners.get(0)).lastSetTtl);
                 // Regression (issue: audit finding): tryReadRepair used to
-                // re-probe the primary too — the one owner already known
-                // to have missed by the normal read path — wasting a
-                // redundant GET on it. The primary must be probed exactly
-                // once: by getBytes()'s own read(), never again by
-                // tryReadRepair.
+                // re-probe the primary too, before returning, wasting a
+                // GET on the owner known to have missed. The primary is now
+                // read twice: by getBytes()'s own read(), and once by the
+                // background repair's recheck just before it writes; the
+                // replica likewise once for the read and once for the
+                // recheck.
                 assertEquals(
-                        1,
+                        2,
                         cluster.nodes().get(owners.get(0)).getCount.get(),
-                        "read repair must not re-probe the primary that just missed");
+                        "the primary: the read, then one recheck before the repair");
+                assertEquals(
+                        2,
+                        cluster.nodes().get(owners.get(1)).getCount.get(),
+                        "the replica: the probe, then one recheck before the repair");
             }
         }
     }
@@ -5719,6 +5724,74 @@ class NanocachedClientTest {
                         "the repair must carry the bytes read, not the caller's later in-place edit");
             }
         }
+    }
+
+    // A primary-first delete leaves the primary without the key for about
+    // one round trip while the replica still has it. The repair must recheck
+    // both owners before writing, so a delete racing the read is not undone.
+    // Each test holds the repair back (one blocked background thread), makes
+    // the change the race would make, then lets the repair run.
+
+    private interface RecheckRace {
+        void change(MockNode primary, MockNode replica, String stored);
+    }
+
+    private void assertNotRepairedAfter(RecheckRace race, String expectedAtPrimary) throws Exception {
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+        try (Cluster cluster = startCluster(2)) {
+            List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);
+            MockNode primary = cluster.nodes().get(owners.get(0));
+            MockNode replica = cluster.nodes().get(owners.get(1));
+            String stored = MockNode.keyOf("k".getBytes(StandardCharsets.UTF_8));
+            replica.store.put(stored, "from-replica".getBytes(StandardCharsets.UTF_8));
+
+            try (NanocachedClient client =
+                    connectWithReadRepair(cluster.discovery().port())) {
+                java.util.concurrent.CountDownLatch release = blockBackgroundLegs(client);
+                try {
+                    assertArrayEquals(
+                            "from-replica".getBytes(StandardCharsets.UTF_8),
+                            client.getBytes("k").orElseThrow(),
+                            "the read still returns the replica's value at once");
+                    race.change(primary, replica, stored);
+                } finally {
+                    release.countDown();
+                }
+
+                // The recheck has run once the primary saw its second G (a
+                // repair without one writes with the 60 s TTL); give a repair
+                // that would follow the recheck time to land.
+                waitFor(
+                        () -> primary.getCount.get() >= 2 || primary.lastSetTtl == 60,
+                        "the repair's recheck of the primary, or the repair");
+                Thread.sleep(300);
+                byte[] atPrimary = primary.store.get(stored);
+                assertEquals(
+                        expectedAtPrimary,
+                        atPrimary == null ? null : new String(atPrimary, StandardCharsets.UTF_8),
+                        "the primary must not be repaired");
+                assertEquals(0, client.stats().readRepairFailures(), "a skipped repair is not a failure");
+            }
+        }
+    }
+
+    @Test
+    void aReplicaCopyDeletedBeforeTheRecheckIsNotRepairedOntoThePrimary() throws Exception {
+        assertNotRepairedAfter((primary, replica, stored) -> replica.store.remove(stored), null);
+    }
+
+    @Test
+    void aReplicaCopyThatChangedBeforeTheRecheckIsNotRepairedOntoThePrimary() throws Exception {
+        assertNotRepairedAfter(
+                (primary, replica, stored) -> replica.store.put(stored, "newer".getBytes(StandardCharsets.UTF_8)),
+                null);
+    }
+
+    @Test
+    void aPrimaryThatHasTheKeyAtTheRecheckIsNotOverwritten() throws Exception {
+        assertNotRepairedAfter(
+                (primary, replica, stored) -> primary.store.put(stored, "fresh".getBytes(StandardCharsets.UTF_8)),
+                "fresh");
     }
 
     @Test
