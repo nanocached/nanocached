@@ -47,6 +47,14 @@ framework adapters at one version, whether or not a component changed.
   is still arriving after that `E`, as it already did after a malformed frame
   (#1408, #1941).
 
+- Proxy: a `D`/`d` whose primary stayed unreachable through the retry was
+  answered with an error and no other owner was sent the delete, so a later
+  `G` that fell back to a replica returned the deleted value, and the replica
+  kept it once promoted. The other owners now get their delete before the
+  client gets the error; a later request on the key from the same connection
+  still waits until those legs are enqueued. A `W` is retried as before
+  (#2016).
+
 - Node: a decommission that retried a key's transfer after a refused or
   failed attempt resent the value and TTL it had read before the first try.
   A client write that landed during the backoff (or the reconnect) was

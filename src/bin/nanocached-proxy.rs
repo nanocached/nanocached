@@ -6315,7 +6315,8 @@ async fn finish_write(
 /// One whole write fan-out over the *current* ring via `call` (redials
 /// dead shared connections) — `finish_write`'s retry path for both a
 /// primary `W` and a transport failure. A delete reaches the other owners
-/// only once the primary has answered (see `finish_write`).
+/// only once the primary has answered (see `finish_write`) or this retry
+/// of it has failed too.
 async fn refan_write(
     context: &ProxyContext,
     namespace: &[u8],
@@ -6343,7 +6344,17 @@ async fn refan_write(
             }
             Ok(answer)
         }
-        Err(_) => Err(Fatal::Transient),
+        Err(_) => {
+            // The primary stayed unreachable (or the frame was not sent)
+            // through the retry: the client gets an error, but the other
+            // owners still get their delete first. Left holding the value,
+            // a replica would answer a later `G` that falls back to it, and
+            // be promoted with it once the primary is dropped.
+            if write.is_none() {
+                delete_on_other_owners(context, namespace, key, primary, signal).await;
+            }
+            Err(Fatal::Transient)
+        }
     }
 }
 
@@ -17885,11 +17896,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_delete_does_not_reach_a_replica_while_its_primary_is_unreachable() {
-        // As for a `ttl=0` touch (issue #934): sent together with the primary
-        // leg, the replica deleted its copy while the primary could not be
-        // reached, and the re-fan over a refreshed ring that made it the
-        // primary would have answered `N` for a key that existed.
+    async fn a_delete_whose_primary_stays_unreachable_still_deletes_the_replica() {
+        // As for a `ttl=0` touch (issue #934), the replica is not sent its
+        // delete together with the primary leg: sent together, it deleted
+        // its copy while the primary could not be reached, and the re-fan
+        // over a refreshed ring that made it the primary would have
+        // answered `N` for a key that existed. Issue #2016: but once the
+        // retry of the primary leg has failed too, the replica still gets
+        // its delete before the client gets the error. Left holding the
+        // value, it answered a later `G` that fell back to it.
         for namespaced in [false, true] {
             let (live, proxy, key) = live_replica_dead_primary_cluster().await;
             store_on(&live, b"", key.as_bytes());
@@ -17903,10 +17918,22 @@ mod tests {
             assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 1");
             assert_eq!(
                 live.deletes(),
-                0,
-                "namespaced={namespaced}: the replica must not be sent the delete while the primary leg fails"
+                1,
+                "namespaced={namespaced}: the replica is sent its delete once, after the primary leg failed"
             );
-            assert_eq!(live.entry(b"", key.as_bytes()), Some(b"v".to_vec()));
+            assert!(
+                live.entry(b"", key.as_bytes()).is_none(),
+                "namespaced={namespaced}"
+            );
+
+            // A read that falls back to the replica no longer finds it.
+            let get = format!("G {} 2\n{key}", key.len());
+            stream.write_all(get.as_bytes()).await.unwrap();
+            assert_eq!(
+                read_line(&mut stream, &mut buf).await.unwrap(),
+                "N 2",
+                "namespaced={namespaced}"
+            );
         }
     }
 
