@@ -2072,7 +2072,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// <para>In a cluster the other owners are sent their delete only after
     /// the primary has answered, not alongside it (as for a touch with TTL
     /// 0), so a primary that cannot be reached or answers <c>W</c> is
-    /// rerouted while the surviving owner still holds the entry.</para></summary>
+    /// rerouted while the surviving owner still holds the entry. When the
+    /// primary still cannot be reached after that retry, the other owners
+    /// are sent the delete before the <see cref="ConnectionLostException"/>
+    /// is thrown.</para></summary>
     public Task<bool> DeleteAsync(byte[] key, CancellationToken cancellationToken = default) =>
         cancellationToken.IsCancellationRequested
         ? Task.FromCanceled<bool>(cancellationToken)
@@ -2093,10 +2096,39 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         namespaceBytes = OwnedForBackgroundLegs(namespaceBytes);
         key = OwnedForBackgroundLegs(key);
         await BeforeOperationAsync().ConfigureAwait(false);
-        return await WithClusterRetryAsync(
-            () => WriteAsync(
-                namespaceBytes, key, connection => connection.DeleteAsync(namespaceBytes, key), primaryFirst: true))
-            .ConfigureAwait(false);
+        try
+        {
+            return await WithClusterRetryAsync(
+                () => WriteAsync(
+                    namespaceBytes, key, connection => connection.DeleteAsync(namespaceBytes, key), primaryFirst: true))
+                .ConfigureAwait(false);
+        }
+        catch (ConnectionLostException) when (_ring is not null)
+        {
+            // Issue #2007: a primary that is dead but still listed (until
+            // discovery's liveness timeout) fails the retry after the forced
+            // refresh too, so the primary-first fan-out never sent the other
+            // owners theirs. A read falling back to them would then return
+            // the deleted value, and one of them would be promoted with it.
+            // A delete is safe to apply at any time, so they get it now, all
+            // at once and awaited, before the error is rethrown; the caller
+            // still gets the error, so the bool keeps meaning what the
+            // primary answered. A W or any other error leaves them alone.
+            await Task.WhenAll(OwnerNames(namespaceBytes, key).Skip(1).Select(async name =>
+            {
+                try
+                {
+                    await ApplyReconnectingAsync(name, connection => connection.DeleteAsync(namespaceBytes, key))
+                        .ConfigureAwait(false);
+                }
+                catch (Exception error) when (error is NanocachedException or IOException
+                    or System.Net.Sockets.SocketException or ObjectDisposedException)
+                {
+                    Interlocked.Increment(ref _replicaWriteFailures);
+                }
+            })).ConfigureAwait(false);
+            throw;
+        }
     }
 
     // ── Touch (issue #825) ───────────────────────────────────────────

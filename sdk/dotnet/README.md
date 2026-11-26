@@ -441,6 +441,14 @@ runs), and callers that were waiting on a refresh that began before their
 failure share one follow-up refresh that starts when the window has
 passed. The 30-second staleness refresh is not delayed.
 
+A `DeleteAsync` is sent to the other owners only once the primary has
+answered, so a primary that was unreachable or answered `W` is retried
+with no copy removed yet. If the primary is still unreachable after the
+retry (it died and discovery still lists it), the other owners are sent
+the delete anyway before the call throws `ConnectionLostException`: a
+read that falls back to them then misses instead of returning the deleted
+value.
+
 ## Fire-and-forget replica writes
 
 Off by default. `SetAsync`/`DeleteAsync` normally wait for every replica

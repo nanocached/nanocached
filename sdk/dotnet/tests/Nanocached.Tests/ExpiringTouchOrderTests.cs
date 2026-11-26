@@ -228,6 +228,50 @@ public class ExpiringTouchOrderTests
         Assert.Equal(1, replica.DeleteRequestCount);
     }
 
+    // Issue #2007: the primary goes away and the roster still lists it, so
+    // the retry after the forced refresh routes to it again and the call
+    // fails. The other owners used to be left holding the value, and a read
+    // falling back to them returned it. They now get the delete before the
+    // error is raised.
+    [Fact]
+    public async Task ADeleteWhosePrimaryStaysUnreachableDeletesTheOtherOwnersBeforeFailing()
+    {
+        using var cluster = new Cluster();
+        await cluster.ConnectAsync();
+        const string key = "shared-key";
+        await cluster.Client.SetAsync(key, "v");
+        var (_, primary) = cluster.Primary(key);
+        var (_, replica) = cluster.Replica(key);
+        primary.Dispose();
+        await Task.Delay(100);
+
+        await Assert.ThrowsAsync<ConnectionLostException>(() => cluster.Client.DeleteAsync(key));
+        Assert.Equal(1, replica.DeleteRequestCount);
+        Assert.True(replica.Store.IsEmpty, "the replica's copy is gone");
+        // A plain read falls back to the replica on the connection failure
+        // and no longer finds the deleted value.
+        Assert.Null(await cluster.Client.GetAsync(key));
+    }
+
+    // Issue #2007: only a connection failure fans the delete out after the
+    // retry; a W path is unchanged.
+    [Fact]
+    public async Task ADeleteWhosePrimaryAnswersWrongNodeTwiceLeavesTheOtherOwnersAlone()
+    {
+        using var cluster = new Cluster();
+        await cluster.ConnectAsync();
+        const string key = "shared-key";
+        await cluster.Client.SetAsync(key, "v");
+        var (_, primary) = cluster.Primary(key);
+        var (_, replica) = cluster.Replica(key);
+        primary.AnswerWrongNodeOnce();
+        primary.AnswerWrongNodeOnce();
+
+        await Assert.ThrowsAsync<WrongNodeException>(() => cluster.Client.DeleteAsync(key));
+        Assert.Equal(0, replica.DeleteRequestCount);
+        Assert.False(replica.Store.IsEmpty);
+    }
+
     [Fact]
     public async Task ADeleteSendsTheReplicaItsFrameOnlyAfterThePrimaryAnswered()
     {
