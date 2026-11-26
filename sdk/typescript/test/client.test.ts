@@ -27,6 +27,7 @@ import {
   HEDGE_READ_TUNING,
   KEEPALIVE_TUNING,
   MAX_BATCH_KEYS,
+  READ_REPAIR_TUNING,
   resolveReconnectCooldownMs,
 } from "../src/client.js";
 import { Connection, REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
@@ -6960,6 +6961,38 @@ describe("NanocachedClient read repair (read repair)", () => {
     }
   });
 
+  // A delete sends its replica legs only after the primary answered, so a
+  // read-repair read can see the primary miss and the replica still hit. The
+  // write-back waits, re-probes both owners, and writes only if the primary
+  // still misses and the replica still holds the same bytes.
+  for (const race of ["replica deleted", "primary written"] as const) {
+    it(`does not repair when the ${race} during the recheck wait`, async () => {
+      const defaultDelay = READ_REPAIR_TUNING.recheckDelayMs;
+      READ_REPAIR_TUNING.recheckDelayMs = 200;
+      const cluster = await startReplicatedCluster();
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+        readRepair: true,
+      });
+      try {
+        const { primary, replica } = cluster.ownerOf("k");
+        replica.mock.store.set("k", Buffer.from("from-replica"));
+
+        assert.equal(await client.get("k"), "from-replica");
+        if (race === "replica deleted") replica.mock.store.delete("k");
+        else primary.mock.store.set("k", Buffer.from("newer"));
+        await client.close(); // drains the write-back
+        if (race === "replica deleted") assert.ok(!primary.mock.store.has("k"), "the deleted value was written back");
+        else assert.equal(primary.mock.store.get("k")?.toString(), "newer");
+        assert.equal(client.stats().readRepairFailures, 0);
+      } finally {
+        READ_REPAIR_TUNING.recheckDelayMs = defaultDelay;
+        await client.close();
+        await cluster.close();
+      }
+    });
+  }
+
   it("stays a clean miss when no owner has the value", async () => {
     const cluster = await startReplicatedCluster();
     const client = await NanocachedClient.connect({
@@ -6989,11 +7022,13 @@ describe("NanocachedClient read repair (read repair)", () => {
         const { primary, replica } = cluster.ownerOf("k");
         replica.mock.store.set("k", Buffer.from("hello"));
         const connection = await (client as any).memberConnection(primary.name);
-        // Hold the primary's connection once the miss GET has been answered.
+        // Hold the primary's connection once the miss GET has been answered
+        // (only that one: the write-back's own recheck GET follows later).
         let release!: () => void;
         const get = connection.get.bind(connection);
         connection.get = async (...args: unknown[]) => {
           const result = await get(...args);
+          connection.get = get;
           connection.writeGate = new Promise<void>((resolve) => (release = resolve));
           return result;
         };
