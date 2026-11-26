@@ -5006,6 +5006,23 @@ describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
     });
   });
 
+  it("a delete whose primary stays unreachable still deletes the replica before it throws", async () => {
+    // The primary is dead but discovery still lists it, so the retry after
+    // the forced refresh routes to it again and fails. The replica is sent
+    // the delete before the error is thrown, so a read falling back to it
+    // no longer returns the deleted value.
+    await withCluster(async (client, cluster) => {
+      const { primary, replica } = cluster.ownerOf("k");
+      await client.set("k", "payload");
+      await primary.mock.close();
+      await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
+      await assert.rejects(() => client.delete("k"), ConnectionLostError);
+      assert.equal(replica.mock.deleteCount(), 1);
+      assert.equal(replica.mock.store.has("k"), false);
+      assert.equal(await client.get("k"), null);
+    });
+  });
+
   it("a touch with a live or removed TTL still fans out to every owner at once (issue #934)", async () => {
     await withCluster(async (client, cluster) => {
       const { primary, replica } = cluster.ownerOf("k");
