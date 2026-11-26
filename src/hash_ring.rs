@@ -614,3 +614,35 @@ mod tests {
     const NS_USERS_EMPTY_OWNERS: [&str; 3] = ["node-b", "node-c", "node-a"];
     const NS_BINARY_BETA_OWNERS: [&str; 3] = ["node-b", "node-a", "node-c"];
 }
+
+/// Kani proof harnesses (`cargo kani --bin nanocached-node`).
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Continuing an FNV-1a state gives the hash of the concatenation, which
+    /// `namespace_state` and `KeyHasher` rely on to hash a namespace once.
+    /// From any state, for every split of 4 arbitrary bytes.
+    #[kani::proof]
+    #[kani::unwind(6)]
+    fn fnv1a_continue_hashes_the_concatenation() {
+        let state: u64 = kani::any();
+        let bytes: [u8; 4] = kani::any();
+        let whole = fnv1a_continue(state, &bytes);
+        for split in 0..=4 {
+            assert_eq!(
+                fnv1a_continue(fnv1a_continue(state, &bytes[..split]), &bytes[split..]),
+                whole
+            );
+        }
+    }
+
+    /// `fmix64` is injective (the module docs call it bijective).
+    #[kani::proof]
+    fn fmix64_is_injective() {
+        let x: u64 = kani::any();
+        let y: u64 = kani::any();
+        kani::assume(x != y);
+        assert_ne!(fmix64(x), fmix64(y));
+    }
+}

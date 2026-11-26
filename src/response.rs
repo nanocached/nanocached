@@ -605,3 +605,25 @@ mod tests {
         assert_eq!(Response::Unauthorized.encode_identity_tagged(), b"EnT\n");
     }
 }
+
+/// Kani proof harnesses (`cargo kani --bin nanocached-node`).
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// `ttl_wire_seconds` is the TTL rounded up to whole seconds, for every
+    /// `Duration` whose rounding fits a `u64`: the whole seconds when there
+    /// is no fraction, one more when there is, and zero only for zero.
+    #[kani::proof]
+    fn ttl_wire_seconds_rounds_up() {
+        let ttl = Duration::new(kani::any(), kani::any_where(|n: &u32| *n < 1_000_000_000));
+        kani::assume(ttl.as_secs() < u64::MAX || ttl.subsec_nanos() == 0);
+        let seconds = ttl_wire_seconds(ttl);
+        if ttl.subsec_nanos() == 0 {
+            assert_eq!(seconds, ttl.as_secs());
+        } else {
+            assert_eq!(seconds - 1, ttl.as_secs());
+        }
+        assert_eq!(seconds == 0, ttl.is_zero());
+    }
+}

@@ -5062,3 +5062,146 @@ mod tests {
         assert_eq!(response.encode_with_tag(9), b"O 2 S W 9\n");
     }
 }
+
+/// Kani proof harnesses (`cargo kani --bin nanocached-node`): bounded
+/// symbolic inputs, so a success covers every input up to the stated size.
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// One more digit than `usize::MAX` has, so overflow is reachable.
+    const LENGTH_FIELD_MAX: usize = 21;
+
+    /// `parse_length` accepts exactly the non-empty all-digit fields whose
+    /// value fits a `usize`, and returns that value.
+    #[kani::proof]
+    #[kani::unwind(23)]
+    fn parse_length_is_exact_decimal() {
+        let bytes: [u8; LENGTH_FIELD_MAX] = kani::any();
+        let len: usize = kani::any_where(|len: &usize| *len <= LENGTH_FIELD_MAX);
+        let field = &bytes[..len];
+
+        let mut digits = true;
+        let mut value: u128 = 0;
+        for byte in field {
+            if byte.is_ascii_digit() {
+                value = value * 10 + u128::from(byte - b'0');
+            } else {
+                digits = false;
+            }
+        }
+        let accepted = len > 0 && digits && value <= usize::MAX as u128;
+
+        match parse_length(field) {
+            Ok(parsed) => {
+                assert!(accepted);
+                assert_eq!(parsed as u128, value);
+            }
+            Err(error) => {
+                assert!(!accepted);
+                assert_eq!(error, ParseError::InvalidLength);
+            }
+        }
+    }
+
+    fn lower_hex(nibble: u8) -> u8 {
+        if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        }
+    }
+
+    /// Every digest survives its lowercase-hex encoding, and a 32-byte
+    /// field parses to a digest only when it is that digest's encoding.
+    #[kani::proof]
+    #[kani::unwind(33)]
+    fn cas_digest_round_trips_and_nothing_else_parses() {
+        let digest: [u8; 16] = kani::any();
+        let mut encoded = [0u8; 32];
+        for (index, byte) in digest.iter().enumerate() {
+            encoded[2 * index] = lower_hex(byte >> 4);
+            encoded[2 * index + 1] = lower_hex(byte & 0x0f);
+        }
+        assert_eq!(
+            parse_cas_condition(&encoded, kani::any()),
+            Ok(CasCondition::Digest(digest))
+        );
+
+        let field: [u8; 32] = kani::any();
+        if let Ok(CasCondition::Digest(parsed)) = parse_cas_condition(&field, kani::any()) {
+            for (index, byte) in parsed.iter().enumerate() {
+                assert_eq!(field[2 * index], lower_hex(byte >> 4));
+                assert_eq!(field[2 * index + 1], lower_hex(byte & 0x0f));
+            }
+        }
+    }
+
+    /// `field_ends` never panics; it fails exactly when an end overflows,
+    /// and otherwise each end is the previous one plus its length.
+    #[kani::proof]
+    fn field_ends_are_checked_sums() {
+        let start: usize = kani::any();
+        let lengths: [usize; 3] = kani::any();
+        match field_ends(start, lengths) {
+            Ok([a, b, c]) => {
+                assert_eq!(a, start + lengths[0]);
+                assert_eq!(b, a + lengths[1]);
+                assert_eq!(c, b + lengths[2]);
+            }
+            Err(error) => {
+                assert_eq!(error, ParseError::InvalidLength);
+                let total =
+                    start as u128 + lengths[0] as u128 + lengths[1] as u128 + lengths[2] as u128;
+                assert!(total > usize::MAX as u128);
+            }
+        }
+    }
+
+    const SCAN_MAX: usize = 6;
+
+    /// From a fresh `MigrateProgress`, the header scan finds the first `\n`;
+    /// resumed from any recorded progress, it never panics.
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn header_line_end_is_the_first_lf() {
+        let bytes: [u8; SCAN_MAX] = kani::any();
+        let len: usize = kani::any_where(|len: &usize| *len <= SCAN_MAX);
+        let input = &bytes[..len];
+
+        let mut fresh = MigrateProgress::default();
+        match find_header_line_end(input, &mut fresh) {
+            Some(end) => {
+                assert!(end < len && input[end] == b'\n');
+                assert!(input[..end].iter().all(|byte| *byte != b'\n'));
+            }
+            None => assert!(input.iter().all(|byte| *byte != b'\n')),
+        }
+
+        let mut resumed = MigrateProgress {
+            line_end: kani::any(),
+            line_scanned_to: kani::any(),
+            ..MigrateProgress::default()
+        };
+        let _ = find_header_line_end(input, &mut resumed);
+    }
+
+    const ENTRY_MAX: usize = 8;
+
+    /// A roster entry header at any cursor inside the buffer parses
+    /// without panicking, and an entry it returns lies inside the buffer.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn joined_entry_stays_inside_the_buffer() {
+        let bytes: [u8; ENTRY_MAX] = kani::any();
+        let len: usize = kani::any_where(|len: &usize| *len <= ENTRY_MAX);
+        let cursor: usize = kani::any_where(|cursor: &usize| *cursor <= len);
+        let input = &bytes[..len];
+        if let Ok(entry) = next_joined_entry(input, cursor) {
+            assert!(entry.name_start > cursor);
+            assert_eq!(entry.addr_start, entry.name_start + entry.name_length);
+            assert_eq!(entry.end, entry.addr_start + entry.addr_length);
+            assert!(entry.end <= len);
+        }
+    }
+}
