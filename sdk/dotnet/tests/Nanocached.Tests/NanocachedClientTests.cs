@@ -3754,7 +3754,7 @@ public class NanocachedClientTests
     }
 
     [Fact]
-    public async Task ReadRepairProbesOnlyTheRemainingOwnersNotThePrimary()
+    public async Task ReadRepairRechecksEachOwnerOnceBeforeRepairing()
     {
         // Regression: TryReadRepairAsync used to re-probe every owner,
         // including the primary that the normal read path had already
