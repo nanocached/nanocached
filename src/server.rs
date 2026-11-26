@@ -6940,7 +6940,7 @@ impl MigrationGuard {
     /// behavior for a rolling upgrade — see `Command::Migrate::
     /// generation`'s own doc comment.
     ///
-    /// A same-`joining_name` `M` carrying a *different* generation is a
+    /// A same-`joining_name` `M` carrying a *newer* generation is a
     /// genuinely new join for that name superseding the one already
     /// occupying the slot (a crash + fast restart of the joining node
     /// under the same identity — see this struct's own `generation`
@@ -6951,7 +6951,10 @@ impl MigrationGuard {
     /// Already completed (forwarding grace or not), it falls into the
     /// same issue #62/#93 supersede logic below that a genuinely
     /// different `joining_name` does — whether its marks are restored or
-    /// kept depends on `joined`, exactly as for a different name.
+    /// kept depends on `joined`, exactly as for a different name. One
+    /// carrying an *older* generation is a stale send of a join discovery
+    /// has already superseded, and is rejected with `Conflict` without
+    /// touching the slot (issue #1994).
     ///
     /// Reuses `migration_target_for`'s lazy-expiry check first: a slot
     /// left by a prior handoff that finished *and* whose forwarding grace
@@ -7017,6 +7020,29 @@ impl MigrationGuard {
                     Some(acked_entries) => MigrationOutcome::DuplicateAcked(acked_entries),
                     None => MigrationOutcome::Conflict,
                 };
+            }
+
+            // Issue #1994: a same-name `M` at an *older* generation than
+            // the handoff here is a stale send of a join discovery has
+            // already superseded (a retry that was still in flight when the
+            // joiner re-registered). It must not abort the newer handoff
+            // still transferring, nor replace a completed one — that would
+            // restore its handed-off copies and revert `known_ring` under a
+            // joiner discovery may already list as a member. Rejected and
+            // left alone. A remnant is no handoff any more and is replaced
+            // as before.
+            let older_generation = match (existing.generation, generation) {
+                (Some(existing_generation), Some(generation)) => generation < existing_generation,
+                _ => false,
+            };
+            if same_name && older_generation && !existing.remnant {
+                let existing_generation = existing.generation;
+                drop(guard);
+                eprintln!(
+                    "WARN ignoring M for {joining_name} at generation {generation:?}: the \
+                     handoff here is for its newer generation {existing_generation:?}"
+                );
+                return MigrationOutcome::Conflict;
             }
 
             if existing.completed_at.is_none() {
@@ -29072,6 +29098,89 @@ mod tests {
             active.abort_requested.load(Ordering::SeqCst),
             "the superseded handoff must be told to stop"
         );
+    }
+
+    /// Issue #1994: a stale `M` from an older generation of the same
+    /// joiner, arriving after the newer generation's handoff took the
+    /// slot, is rejected without touching that handoff — neither aborting
+    /// it while it transfers nor replacing it once completed.
+    #[test]
+    fn migration_guard_new_leaves_a_newer_generation_alone_for_an_older_ones_m() {
+        for completed in [false, true] {
+            let after_ring = Arc::new(HashRing::new(vec![
+                "ready-node".to_string(),
+                "joiner-0".to_string(),
+            ]));
+            let pre_completion_ring = Arc::new(Membership {
+                ring: Arc::new(HashRing::new(vec!["ready-node".to_string()])),
+                replication: 2,
+            });
+            let known_ring: KnownRing = Arc::new(Mutex::new(Some(Arc::new(Membership {
+                ring: Arc::clone(&after_ring),
+                replication: 2,
+            }))));
+            let known_before = Arc::clone(known_ring.lock().unwrap().as_ref().unwrap());
+            let slot = Arc::new(Mutex::new(Some(ActiveMigration {
+                joining_name: "joiner-0".to_string(),
+                joining_addr: "127.0.0.1:11".to_string(),
+                joining_token: "tok-joiner-0-v2".to_string(),
+                after_ring: Arc::clone(&after_ring),
+                replication: 2,
+                generation: Some(2),
+                completed_at: completed.then(Instant::now),
+                forwarding_grace: forwarding_grace(0),
+                acked_entries: Some(1),
+                abort_requested: Arc::new(AtomicBool::new(false)),
+                marked_keys: vec![key(b"key-3")],
+                confirmed: false,
+                pre_completion_ring: completed.then(|| Arc::clone(&pre_completion_ring)),
+                pending_clears: PendingClears::default(),
+                forward_connection: Arc::new(AsyncMutex::new(None)),
+                forward_revoked: Arc::new(AtomicBool::new(false)),
+                lingering: Vec::new(),
+                remnant: false,
+            })));
+
+            // Generation 1's `M`, built before joiner-0 was a member.
+            let joined = vec![("ready-node".to_string(), "127.0.0.1:1".to_string())];
+            let outcome = MigrationGuard::new(
+                Arc::clone(&slot),
+                "joiner-0".to_string(),
+                "127.0.0.1:9".to_string(),
+                "tok-joiner-0".to_string(),
+                Arc::clone(&after_ring),
+                2,
+                Some(1),
+                &joined,
+                &known_ring,
+                &RingHistory::default(),
+            );
+
+            assert!(
+                matches!(outcome, MigrationOutcome::Conflict),
+                "completed={completed}: an older generation's M must be rejected"
+            );
+            let existing = slot.lock().unwrap();
+            let active = existing.as_ref().expect("the newer handoff keeps the slot");
+            assert_eq!(active.generation, Some(2), "completed={completed}");
+            assert_eq!(
+                active.marked_keys,
+                vec![key(b"key-3")],
+                "completed={completed}"
+            );
+            assert!(
+                !active.abort_requested.load(Ordering::SeqCst),
+                "completed={completed}: the newer handoff must not be told to stop"
+            );
+            assert!(
+                !active.forward_revoked.load(Ordering::SeqCst),
+                "completed={completed}: its forwarding must not be revoked"
+            );
+            assert!(
+                Arc::ptr_eq(known_ring.lock().unwrap().as_ref().unwrap(), &known_before),
+                "completed={completed}: known_ring must not revert"
+            );
+        }
     }
 
     #[test]

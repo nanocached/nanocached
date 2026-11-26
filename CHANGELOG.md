@@ -42,6 +42,16 @@ framework adapters at one version, whether or not a component changed.
   half-close and a short drain, under the shared cap on concurrent refusals,
   and no plaintext reply once TLS is on (#1940).
 
+- Discovery, node: a retried `M` of a join generation that a newer
+  generation of the same joiner had superseded was followed by an `X`, and
+  since `X` names only the joiner, the node aborted the newer generation's
+  handoff (discovery then waited out the migration timeout for its `C`), or,
+  had that handoff completed, restored its handed-off copies and reverted its
+  ring under a member. Discovery now sends no `X` for a superseded
+  generation, and the node rejects an `M` of an older generation than the
+  handoff it holds for that joiner instead of aborting or replacing it
+  (#1994).
+
 - Proxy: a repeated `A` on an authenticated connection with requests
   pipelined behind it got `E` followed by a reset. The proxy now drains what
   is still arriving after that `E`, as it already did after a malformed frame
