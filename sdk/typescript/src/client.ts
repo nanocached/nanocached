@@ -416,13 +416,22 @@ const READ_REPAIR_TTL_SECONDS = 60;
 
 /** How long a read-repair write-back waits after the replica hit before it
  * re-probes the primary (it must still miss) and that replica (it must
- * still hold the same bytes). A delete sends its replica legs only after the
- * primary has answered, so for about one round trip the primary misses while
- * the replica still has the key; without the recheck a repair landing in that
- * window wrote the deleted value back to the primary. A fixed, small bound
- * rather than a measured round trip. Mutable only so tests can change it,
- * mirroring FIRE_AND_FORGET_TUNING. */
-export const READ_REPAIR_TUNING = { recheckDelayMs: 20 };
+ * still hold the same bytes): the elapsed time of the primary read that
+ * missed (the whole retried read), clamped to [minMs, maxMs]. A delete sends
+ * its replica legs only after the primary has answered, so for about one
+ * round trip the primary misses while the replica still has the key; without
+ * the recheck a repair landing in that window wrote the deleted value back to
+ * the primary. The floor covers a writer farther from the primary than this
+ * reader; the ceiling keeps the held background slot short. Same bounds in
+ * every SDK. Mutable only so tests can change them, mirroring
+ * FIRE_AND_FORGET_TUNING. */
+export const READ_REPAIR_TUNING = { recheckMinMs: 5, recheckMaxMs: 50 };
+
+/** The read-repair recheck wait for a primary read that took
+ * `primaryReadMs`: clamped to READ_REPAIR_TUNING's bounds. */
+export function readRepairRecheckWaitMs(primaryReadMs: number): number {
+  return Math.min(Math.max(primaryReadMs, READ_REPAIR_TUNING.recheckMinMs), READ_REPAIR_TUNING.recheckMaxMs);
+}
 
 /** Bounds how many replica writes a single client may have running in
  * the background at once when `fireAndForgetReplicas` is enabled
@@ -1578,13 +1587,14 @@ export class NanocachedClient {
   private async getRawInNamespace(namespace: Uint8Array, key: string | Uint8Array): Promise<Buffer | null> {
     if (this.closed) throw new AlreadyClosedError();
     await this.maybeRefreshNodeList();
+    const started = performance.now();
     let value = await this.withWrongNodeRetry(() =>
       this.target.kind === "cluster"
         ? this.readFromOwners(key, namespace, (connection) => connection.get(key, namespace))
         : this.connectionForSingleTarget().then((connection) => connection.get(key, namespace)),
     );
     if (value === null && this.readRepair && this.target.kind === "cluster") {
-      value = await this.tryReadRepair(key, namespace);
+      value = await this.tryReadRepair(key, namespace, performance.now() - started);
     }
     return value;
   }
@@ -1615,8 +1625,9 @@ export class NanocachedClient {
    * `names[0]` (the true primary) in the background, with TTL
    * READ_REPAIR_TTL_SECONDS (the original TTL can't be recovered from a
    * GET, and TTL 0 would permanently resurrect already-expired data),
-   * but only if, after READ_REPAIR_TUNING.recheckDelayMs, the primary
-   * still misses and that owner still holds the same bytes.
+   * but only if, after waiting `primaryReadMs` (the primary read that
+   * missed) clamped by readRepairRecheckWaitMs, the client is still open,
+   * the primary still misses and that owner still holds the same bytes.
    * That write-back is bounded and tracked the same way a
    * fireAndForgetReplicas replica write is (FIRE_AND_FORGET_TUNING.maxInFlight,
    * backgroundReplicaWrites — fire-and-forget replica writes), so close() drains it too
@@ -1630,7 +1641,7 @@ export class NanocachedClient {
    * #43). Nothing here may turn an already-accepted miss into an error —
    * except an actual programming bug (isSwallowable), which still
    * propagates. */
-  private async tryReadRepair(key: string | Uint8Array, namespace: Uint8Array): Promise<Buffer | null> {
+  private async tryReadRepair(key: string | Uint8Array, namespace: Uint8Array, primaryReadMs = 0): Promise<Buffer | null> {
     const names = this.ownerNames(key, namespace);
     // Every owner but the primary, which the normal read path already
     // probed and got a clean miss from (same as the Rust, Go, Java and
@@ -1668,13 +1679,15 @@ export class NanocachedClient {
         // the read returns), so the write-back sends copies.
         const repair = detachedLegBytes(key, value)();
         const replicaName = name;
+        const waitMs = readRepairRecheckWaitMs(primaryReadMs);
         const repaired = (async () => {
           // Recheck before writing (see READ_REPAIR_TUNING): a delete racing
           // this read removes the replica's copy about one round trip after
           // the primary's, and a write racing it fills the primary. Either
-          // way nothing is written. A failed re-probe skips the repair
-          // silently, as a failed owner probe does.
-          await new Promise((resolve) => setTimeout(resolve, READ_REPAIR_TUNING.recheckDelayMs));
+          // way nothing is written. A failed re-probe, or close() during the
+          // wait, skips the repair silently, as a failed owner probe does.
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          if (this.closed) return;
           try {
             const primary = await this.memberConnection(primaryName);
             if ((await primary.get(repair.key, namespace)) !== null) return;

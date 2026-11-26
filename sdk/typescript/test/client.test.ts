@@ -28,6 +28,7 @@ import {
   KEEPALIVE_TUNING,
   MAX_BATCH_KEYS,
   READ_REPAIR_TUNING,
+  readRepairRecheckWaitMs,
   resolveReconnectCooldownMs,
 } from "../src/client.js";
 import { Connection, REQUEST_TIMEOUT_TUNING } from "../src/connection.js";
@@ -6967,8 +6968,8 @@ describe("NanocachedClient read repair (read repair)", () => {
   // still misses and the replica still holds the same bytes.
   for (const race of ["replica deleted", "primary written"] as const) {
     it(`does not repair when the ${race} during the recheck wait`, async () => {
-      const defaultDelay = READ_REPAIR_TUNING.recheckDelayMs;
-      READ_REPAIR_TUNING.recheckDelayMs = 200;
+      const defaults = { ...READ_REPAIR_TUNING };
+      READ_REPAIR_TUNING.recheckMinMs = READ_REPAIR_TUNING.recheckMaxMs = 200;
       const cluster = await startReplicatedCluster();
       const client = await NanocachedClient.connect({
         addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
@@ -6981,17 +6982,47 @@ describe("NanocachedClient read repair (read repair)", () => {
         assert.equal(await client.get("k"), "from-replica");
         if (race === "replica deleted") replica.mock.store.delete("k");
         else primary.mock.store.set("k", Buffer.from("newer"));
-        await client.close(); // drains the write-back
+        await Promise.allSettled((client as any).backgroundReplicaWrites);
         if (race === "replica deleted") assert.ok(!primary.mock.store.has("k"), "the deleted value was written back");
         else assert.equal(primary.mock.store.get("k")?.toString(), "newer");
         assert.equal(client.stats().readRepairFailures, 0);
       } finally {
-        READ_REPAIR_TUNING.recheckDelayMs = defaultDelay;
+        Object.assign(READ_REPAIR_TUNING, defaults);
         await client.close();
         await cluster.close();
       }
     });
   }
+
+  it("stops a repair whose client was closed during the recheck wait", async () => {
+    const defaults = { ...READ_REPAIR_TUNING };
+    READ_REPAIR_TUNING.recheckMinMs = READ_REPAIR_TUNING.recheckMaxMs = 200;
+    const cluster = await startReplicatedCluster();
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: cluster.discovery.port }],
+      readRepair: true,
+    });
+    try {
+      const { primary, replica } = cluster.ownerOf("k");
+      replica.mock.store.set("k", Buffer.from("from-replica"));
+
+      assert.equal(await client.get("k"), "from-replica");
+      await client.close(); // drains the waiting repair, which stops
+      assert.ok(!primary.mock.store.has("k"), "a closed client wrote the repair");
+      assert.equal(primary.mock.getCount(), 1, "a closed client sent the recheck");
+      assert.equal(client.stats().readRepairFailures, 0);
+    } finally {
+      Object.assign(READ_REPAIR_TUNING, defaults);
+      await client.close();
+      await cluster.close();
+    }
+  });
+
+  it("waits for the primary read's time, clamped to 5..50 ms, before the recheck", () => {
+    assert.equal(readRepairRecheckWaitMs(0), 5);
+    assert.equal(readRepairRecheckWaitMs(20), 20);
+    assert.equal(readRepairRecheckWaitMs(1000), 50);
+  });
 
   it("stays a clean miss when no owner has the value", async () => {
     const cluster = await startReplicatedCluster();
@@ -7038,7 +7069,9 @@ describe("NanocachedClient read repair (read repair)", () => {
         assert.equal(value?.toString(), "hello");
         (reused === "key" ? key : value).fill("Z".charCodeAt(0));
         release();
-        await client.close(); // drains the write-back
+        // Waited out rather than drained by close(), which stops a repair
+        // still in its recheck wait.
+        await Promise.allSettled((client as any).backgroundReplicaWrites);
 
         assert.deepEqual(
           [...primary.mock.store.entries()].map(([k, v]) => [k, v.toString()]),
