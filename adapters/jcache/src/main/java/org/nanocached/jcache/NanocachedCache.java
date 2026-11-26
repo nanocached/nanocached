@@ -1095,6 +1095,7 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     @Override
     public void deregisterCacheEntryListener(CacheEntryListenerConfiguration<K, V> config) {
         requireNotClosed();
+        Objects.requireNonNull(config, "cacheEntryListenerConfiguration");
         synchronized (listeners) {
             listeners.removeIf(registered -> registered.config().equals(config));
             synchronized (this) {

@@ -1556,6 +1556,11 @@ class NanocachedCacheTest {
         assertTrue(events.isEmpty());
     }
 
+    @Test
+    void deregisteringANullListenerConfigurationIsANullPointerException() {
+        assertThrows(NullPointerException.class, () -> cache.deregisterCacheEntryListener(null));
+    }
+
     private static List<CacheEntryListenerConfiguration<String, String>> listenerConfigurations(
             javax.cache.configuration.CompleteConfiguration<String, String> configuration) {
         List<CacheEntryListenerConfiguration<String, String>> configs = new java.util.ArrayList<>();
