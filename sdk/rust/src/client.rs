@@ -2475,7 +2475,10 @@ impl NanocachedClient {
         // it. A delete is safe to apply at any time, so they get it now,
         // before the error is raised; the caller still gets the error, so
         // the `bool` keeps meaning what the primary answered. A `W` or any
-        // other error leaves them alone, as before.
+        // other error leaves them alone, as before. The legs run at once
+        // and are awaited even with `fire_and_forget_replicas`, so they
+        // have been answered when the error reaches the caller; a failed
+        // leg counts in `replica_write_failures`.
         if let Err(Error::ConnectionLost(_)) = &result {
             let others: Vec<String> = {
                 let state = self.inner.state.lock().await;
@@ -2484,10 +2487,18 @@ impl NanocachedClient {
                     .skip(1)
                     .collect()
             };
-            if !others.is_empty() {
-                self.replicate_writes(namespace, key, &others, WriteBody::Delete)
-                    .await;
-            }
+            let legs = others.iter().map(|name| async move {
+                let op = |connection: Arc<Connection>| async move {
+                    connection.delete(namespace, key).await
+                };
+                if self.apply_reconnecting(Some(name), &op).await.is_err() {
+                    self.inner
+                        .stats
+                        .replica_write_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            futures_util::future::join_all(legs).await;
         }
         result
     }
