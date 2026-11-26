@@ -155,7 +155,10 @@ var errServerRejected = errors.New("nanocached: the server rejected the request"
 // reply never arriving, the connection closing mid-read) is deliberately
 // NOT marked: the server may already have received and executed a
 // complete frame by then, so resending a non-idempotent request could
-// double-apply it — see connection.go's attemptRequest.
+// double-apply it — see connection.go's attemptRequest. The one exception
+// is a request pipelined behind one a node refused with `En`: the node
+// reads nothing after the request it refuses, so poisonRejecting marks
+// those as not sent.
 var errRequestNotSent = errors.New("nanocached: request was not sent")
 
 // notSent marks err with errRequestNotSent via errors.Join — preserving
