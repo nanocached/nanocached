@@ -833,6 +833,20 @@ here.</p>
   non-hedged read falls to the next owner only on connection failure. The
   primary&rsquo;s answer is the answer; probing the other owners on a miss
   is what read repair, off by default, opts into.</li>
+  <li>With read repair on, a read that runs alongside a delete of the same
+  key can still write the deleted value back to the primary for the
+  60-second repair TTL. A delete reaches the primary first and the other
+  owners about one round trip later; a read in that gap misses on the
+  primary and hits the replica. The repair therefore waits for the round
+  trip of the primary read (at least 5&nbsp;ms, at most 50&nbsp;ms) and
+  is written only if the primary still misses and the replica still
+  returns the same bytes, which a delete that has reached the replica
+  fails. Only a delete whose replica leg arrives after that wait gets past
+  it. In 500 delete-and-read races on a 2-node, 2-replica cluster on one
+  host, 421 left the key on the primary without the check and none with
+  it. Closing the gap would need a version on every write, a wire change;
+  the read itself returning the value being deleted is the same race as a
+  read just before the delete.</li>
 </ul>
 <p><strong>Data model and operations</strong></p>
 <ul>

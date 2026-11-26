@@ -400,8 +400,15 @@ existed, err := client.Delete("greeting")</code></pre>
   the primary in the background, with a fixed 60-second TTL, if one
   still holds the value.
   Closes the post-restart window client-side replication otherwise
-  leaves open, at the cost of extra reads on the misses it applies to;
-  each SDK's README has a "Read repair" section.</li>
+  leaves open, at the cost of extra reads on the misses it applies to.
+  Before writing, the repair waits for the round trip of the primary read
+  that missed (at least 5&nbsp;ms, at most 50&nbsp;ms), then re-reads the
+  primary, which must still miss, and the replica that answered, which
+  must still return the same bytes; otherwise it is skipped. This keeps a
+  read that races a delete from writing the deleted value back, except
+  when the delete reaches the replica later than that wait (see
+  <a href="architecture.html#accepted-behaviour">accepted behaviour</a>).
+  Each SDK's README has a "Read repair" section.</li>
 </ul>
 
 <h2 id="differences">Where the SDKs differ on purpose</h2>

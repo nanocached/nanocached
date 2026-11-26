@@ -272,6 +272,13 @@ framework adapters at one version, whether or not a component changed.
   item on refused over-cap connections now names the proxy too. The HELP of
   `nanocached_proxy_upstream_failures_total` now says it also counts the
   failures answered `R` to a retry-capable client (#2003).
+
+- Docs: the accepted-behaviour list and the SDKs page now say that read
+  repair rechecks both owners before writing, and that a read racing a
+  delete can still write the deleted value back to the primary for the
+  60 s repair TTL when the delete reaches the replica after that recheck
+  (#2004).
+
 - Docs: the accepted-behaviour list and the getting-started limits now say
   that the 128 rejected-connection slots of a node and of discovery are
   process-wide: a source keeping 128 rejected connections lingering makes

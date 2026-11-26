@@ -7829,13 +7829,6 @@ async fn finds_a_value_on_a_replica_and_repairs_the_primary() {
     );
 
     let primary = node_by_name(&nodes, &owners[0]);
-    assert_eq!(
-        primary.state.gets.load(Ordering::SeqCst),
-        1,
-        "read repair must not re-probe the primary — the normal read path \
-         already got a clean miss from it"
-    );
-
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while !primary
         .state
@@ -7855,12 +7848,125 @@ async fn finds_a_value_on_a_replica_and_repairs_the_primary() {
         Some("S 1 12 60"),
         "repair TTL should be READ_REPAIR_TTL (60s), not immortal (ttl_seconds 0)"
     );
+    // Issue #2004: before writing, the repair re-probed the primary (still a
+    // miss) and the replica (still the same bytes) once each.
+    assert_eq!(primary.state.gets.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        node_by_name(&nodes, &owners[1])
+            .state
+            .gets
+            .load(Ordering::SeqCst),
+        2
+    );
 
     client.close().await;
     discovery.stop();
     for (_, node) in nodes {
         node.stop();
     }
+}
+
+/// Issue #2004: a read-repair read that hits a replica, then the replica's
+/// copy changes (`change` runs right after the read returned, before the
+/// background repair task gets to run), must not write the repair. Waits
+/// until the repair task has re-probed both owners, then a little longer,
+/// and returns the primary's mock state.
+async fn read_repair_after_change(
+    change: impl FnOnce(&MockNode, &MockNode),
+) -> (Option<Vec<u8>>, Option<String>) {
+    let (nodes, discovery) = start_cluster(2).await;
+    let owners = owners_of("k");
+    let primary = node_by_name(&nodes, &owners[0]);
+    let replica = node_by_name(&nodes, &owners[1]);
+    replica
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .insert(b"k".to_vec(), b"from-replica".to_vec());
+
+    let client = NanocachedClient::connect(options(discovery.port).read_repair(true))
+        .await
+        .unwrap();
+    // The read itself still returns what the replica had.
+    assert_eq!(
+        client.get_bytes("k").await.unwrap(),
+        Some(b"from-replica".to_vec())
+    );
+    // The test runtime is single-threaded, so the spawned repair has not run
+    // yet: this lands before its wait and recheck, as a delete's replica leg
+    // does one round trip after the primary answered.
+    change(primary, replica);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while replica.state.gets.load(Ordering::SeqCst) < 2
+        && primary.state.gets.load(Ordering::SeqCst) < 2
+    {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let stored = primary
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .get(b"k".as_slice())
+        .cloned();
+    let last_set = primary.state.last_set_header.lock().unwrap().clone();
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+    (stored, last_set)
+}
+
+#[tokio::test]
+async fn a_replica_copy_deleted_before_the_recheck_is_not_repaired_onto_the_primary() {
+    // Issue #2004: a delete is primary-first, so for about one round trip
+    // the primary misses while the replica still has the value. A
+    // read-repair read in that window used to write the deleted value back
+    // to the primary for 60 s.
+    let (stored, last_set) = read_repair_after_change(|_, replica| {
+        replica.state.store.lock().unwrap().remove(b"k".as_slice());
+    })
+    .await;
+    assert_eq!(stored, None, "the deleted value was written back");
+    assert_eq!(last_set, None, "no repair write may reach the primary");
+}
+
+#[tokio::test]
+async fn a_replica_copy_that_changed_before_the_recheck_is_not_repaired_onto_the_primary() {
+    let (stored, last_set) = read_repair_after_change(|_, replica| {
+        replica
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .insert(b"k".to_vec(), b"newer".to_vec());
+    })
+    .await;
+    assert_eq!(stored, None);
+    assert_eq!(last_set, None);
+}
+
+#[tokio::test]
+async fn a_primary_that_has_the_key_at_the_recheck_is_not_overwritten() {
+    let (stored, last_set) = read_repair_after_change(|primary, _| {
+        primary
+            .state
+            .store
+            .lock()
+            .unwrap()
+            .insert(b"k".to_vec(), b"fresh".to_vec());
+    })
+    .await;
+    assert_eq!(stored, Some(b"fresh".to_vec()));
+    assert_eq!(last_set, None);
 }
 
 #[tokio::test]
