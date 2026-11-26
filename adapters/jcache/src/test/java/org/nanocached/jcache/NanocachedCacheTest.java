@@ -1505,6 +1505,69 @@ class NanocachedCacheTest {
         assertNull(manager.getCache("duplicated"), "a rejected cache must not be registered");
     }
 
+    // getConfiguration must list the listeners actually registered: register
+    // and deregister used to change only the delivery list, so a copy made
+    // after a deregister carried the removed listener into a new cache.
+    @Test
+    @SuppressWarnings("unchecked") // JSR-107's getConfiguration takes a raw class literal
+    void registerAndDeregisterUpdateTheConfigurationGetConfigurationReturns() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        CacheEntryListenerConfiguration<String, String> config = new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(new RecordingListener<String, String>(events)), null, true, true);
+
+        cache.registerCacheEntryListener(config);
+        assertEquals(
+                List.of(config),
+                listenerConfigurations(cache.getConfiguration(javax.cache.configuration.CompleteConfiguration.class)));
+
+        cache.deregisterCacheEntryListener(config);
+        javax.cache.configuration.CompleteConfiguration<String, String> afterDeregister =
+                cache.getConfiguration(javax.cache.configuration.CompleteConfiguration.class);
+        assertEquals(List.of(), listenerConfigurations(afterDeregister));
+
+        // A cache created from that configuration must not get the removed listener back.
+        Cache<String, String> copied = manager.createCache("copied", afterDeregister);
+        copied.put("a", "1");
+        assertTrue(events.isEmpty(), "the deregistered listener must not be registered on the new cache");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked") // JSR-107's getConfiguration takes a raw class literal
+    void aListenerGivenAtCreateCacheIsListedOnceAndCanBeDeregistered() {
+        List<String> events = new CopyOnWriteArrayList<>();
+        CacheEntryListenerConfiguration<String, String> config = new MutableCacheEntryListenerConfiguration<>(
+                FactoryBuilder.factoryOf(new RecordingListener<String, String>(events)), null, true, true);
+        MutableConfiguration<String, String> withListener = new MutableConfiguration<>();
+        withListener.setTypes(String.class, String.class);
+        withListener.addCacheEntryListenerConfiguration(config);
+        Cache<String, String> configured = manager.createCache("configured", withListener);
+        assertEquals(
+                List.of(config),
+                listenerConfigurations(
+                        configured.getConfiguration(javax.cache.configuration.CompleteConfiguration.class)));
+
+        configured.deregisterCacheEntryListener(config);
+
+        assertEquals(
+                List.of(),
+                listenerConfigurations(
+                        configured.getConfiguration(javax.cache.configuration.CompleteConfiguration.class)));
+        configured.put("a", "1");
+        assertTrue(events.isEmpty());
+    }
+
+    @Test
+    void deregisteringANullListenerConfigurationIsANullPointerException() {
+        assertThrows(NullPointerException.class, () -> cache.deregisterCacheEntryListener(null));
+    }
+
+    private static List<CacheEntryListenerConfiguration<String, String>> listenerConfigurations(
+            javax.cache.configuration.CompleteConfiguration<String, String> configuration) {
+        List<CacheEntryListenerConfiguration<String, String>> configs = new java.util.ArrayList<>();
+        configuration.getCacheEntryListenerConfigurations().forEach(configs::add);
+        return configs;
+    }
+
     // ── configuration / lifecycle ────────────────────────────────────
 
     @Test
