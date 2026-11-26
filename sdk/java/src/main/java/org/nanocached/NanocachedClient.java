@@ -529,6 +529,14 @@ public final class NanocachedClient implements AutoCloseable {
     // immortal key just gets re-repaired on a later miss. Cross-SDK
     // policy decision, applied identically across all SDKs.
     private static final long READ_REPAIR_TTL_SECONDS = 60;
+    // Before a read repair writes, it waits about one round trip (the
+    // missed primary read's own elapsed time, clamped to these bounds) and
+    // rechecks both owners, so a primary-first delete whose replica leg is
+    // still in flight is not undone. The floor covers a writer farther from
+    // the primary than this reader; the ceiling keeps the held permit short.
+    // The same rule and bounds as the other SDKs.
+    private static final long READ_REPAIR_RECHECK_MIN_NANOS = TimeUnit.MILLISECONDS.toNanos(5);
+    private static final long READ_REPAIR_RECHECK_MAX_NANOS = TimeUnit.MILLISECONDS.toNanos(50);
     static volatile long keepAliveIntervalMillis = 30_000;
     // Fire-and-forget replica writes: bounds how many replica writes a single client
     // may have running in the background at once when
@@ -2024,9 +2032,13 @@ public final class NanocachedClient implements AutoCloseable {
     private byte[] readRawBytes(byte[] namespace, byte[] key) {
         validateKey(namespace, key);
         beforeOperation();
+        long started = System.nanoTime();
         byte[] value = withWrongNodeRetry(() -> read(namespace, key, connection -> connection.get(namespace, key)));
         if (value == null && readRepair && ring != null) {
-            value = tryReadRepair(namespace, key);
+            long recheckAfterNanos = Math.min(
+                    Math.max(System.nanoTime() - started, READ_REPAIR_RECHECK_MIN_NANOS),
+                    READ_REPAIR_RECHECK_MAX_NANOS);
+            value = tryReadRepair(namespace, key, recheckAfterNanos);
         }
         return value;
     }
@@ -2047,8 +2059,17 @@ public final class NanocachedClient implements AutoCloseable {
      * (fire-and-forget replica writes): past the cap, the repair for this miss is simply skipped,
      * since read repair is opportunistic and a later miss on the same key repairs it (audit
      * finding, unbounded/undrained read-repair write-backs).
+     *
+     * <p>A delete goes to the primary first and to the other owners only after the primary has
+     * answered, so for about one round trip the primary has lost the key while a replica still has
+     * it; repairing from that replica would write the deleted value back for 60 s. So the
+     * background repair first waits {@code recheckAfterNanos} (the missed primary read's elapsed
+     * time, clamped to 5-50 ms), stops if the client was closed meanwhile, then reads the primary
+     * again, which must still answer a clean miss, and then the replica that hit, which must return
+     * the same bytes. Only then does it write. Any other outcome skips the repair without counting
+     * it as a failure. A delete whose replica leg lands after that recheck can still be undone.
      */
-    private byte[] tryReadRepair(byte[] namespace, byte[] key) {
+    private byte[] tryReadRepair(byte[] namespace, byte[] key, long recheckAfterNanos) {
         List<String> names = ownerNames(namespace, key);
         if (names.isEmpty()) return null;
         String primary = names.get(0);
@@ -2075,6 +2096,9 @@ public final class NanocachedClient implements AutoCloseable {
                 byte[] repairKey = key.clone();
                 byte[] repairValue = value.clone();
                 Runnable repair = () -> {
+                    if (!stillRepairable(primary, name, repairNamespace, repairKey, repairValue, recheckAfterNanos)) {
+                        return;
+                    }
                     try {
                         applyReconnecting(() -> memberConnection(primary), connection -> {
                             connection.set(repairNamespace, repairKey, repairValue, READ_REPAIR_TTL_SECONDS);
@@ -2112,6 +2136,38 @@ public final class NanocachedClient implements AutoCloseable {
             return value;
         }
         return null;
+    }
+
+    /**
+     * The recheck {@link #tryReadRepair}'s background repair runs before writing: after waiting
+     * {@code recheckAfterNanos}, {@code primary} must still answer a clean miss and then {@code
+     * replica} (read last, since a racing delete reaches it last) must still hold {@code value},
+     * byte for byte. {@code false} skips the repair: a hit or a different value, a {@code W}, any
+     * failure, an interrupted wait or a client closed during it.
+     */
+    private boolean stillRepairable(
+            String primary, String replica, byte[] namespace, byte[] key, byte[] value, long recheckAfterNanos) {
+        try {
+            TimeUnit.NANOSECONDS.sleep(recheckAfterNanos);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        if (closed) {
+            return false;
+        }
+        try {
+            byte[] atPrimary =
+                    applyReconnecting(() -> memberConnection(primary), connection -> connection.get(namespace, key));
+            if (atPrimary != null) {
+                return false;
+            }
+            byte[] atReplica =
+                    applyReconnecting(() -> memberConnection(replica), connection -> connection.get(namespace, key));
+            return Arrays.equals(atReplica, value);
+        } catch (NanocachedException skipped) {
+            return false;
+        }
     }
 
     private static String decodeUtf8Strict(byte[] bytes) {
