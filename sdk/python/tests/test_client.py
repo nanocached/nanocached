@@ -5349,6 +5349,64 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_a_replica_copy_deleted_during_the_recheck_wait_is_not_repaired(self):
+        # A delete sends its replica legs only after the primary answered,
+        # so a read-repair read can see the primary miss and the replica
+        # still hit. The write-back waits, re-probes, finds the replica's
+        # copy gone, and writes nothing back to the primary.
+        from nanocached import _client as client_module
+
+        default_delay = client_module._READ_REPAIR_RECHECK_DELAY
+        client_module._READ_REPAIR_RECHECK_DELAY = 0.2
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_repair=True
+            )
+            try:
+                primary, replica = self.owners_of("k")
+                nodes[replica].store[b"k"] = b"from-replica"
+
+                self.assertEqual(await client.get_bytes("k"), b"from-replica")
+                # The delete's replica leg, arriving after the read's probe.
+                del nodes[replica].store[b"k"]
+                await asyncio.gather(*client._background_replica_writes)
+                self.assertNotIn(b"k", nodes[primary].store)
+                self.assertEqual(client.stats().read_repair_failures, 0)
+            finally:
+                await client.close()
+        finally:
+            client_module._READ_REPAIR_RECHECK_DELAY = default_delay
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_a_primary_written_during_the_recheck_wait_is_not_overwritten(self):
+        from nanocached import _client as client_module
+
+        default_delay = client_module._READ_REPAIR_RECHECK_DELAY
+        client_module._READ_REPAIR_RECHECK_DELAY = 0.2
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_repair=True
+            )
+            try:
+                primary, replica = self.owners_of("k")
+                nodes[replica].store[b"k"] = b"from-replica"
+
+                self.assertEqual(await client.get_bytes("k"), b"from-replica")
+                nodes[primary].store[b"k"] = b"newer"
+                await asyncio.gather(*client._background_replica_writes)
+                self.assertEqual(nodes[primary].store[b"k"], b"newer")
+            finally:
+                await client.close()
+        finally:
+            client_module._READ_REPAIR_RECHECK_DELAY = default_delay
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
     async def test_stays_a_clean_miss_when_no_owner_has_the_value(self):
         nodes, discovery = await self.start_cluster()
         try:

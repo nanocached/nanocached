@@ -276,6 +276,16 @@ def _resolve_reconnect_cooldown(reconnect_cooldown: float | None, disable: bool)
 # Cross-SDK policy decision, applied identically across all SDKs.
 _READ_REPAIR_TTL = 60
 
+# How long a read-repair write-back waits after the replica hit before it
+# re-probes the primary (must still miss) and that replica (must still
+# hold the same bytes). A delete sends its replica legs only after the
+# primary has answered, so for about one round trip the primary misses
+# while the replica still has the key; without the recheck a repair landing
+# in that window wrote the deleted value back to the primary. A fixed,
+# small bound rather than a measured round trip. Mutable only so tests can
+# change it.
+_READ_REPAIR_RECHECK_DELAY = 0.02
+
 # Reserved for keep-alive pings: 0x00 followed by the ASCII bytes of
 # "nanocached-keepalive" (21 bytes total) — not just a single NUL, which
 # is itself a valid application key. A keep-alive G refreshes the server's
@@ -1323,7 +1333,9 @@ class NanocachedClient:
         value — that same value repairs the true primary in the
         background, with TTL _READ_REPAIR_TTL (the original TTL can't be
         recovered from a GET, and TTL 0 would permanently resurrect
-        already-expired data). The write-back shares its admission check
+        already-expired data), but only if, after
+        _READ_REPAIR_RECHECK_DELAY, the primary still misses and that owner
+        still holds the same bytes. The write-back shares its admission check
         and its tracking set (_background_replica_writes) with
         fire_and_forget_replicas writes in _write() — one combined pool of
         at most _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES in flight, exactly
@@ -1353,7 +1365,25 @@ class NanocachedClient:
             if names:
                 primary = names[0]
 
-                async def repair(primary: str = primary, value: bytes = value) -> None:
+                async def repair(
+                    primary: str = primary, replica: str = name, value: bytes = value
+                ) -> None:
+                    # Recheck before writing (see _READ_REPAIR_RECHECK_DELAY):
+                    # a delete racing this read removes the replica's copy
+                    # about one round trip after the primary's, and a write
+                    # racing it fills the primary. Either way nothing is
+                    # written. A failed re-probe skips the repair silently,
+                    # as a failed owner probe does.
+                    await asyncio.sleep(_READ_REPAIR_RECHECK_DELAY)
+                    try:
+                        primary_connection = await self._member_connection(primary)
+                        if await primary_connection.get(key, namespace) is not None:
+                            return
+                        replica_connection = await self._member_connection(replica)
+                        if await replica_connection.get(key, namespace) != value:
+                            return
+                    except _SWALLOWABLE_ERRORS:
+                        return
                     try:
                         connection = await self._member_connection(primary)
                         await connection.set(key, value, _READ_REPAIR_TTL, namespace)
