@@ -1460,11 +1460,13 @@ class NanocachedClient:
             # would return the deleted value. A delete is safe to apply at
             # any time, so the other owners are sent it before the error
             # is raised; the caller still gets the error, since whether
-            # the key existed is the primary's answer. A `W` answer is not
-            # caught here and keeps its own path.
+            # the key existed is the primary's answer. The legs run
+            # concurrently and are awaited even with
+            # fire_and_forget_replicas, so a read after the error sees them.
+            # A `W` answer is not caught here and keeps its own path.
             if self._ring is not None and not self._closed:
                 others = self._owner_names(namespace, key_bytes)[1:]
-                tasks = self._dispatch_replica_writes(others, op)
+                tasks = self._dispatch_replica_writes(others, op, synchronous=True)
                 if tasks:
                     for outcome in await asyncio.gather(*tasks, return_exceptions=True):
                         if isinstance(outcome, BaseException):
@@ -3658,7 +3660,11 @@ class NanocachedClient:
         task.add_done_callback(release)
 
     def _dispatch_replica_writes(
-        self, names: list[str], op: Callable[[Connection], Awaitable[object]]
+        self,
+        names: list[str],
+        op: Callable[[Connection], Awaitable[object]],
+        *,
+        synchronous: bool = False,
     ) -> list[asyncio.Task[None]]:
         """Admits each name in ``names`` as a replica leg running ``op`` —
         the fan-out machinery shared by _write()'s own replica legs and
@@ -3670,7 +3676,8 @@ class NanocachedClient:
         synchronously. Every leg swallows _SWALLOWABLE_ERRORS internally
         and counts it in stats().replica_write_failures (client-side
         replication) — only a genuine programming error can still surface
-        in a returned task's result."""
+        in a returned task's result. ``synchronous`` returns every leg to be
+        awaited, even with fire_and_forget_replicas."""
 
         async def replica_write(name: str) -> None:
             try:
@@ -3703,6 +3710,7 @@ class NanocachedClient:
             # path exactly as with the option off.
             if (
                 self._fire_and_forget_replicas
+                and not synchronous
                 and not self._closed
                 and len(self._background_replica_writes) < _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
             ):

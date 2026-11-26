@@ -2863,6 +2863,29 @@ class DeleteClusterTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await self.stop(client, discovery, nodes)
 
+    async def test_the_fallback_deletes_are_awaited_even_with_fire_and_forget_replicas(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", discovery.port)], fire_and_forget_replicas=True
+        )
+        try:
+            primary_name, replica_name = self.owners_of("k")
+            replica = nodes[replica_name]
+            await client.set("k", "v")
+            await wait_for(lambda: b"k" in replica.store, "the replica write")
+            await nodes[primary_name].close()
+            gate = replica.hold_delete_replies()
+            task = asyncio.ensure_future(client.delete("k"))
+            await wait_for(lambda: replica.deletes, "the replica to receive the delete")
+            await asyncio.sleep(0.1)
+            self.assertFalse(task.done(), "delete raised before its fallback delete was answered")
+            gate.set()
+            with self.assertRaises((ConnectionError, OSError)):
+                await task
+            self.assertEqual(client._background_replica_writes, set())
+        finally:
+            await self.stop(client, discovery, nodes)
+
     async def test_a_cluster_delete_rerouted_after_a_wrong_node_answer_returns_true(self):
         for ns in (None, "ns"):
             with self.subTest(ns=ns):
