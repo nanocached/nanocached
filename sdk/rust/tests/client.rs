@@ -3738,7 +3738,12 @@ async fn a_delete_rerouted_after_a_wrong_node_answer_reports_that_the_key_existe
 }
 
 #[tokio::test]
-async fn a_delete_reroutes_a_dead_primary_with_no_replica_deleted() {
+async fn a_delete_whose_primary_stays_unreachable_deletes_the_other_owners_before_failing() {
+    // Issue #2005: the primary goes away and the roster still lists it, so
+    // the retry after the forced refresh routes to it again and the call
+    // fails. The other owners used to be left holding the value, and a read
+    // falling back to them returned it. They now get the delete before the
+    // error is raised.
     let key = "shared-key";
     let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
     let client = NanocachedClient::connect(options(discovery.port))
@@ -3748,25 +3753,44 @@ async fn a_delete_reroutes_a_dead_primary_with_no_replica_deleted() {
     let primary = node_named(&nodes, &owners[0]);
     let replica = node_named(&nodes, &owners[1]);
 
-    // The primary goes away and the roster still lists it: the call fails,
-    // and the replica's copy was left alone.
     primary.stop();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let result = client.delete(key).await;
     assert!(
         matches!(result, Err(Error::ConnectionLost(_))),
-        "{result:?}"
+        "the caller still gets the primary's failure: {result:?}"
     );
-    assert_eq!(replica.state.deletes_received.load(Ordering::SeqCst), 0);
-    assert!(stored(replica, key), "the copy is still there");
+    assert_eq!(replica.state.deletes_received.load(Ordering::SeqCst), 1);
+    assert!(!stored(replica, key), "the replica's copy is gone");
+    // A plain read falls back to the replica on the connection failure and
+    // no longer finds the deleted value.
+    assert_eq!(client.get(key).await.unwrap(), None);
 
-    // Once the roster drops the primary the reroute reaches the replica as
-    // the new primary, which still has the key. The next forced refresh
-    // waits out the minimum interval (issue #1580).
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    shrink_roster_to(&discovery, &nodes, &owners[1]);
-    assert!(client.delete(key).await.unwrap(), "the key existed");
-    assert!(!stored(replica, key));
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_delete_whose_primary_answers_wrong_node_twice_leaves_the_other_owners_alone() {
+    // Issue #2005: only a connection failure fans the delete out after the
+    // retries; a `W` path is unchanged.
+    let key = "shared-key";
+    let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let owners = owners_of(key);
+    let primary = node_named(&nodes, &owners[0]);
+    let replica = node_named(&nodes, &owners[1]);
+
+    primary.state.wrong_node_replies.store(2, Ordering::SeqCst);
+    let result = client.delete(key).await;
+    assert!(matches!(result, Err(Error::WrongNode)), "{result:?}");
+    assert_eq!(replica.state.deletes_received.load(Ordering::SeqCst), 0);
+    assert!(stored(replica, key));
 
     client.close().await;
     discovery.stop();
