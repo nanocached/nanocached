@@ -4,7 +4,12 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -21,6 +26,16 @@ import java.util.UUID;
  * (0x00), which neither of the others can begin with. Without that marker a {@code byte[]} whose
  * bytes happened to spell, say, {@code "String:foo"} would map to the same wire key as the string
  * {@code "foo"} and one would read back the other's value.
+ *
+ * <p>JDK serialization writes an instance it has already written as a back-reference, so on its own
+ * a key holding the same {@code String} twice ({@code List.of(x, x)}, a multi-argument key built
+ * from {@code (x, x)}) and an {@code equals()}-equal key holding two separate copies would be
+ * different bytes, and an evict built from separately parsed arguments would miss. The stream
+ * therefore replaces every {@code String}, boxed primitive, {@code UUID}, {@code BigInteger} and
+ * {@code BigDecimal} with the first {@code equals()}-equal value it wrote, so a repeated value is a
+ * back-reference whether or not it was the same instance. Other types keep plain JDK semantics: two
+ * separate but equal instances of them (dates, collections, application classes) are written in
+ * full, the same instance twice as a back-reference.
  */
 final class KeyCodec {
 
@@ -60,12 +75,54 @@ final class KeyCodec {
                     + " is neither a simple type nor Serializable");
         }
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+        try (ObjectOutputStream out = new SharingEqualValues(bytes)) {
             out.writeObject(key);
         } catch (IOException e) {
             throw new IllegalStateException("nanocached-jcache: failed to serialize cache key", e);
         }
         return bytes.toByteArray();
+    }
+
+    /**
+     * The value classes whose serialized form depends only on {@code equals()}, so replacing one by
+     * an equal instance cannot change what the key means. Matched by exact class, so a subclass of
+     * {@code BigInteger} or {@code BigDecimal} (the two that are not final) is left alone.
+     */
+    private static final Set<Class<?>> SHARED_VALUE_CLASSES = Set.of(
+            String.class,
+            Long.class,
+            Integer.class,
+            Short.class,
+            Byte.class,
+            Double.class,
+            Float.class,
+            Boolean.class,
+            Character.class,
+            UUID.class,
+            BigInteger.class,
+            BigDecimal.class);
+
+    /**
+     * An {@link ObjectOutputStream} that writes the second of two {@code equals()}-equal simple
+     * values as a back-reference to the first, as it already does for the same instance — see the
+     * class doc. {@code replaceObject} runs before the stream looks the replacement up in its handle
+     * table, so the substituted instance is found there.
+     */
+    private static final class SharingEqualValues extends ObjectOutputStream {
+        private final Map<Object, Object> firstWritten = new HashMap<>();
+
+        SharingEqualValues(ByteArrayOutputStream bytes) throws IOException {
+            super(bytes);
+            enableReplaceObject(true);
+        }
+
+        @Override
+        protected Object replaceObject(Object obj) {
+            if (obj == null || !SHARED_VALUE_CLASSES.contains(obj.getClass())) {
+                return obj;
+            }
+            return firstWritten.computeIfAbsent(obj, value -> value);
+        }
     }
 
     /**

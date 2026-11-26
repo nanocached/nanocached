@@ -1303,7 +1303,7 @@ final class Connection {
      */
     private Response readAckRoster(int marker, String what, java.util.function.Function<String, MultiEntry> entryOf)
             throws IOException {
-        String[] fields = readLine().split(" ");
+        String[] fields = readHeaderFields();
         if (fields.length < 1) {
             throw new NanocachedException.ConnectionLost("nanocached: invalid " + what + " header in response", null);
         }
@@ -1336,7 +1336,7 @@ final class Connection {
                 // tags). A get-and-touch's reply (issue #825) adds `I`'s
                 // optional TTL between them — told apart by field count for
                 // the connection's mode, never guessed frame by frame.
-                String[] fields = readLine().split(" ");
+                String[] fields = readHeaderFields();
                 int valueFields = tagged ? 2 : 1;
                 if (fields.length != valueFields && fields.length != valueFields + 1) {
                     throw new NanocachedException.ConnectionLost("nanocached: invalid value header in response", null);
@@ -1369,7 +1369,7 @@ final class Connection {
             // ttl and 2 means ttl present; tagged, 1 means just the tag
             // and 2 means ttl-then-tag.
             case 'I' -> {
-                String[] fields = readLine().split(" ");
+                String[] fields = readHeaderFields();
                 int fieldsWithoutTtl = tagged ? 2 : 1;
                 int fieldsWithTtl = tagged ? 3 : 2;
                 if (fields.length != fieldsWithoutTtl && fields.length != fieldsWithTtl) {
@@ -1413,7 +1413,11 @@ final class Connection {
                     expectLf(); // the trailing '\n'
                     return new Response(marker, null, -1, null, null);
                 }
-                return new Response(marker, null, parseTag(readLine()), null, null);
+                String[] fields = readHeaderFields();
+                if (fields.length != 1) {
+                    throw new NanocachedException.ConnectionLost("nanocached: invalid tagged response header", null);
+                }
+                return new Response(marker, null, parseTag(fields[0]), null, null);
             }
             // 'M' is multi-get's (issue #151, docs/protocol.html#multi)
             // reply: `M <n> <result-1> ... <result-n>[ <tag>]\n<hit
@@ -1423,7 +1427,7 @@ final class Connection {
             // read here, inline, in token order, since only hit tokens
             // consume body bytes).
             case 'M' -> {
-                String[] fields = readLine().split(" ");
+                String[] fields = readHeaderFields();
                 if (fields.length < 1) {
                     throw new NanocachedException.ConnectionLost(
                             "nanocached: invalid multi-get header in response", null);
@@ -1575,9 +1579,37 @@ final class Connection {
     }
 
     /**
-     * Reads up to (and consuming) the next '\n', returning what preceded it. Bounded by {@link
-     * #MAX_HEADER_LINE_LENGTH}: a malicious or buggy node streaming bytes with no '\n' must fail
-     * fast instead of growing this buffer without bound.
+     * Reads the rest of a response header line after its marker byte and splits it into fields,
+     * strictly: the line must be one space followed by fields separated by single spaces, ending in
+     * a bare {@code '\n'}. Anything else ({@code V5\n} with no space after the marker, a trailing
+     * space or {@code '\r'}, a tab, a doubled space) is a protocol error that poisons the
+     * connection, as in the Go, .NET, Python and TypeScript SDKs: a peer that deviates from the
+     * grammar cannot be trusted to frame the next response either. A trailing {@code '\r'} is left
+     * on the last field, where the digits-only field check rejects it.
+     */
+    private String[] readHeaderFields() throws IOException {
+        String line = readLine();
+        if (line.length() < 2 || line.charAt(0) != ' ') {
+            throw malformedHeader();
+        }
+        String[] fields = line.substring(1).split(" ", -1);
+        for (String field : fields) {
+            if (field.isEmpty()) {
+                throw malformedHeader();
+            }
+        }
+        return fields;
+    }
+
+    private static NanocachedException.ConnectionLost malformedHeader() {
+        return new NanocachedException.ConnectionLost(
+                "nanocached: malformed response header line (connection desynced)", null);
+    }
+
+    /**
+     * Reads up to (and consuming) the next '\n', returning what preceded it, untrimmed. Bounded by
+     * {@link #MAX_HEADER_LINE_LENGTH}: a malicious or buggy node streaming bytes with no '\n' must
+     * fail fast instead of growing this buffer without bound.
      */
     private String readLine() throws IOException {
         ByteArrayOutputStream line = new ByteArrayOutputStream();
@@ -1587,7 +1619,7 @@ final class Connection {
             }
             line.write(b);
         }
-        return line.toString(StandardCharsets.US_ASCII).trim();
+        return line.toString(StandardCharsets.US_ASCII);
     }
 
     private byte[] readExactly(int length) throws IOException {

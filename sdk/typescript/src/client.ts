@@ -1741,7 +1741,9 @@ export class NanocachedClient {
    * other owners are sent the delete only after the primary has answered
    * (issue #934's ordering for an expiring touch): a replica deleted up
    * front would answer `N` when a primary that fails or answers `W` is
-   * rerouted to it. The primary's answer is returned. */
+   * rerouted to it. The primary's answer is returned. A primary still
+   * unreachable after the retry throws, but only once the other owners
+   * have been sent the delete. */
   async delete(key: string | Uint8Array): Promise<boolean> {
     return this.deleteInNamespace(EMPTY_NAMESPACE, key);
   }
@@ -2028,18 +2030,55 @@ export class NanocachedClient {
     await this.maybeRefreshNodeList();
     // Replicas only after the primary answered: a reroute to a replica
     // deleted up front would answer `N` for a key that existed.
-    return this.withWrongNodeRetry(() =>
-      this.target.kind === "cluster"
-        ? this.writeToOwners(
-            key,
-            namespace,
-            (connection, bytes) => connection.delete(bytes.key, namespace),
-            undefined,
-            false,
-            true,
-          )
-        : this.connectionForSingleTarget().then((connection) => connection.delete(key, namespace)),
+    try {
+      return await this.withWrongNodeRetry(() =>
+        this.target.kind === "cluster"
+          ? this.writeToOwners(
+              key,
+              namespace,
+              (connection, bytes) => connection.delete(bytes.key, namespace),
+              undefined,
+              false,
+              true,
+            )
+          : this.connectionForSingleTarget().then((connection) => connection.delete(key, namespace)),
+      );
+    } catch (error) {
+      // The primary stayed unreachable through the retry (dead, but still
+      // listed until discovery's liveness timeout), so no replica was sent
+      // the delete, and a read falling back to one would return the deleted
+      // value. A delete is safe to apply at any time, so the other owners
+      // are sent it before the error is thrown; the caller still gets the
+      // error, since whether the key existed is the primary's answer. A `W`
+      // is not a connection error and keeps its own path.
+      if (this.target.kind === "cluster" && !this.closed && isConnectionError(error)) {
+        await this.deleteFromReplicas(key, namespace);
+      }
+      throw error;
+    }
+  }
+
+  /** Sends a plain delete to every owner of `key` but the primary, awaited,
+   * with each failure swallowed and counted in `replicaWriteFailures` like a
+   * replica leg's. */
+  private async deleteFromReplicas(key: string | Uint8Array, namespace: Uint8Array): Promise<void> {
+    const [, ...replicaNames] = this.ownerNames(key, namespace);
+    const results = await Promise.allSettled(
+      replicaNames.map(async (name) => {
+        try {
+          const connection = await this.memberConnection(name);
+          await connection.delete(key, namespace);
+        } catch (error) {
+          if (!isSwallowable(error)) throw error;
+          this.replicaWriteFailures++;
+        }
+      }),
     );
+    for (const result of results) {
+      if (result.status === "rejected") {
+        console.warn("nanocached: a replica write raised an unexpected error:", result.reason);
+      }
+    }
   }
 
   private async touchInNamespace(namespace: Uint8Array, key: string | Uint8Array, ttlSeconds: number | null): Promise<boolean> {

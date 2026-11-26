@@ -967,6 +967,54 @@ describe("NanocachedClient reconnect-on-use", () => {
     }
   });
 
+  it("rejects a discovery node list entry with a zero-length name or address", async () => {
+    // A zero-length name or address used to be accepted; the discovery
+    // server's own parser and the Go and Python SDKs refuse it as a
+    // protocol error.
+    const { createServer } = await import("node:net");
+    const sockets = new Set<import("node:net").Socket>();
+    for (const entry of ["0 14\n127.0.0.1:7001\n", "2 0\nn1\n"]) {
+      const server = createServer((socket) => {
+        sockets.add(socket);
+        socket.on("error", () => {});
+        let buffer = "";
+        socket.on("data", (chunk: Buffer) => {
+          buffer += chunk.toString("latin1");
+          for (;;) {
+            const lf = buffer.indexOf("\n");
+            if (lf === -1) return;
+            const parts = buffer.slice(0, lf).split(" ");
+            if (parts[0] === "A") {
+              const secretLength = Number(parts[1]);
+              if (buffer.length < lf + 1 + secretLength) return;
+              buffer = buffer.slice(lf + 1 + secretLength);
+              socket.write(parts[2] === "T" ? "OdT\n" : "Od\n");
+            } else if (parts[0] === "L") {
+              buffer = buffer.slice(lf + 1);
+              socket.write(`N 1 1\n${entry}`);
+            } else {
+              buffer = buffer.slice(lf + 1);
+            }
+          }
+        });
+      });
+      const port = await new Promise<number>((resolve) => {
+        server.listen(0, "127.0.0.1", () => resolve((server.address() as { port: number }).port));
+      });
+      try {
+        const { connectAndIdentify } = await import("../src/identify.js");
+        await assert.rejects(
+          connectAndIdentify({ host: "127.0.0.1", port, connectDeadlineMs: 2000 }),
+          /invalid entry lengths in discovery response/,
+        );
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        sockets.clear();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+  });
+
   it("shares one deadline budget across the dial and the handshake read, instead of a fresh one for each", async () => {
     // Regression (issue #47 audit item 3): the dial and the ack read used
     // to each get their own independent deadlineMs-long timer, so a dial
@@ -5005,6 +5053,23 @@ describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
       assert.equal(await call, true);
       assert.equal(replica.mock.deleteCount(), 1);
       assert.equal(replica.mock.store.has("k"), false);
+    });
+  });
+
+  it("a delete whose primary stays unreachable still deletes the replica before it throws", async () => {
+    // The primary is dead but discovery still lists it, so the retry after
+    // the forced refresh routes to it again and fails. The replica is sent
+    // the delete before the error is thrown, so a read falling back to it
+    // no longer returns the deleted value.
+    await withCluster(async (client, cluster) => {
+      const { primary, replica } = cluster.ownerOf("k");
+      await client.set("k", "payload");
+      await primary.mock.close();
+      await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
+      await assert.rejects(() => client.delete("k"), ConnectionLostError);
+      assert.equal(replica.mock.deleteCount(), 1);
+      assert.equal(replica.mock.store.has("k"), false);
+      assert.equal(await client.get("k"), null);
     });
   });
 
