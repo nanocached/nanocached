@@ -3774,6 +3774,32 @@ async fn a_delete_whose_primary_stays_unreachable_deletes_the_other_owners_befor
 }
 
 #[tokio::test]
+async fn a_delete_reroutes_a_primary_dropped_from_the_roster_to_the_value() {
+    // Once the roster drops the dead primary, the forced refresh's retry
+    // reaches the replica as the new primary, which still has the key.
+    let key = "shared-key";
+    let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let owners = owners_of(key);
+    let replica = node_named(&nodes, &owners[1]);
+
+    node_named(&nodes, &owners[0]).stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    shrink_roster_to(&discovery, &nodes, &owners[1]);
+    assert!(client.delete(key).await.unwrap(), "the key existed");
+    assert_eq!(replica.state.deletes_received.load(Ordering::SeqCst), 1);
+    assert!(!stored(replica, key));
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
 async fn a_delete_whose_primary_answers_wrong_node_twice_leaves_the_other_owners_alone() {
     // Issue #2005: only a connection failure fans the delete out after the
     // retries; a `W` path is unchanged.
