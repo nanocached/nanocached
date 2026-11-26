@@ -441,6 +441,14 @@ runs), and callers that were waiting on a refresh that began before their
 failure share one follow-up refresh that starts when the window has
 passed. The 30-second staleness refresh is not delayed.
 
+A `DeleteAsync` is sent to the other owners only once the primary has
+answered, so a primary that was unreachable or answered `W` is retried
+with no copy removed yet. If the primary is still unreachable after the
+retry (it died and discovery still lists it), the other owners are sent
+the delete anyway before the call throws `ConnectionLostException`: a
+read that falls back to them then misses instead of returning the deleted
+value.
+
 ## Fire-and-forget replica writes
 
 Off by default. `SetAsync`/`DeleteAsync` normally wait for every replica
@@ -489,6 +497,18 @@ fire-and-forget replica write, is capped (the two share one in-flight
 budget) and drained by `Close()`. Past the cap the repair for that miss
 is simply skipped: it only fires on an already-rare clean miss, and
 losing one costs nothing beyond staying in the window for one more read.
+
+A delete reaches the key's primary first and its other owners about one
+round trip later, so a read that runs alongside a delete can find the
+primary already missing while a replica still holds the key. That read
+returns the deleted value. The repair is not written at once: the
+background task waits for the round trip of the primary read that missed
+(at least 5 ms, at most 50 ms), re-reads the primary, which must still
+miss, and then the replica, which must still return the same bytes; only
+then does it write. By then a racing delete has normally reached the
+replica, so its value is not written back. A delete whose replica leg
+takes longer than that wait can still be undone on the primary for the
+60-second repair TTL: the check narrows the window, it does not close it.
 
 ## Hedged reads
 

@@ -14,6 +14,18 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node: a receive buffer that grew under the in-flight overdraft token kept
+  it until its frame arrived, which only the client decided, so a client
+  that stalled or trickled mid-frame made every other large upload that
+  needed the token wait up to its 60 s frame deadline, and some were closed
+  with "in-flight byte budget exhausted". Each growth under the token must
+  now fill within 2 s plus 1 s per MiB; a buffer that falls behind is
+  charged its growth and gives the token up if the budget has room, and its
+  connection is closed otherwise. A connection that got the token after the
+  pinned bytes had gone no longer gives it up to wait for bytes a larger
+  charge queued ahead is owed, which once left every waiter waiting for
+  bytes with the token free (#1995).
+
 - Node: `/metrics` gave distinct namespaces the same `namespace` label, so
   the scrape held duplicate series: names that are not valid UTF-8 all
   decoded to `�`, and a short name could be spelled like a long name's
@@ -42,10 +54,26 @@ framework adapters at one version, whether or not a component changed.
   half-close and a short drain, under the shared cap on concurrent refusals,
   and no plaintext reply once TLS is on (#1940).
 
+- Discovery, node: a retried `M` of a join generation that a newer
+  generation of the same joiner had superseded was followed by an `X`, and
+  since `X` names only the joiner, the node aborted the newer generation's
+  handoff (discovery then waited out the migration timeout for its `C`), or,
+  had that handoff completed, restored its handed-off copies and reverted its
+  ring under a member. Discovery now sends no `X` for a superseded
+  generation, and the node rejects an `M` of an older generation than the
+  handoff it holds for that joiner instead of aborting or replacing it
+  (#1994).
+
 - Proxy: a repeated `A` on an authenticated connection with requests
   pipelined behind it got `E` followed by a reset. The proxy now drains what
   is still arriving after that `E`, as it already did after a malformed frame
   (#1408, #1941).
+
+- Proxy: the `E` for an upstream failure (a backend that failed the request,
+  or an `i`/`k`/`x` whose outcome is unknown) closed the connection with the
+  requests pipelined behind it unread, which made the close a reset that can
+  discard the `E`. The proxy now drains what is still arriving after that
+  `E` too (#2002).
 
 - Node: a decommission that retried a key's transfer after a refused or
   failed attempt resent the value and TTL it had read before the first try.
@@ -229,6 +257,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the proxy ordering section now says that a delete (`D`/`d`) is in
+  the connection's order like an expiring touch: a later request on the key
+  waits a round trip to the primary, and the delete's reply takes the
+  primary's round trip and then the other owners'. The accepted-behaviour
+  item on refused over-cap connections now names the proxy too. The HELP of
+  `nanocached_proxy_upstream_failures_total` now says it also counts the
+  failures answered `R` to a retry-capable client (#2003).
 - Docs: the accepted-behaviour list and the getting-started limits now say
   that the 128 rejected-connection slots of a node and of discovery are
   process-wide: a source keeping 128 rejected connections lingering makes

@@ -181,6 +181,10 @@ the node list, so the SDK needs no configuration:
 - `set` fans out to all R owners in parallel; `delete` goes to the
   primary first and to the other owners once it has answered, so a primary
   that fails or answers `W` is rerouted before any replica lost its copy.
+  If the primary is still unreachable after the retry (dead but still
+  listed by discovery), the other owners are sent the delete anyway before
+  the connection error is thrown, so a read that falls back to a replica
+  does not return the deleted value.
   The primary's result is the operation's result; a dead replica never
   fails a write.
 - `get` asks the primary and falls over to the next owner only when the

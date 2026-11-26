@@ -2839,6 +2839,53 @@ class DeleteClusterTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await self.stop(client, discovery, nodes)
 
+    async def test_a_delete_whose_primary_stays_unreachable_still_deletes_the_replica(self):
+        # The primary is dead but discovery still lists it, so the retry
+        # after the forced refresh routes to it again and fails. The
+        # replicas are then sent the delete before the error is raised,
+        # so a read that falls back to a replica no longer returns the
+        # deleted value.
+        for ns in (None, "ns"):
+            with self.subTest(ns=ns):
+                nodes, discovery = await self.start_cluster()
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    target = client if ns is None else client.namespace(ns)
+                    ns_bytes = b"" if ns is None else ns.encode()
+                    primary_name, replica_name = self.owners_of("k", ns_bytes)
+                    replica = nodes[replica_name]
+                    await target.set("k", "v")
+                    await nodes[primary_name].close()
+                    with self.assertRaises((ConnectionError, OSError)):
+                        await target.delete("k")
+                    self.assertEqual(replica.deletes, [(ns_bytes, b"k")])
+                    self.assertIsNone(await target.get("k"))
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+    async def test_the_fallback_deletes_are_awaited_even_with_fire_and_forget_replicas(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", discovery.port)], fire_and_forget_replicas=True
+        )
+        try:
+            primary_name, replica_name = self.owners_of("k")
+            replica = nodes[replica_name]
+            await client.set("k", "v")
+            await wait_for(lambda: b"k" in replica.store, "the replica write")
+            await nodes[primary_name].close()
+            gate = replica.hold_delete_replies()
+            task = asyncio.ensure_future(client.delete("k"))
+            await wait_for(lambda: replica.deletes, "the replica to receive the delete")
+            await asyncio.sleep(0.1)
+            self.assertFalse(task.done(), "delete raised before its fallback delete was answered")
+            gate.set()
+            with self.assertRaises((ConnectionError, OSError)):
+                await task
+            self.assertEqual(client._background_replica_writes, set())
+        finally:
+            await self.stop(client, discovery, nodes)
+
     async def test_a_cluster_delete_rerouted_after_a_wrong_node_answer_returns_true(self):
         for ns in (None, "ns"):
             with self.subTest(ns=ns):
@@ -5349,6 +5396,110 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_a_replica_copy_deleted_during_the_recheck_wait_is_not_repaired(self):
+        # A delete sends its replica legs only after the primary answered,
+        # so a read-repair read can see the primary miss and the replica
+        # still hit. The write-back waits, re-probes, finds the replica's
+        # copy gone, and writes nothing back to the primary.
+        from nanocached import _client as client_module
+
+        default_bounds = (
+            client_module._READ_REPAIR_RECHECK_MIN,
+            client_module._READ_REPAIR_RECHECK_MAX,
+        )
+        client_module._READ_REPAIR_RECHECK_MIN = client_module._READ_REPAIR_RECHECK_MAX = 0.2
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_repair=True
+            )
+            try:
+                primary, replica = self.owners_of("k")
+                nodes[replica].store[b"k"] = b"from-replica"
+
+                self.assertEqual(await client.get_bytes("k"), b"from-replica")
+                # The delete's replica leg, arriving after the read's probe.
+                del nodes[replica].store[b"k"]
+                await asyncio.gather(*client._background_replica_writes)
+                self.assertNotIn(b"k", nodes[primary].store)
+                self.assertEqual(client.stats().read_repair_failures, 0)
+            finally:
+                await client.close()
+        finally:
+            client_module._READ_REPAIR_RECHECK_MIN, client_module._READ_REPAIR_RECHECK_MAX = (
+                default_bounds
+            )
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    async def test_close_during_the_recheck_wait_skips_the_repair(self):
+        from nanocached import _client as client_module
+
+        default_bounds = (
+            client_module._READ_REPAIR_RECHECK_MIN,
+            client_module._READ_REPAIR_RECHECK_MAX,
+        )
+        client_module._READ_REPAIR_RECHECK_MIN = client_module._READ_REPAIR_RECHECK_MAX = 0.2
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_repair=True
+            )
+            primary, replica = self.owners_of("k")
+            nodes[replica].store[b"k"] = b"from-replica"
+
+            self.assertEqual(await client.get_bytes("k"), b"from-replica")
+            await client.close()  # drains the waiting repair, which stops
+            self.assertNotIn(b"k", nodes[primary].store)
+            self.assertEqual(nodes[primary].get_count, 1)
+            self.assertEqual(client.stats().read_repair_failures, 0)
+        finally:
+            client_module._READ_REPAIR_RECHECK_MIN, client_module._READ_REPAIR_RECHECK_MAX = (
+                default_bounds
+            )
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
+    def test_the_recheck_waits_for_the_primary_reads_time_within_the_bounds(self):
+        from nanocached._client import _read_repair_recheck_wait
+
+        self.assertEqual(_read_repair_recheck_wait(0.0), 0.005)
+        self.assertEqual(_read_repair_recheck_wait(0.02), 0.02)
+        self.assertEqual(_read_repair_recheck_wait(1.0), 0.05)
+
+    async def test_a_primary_written_during_the_recheck_wait_is_not_overwritten(self):
+        from nanocached import _client as client_module
+
+        default_bounds = (
+            client_module._READ_REPAIR_RECHECK_MIN,
+            client_module._READ_REPAIR_RECHECK_MAX,
+        )
+        client_module._READ_REPAIR_RECHECK_MIN = client_module._READ_REPAIR_RECHECK_MAX = 0.2
+        nodes, discovery = await self.start_cluster()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], read_repair=True
+            )
+            try:
+                primary, replica = self.owners_of("k")
+                nodes[replica].store[b"k"] = b"from-replica"
+
+                self.assertEqual(await client.get_bytes("k"), b"from-replica")
+                nodes[primary].store[b"k"] = b"newer"
+                await asyncio.gather(*client._background_replica_writes)
+                self.assertEqual(nodes[primary].store[b"k"], b"newer")
+            finally:
+                await client.close()
+        finally:
+            client_module._READ_REPAIR_RECHECK_MIN, client_module._READ_REPAIR_RECHECK_MAX = (
+                default_bounds
+            )
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
     async def test_stays_a_clean_miss_when_no_owner_has_the_value(self):
         nodes, discovery = await self.start_cluster()
         try:
@@ -5379,6 +5530,9 @@ class ReadRepairTests(unittest.IsolatedAsyncioTestCase):
             nodes[primary].delay_sets(0.08)
 
             self.assertEqual(await client.get_bytes("k"), b"from-replica")
+            # Past the recheck wait (close() during the wait skips the
+            # repair): the primary has been sent its recheck GET.
+            await wait_for(lambda: nodes[primary].get_count >= 2, "the primary recheck")
             await client.close()
             self.assertIn(
                 b"k",

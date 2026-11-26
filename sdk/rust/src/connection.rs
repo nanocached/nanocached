@@ -1636,15 +1636,14 @@ async fn read_one_response(
     match marker {
         b'V' => {
             let header = read_line(read_half).await?;
-            let header = header.trim();
             // Untagged: `V <len>`. Tagged: `V <len> <tag>` (echoed response tags) —
             // the tag rides as a second field on the same header line.
             // issue #825: get-and-touch's reply also carries the TTL now in
             // effect — `V <len> <ttl>`, tagged `V <len> <ttl> <tag>` —
             // disambiguated by the field count, like `I` below.
-            let fields: Vec<&str> = header.split(' ').collect();
             let invalid_header =
                 || Error::Protocol("nanocached: invalid value header in response".to_string());
+            let fields = split_header_fields(&header).ok_or_else(invalid_header)?;
             let (length_field, ttl_field, tag) = match (tagged, fields.as_slice()) {
                 (false, [length]) => (*length, None, None),
                 (false, [length, ttl]) => (*length, Some(*ttl), None),
@@ -1683,8 +1682,11 @@ async fn read_one_response(
             // — decided purely by whether this connection is tagged, never
             // guessed frame by frame.
             let header = read_line(read_half).await?;
-            let header = header.trim();
-            let mut fields = header.split(' ').filter(|field| !field.is_empty());
+            let mut fields = split_header_fields(&header)
+                .ok_or_else(|| {
+                    Error::Protocol("nanocached: invalid incr response header".to_string())
+                })?
+                .into_iter();
             let length_field = fields.next().ok_or_else(|| {
                 Error::Protocol("nanocached: invalid incr response header".to_string())
             })?;
@@ -1739,7 +1741,15 @@ async fn read_one_response(
                 // #129) — every no-value marker's tag rides as its header
                 // line's sole field.
                 let line = read_line(read_half).await?;
-                Ok((marker, None, None, Some(parse_tag(line.trim())?), None))
+                let tag = match split_header_fields(&line).as_deref() {
+                    Some([tag]) => parse_tag(tag)?,
+                    _ => {
+                        return Err(Error::Protocol(
+                            "nanocached: invalid tagged status header in response".to_string(),
+                        ));
+                    }
+                };
+                Ok((marker, None, None, Some(tag), None))
             } else {
                 expect_lf(read_half).await?;
                 Ok((marker, None, None, None, None))
@@ -1764,8 +1774,13 @@ async fn read_one_response(
                 _ => "touch",
             };
             let header = read_line(read_half).await?;
-            let header = header.trim();
-            let mut fields = header.split(' ').filter(|field| !field.is_empty());
+            let mut fields = split_header_fields(&header)
+                .ok_or_else(|| {
+                    Error::Protocol(format!(
+                        "nanocached: invalid multi-{what} header in response"
+                    ))
+                })?
+                .into_iter();
             let count: usize = fields.next().and_then(parse_strict).ok_or_else(|| {
                 Error::Protocol(format!(
                     "nanocached: invalid multi-{what} header in response"
@@ -1881,6 +1896,23 @@ async fn read_one_response(
             other as char
         ))),
     }
+}
+
+/// Splits a response header line (the bytes after the marker, without the
+/// `\n` that [`read_line`] strips) into its fields, or `None` when the line
+/// deviates from the wire grammar: it must start with exactly one space and
+/// its fields are separated by single spaces, with no empty field and no
+/// trailing whitespace. A `\r` or a tab is never a separator, so it stays
+/// inside a field and fails that field's own grammar. Mirrors Go's
+/// `splitHeaderFields`; a deviation is a protocol error, which poisons the
+/// connection (#1999).
+fn split_header_fields(line: &str) -> Option<Vec<&str>> {
+    let rest = line.strip_prefix(' ')?;
+    let fields: Vec<&str> = rest.split(' ').collect();
+    if fields.iter().any(|field| field.is_empty()) {
+        return None;
+    }
+    Some(fields)
 }
 
 /// The `Protocol` message for a node's `En` — the same text the generic
@@ -2101,6 +2133,60 @@ mod tests {
             );
             let ok = read_one_from_bytes(&[marker, b'\n'], false, UNBOUNDED_MULTI_GET).await;
             assert!(ok.is_ok(), "'{}\\n' must parse, got {ok:?}", marker as char);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_header_with_stray_whitespace_or_empty_fields_is_a_protocol_error() {
+        // Issue #1999: header lines used to be trimmed and (for `I`, `M`,
+        // `O` and `Y`) empty fields dropped, so these desynced forms were
+        // accepted. Fields are separated by exactly one space, with no
+        // leading or trailing whitespace and LF only.
+        for (wire, tagged) in [
+            (&b"V 5 \nhello"[..], false),
+            (b"V5\nhello", false),
+            (b"V\t5\r\nhello", false),
+            (b"V 5\r\nhello", false),
+            (b"V  5\nhello", false),
+            (b"V\nhello", false),
+            (b"V \nhello", false),
+            (b"S 3 \n", true),
+            (b"S  3\n", true),
+            (b"S3\n", true),
+            (b"S 3\r\n", true),
+            (b"I 1 \n5", false),
+            (b"I  1\n5", false),
+            (b"I 1 60  3\n5", true),
+            (b"M 2  5 -\nhello", false),
+            (b"M 2 5 - \nhello", false),
+            (b"O 1  S\n", false),
+            (b"Y 1 N \n", false),
+        ] {
+            let result = read_one_from_bytes(wire, tagged, UNBOUNDED_MULTI_GET).await;
+            assert!(
+                matches!(result, Err(Error::Protocol(_))),
+                "{:?} (tagged={tagged}) must be a protocol error, got {result:?}",
+                String::from_utf8_lossy(wire)
+            );
+        }
+        // The well-formed counterparts still parse.
+        for (wire, tagged) in [
+            (&b"V 5\nhello"[..], false),
+            (b"V 5 60\nhello", false),
+            (b"V 5 7\nhello", true),
+            (b"S 3\n", true),
+            (b"I 1\n5", false),
+            (b"I 1 60 3\n5", true),
+            (b"M 2 5 -\nhello", false),
+            (b"O 1 S\n", false),
+            (b"Y 1 N 4\n", true),
+        ] {
+            let result = read_one_from_bytes(wire, tagged, UNBOUNDED_MULTI_GET).await;
+            assert!(
+                result.is_ok(),
+                "{:?} (tagged={tagged}) must parse, got {result:?}",
+                String::from_utf8_lossy(wire)
+            );
         }
     }
 

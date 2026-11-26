@@ -276,6 +276,26 @@ def _resolve_reconnect_cooldown(reconnect_cooldown: float | None, disable: bool)
 # Cross-SDK policy decision, applied identically across all SDKs.
 _READ_REPAIR_TTL = 60
 
+# How long a read-repair write-back waits after the replica hit before it
+# re-probes the primary (must still miss) and that replica (must still
+# hold the same bytes): the elapsed time of the primary read that missed
+# (the whole retried read), clamped to these bounds. A delete sends its
+# replica legs only after the primary has answered, so for about one round
+# trip the primary misses while the replica still has the key; without the
+# recheck a repair landing in that window wrote the deleted value back to
+# the primary. The floor covers a writer farther from the primary than
+# this reader; the ceiling keeps the held background slot short. Same
+# bounds in every SDK. Mutable only so tests can change them.
+_READ_REPAIR_RECHECK_MIN = 0.005
+_READ_REPAIR_RECHECK_MAX = 0.05
+
+
+def _read_repair_recheck_wait(primary_read_seconds: float) -> float:
+    """The read-repair recheck wait: ``primary_read_seconds`` clamped to
+    _READ_REPAIR_RECHECK_MIN.._READ_REPAIR_RECHECK_MAX."""
+    return min(max(primary_read_seconds, _READ_REPAIR_RECHECK_MIN), _READ_REPAIR_RECHECK_MAX)
+
+
 # Reserved for keep-alive pings: 0x00 followed by the ASCII bytes of
 # "nanocached-keepalive" (21 bytes total) — not just a single NUL, which
 # is itself a valid application key. A keep-alive G refreshes the server's
@@ -1266,13 +1286,14 @@ class NanocachedClient:
         key_bytes = _to_bytes(key)
         _check_key(key_bytes, namespace)
         await self._before_operation()
+        started = time.monotonic()
         value = await self._with_wrong_node_retry(
             lambda: self._read(
                 namespace, key_bytes, lambda connection: connection.get(key_bytes, namespace)
             )
         )
         if value is None and self._read_repair and self._ring is not None:
-            value = await self._try_read_repair(namespace, key_bytes)
+            value = await self._try_read_repair(namespace, key_bytes, time.monotonic() - started)
         if value is None or not self._compress:
             return value
         return decompress_value(value)
@@ -1301,19 +1322,22 @@ class NanocachedClient:
         key_bytes = _to_bytes(key)
         _check_key(key_bytes, namespace)
         await self._before_operation()
+        started = time.monotonic()
         raw = await self._with_wrong_node_retry(
             lambda: self._read(
                 namespace, key_bytes, lambda connection: connection.get(key_bytes, namespace)
             )
         )
         if raw is None and self._read_repair and self._ring is not None:
-            raw = await self._try_read_repair(namespace, key_bytes)
+            raw = await self._try_read_repair(namespace, key_bytes, time.monotonic() - started)
         if raw is None:
             return None
         token = content_digest(raw)
         return (decompress_value(raw) if self._compress else raw), token
 
-    async def _try_read_repair(self, namespace: bytes, key: bytes) -> bytes | None:
+    async def _try_read_repair(
+        self, namespace: bytes, key: bytes, primary_read_seconds: float = 0.0
+    ) -> bytes | None:
         """read repair: probes the remaining owners of ``key`` —
         every owner but the primary, which the normal read path already
         probed and got a clean miss from (same as the Rust, Go, Java and
@@ -1323,7 +1347,11 @@ class NanocachedClient:
         value — that same value repairs the true primary in the
         background, with TTL _READ_REPAIR_TTL (the original TTL can't be
         recovered from a GET, and TTL 0 would permanently resurrect
-        already-expired data). The write-back shares its admission check
+        already-expired data), but only if, after waiting
+        ``primary_read_seconds`` (the primary read that missed) clamped to
+        _READ_REPAIR_RECHECK_MIN.._READ_REPAIR_RECHECK_MAX, the client is
+        still open, the primary still misses and that owner still holds the
+        same bytes. The write-back shares its admission check
         and its tracking set (_background_replica_writes) with
         fire_and_forget_replicas writes in _write() — one combined pool of
         at most _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES in flight, exactly
@@ -1353,7 +1381,33 @@ class NanocachedClient:
             if names:
                 primary = names[0]
 
-                async def repair(primary: str = primary, value: bytes = value) -> None:
+                wait = _read_repair_recheck_wait(primary_read_seconds)
+
+                async def repair(
+                    primary: str = primary,
+                    replica: str = name,
+                    value: bytes = value,
+                    wait: float = wait,
+                ) -> None:
+                    # Recheck before writing (see _READ_REPAIR_RECHECK_MIN):
+                    # a delete racing this read removes the replica's copy
+                    # about one round trip after the primary's, and a write
+                    # racing it fills the primary. Either way nothing is
+                    # written. A failed re-probe, or close() during the
+                    # wait, skips the repair silently, as a failed owner
+                    # probe does.
+                    await asyncio.sleep(wait)
+                    if self._closed:
+                        return
+                    try:
+                        primary_connection = await self._member_connection(primary)
+                        if await primary_connection.get(key, namespace) is not None:
+                            return
+                        replica_connection = await self._member_connection(replica)
+                        if await replica_connection.get(key, namespace) != value:
+                            return
+                    except _SWALLOWABLE_ERRORS:
+                        return
                     try:
                         connection = await self._member_connection(primary)
                         await connection.set(key, value, _READ_REPAIR_TTL, namespace)
@@ -1435,7 +1489,8 @@ class NanocachedClient:
         deleted no replica's copy when the call is rerouted, so the reroute
         still finds the key. Those replica deletes run after the primary's
         answer, outside the pipelined-order guarantee, like the retry
-        paths."""
+        paths. A primary still unreachable after the retry raises, but
+        only once the other owners have been sent the delete."""
         return await self._delete(b"", key)
 
     async def _delete(self, namespace: bytes, key: str | bytes) -> bool:
@@ -1444,14 +1499,36 @@ class NanocachedClient:
         key_bytes = _to_bytes(key)
         _check_key(key_bytes, namespace)
         await self._before_operation()
-        return await self._with_wrong_node_retry(
-            lambda: self._write(
-                namespace,
-                key_bytes,
-                lambda connection: connection.delete(key_bytes, namespace),
-                primary_first=True,
-            ),
-        )
+
+        def op(connection: Connection) -> Awaitable[bool]:
+            return connection.delete(key_bytes, namespace)
+
+        try:
+            return await self._with_wrong_node_retry(
+                lambda: self._write(namespace, key_bytes, op, primary_first=True),
+            )
+        except (ConnectionError, OSError):
+            # The primary stayed unreachable through the retry (dead, but
+            # still listed until discovery's liveness timeout), so no
+            # replica was sent the delete, and a read falling back to one
+            # would return the deleted value. A delete is safe to apply at
+            # any time, so the other owners are sent it before the error
+            # is raised; the caller still gets the error, since whether
+            # the key existed is the primary's answer. The legs run
+            # concurrently and are awaited even with
+            # fire_and_forget_replicas, so a read after the error sees them.
+            # A `W` answer is not caught here and keeps its own path.
+            if self._ring is not None and not self._closed:
+                others = self._owner_names(namespace, key_bytes)[1:]
+                tasks = self._dispatch_replica_writes(others, op, synchronous=True)
+                if tasks:
+                    for outcome in await asyncio.gather(*tasks, return_exceptions=True):
+                        if isinstance(outcome, BaseException):
+                            _warn(
+                                "nanocached: a replica write raised an unexpected error: "
+                                f"{outcome!r}"
+                            )
+            raise
 
     # ── Touch (issue #825) ─────────────────────────────────────────────
 
@@ -3637,7 +3714,11 @@ class NanocachedClient:
         task.add_done_callback(release)
 
     def _dispatch_replica_writes(
-        self, names: list[str], op: Callable[[Connection], Awaitable[object]]
+        self,
+        names: list[str],
+        op: Callable[[Connection], Awaitable[object]],
+        *,
+        synchronous: bool = False,
     ) -> list[asyncio.Task[None]]:
         """Admits each name in ``names`` as a replica leg running ``op`` —
         the fan-out machinery shared by _write()'s own replica legs and
@@ -3649,7 +3730,8 @@ class NanocachedClient:
         synchronously. Every leg swallows _SWALLOWABLE_ERRORS internally
         and counts it in stats().replica_write_failures (client-side
         replication) — only a genuine programming error can still surface
-        in a returned task's result."""
+        in a returned task's result. ``synchronous`` returns every leg to be
+        awaited, even with fire_and_forget_replicas."""
 
         async def replica_write(name: str) -> None:
             try:
@@ -3682,6 +3764,7 @@ class NanocachedClient:
             # path exactly as with the option off.
             if (
                 self._fire_and_forget_replicas
+                and not synchronous
                 and not self._closed
                 and len(self._background_replica_writes) < _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
             ):
