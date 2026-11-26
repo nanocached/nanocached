@@ -341,10 +341,15 @@ function parseEntry(buf: Buffer, offset: number): { node: DiscoveredNode; end: n
   // the same strictness protocol.ts already applies to every node frame.
   const nameLength = parseStrictInteger(lengths[0]);
   const addrLength = parseStrictInteger(lengths[1]);
+  // A zero-length name or address is refused too, as the discovery
+  // server's own parser and the Go and Python SDKs refuse it, so a
+  // malformed roster fails the same way in every SDK.
   if (
     nameLength === undefined ||
+    nameLength === 0 ||
     nameLength > MAX_NODE_FIELD_LENGTH ||
     addrLength === undefined ||
+    addrLength === 0 ||
     addrLength > MAX_NODE_FIELD_LENGTH
   ) {
     throw new NanocachedError("nanocached: invalid entry lengths in discovery response");

@@ -112,6 +112,29 @@ User previous = users.getAndPut("alice", newUser);   // atomic retry loop
 users.removeAll();                                    // maps to CLEAR
 ```
 
+## Cache keys
+
+A `String`, boxed number, `Boolean`, `Character` or `UUID` key is sent
+as its type name and value (`String:alice`, `Long:42`), so `"42"` and
+`42L` are different keys; a `byte[]` key is sent as its bytes. Any other
+key must be `Serializable` and is sent as its JDK serialization, which
+has to be the same on every JVM sharing the cache.
+
+JDK serialization writes an object it has already written as a
+reference to the first copy. For a `String`, boxed primitive, `UUID`,
+`BigInteger` or `BigDecimal` inside such a key, the provider writes
+every value `equals()`-equal to one already written as
+such a reference, whether or not it is the same instance, so equal keys
+built from them encode the same: a multi-argument key `(from, from)`
+matches one built from two separately parsed copies of `from`. A key
+that repeated such a value as two separate instances is sent differently
+than before this change, so its existing entry becomes a miss once.
+Other types keep plain JDK serialization: two separate but equal
+instances (dates, collections, your own classes) are written in full,
+the same instance twice as a reference, so equal keys can still encode
+differently; so can a key whose own `equals` is not structural (a
+`HashMap` built in a different insertion order).
+
 ## Honest subset — what this cannot do
 
 - **`iterator()`** always throws `UnsupportedOperationException`: the wire

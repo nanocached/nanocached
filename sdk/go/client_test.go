@@ -5543,14 +5543,17 @@ func TestReadRepairFindsAValueOnAReplicaAndRepairsThePrimary(t *testing.T) {
 		t.Fatalf("GetBytes = %q, %v, %v", value, ok, err)
 	}
 
-	// The primary must not be re-probed by read repair — it already
-	// missed once on the normal read path.
-	if got := nodes[owners[0]].getCount.Load(); got != 1 {
-		t.Fatalf("primary getCount = %d, want 1 (read repair must not re-probe it)", got)
-	}
-
 	if !waitUntil(t, 2*time.Second, func() bool { return nodes[owners[0]].hasKey(key) }) {
 		t.Fatal("the primary was never repaired")
+	}
+	// The primary is read once by the normal read path and once more by the
+	// recheck before the repair; the replica once by the probe and once by
+	// the recheck.
+	if got := nodes[owners[0]].getCount.Load(); got != 2 {
+		t.Fatalf("primary getCount = %d, want 2 (the read and the recheck)", got)
+	}
+	if got := nodes[owners[1]].getCount.Load(); got != 2 {
+		t.Fatalf("replica getCount = %d, want 2 (the probe and the recheck)", got)
 	}
 	if got := nodes[owners[0]].lastSetTTL.Load(); got != "60" {
 		t.Fatalf("repair TTL = %v, want %d (readRepairTTL, not immortal)", got, readRepairTTL)
@@ -5577,6 +5580,127 @@ func TestReadRepairStaysACleanMissWhenNoOwnerHasTheValue(t *testing.T) {
 		if got := nodes[name].getCount.Load(); got != 1 {
 			t.Fatalf("owner %s getCount = %d, want exactly 1", name, got)
 		}
+	}
+}
+
+// lengthenReadRepairRecheck makes every read repair wait d before its recheck.
+func lengthenReadRepairRecheck(t *testing.T, d time.Duration) {
+	t.Helper()
+	previousMin, previousMax := readRepairRecheckMin, readRepairRecheckMax
+	readRepairRecheckMin, readRepairRecheckMax = d, d
+	t.Cleanup(func() { readRepairRecheckMin, readRepairRecheckMax = previousMin, previousMax })
+}
+
+// A read that lands between a delete's primary leg and its replica legs gets
+// a clean miss from the primary and a hit from the replica. The repair waits
+// about one round trip and rechecks both before writing, so the value the
+// delete removed from the replica meanwhile is not written back to the
+// primary; nor is a value the replica no longer holds as it was read.
+func TestReadRepairRechecksBeforeWritingAndSkipsAValueTheReplicaNoLongerHolds(t *testing.T) {
+	cases := map[string]func(replica *mockNode){
+		// Another client's delete that the primary has already applied
+		// (the read missed there) and whose replica leg, sent after the
+		// primary's answer, lands after the read's probe.
+		"deleted on the replica after the probe": func(replica *mockNode) {
+			replica.store.Delete(storeKey{"", "k"})
+		},
+		"changed on the replica": func(replica *mockNode) {
+			replica.store.Store(storeKey{"", "k"}, []byte("newer"))
+		},
+	}
+	for name, change := range cases {
+		t.Run(name, func(t *testing.T) {
+			lengthenReadRepairRecheck(t, 300*time.Millisecond)
+
+			nodes, discovery := startCluster(t, 2)
+			owners := ownersOf("k")
+			primary, replica := nodes[owners[0]], nodes[owners[1]]
+			replica.store.Store(storeKey{"", "k"}, []byte("from-replica"))
+			client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}, ReadRepair: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			closeClient := sync.OnceFunc(client.Close)
+			t.Cleanup(closeClient)
+
+			value, ok, err := client.GetBytes("k")
+			if err != nil || !ok || string(value) != "from-replica" {
+				t.Fatalf("GetBytes = %q, %v, %v, want the replica's value", value, ok, err)
+			}
+			change(replica)
+			// Close only once the recheck has read the replica: a Close()
+			// during the wait would skip the repair on its own. Close()
+			// then waits for the task, which writes or skips without
+			// looking at the closed flag again.
+			if !waitUntil(t, 5*time.Second, func() bool { return replica.getCount.Load() == 2 }) {
+				t.Fatal("the recheck never read the replica")
+			}
+			closeClient()
+			if stored, ok := primary.store.Load(storeKey{"", "k"}); ok {
+				t.Fatalf("the primary was repaired with %q", stored)
+			}
+			if got := client.Stats().ReadRepairFailures; got != 0 {
+				t.Fatalf("ReadRepairFailures = %d, want 0 (a skipped repair is not a failure)", got)
+			}
+		})
+	}
+}
+
+// A primary that has the key by the time of the recheck (a write landed) is
+// not overwritten with the replica's older value.
+func TestReadRepairSkipsAPrimaryThatNoLongerMisses(t *testing.T) {
+	lengthenReadRepairRecheck(t, 300*time.Millisecond)
+
+	nodes, discovery := startCluster(t, 2)
+	owners := ownersOf("k")
+	primary, replica := nodes[owners[0]], nodes[owners[1]]
+	replica.store.Store(storeKey{"", "k"}, []byte("from-replica"))
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}, ReadRepair: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeClient := sync.OnceFunc(client.Close)
+	t.Cleanup(closeClient)
+
+	if _, ok, err := client.GetBytes("k"); err != nil || !ok {
+		t.Fatalf("GetBytes = %v, %v, want a hit", ok, err)
+	}
+	primary.store.Store(storeKey{"", "k"}, []byte("newer"))
+	if !waitUntil(t, 5*time.Second, func() bool { return primary.getCount.Load() == 2 }) {
+		t.Fatal("the recheck never read the primary")
+	}
+	closeClient()
+	if stored, _ := primary.store.Load(storeKey{"", "k"}); string(stored.([]byte)) != "newer" {
+		t.Fatalf("primary holds %q, want newer", stored)
+	}
+}
+
+// A Close() that starts while a repair waits for its recheck skips the
+// repair (no recheck, no write) but still waits for the task to exit.
+func TestReadRepairSkipsTheRepairWhenCloseStartsDuringTheRecheckWait(t *testing.T) {
+	lengthenReadRepairRecheck(t, 300*time.Millisecond)
+
+	nodes, discovery := startCluster(t, 2)
+	owners := ownersOf("k")
+	primary, replica := nodes[owners[0]], nodes[owners[1]]
+	replica.store.Store(storeKey{"", "k"}, []byte("from-replica"))
+	client, err := Connect(Config{Addresses: []Address{addr(discovery.address())}, ReadRepair: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := client.GetBytes("k"); err != nil || !ok {
+		t.Fatalf("GetBytes = %v, %v, want a hit", ok, err)
+	}
+	started := time.Now()
+	client.Close()
+	if elapsed := time.Since(started); elapsed < 200*time.Millisecond {
+		t.Fatalf("Close() returned after %v, before the repair task finished its wait", elapsed)
+	}
+	if primary.hasKey("k") {
+		t.Fatal("the primary was repaired after Close() started")
+	}
+	if got := primary.getCount.Load(); got != 1 {
+		t.Fatalf("primary getCount = %d, want 1 (no recheck after Close)", got)
 	}
 }
 

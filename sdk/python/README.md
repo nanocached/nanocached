@@ -109,7 +109,10 @@ and `get` asks the primary, falling over to the next owner only when the
 holder is unreachable. `client.replication` exposes the factor in use.
 A `delete` goes to the primary first and to the other owners only once the
 primary has answered, so a reroute after a failed or wrong-node primary still
-finds the key and returns `True`.
+finds the key and returns `True`. If the primary is still unreachable after
+the retry (dead but still listed by discovery), the other owners are sent the
+delete anyway before the connection error is raised, so a read that falls
+back to a replica does not return the deleted value.
 
 ## Namespaces
 
@@ -491,6 +494,17 @@ fire-and-forget replica write, is capped (the two share one in-flight
 budget) and drained by `close()`. Past the cap the repair for that miss
 is simply skipped: it only fires on an already-rare clean miss, and
 losing one costs nothing beyond staying in the window for one more read.
+
+A delete reaches the other owners only after the primary has answered, so
+for about one round trip the primary misses while a replica still has the
+key. A read landing there still returns the value being deleted, but the
+repair does not write it back: it first waits as long as the primary read
+that missed took (at least 5 ms, at most 50 ms), stops if the client was
+closed meanwhile, then re-probes the primary (it must still miss) and that
+replica (it must still hold the same bytes), and writes only if both hold. This narrows the window without
+closing it: a delete whose replica legs take longer than that wait to land
+can still have its value written back to the primary for up to the
+60-second repair TTL.
 
 ## Hedged reads
 
