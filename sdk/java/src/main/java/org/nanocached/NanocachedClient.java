@@ -3818,15 +3818,43 @@ public final class NanocachedClient implements AutoCloseable {
         // replica would delete its copy while a primary that failed or
         // answered W is rerouted to it, and the call would return false for
         // a key that existed.
-        return withWrongNodeRetry(() -> write(
-                namespace,
-                key,
-                connection -> connection.delete(ownedNamespace, ownedKey),
-                null,
-                null,
-                true,
-                false,
-                true));
+        ConnectionOp<Boolean> op = connection -> connection.delete(ownedNamespace, ownedKey);
+        try {
+            return withWrongNodeRetry(() -> write(namespace, key, op, null, null, true, false, true));
+        } catch (NanocachedException.ConnectionLost primaryFailure) {
+            deleteOnOtherOwners(namespace, key, op, primaryFailure);
+            throw primaryFailure;
+        }
+    }
+
+    /**
+     * After a delete's primary leg has failed for good with a connection error (the refresh and
+     * retry included: a dead primary that discovery still lists), sends the delete to the other
+     * owners before the caller sees {@code primaryFailure}. Otherwise every replica would keep the
+     * value, a plain read falling back to a replica on the dead primary would return it, and once
+     * discovery dropped the primary the replica would be promoted holding it. A delete can be
+     * applied at any time, so this cannot undo anything; the caller still gets the error, so what
+     * {@code delete} reports is unchanged. A {@code W} is not a connection error and does not get
+     * here. The legs are the ordinary replica legs, bounded and drained like any other; their
+     * failures are counted and never replace {@code primaryFailure}.
+     */
+    private void deleteOnOtherOwners(
+            byte[] namespace, byte[] key, ConnectionOp<Boolean> op, NanocachedException.ConnectionLost primaryFailure) {
+        if (ring == null || primaryFailure instanceof NanocachedException.ServerRejected) {
+            return;
+        }
+        List<String> names = ownerNames(namespace, key);
+        if (names.size() < 2) {
+            return;
+        }
+        for (CompletableFuture<Void> pending :
+                startReplicaWrites(names.subList(1, names.size()), op, null, null, false)) {
+            try {
+                pending.join();
+            } catch (CompletionException wrapped) {
+                reportBackgroundWriteBug(unwrapReplicaBug(wrapped));
+            }
+        }
     }
 
     public void setMany(Map<String, String> values) {
