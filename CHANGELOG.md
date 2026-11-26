@@ -26,6 +26,18 @@ framework adapters at one version, whether or not a component changed.
   charge queued ahead is owed, which once left every waiter waiting for
   bytes with the token free (#1995).
 
+- Node: a receive buffer that grew under the overdraft token kept its whole
+  grown allocation after its frame was answered when more than 64 KiB of the
+  next frame had already arrived with it, charged only what it had been
+  before the token: after the frame was split off, the buffer's reported
+  capacity covered only what lay past the split, so neither the rebuild nor
+  the next growth ran. The token was free again, so every connection that
+  took it after could do the same, and a node with an 8 MiB budget reached
+  114 MB of RSS with 120 connections each stopped 100 KB into its next
+  store (32 MB when stopped under 64 KiB). The buffer is now rebuilt to what
+  it holds once the token is gone, and what it holds beyond 64 KiB is
+  charged, or taken under the token again within its bound (#2040).
+
 - Node: `/metrics` gave distinct namespaces the same `namespace` label, so
   the scrape held duplicate series: names that are not valid UTF-8 all
   decoded to `�`, and a short name could be spelled like a long name's

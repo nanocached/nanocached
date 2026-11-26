@@ -3228,6 +3228,11 @@ async fn handle_connection(
     // Issue #1995: by when the growth taken under `receive_overdraft` must
     // have filled (`overdraft_fill_time`). Meaningless without the token.
     let mut overdraft_deadline = Instant::now();
+    // Issue #2040: the buffer's allocation grew under `receive_overdraft`
+    // and was not charged since. Once the token is gone (its frame was
+    // answered), the buffer is rebuilt to what it still holds, whatever
+    // its size, so that allocation does not outlive the token uncharged.
+    let mut grew_uncharged = false;
     // No secret configured means auth isn't required, so every connection
     // starts already authenticated.
     let mut authenticated = config.auth_secret.is_none();
@@ -4795,12 +4800,28 @@ async fn handle_connection(
                 .saturating_add(REQUEST_BUFFER_SHRINK_THRESHOLD);
         let charged_under_threshold =
             received.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD && receive_charged > 0;
-        if (mostly_slack || charged_under_threshold)
-            && received.len() <= REQUEST_BUFFER_SHRINK_THRESHOLD
+        //
+        // Issue #2040: a buffer that grew under the overdraft token is
+        // rebuilt once the token is gone, even with more than the
+        // threshold left in it. The rule above keeps such a buffer when
+        // the next frame's first bytes are over the threshold, and its
+        // `capacity()` after the `split_to` reports only what lies past
+        // the split, so the whole grown allocation (about a frame) stayed
+        // uncharged until the client sent more or the frame deadline
+        // closed it, and every connection that took the token after it
+        // could do the same. The copy is at most what the buffer holds,
+        // once per token; what it holds beyond the threshold is then
+        // charged by the growth below, which takes the token again,
+        // under its own bound, if the room cannot cover it.
+        let overdraft_left_uncharged = grew_uncharged && receive_overdraft.is_none();
+        if overdraft_left_uncharged
+            || ((mostly_slack || charged_under_threshold)
+                && received.len() <= REQUEST_BUFFER_SHRINK_THRESHOLD)
         {
             let mut shrunk = BytesMut::with_capacity(received.len());
             shrunk.extend_from_slice(&received);
             received = shrunk;
+            grew_uncharged = false;
             #[cfg(test)]
             RECEIVE_BUFFER_REBUILDS.with(|n| n.set(n.get() + 1));
         }
@@ -4833,9 +4854,10 @@ async fn handle_connection(
         // Issue #1869: a growth the room cannot cover may instead take the
         // overdraft token (`InFlightBudget::charge_growth`), and the frame
         // still arriving then grows uncharged until it is complete. What
-        // it grew by stays uncharged until the buffer is rebuilt below
-        // the threshold, or is charged by the next growth, which asks
-        // for everything beyond `receive_charged`.
+        // it grew by is charged when the token's bound runs out (below),
+        // or, once the frame has been answered, given up by the rebuild
+        // above (issue #2040) and charged again by the next growth, which
+        // asks for everything beyond `receive_charged`.
         if received.capacity() - received.len() < READ_CHUNK_SIZE {
             let grown = (received.capacity() * 2).max(received.len() + READ_CHUNK_SIZE);
             let want = config
@@ -4875,6 +4897,7 @@ async fn handle_connection(
             if receive_overdraft.is_some() {
                 overdraft_deadline =
                     Instant::now() + overdraft_fill_time(grown.saturating_sub(received.capacity()));
+                grew_uncharged = true;
             }
             received.reserve(grown - received.len());
         }
@@ -4916,6 +4939,8 @@ async fn handle_connection(
                     None => more,
                 });
             }
+            // The growth is charged now, as the buffer's whole capacity.
+            grew_uncharged = false;
             receive_overdraft = None;
         }
         let read_deadline = if receive_overdraft.is_some() {
@@ -13354,6 +13379,82 @@ mod tests {
         drop(client);
         let _ = timeout(Duration::from_secs(5), task).await;
         assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// Issue #2040: a store whose buffer grew under the overdraft token is
+    /// answered with more than the threshold of the next frame already in
+    /// the buffer, and the client sends no more. After the `split_to` the
+    /// buffer's `capacity()` reports only what lies past the split, which
+    /// still had room to read into, so neither the rebuild nor the growth
+    /// ran: the whole grown allocation stayed with the buffer, charged
+    /// only what was charged before the token, while the token was free
+    /// for the next connection to do the same. Now the buffer is rebuilt
+    /// to what it holds once the token is gone, and what it holds beyond
+    /// the threshold is charged, or taken under the token again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_buffer_grown_under_the_overdraft_token_is_rebuilt_once_its_frame_is_answered() {
+        const SIZE: usize = 300_000;
+        const TAIL: usize = 100_000;
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        // Everything but 128 KiB is held and pinned, as other connections'
+        // receive buffers would be, so the store's growth past 128 KiB
+        // cannot be charged and takes the token.
+        const OTHERS: usize = MAX_REQUEST_SIZE - 128 * 1024;
+        let held = budget.charge(OTHERS).await;
+        budget.pinned.fetch_add(OTHERS, Ordering::Relaxed);
+
+        let (mut client, server) = tcp_pair().await;
+        let task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        // All but the end of the store first, so that the read completing
+        // it brings the next frame's first bytes in with it.
+        let mut head = format!("S 1 {SIZE}\nk").into_bytes();
+        head.extend(std::iter::repeat_n(b'v', SIZE - 1_000));
+        client.write_all(&head).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(budget.overdraft.available_permits(), 0, "the premise");
+        RECEIVE_BUFFER_REBUILDS.with(|n| n.set(0));
+        let mut rest = vec![b'v'; 1_000];
+        let next = format!("S 2 {SIZE}\nkk").into_bytes();
+        let next_len = next.len();
+        rest.extend(next);
+        rest.extend(std::iter::repeat_n(b'w', TAIL - next_len));
+        client.write_all(&rest).await.unwrap();
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply, b"S\n");
+        sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            RECEIVE_BUFFER_REBUILDS.with(|n| n.get()) >= 1,
+            "the buffer that grew under the token is rebuilt to the {TAIL} bytes it holds"
+        );
+        let charged = MAX_REQUEST_SIZE - OTHERS - budget.available();
+        assert!(
+            budget.overdraft.available_permits() == 0
+                || charged + REQUEST_BUFFER_SHRINK_THRESHOLD >= TAIL,
+            "the buffer holds {TAIL} bytes, charged {charged}, without the token"
+        );
+
+        drop(client);
+        let _ = timeout(Duration::from_secs(5), task).await;
+        assert_eq!(budget.overdraft.available_permits(), 1);
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE - OTHERS);
+        budget.pinned.fetch_sub(OTHERS, Ordering::Relaxed);
+        drop(held);
         drop(request_tx);
         cache_task.await.unwrap();
     }

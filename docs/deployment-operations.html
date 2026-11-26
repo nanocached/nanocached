@@ -125,7 +125,9 @@ growth under the slot must fill within 2&nbsp;seconds plus 1&nbsp;second
 per MiB it grew by. A connection that falls behind is charged what it grew
 by and gives the slot up if the budget has that much free by then, and is
 closed otherwise, so a stalled or trickling client cannot keep the other
-large uploads waiting for its frame deadline. That overshoots the budget by one frame or
+large uploads waiting for its frame deadline. Once its frame has been answered, the buffer
+gives up what it grew to and keeps only the bytes still in it, charged like any other
+growth, even when more than 64&nbsp;KiB of the next frame has already arrived. That overshoots the budget by one frame or
 reply, never more, and a connection with no buffer charged keeps waiting
 for the budget. A connection that cannot get its share in time is closed,
 like a stalled one.</p>
