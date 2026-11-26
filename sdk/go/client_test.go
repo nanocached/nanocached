@@ -108,6 +108,7 @@ type mockNode struct {
 	lastSetTTL             atomic.Value // string: the TTL field of the last S, or "none"
 	setDelay               atomic.Int64 // nanoseconds; sleep this long before every S reply
 	getDelay               atomic.Int64 // nanoseconds; sleep this long before every G reply
+	deleteDelay            atomic.Int64 // nanoseconds; sleep this long before applying every D
 	conns                  sync.Map     // net.Conn -> struct{}
 	silent                 atomic.Bool  // once true, every G/S/D is read but never answered
 	closed                 atomic.Bool  // set by close(): no connection accepted from now on stays open
@@ -1398,6 +1399,9 @@ func (m *mockNode) serve(conn net.Conn) {
 				continue
 			}
 			m.deletesReceived.Add(1)
+			if delay := time.Duration(m.deleteDelay.Load()); delay > 0 {
+				time.Sleep(delay)
+			}
 			reply := "N" + tagSuffix + "\n"
 			if m.takeWrongNode() {
 				reply = "W" + tagSuffix + "\n"

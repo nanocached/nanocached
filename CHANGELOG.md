@@ -75,6 +75,14 @@ framework adapters at one version, whether or not a component changed.
   discard the `E`. The proxy now drains what is still arriving after that
   `E` too (#2002).
 
+- Proxy: a `D`/`d` whose primary stayed unreachable through the retry was
+  answered with an error and no other owner was sent the delete, so a later
+  `G` that fell back to a replica returned the deleted value, and the replica
+  kept it once promoted. The other owners now get their delete before the
+  client gets the error; a later request on the key from the same connection
+  still waits until those legs are enqueued. A `W` is retried as before
+  (#2016).
+
 - Node: a decommission that retried a key's transfer after a refused or
   failed attempt resent the value and TTL it had read before the first try.
   A client write that landed during the backoff (or the reconnect) was
@@ -264,6 +272,13 @@ framework adapters at one version, whether or not a component changed.
   item on refused over-cap connections now names the proxy too. The HELP of
   `nanocached_proxy_upstream_failures_total` now says it also counts the
   failures answered `R` to a retry-capable client (#2003).
+
+- Docs: the accepted-behaviour list and the SDKs page now say that read
+  repair rechecks both owners before writing, and that a read racing a
+  delete can still write the deleted value back to the primary for the
+  60 s repair TTL when the delete reaches the replica after that recheck
+  (#2004).
+
 - Docs: the accepted-behaviour list and the getting-started limits now say
   that the 128 rejected-connection slots of a node and of discovery are
   process-wide: a source keeping 128 rejected connections lingering makes

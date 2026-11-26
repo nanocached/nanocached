@@ -214,8 +214,9 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
 
     /**
      * The cache's own copy (issue #1949), made by {@code createCache}: never handed out, only
-     * copied by {@link #getConfiguration}, and changed only by {@link #setStatisticsEnabled}.
-     * Guarded by {@code this}.
+     * copied by {@link #getConfiguration}, and changed only by {@link #setStatisticsEnabled} and by
+     * listener registration and deregistration, which keep its listener configurations equal to
+     * {@code listeners}. Guarded by {@code this}.
      */
     private final MutableConfiguration<K, V> configuration;
 
@@ -1050,7 +1051,16 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     @Override
     public void registerCacheEntryListener(CacheEntryListenerConfiguration<K, V> config) {
         requireNotClosed();
-        addListener(Objects.requireNonNull(config, "cacheEntryListenerConfiguration"));
+        Objects.requireNonNull(config, "cacheEntryListenerConfiguration");
+        // Under the registration lock, so the configuration's listener list
+        // and the delivery list change together (the constructor's
+        // configuration already lists the listeners it registers).
+        synchronized (listeners) {
+            addListener(config);
+            synchronized (this) {
+                configuration.addCacheEntryListenerConfiguration(config);
+            }
+        }
     }
 
     /**
@@ -1085,7 +1095,13 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
     @Override
     public void deregisterCacheEntryListener(CacheEntryListenerConfiguration<K, V> config) {
         requireNotClosed();
-        listeners.removeIf(registered -> registered.config().equals(config));
+        Objects.requireNonNull(config, "cacheEntryListenerConfiguration");
+        synchronized (listeners) {
+            listeners.removeIf(registered -> registered.config().equals(config));
+            synchronized (this) {
+                configuration.removeCacheEntryListenerConfiguration(config);
+            }
+        }
     }
 
     private void fireCreated(K key, V value) {
