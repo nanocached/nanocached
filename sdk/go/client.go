@@ -1329,7 +1329,10 @@ func (c *Client) setBytesNS(namespace []byte, key string, value []byte, ttlSecon
 // has answered, as for Touch with ttlSeconds == 0 (issue #934): a primary
 // that could not be reached or answered `W` is rerouted with no replica
 // deleted yet, so the reroute does not report false from a copy this call
-// already removed.
+// already removed. A primary that is still unreachable after the refresh
+// and retry returns ErrConnectionLost, but only after the other owners have
+// been sent the delete, so a read that falls back to a replica does not
+// return the deleted value.
 func (c *Client) Delete(key string) (existed bool, err error) {
 	return c.deleteNS(nil, key)
 }
@@ -1358,7 +1361,45 @@ func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error
 			return opErr
 		}, c.applyReconnecting, true)
 	})
+	if err != nil && errors.Is(err, ErrConnectionLost) && !errors.Is(err, ErrWrongNode) {
+		c.deleteOtherOwnersAfterLostPrimary(namespace, keyBytes)
+	}
 	return existed, err
+}
+
+// deleteOtherOwnersAfterLostPrimary sends a delete whose primary leg still
+// failed with a lost connection after the refresh and retry (a dead primary
+// discovery still lists) to the key's other owners before the caller gets
+// the error. Without it no owner would receive the delete: a read falls back
+// to a replica on the dead primary and finds the value, and once discovery
+// drops the primary that replica is promoted with it. A delete is safe to
+// apply at any time, and the caller still gets the error, so existed is
+// unchanged. A primary that answered `W` is not covered: it is reachable and
+// the retry already rerouted. The replicas are the owners on the ring in
+// force now, without its primary, which the retry just failed to reach.
+// They are sent concurrently and awaited before the error is returned, even
+// with FireAndForgetReplicas (as in the other SDKs): the caller learns of
+// the failure only once the delete has reached every owner it can. A failed
+// leg is counted in Stats().ReplicaWriteFailures.
+func (c *Client) deleteOtherOwnersAfterLostPrimary(namespace, key []byte) {
+	names := c.ownerNames(namespace, key)
+	if len(names) < 2 {
+		return
+	}
+	var wg sync.WaitGroup
+	for _, name := range names[1:] {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := c.applyReconnecting(name, func(conn *connection) error {
+				_, err := conn.deleteNS(namespace, key)
+				return err
+			}); err != nil {
+				c.stats.replicaWriteFailures.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // ── バッチ操作 (issues #128/#150/#151) ───────────────────────────────
