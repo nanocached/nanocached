@@ -235,6 +235,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the proxy ordering section now says that a delete (`D`/`d`) is in
+  the connection's order like an expiring touch: a later request on the key
+  waits a round trip to the primary, and the delete's reply takes the
+  primary's round trip and then the other owners'. The accepted-behaviour
+  item on refused over-cap connections now names the proxy too. The HELP of
+  `nanocached_proxy_upstream_failures_total` now says it also counts the
+  failures answered `R` to a retry-capable client (#2003).
 - Docs: the accepted-behaviour list and the getting-started limits now say
   that the 128 rejected-connection slots of a node and of discovery are
   process-wide: a source keeping 128 rejected connections lingering makes

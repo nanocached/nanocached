@@ -9042,7 +9042,7 @@ async fn serve_metrics_connection(
                  # HELP nanocached_proxy_requests_total Requests dispatched (all ops).\n\
                  # TYPE nanocached_proxy_requests_total counter\n\
                  nanocached_proxy_requests_total {requests}\n\
-                 # HELP nanocached_proxy_upstream_failures_total Requests that failed upstream after retries (answered E).\n\
+                 # HELP nanocached_proxy_upstream_failures_total Requests that failed upstream after retries (answered E, or R to a retry-capable client).\n\
                  # TYPE nanocached_proxy_upstream_failures_total counter\n\
                  nanocached_proxy_upstream_failures_total {failures}\n\
                  # HELP nanocached_proxy_replica_refusals_total Replica legs of a write a node answered W or E: the client saw success, but that replica's copy is missing or stale until the next write.\n\
