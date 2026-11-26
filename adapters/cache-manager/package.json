@@ -53,7 +53,7 @@
     "nanocached": "link:../../sdk/typescript"
   },
   "devDependencies": {
-    "@types/node": "^24.0.0",
+    "@types/node": "^26.6.6",
     "cache-manager": "^5",
     "oxfmt": "0.78.0",
     "oxlint": "1.94.0",
