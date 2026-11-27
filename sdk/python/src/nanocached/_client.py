@@ -3539,7 +3539,9 @@ class NanocachedClient:
           waited for, so hedging never turns a hit into a miss; it is
           accepted only once every owner has answered or failed;
         - a failure (connection-level or a NanocachedError other than
-          WrongNodeError) just hedges onward immediately;
+          WrongNodeError) just hedges onward immediately: the next owner,
+          if any, starts right away, even while other legs are still in
+          flight;
         - WrongNodeError propagates as in _read().
 
         An owner with _HEDGE_SUSPECT_LATE_LEGS late legs outstanding (see
@@ -3684,6 +3686,7 @@ class NanocachedClient:
                 hit_value: object = None
                 wrong_node: WrongNodeError | None = None
                 primary_missed = False
+                failed = 0
                 for task in done:
                     index = legs[task]
                     try:
@@ -3692,6 +3695,7 @@ class NanocachedClient:
                         wrong_node = error
                     except (NanocachedError, ConnectionError, OSError) as error:
                         last_error = error
+                        failed += 1
                     else:
                         if value is not None:
                             hit_value = value
@@ -3708,9 +3712,18 @@ class NanocachedClient:
                 if primary_missed:
                     await resolve_losers(pending)
                     return None
+                # A failed leg hedges onward at once: each one is replaced
+                # by the next owner right away, even while other legs (a
+                # silent primary) are still in flight, rather than waiting
+                # out another interval.
+                for _ in range(failed):
+                    if next_index >= len(names):
+                        break
+                    pending.add(start(next_index))
+                    next_index += 1
                 if not pending and next_index < len(names):
-                    # Everything so far failed or missed provisionally: the
-                    # next owner gets its turn right away.
+                    # Everything so far missed provisionally: the next
+                    # owner gets its turn right away.
                     pending.add(start(next_index))
                     next_index += 1
         except asyncio.CancelledError:
