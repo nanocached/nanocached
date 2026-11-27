@@ -436,6 +436,49 @@ class NanocachedCacheManagerTest {
         assertNull(cache.get(new SimpleKey(from, from)));
     }
 
+    /** A key object holding two values: the shape a composite {@code @Cacheable(key = ...)} builds. */
+    record Pair(String a, String b) implements Serializable {}
+
+    @Test
+    void aKeyObjectHoldingOneStringTwiceMatchesAnEqualOneHoldingTwoCopies() {
+        // JDK serialization writes the second reference to one String as a
+        // back-reference, so Pair(s, s) and Pair(s, copyOf(s)) — equal keys —
+        // used to be different wire keys: the lookup missed and the evict
+        // left the entry in place.
+        Cache cache = manager().build().getCache("pairs");
+        String s = "x";
+        cache.put(new Pair(s, s), "v");
+        cache.put(new SimpleKey(new Pair(s, s), 1), "w");
+
+        Pair copies = new Pair("x", new String("x"));
+        assertEquals("v", cache.get(copies, String.class));
+        assertEquals("w", cache.get(new SimpleKey(copies, 1), String.class));
+        assertTrue(cache.evictIfPresent(copies));
+        assertTrue(cache.evictIfPresent(new SimpleKey(copies, 1)));
+        assertNull(cache.get(new Pair(s, s)));
+        assertNull(cache.get(new SimpleKey(new Pair(s, s), 1)));
+    }
+
+    @Test
+    void equalValuesOfDifferentTypesInAKeyObjectStayDistinct() {
+        DefaultCacheKeyConverter converter = new DefaultCacheKeyConverter();
+        List<Object> asLong = new java.util.ArrayList<>(List.of(42L, 42L));
+        List<Object> mixed = new java.util.ArrayList<>(List.of(42L, 42));
+
+        assertFalse(java.util.Arrays.equals(converter.toKeyBytes(asLong), converter.toKeyBytes(mixed)));
+    }
+
+    @Test
+    void aKeyObjectWithoutRepeatedValuesKeepsPlainJdkSerialization() throws Exception {
+        Pair key = new Pair("a", "b");
+        java.io.ByteArrayOutputStream plain = new java.io.ByteArrayOutputStream();
+        try (java.io.ObjectOutputStream out = new java.io.ObjectOutputStream(plain)) {
+            out.writeObject(key);
+        }
+
+        assertArrayEquals(plain.toByteArray(), new DefaultCacheKeyConverter().toKeyBytes(key));
+    }
+
     @Test
     void differentMultiArgumentKeysStayDistinct() {
         DefaultCacheKeyConverter converter = new DefaultCacheKeyConverter();

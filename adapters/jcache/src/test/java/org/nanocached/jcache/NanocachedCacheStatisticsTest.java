@@ -265,4 +265,57 @@ class NanocachedCacheStatisticsTest {
         statistics.clear();
         assertCounts(0, 0, 0, 0);
     }
+
+    // ── enabling and disabling ──────────────────────────────────────
+
+    @Test
+    void operationsRunWhileStatisticsWereOffAreNotCountedOnceTheyAreTurnedOn() {
+        MutableConfiguration<String, String> config = new MutableConfiguration<>();
+        config.setTypes(String.class, String.class);
+        Cache<String, String> off = manager.createCache("stats-off", config);
+        off.get("a");
+        off.get("b");
+        off.put("c", "1");
+        manager.enableStatistics("stats-off", true);
+        CacheStatisticsMXBean offStatistics = statisticsOf("stats-off");
+        assertEquals(
+                java.util.List.of(0L, 0L, 0L, 0L),
+                java.util.List.of(
+                        offStatistics.getCacheHits(),
+                        offStatistics.getCacheMisses(),
+                        offStatistics.getCachePuts(),
+                        offStatistics.getCacheRemovals()),
+                "[hits, misses, puts, removals]");
+        off.get("c");
+        assertEquals(1, offStatistics.getCacheHits());
+    }
+
+    @Test
+    void disablingStatisticsFreezesTheCountsAndReEnablingContinuesThem() {
+        cache.put("a", "1");
+        cache.get("a");
+        assertCounts(1, 0, 1, 0);
+        manager.enableStatistics("stats", false);
+        cache.get("a");
+        cache.get("missing");
+        cache.put("b", "2");
+        cache.remove("b");
+        manager.enableStatistics("stats", true);
+        assertCounts(1, 0, 1, 0);
+        cache.get("missing");
+        assertCounts(1, 1, 1, 0);
+    }
+
+    private static CacheStatisticsMXBean statisticsOf(String cacheName) {
+        try {
+            ObjectName objectName = new ObjectName("javax.cache:type=CacheStatistics,CacheManager="
+                    + ObjectName.quote("test:statistics")
+                    + ",Cache="
+                    + ObjectName.quote(cacheName));
+            return JMX.newMXBeanProxy(
+                    ManagementFactory.getPlatformMBeanServer(), objectName, CacheStatisticsMXBean.class);
+        } catch (javax.management.MalformedObjectNameException e) {
+            throw new AssertionError(e);
+        }
+    }
 }

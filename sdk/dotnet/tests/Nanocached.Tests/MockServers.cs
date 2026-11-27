@@ -378,7 +378,9 @@ public sealed class MockNode : IDisposable
     /// <summary>issue #934: hold every <c>t</c>/<c>y</c> frame for
     /// <paramref name="millis"/> after it was logged and before it is
     /// applied and answered, so a test can look at what the other nodes
-    /// have seen while this one has not answered yet.</summary>
+    /// have seen while this one has not answered yet. A <c>t</c> that
+    /// <see cref="RejectTouchLikeAnOldServer"/> rejects is held the same
+    /// way before its rejection.</summary>
     public void DelayTouches(int millis) => _touchDelayMillis = millis;
     private volatile string _rejectTouchReply = "En\n";
 
@@ -1225,6 +1227,9 @@ public sealed class MockNode : IDisposable
                         _touchFrames.Enqueue(string.Join(' ', parts));
                         if (_rejectTouch)
                         {
+                            // A delay holds the rejection too, so a test
+                            // can pipeline a request behind it first.
+                            if (_touchDelayMillis > 0) await Task.Delay(_touchDelayMillis);
                             await Wire.WriteAsync(stream, _rejectTouchReply.Replace("{tag}", tag));
                             return;
                         }

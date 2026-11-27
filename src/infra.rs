@@ -22,7 +22,7 @@ use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::io;
 use std::io::BufReader;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -278,14 +278,25 @@ pub fn check_host_port(addr: &str) -> Result<(), String> {
         return Err(invalid("no host"));
     }
     if host.contains(':') {
-        let bracketed = host
+        let brackets = "an IPv6 host must be in brackets, as in [::1]:8357";
+        let Some(inner) = host
             .strip_prefix('[')
             .and_then(|host| host.strip_suffix(']'))
-            .is_some_and(|inner| inner.parse::<Ipv6Addr>().is_ok());
-        if !bracketed {
-            return Err(invalid(
-                "an IPv6 host must be in brackets, as in [::1]:8357",
-            ));
+        else {
+            return Err(invalid(brackets));
+        };
+        // Parsed as the `SocketAddrV6` the connect itself parses, so a
+        // link-local host with a numeric scope id (`[fe80::1%2]:8357`)
+        // passes; `Ipv6Addr` has no zone and refused it. A named zone
+        // (`%eth0`) is refused by that parse and by the resolver alike,
+        // so it could never connect.
+        if addr.parse::<SocketAddrV6>().is_err() {
+            return Err(invalid(match inner.split_once('%') {
+                Some((ip, _)) if ip.parse::<Ipv6Addr>().is_ok() => {
+                    "an IPv6 scope id must be a number, as in [fe80::1%2]:8357"
+                }
+                _ => brackets,
+            }));
         }
     }
     Ok(())
@@ -300,10 +311,16 @@ pub fn check_host_port(addr: &str) -> Result<(), String> {
 /// there either), so TLS to an IPv6 address would otherwise always fail.
 pub fn server_name_from_addr(addr: &str) -> io::Result<ServerName<'static>> {
     let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
-    let host = host
+    let host = match host
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
+    {
+        // A link-local host's scope id (`[fe80::1%2]:8356`) picks the
+        // interface to dial out of; it is not part of the address a
+        // certificate names, and `ServerName` refuses it.
+        Some(inner) => inner.split_once('%').map_or(inner, |(ip, _)| ip),
+        None => host,
+    };
 
     ServerName::try_from(host.to_string()).map_err(|error| {
         io::Error::new(
@@ -1289,6 +1306,12 @@ mod tests {
     }
 
     #[test]
+    fn server_name_from_addr_drops_the_scope_id_of_a_link_local_host() {
+        let name = server_name_from_addr("[fe80::1%2]:8356").unwrap();
+        assert_eq!(name, ServerName::try_from("fe80::1").unwrap());
+    }
+
+    #[test]
     fn server_name_from_addr_still_handles_a_plain_ipv4_host() {
         let name = server_name_from_addr("127.0.0.1:8356").unwrap();
         assert_eq!(name, ServerName::try_from("127.0.0.1").unwrap());
@@ -1502,6 +1525,9 @@ mod tests {
             "discovery.internal:8357",
             "[::1]:8357",
             "[fe80::1]:1",
+            // A link-local host with its scope id: the connect parses it
+            // as a `SocketAddrV6`.
+            "[fe80::1%2]:8357",
             "localhost:65535",
         ] {
             assert_eq!(check_host_port(good), Ok(()), "{good}");
@@ -1524,6 +1550,20 @@ mod tests {
             (
                 "[::1:8357",
                 "an IPv6 host must be in brackets, as in [::1]:8357",
+            ),
+            (
+                "[not:an:ip]:8357",
+                "an IPv6 host must be in brackets, as in [::1]:8357",
+            ),
+            // Neither the connect's parse nor the resolver takes a named
+            // zone or an empty one.
+            (
+                "[fe80::1%eth0]:8357",
+                "an IPv6 scope id must be a number, as in [fe80::1%2]:8357",
+            ),
+            (
+                "[fe80::1%]:8357",
+                "an IPv6 scope id must be a number, as in [fe80::1%2]:8357",
             ),
         ] {
             assert_eq!(
