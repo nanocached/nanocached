@@ -26,6 +26,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node (`trace` feature only): the trace writer's queue was bounded in
+  lines but not in bytes, and a trace line held whole key and namespace
+  names, so with a stderr nobody read, 8,192 queued lines naming keys close
+  to 1 MiB held about 8 GiB. Names are now shown up to 256 bytes followed by
+  the count left out, and a line longer than 4 KiB is cut before it is
+  queued, so the queue holds at most 32 MiB (#2089).
+
 - Discovery: an `M` send that stopped was always logged as "permanently
   failed to send M … after 3 attempts", including when it stopped because a
   newer generation of the same name had superseded the join, or because the
