@@ -4121,7 +4121,24 @@ async fn handle_connection(
                 // unconditional overwrite: if the joiner already holds a
                 // value it keeps it, and if it holds nothing it finally
                 // gets this key instead of missing it permanently.
+                //
+                // Issue #2087: but only a put-if-absent handoff this node
+                // stored. One it refused (`StoredUnchanged`) carries a value
+                // older than what is here: this node holds a live copy, or a
+                // tombstone of a delete made after the sender read the key.
+                // Relayed anyway, it reached a joiner that held nothing yet,
+                // which stored it and then refused this node's own transfer
+                // of the newer value (sent put-if-absent too), or got back a
+                // key deleted here. Not relaying leaves the joiner this
+                // node's state: the live copy comes with the transfer, or
+                // came with it or with the write's own relay if the snapshot
+                // was past the key (a copy here that the join's old ring does
+                // not make this node's to send is the old owners' to send),
+                // and a deleted key stays deleted. A dead copy awaiting the sweep
+                // does not refuse the handoff (`handoff_set_if_absent_at`),
+                // so that case is stored and relayed as before.
                 if let Some(node_context) = &config.node_context
+                    && (!if_absent || matches!(response, Response::Stored))
                     && let Some(target) = unconfirmed_join_target_for(node_context, &key)
                 {
                     let forward = if if_absent {
@@ -24429,6 +24446,129 @@ mod tests {
             "a confirmed joiner gets the client's writes and every clear, not the handoff \
              write or delete"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_put_if_absent_handoff_refused_here_does_not_reach_the_joiner_ahead_of_the_transfer()
+    {
+        // Issue #2087: S holds k = v2 and its handoff to joiner J is in
+        // flight, past its key snapshot but before the send. A
+        // re-replication's `U … A k v1` reaches S, which refuses it (it
+        // holds v2), but the relay sent it on to J regardless; J, holding
+        // nothing, stored v1 and then refused S's own transfer of v2, which
+        // is put-if-absent too. J must end with S's value.
+        let s_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let j_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let s_addr = s_listener.local_addr().unwrap().to_string();
+        let j_addr = j_listener.local_addr().unwrap().to_string();
+
+        let (s_tx, s_rx) = mpsc::channel(64);
+        let (j_tx, j_rx) = mpsc::channel(64);
+        let s_cache = tokio::spawn(run_cache(s_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let j_cache = tokio::spawn(run_cache(j_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        send_command(
+            &s_tx,
+            Command::Set {
+                key: key(b"key-a"),
+                value: Bytes::from_static(b"v2"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        // A fake discovery for the transfer's `C` report.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_task = tokio::spawn(async move {
+            let (mut connection, _) = discovery_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = connection.read(&mut buffer).await.unwrap();
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        let mut s_ctx = two_node_context("s", s_tx.clone());
+        s_ctx.discovery_addr = discovery_addr;
+        let j_ctx = two_node_context("j", j_tx.clone());
+
+        // R=2 over {s, j}: both own every key, before and after the join.
+        let joined = vec![("s".to_string(), s_addr.clone())];
+        let (before_ring, after_ring) = migration_rings(&s_ctx, "j", &joined);
+        let after_ring = Arc::new(after_ring);
+        let migration_guard = MigrationGuard::new(
+            Arc::clone(&s_ctx.active_migration),
+            "j".to_string(),
+            j_addr.clone(),
+            "tk-j".to_string(),
+            Arc::clone(&after_ring),
+            2,
+            None,
+            &joined,
+            &s_ctx.known_ring,
+            &s_ctx.ring_history,
+        )
+        .unwrap_new();
+        let keys = list_keys(&s_tx).await;
+
+        let s_tasks = serve_test_node(s_listener, s_ctx.clone(), s_tx.clone()).await;
+        let j_tasks = serve_test_node(j_listener, j_ctx, j_tx.clone()).await;
+
+        // The transfer peeks v2 and stops before sending it.
+        s_ctx.gates.transfer.hold();
+        let transfer = tokio::spawn(run_migration(
+            s_ctx.clone(),
+            "j".to_string(),
+            j_addr.clone(),
+            "tk-j".to_string(),
+            None,
+            2,
+            before_ring,
+            after_ring,
+            migration_guard,
+            keys,
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut client = TcpStream::connect(&s_addr).await.unwrap();
+        client.write_all(b"U 0 5 2 4 A\ntk-skey-av1").await.unwrap();
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .expect("a reply within 5 s")
+            .unwrap();
+        assert_eq!(
+            &reply, b"S\n",
+            "a refused put-if-absent handoff is still acked"
+        );
+        // Let a relay, if any, land on J.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        s_ctx.gates.transfer.release();
+        timeout(Duration::from_secs(10), transfer)
+            .await
+            .expect("the transfer finishes")
+            .unwrap();
+
+        match send_command(&j_tx, Command::PeekEntry { key: key(b"key-a") }).await {
+            Response::Entries(entries) => {
+                assert_eq!(entries.len(), 1, "the joiner holds the key");
+                assert_eq!(
+                    &entries[0].1[..],
+                    b"v2",
+                    "the joiner must end with this node's value, not the refused v1"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        drop(client);
+        for task in s_tasks.into_iter().chain(j_tasks) {
+            task.abort();
+        }
+        discovery_task.abort();
+        drop(s_tx);
+        drop(j_tx);
+        s_cache.abort();
+        j_cache.abort();
     }
 
     /// A node of a two-node test cluster: accepts on `listener`, serves

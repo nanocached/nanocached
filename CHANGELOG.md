@@ -26,6 +26,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node: a put-if-absent handoff (`U … A`, a re-replication's copy) that a
+  node refused, because it held a newer value or a tombstone of a later
+  delete, was still relayed to its joiner whose join discovery had not
+  confirmed yet. A joiner that held nothing stored that older value and
+  then refused the node's own transfer of the newer one, so it kept the
+  older value (or got back a deleted key). Only a handoff the node stored
+  is relayed now, as for a decommission's entrant (#2087).
+
 - Discovery: an `M` send that stopped was always logged as "permanently
   failed to send M … after 3 attempts", including when it stopped because a
   newer generation of the same name had superseded the join, or because the
