@@ -416,6 +416,16 @@ const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_millis(600);
 
+/// Issue #2048: how long `fetch_roster` holds a later discovery replica's
+/// roster while an earlier-listed one has neither answered nor failed. A
+/// healthy replica answers `L` well within it; one that does not is passed
+/// over after this rather than after its whole `UPSTREAM_IO_TIMEOUT`.
+#[cfg(not(test))]
+const ROSTER_PREFERENCE_WINDOW: Duration = Duration::from_secs(1);
+/// Shrunk under test like `UPSTREAM_IO_TIMEOUT`, and well below half of it.
+#[cfg(test)]
+const ROSTER_PREFERENCE_WINDOW: Duration = Duration::from_millis(150);
+
 /// How often the roster is re-fetched in the background. `W` answers
 /// force an immediate refresh regardless, so this only bounds how stale
 /// the view can get while nothing is being rerouted.
@@ -1197,17 +1207,23 @@ async fn read_exact_into<S: AsyncRead + Unpin>(
 
 // ─── discovery client ────────────────────────────────────────────────
 
-/// Fetches `L` from the fastest answering discovery replica. A `B` (the
-/// replica's startup grace) or connect failure falls back to another
-/// replica; `Err` only once every replica has failed.
+/// Fetches `L` from the discovery replicas in their configured order, as
+/// the SDKs and nodes do: a replica's roster is adopted only once every
+/// replica listed before it has failed (a `B` for its startup grace, an
+/// empty roster, a connect or read failure), or has gone unanswered for
+/// `ROSTER_PREFERENCE_WINDOW`. `Err` only once every replica has failed.
 ///
-/// Issue #409: every replica is raced concurrently (`race_ok`) rather
-/// than tried one at a time — this was the one multi-address fan-out
-/// left sequential by the #177 pass. A `for` loop here meant a
-/// black-holed first replica cost a full `UPSTREAM_IO_TIMEOUT` on every
-/// refresh cycle (`run_refresher`'s `REFRESH_INTERVAL` tick and every
-/// `force_refresh`) before the next replica was even dialed, directly
-/// delaying `/readyz` and `force_refresh` convergence behind it.
+/// Issue #409: every replica is still dialed at once (`first_ok_in_order`)
+/// rather than tried one at a time. A `for` loop here meant a black-holed
+/// first replica cost a full `UPSTREAM_IO_TIMEOUT` on every refresh cycle
+/// (`run_refresher`'s `REFRESH_INTERVAL` tick and every `force_refresh`)
+/// before the next replica was even dialed, delaying `/readyz` and
+/// `force_refresh` convergence behind it; now it costs the window.
+///
+/// Issue #2048: the fastest roster used to win outright. Replicas that
+/// briefly disagree (one has dropped a node the other still lists) then
+/// gave the proxy whichever ring answered first on each refresh, so it
+/// could flip between them, where every SDK keeps to its first replica.
 async fn fetch_roster(
     context_discovery: &[String],
     secret: &Option<Bytes>,
@@ -1238,7 +1254,7 @@ async fn fetch_roster(
         })
         .collect();
 
-    race_ok(futs).await
+    first_ok_in_order(futs, ROSTER_PREFERENCE_WINDOW).await
 }
 
 async fn fetch_roster_from(
@@ -1296,8 +1312,8 @@ async fn fetch_roster_from(
     }
     // A replica with no node registered (a fresh process, or one the
     // nodes stopped heartbeating to) answers `N 0 R`. Like `B` it has no
-    // roster to give yet, so it is a failed fetch: `race_ok` then moves on
-    // to the replicas that do, instead of the first-listed empty one
+    // roster to give yet, so it is a failed fetch: `fetch_roster` then moves
+    // on to the replicas that do, instead of the first-listed empty one
     // winning every refresh and emptying the ring.
     if count == 0 {
         return Err(io::Error::new(
@@ -4505,39 +4521,73 @@ async fn join_all<'a, T>(futs: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>
     .await
 }
 
-/// One future in a `race_ok` fan-out.
+/// One future in a `first_ok_in_order` fan-out.
 type RaceFuture<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
 
-/// Issue #409: like `join_all`, but returns the moment any future
-/// resolves `Ok`, leaving the rest unpolled from then on — a race rather
-/// than a join. Used for a fan-out where only the fastest success
-/// matters (`fetch_roster`'s discovery replicas), as opposed to
-/// `join_all`'s fan-outs where every reply is needed. If every future
-/// resolves `Err` (or `futs` is empty), returns the last error seen in
-/// polling order.
-async fn race_ok<'a, T>(futs: Vec<RaceFuture<'a, T>>) -> io::Result<T> {
-    let mut slots: Vec<Option<RaceFuture<'a, T>>> = futs.into_iter().map(Some).collect();
+/// Where one future of a `first_ok_in_order` fan-out stands.
+enum InOrderSlot<'a, T> {
+    Pending(RaceFuture<'a, T>),
+    Done(T),
+    Failed,
+}
+
+/// Issue #2048: runs every future at once and returns the success of the
+/// earliest-listed one, the configured order deciding rather than speed.
+/// A later future's success is held while an earlier one is still pending,
+/// until `window` has elapsed: from then on the earliest success at hand
+/// wins, so a black-holed first entry delays the answer by `window`, not by
+/// its own timeout (issue #409). The rest are dropped once one is returned.
+/// If every future resolves `Err` (or `futs` is empty), returns the last
+/// error seen.
+async fn first_ok_in_order<'a, T>(futs: Vec<RaceFuture<'a, T>>, window: Duration) -> io::Result<T> {
+    let mut slots: Vec<InOrderSlot<'a, T>> = futs.into_iter().map(InOrderSlot::Pending).collect();
     let mut last_error: Option<io::Error> = None;
-    let mut remaining = slots.len();
+    let mut window_timer = Box::pin(sleep(window));
+    let mut window_over = false;
     std::future::poll_fn(move |cx| {
+        if !window_over && window_timer.as_mut().poll(cx).is_ready() {
+            window_over = true;
+        }
         for slot in slots.iter_mut() {
-            if let Some(fut) = slot.as_mut()
+            if let InOrderSlot::Pending(fut) = slot
                 && let Poll::Ready(value) = fut.as_mut().poll(cx)
             {
-                *slot = None;
-                remaining -= 1;
-                match value {
-                    Ok(value) => return Poll::Ready(Ok(value)),
-                    Err(error) => last_error = Some(error),
+                *slot = match value {
+                    Ok(value) => InOrderSlot::Done(value),
+                    Err(error) => {
+                        last_error = Some(error);
+                        InOrderSlot::Failed
+                    }
+                };
+            }
+        }
+        let mut pending = false;
+        for slot in slots.iter_mut() {
+            match slot {
+                InOrderSlot::Failed => {}
+                InOrderSlot::Pending(_) => {
+                    if !window_over {
+                        // An earlier entry may still answer: nothing listed
+                        // after it is adopted yet.
+                        return Poll::Pending;
+                    }
+                    pending = true;
+                }
+                InOrderSlot::Done(_) => {
+                    let InOrderSlot::Done(value) = std::mem::replace(slot, InOrderSlot::Failed)
+                    else {
+                        unreachable!("matched Done above");
+                    };
+                    return Poll::Ready(Ok(value));
                 }
             }
         }
-        if remaining == 0 {
+        if pending {
+            Poll::Pending
+        } else {
             Poll::Ready(Err(last_error
                 .take()
                 .unwrap_or_else(|| io::Error::other("no futures to race"))))
-        } else {
-            Poll::Pending
         }
     })
     .await
@@ -20682,17 +20732,19 @@ mod tests {
         );
     }
 
-    // ── issue #409(b): `fetch_roster` races its replicas ────────────────
+    // ── issue #409(b): `fetch_roster` dials its replicas at once ────────
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fetch_roster_races_replicas_instead_of_trying_them_in_order() {
+    async fn fetch_roster_does_not_wait_out_a_black_holed_first_replica() {
         // Before the fix, `fetch_roster` tried discovery replicas one at
         // a time in a `for` loop — the one multi-address fan-out left
         // sequential by the earlier #177 pass (every other fan-out in
         // this module already runs concurrently). A black-holed first
         // replica cost a full `UPSTREAM_IO_TIMEOUT` on every refresh
         // cycle, and delayed `/readyz`/`force_refresh` convergence,
-        // before the next (live) replica was even dialed.
+        // before the next (live) replica was even dialed. Issue #2048:
+        // the live replica's roster is held for the preference window
+        // while the first one may still answer, and no longer.
         let black_hole = start_black_hole_node().await;
         let live =
             start_mock_discovery(vec![("node".to_string(), "127.0.0.1:1".to_string())], 1).await;
@@ -20703,23 +20755,89 @@ mod tests {
 
         let ring = result.expect("the live replica's roster should still answer");
         assert_eq!(ring.all_addresses(), vec!["127.0.0.1:1".to_string()]);
-        // Raced concurrently, the live replica answers almost
-        // immediately regardless of where the black hole sits in the
-        // list; sequential trial would have cost a full
+        // Dialed concurrently, the live replica is adopted once the
+        // window is over; sequential trial would have cost a full
         // `UPSTREAM_IO_TIMEOUT` first since the black hole is listed
         // *before* the live replica.
         assert!(
             elapsed < UPSTREAM_IO_TIMEOUT / 2,
-            "elapsed {elapsed:?} suggests the black-holed replica was tried before the live one, not raced"
+            "elapsed {elapsed:?} suggests the black-holed replica was waited out"
         );
+        assert!(
+            elapsed >= ROSTER_PREFERENCE_WINDOW,
+            "elapsed {elapsed:?}: the live replica was adopted while the first could still answer"
+        );
+    }
+
+    /// A listener that forwards each connection to `target` after `delay`:
+    /// a healthy discovery replica that answers slowly.
+    async fn start_delayed_relay(target: String, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let target = target.clone();
+                tokio::spawn(async move {
+                    sleep(delay).await;
+                    if let Ok(mut outbound) = TcpStream::connect(&target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Issue #2048: the first replica is healthy but slower than the second,
+    /// and the two disagree. The proxy adopted the faster one's roster on
+    /// every refresh, where the SDKs and nodes keep to the configured order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_roster_prefers_the_first_replica_over_a_faster_later_one() {
+        let first = start_mock_discovery(
+            vec![
+                ("node-a".to_string(), "127.0.0.1:1".to_string()),
+                ("node-b".to_string(), "127.0.0.1:2".to_string()),
+            ],
+            2,
+        )
+        .await;
+        let slow_first = start_delayed_relay(first, ROSTER_PREFERENCE_WINDOW / 3).await;
+        let fast_second =
+            start_mock_discovery(vec![("node-c".to_string(), "127.0.0.1:3".to_string())], 1).await;
+
+        let ring = fetch_roster(&[slow_first, fast_second], &None, &None)
+            .await
+            .expect("the first replica answers");
+        assert_eq!(
+            ring.all_addresses(),
+            vec!["127.0.0.1:1".to_string(), "127.0.0.1:2".to_string()],
+            "the first replica's roster, not the faster second one's"
+        );
+        assert_eq!(ring.replication, 2);
+    }
+
+    /// Issue #2048: past the window, a later replica's roster is adopted
+    /// while the first is still slow, as for a black hole.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_roster_adopts_a_later_replica_once_the_first_outlasts_the_window() {
+        let first =
+            start_mock_discovery(vec![("node-a".to_string(), "127.0.0.1:1".to_string())], 1).await;
+        let slower_than_window = start_delayed_relay(first, ROSTER_PREFERENCE_WINDOW * 2).await;
+        let second =
+            start_mock_discovery(vec![("node-c".to_string(), "127.0.0.1:3".to_string())], 1).await;
+
+        let ring = fetch_roster(&[slower_than_window, second], &None, &None)
+            .await
+            .expect("the second replica answers");
+        assert_eq!(ring.all_addresses(), vec!["127.0.0.1:3".to_string()]);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_roster_falls_back_when_every_replica_but_one_fails() {
-        // The race still needs a correct fallback story: if the fastest
+        // The fan-out still needs a correct fallback story: if the earlier
         // replicas all fail (refuse, or answer `B` for their startup
         // grace), the one that eventually succeeds must still be
-        // returned rather than the race giving up early.
+        // returned rather than the fetch giving up early.
         let refused = "127.0.0.1:1".to_string(); // connection refused: fails fast
         let live =
             start_mock_discovery(vec![("node".to_string(), "127.0.0.1:2".to_string())], 1).await;
@@ -20731,11 +20849,11 @@ mod tests {
     }
 
     /// Issue #1591: a replica with no node registered answers `N 0 R`. It
-    /// used to count as a success, and listed first it won the race on every
+    /// used to count as a success, and listed first it was adopted on every
     /// refresh, so the proxy adopted an empty ring and answered every
     /// request `B` while the next replica held the full roster.
     #[tokio::test(flavor = "current_thread")]
-    async fn an_empty_roster_from_the_first_replica_loses_the_race() {
+    async fn an_empty_roster_from_the_first_replica_is_passed_over() {
         let empty = start_mock_discovery(Vec::new(), 2).await;
         let live =
             start_mock_discovery(vec![("node".to_string(), "127.0.0.1:2".to_string())], 2).await;

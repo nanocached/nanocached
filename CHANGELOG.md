@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: the roster was taken from whichever discovery replica answered
+  first, not from the first one configured, so a healthy but slower first
+  replica lost to a later one, and replicas that briefly disagreed could
+  flip the proxy's ring from one refresh to the next. Every replica is
+  still asked at once, but a later one's roster is used only once every
+  replica listed before it has failed or gone 1 s without answering, as
+  the SDKs and nodes keep to the configured order (#2048).
+
 - Node: during a forwarding window (a join, a decommission or a
   re-replication), a plain `y` (batch touch) queued a forward for every
   occurrence of a key, and each one copied the cached value in full before
