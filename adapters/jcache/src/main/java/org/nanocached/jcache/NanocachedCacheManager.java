@@ -27,15 +27,24 @@ public final class NanocachedCacheManager implements CacheManager {
     private final NanocachedCachingProvider provider;
     private final URI uri;
     private final ClassLoader classLoader;
+
+    /** What {@link #getProperties} returns copies of — see there. */
+    private final Properties properties;
+
     private final NanocachedClient client;
     private final ConcurrentHashMap<String, NanocachedCache<?, ?>> caches = new ConcurrentHashMap<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     NanocachedCacheManager(
-            NanocachedCachingProvider provider, URI uri, ClassLoader classLoader, NanocachedClient client) {
+            NanocachedCachingProvider provider,
+            URI uri,
+            ClassLoader classLoader,
+            Properties properties,
+            NanocachedClient client) {
         this.provider = provider;
         this.uri = uri;
         this.classLoader = classLoader;
+        this.properties = withoutSecret(properties);
         this.client = client;
     }
 
@@ -54,9 +63,34 @@ public final class NanocachedCacheManager implements CacheManager {
         return classLoader;
     }
 
+    /**
+     * The properties this manager was created with, as JSR-107 asks — except {@code
+     * nanocached.secret}, which is left out. The manager hands its properties to anything that holds
+     * it (a framework's cache metrics or diagnostics, a library that logs its configuration), and
+     * the shared secret authenticates every client of the cluster: it is used once, to connect, and
+     * not kept where any of that code could print it. The values are a snapshot taken when the
+     * manager was created, defaults included; each call returns a fresh copy, so changing it, or
+     * the {@code Properties} passed to {@code getCacheManager}, changes nothing here.
+     */
     @Override
     public Properties getProperties() {
-        return new Properties();
+        Properties copy = new Properties();
+        copy.putAll(properties);
+        return copy;
+    }
+
+    private static final String SECRET_PROPERTY = "nanocached.secret";
+
+    private static Properties withoutSecret(Properties given) {
+        Properties snapshot = new Properties();
+        // stringPropertyNames, not entrySet: it also walks the defaults
+        // chain, which getProperty (and so connect) reads from.
+        for (String name : given.stringPropertyNames()) {
+            if (!SECRET_PROPERTY.equals(name)) {
+                snapshot.setProperty(name, given.getProperty(name));
+            }
+        }
+        return snapshot;
     }
 
     @Override
