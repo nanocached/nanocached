@@ -33,6 +33,10 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Docs: the protocol page said the proxy answers `E <tag>` on a tagged
+  connection. It always sends the bare `E\n`, untagged, like the node's `En`,
+  as the answer to the oldest request still waiting, and then closes the
+  connection. Every SDK already reads it that way (#2112).
 - Proxy: started with `--port 0`, the proxy announced port `0` to discovery,
   which refused every announce (`Ed`), so the proxy never appeared in `Q`. It
   now announces the port its listener bound. The announcing refresher also
