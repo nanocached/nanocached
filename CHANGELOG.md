@@ -26,6 +26,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: started with `--port 0`, the proxy announced port `0` to discovery,
+  which refused every announce (`Ed`), so the proxy never appeared in `Q`. It
+  now announces the port its listener bound. The announcing refresher also
+  starts only once the client and metrics listeners are bound: started
+  before, a `Y` could reach discovery from a proxy whose bind then failed,
+  and that exit sends no `Z`. The node, proxy and discovery log the bound
+  metrics address, so `--metrics-port 0` shows the port taken (#2098).
 - Discovery: an `M` send that stopped was always logged as "permanently
   failed to send M … after 3 attempts", including when it stopped because a
   newer generation of the same name had superseded the join, or because the

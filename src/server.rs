@@ -2039,7 +2039,11 @@ pub(crate) async fn run_with_hooks(
     let metrics_task = match &metrics_address {
         Some(metrics_address) => {
             let metrics_listener = TcpListener::bind(metrics_address.as_str()).await?;
-            println!("INFO metrics endpoint listening on {metrics_address}");
+            // The bound address, so `--metrics-port 0` logs the port taken.
+            println!(
+                "INFO metrics endpoint listening on {}",
+                metrics_listener.local_addr()?
+            );
             // Issue #327: a dedicated, small cap on the metrics port's own
             // accepted connections — independent of, and much smaller
             // than, `connection_limit`/`limits.max_connections` above,

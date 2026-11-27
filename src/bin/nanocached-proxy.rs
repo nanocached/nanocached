@@ -8972,19 +8972,6 @@ async fn run(
     let identity = ProxyIdentity::generate();
     println!("INFO proxy identity: {}", identity.name);
     let backends = Arc::new(SharedBackends::new());
-    let refresher = tokio::spawn(run_refresher(
-        RefresherConfig {
-            discovery: args.discovery.clone(),
-            secret: secret.clone(),
-            tls_connector: tls_connector.clone(),
-            announce: Some((identity, args.port)),
-            drain: drain_rx.clone(),
-            ip_in_flight_share: ip_in_flight_share(args.max_in_flight_bytes),
-        },
-        ring_tx,
-        refresh_rx,
-        Arc::clone(&backends),
-    ));
 
     // Issue #124: SIGTERM/SIGINT begin the drain — the orchestrator's
     // ordinary stop signal is the graceful path.
@@ -8999,8 +8986,8 @@ async fn run(
         tls_connector,
         ring: ring_rx,
         refresh_now: refresh_tx,
-        drain: drain_rx,
-        backends,
+        drain: drain_rx.clone(),
+        backends: Arc::clone(&backends),
         requests_total: std::sync::atomic::AtomicU64::new(0),
         upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
         replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
@@ -9028,7 +9015,8 @@ async fn run(
     // discovery); what each endpoint reports is this binary's own.
     if let Some(port) = args.metrics_port {
         let metrics_listener = TcpListener::bind((args.host.as_str(), port)).await?;
-        println!("INFO metrics endpoint listening on {}:{port}", args.host);
+        let metrics_local = metrics_listener.local_addr()?;
+        println!("INFO metrics endpoint listening on {metrics_local}");
         let metrics_permits = Arc::new(Semaphore::new(METRICS_MAX_CONNECTIONS));
         tokio::spawn(run_metrics_server(
             metrics_listener,
@@ -9038,6 +9026,27 @@ async fn run(
             metrics_permits,
         ));
     }
+
+    // Issue #2098: the refresher, which announces this proxy to discovery,
+    // starts only once both listeners are bound. Started before, it sent
+    // `Y` while a bind could still fail, and the error return sends no `Z`:
+    // discovery listed a proxy that never listened until the liveness
+    // timeout. And it announces the port the listener bound, not
+    // `--port`: with `--port 0` that is the kernel's pick, where `0` itself
+    // is refused (`Ed`) and the proxy never appeared in `Q`.
+    let refresher = tokio::spawn(run_refresher(
+        RefresherConfig {
+            discovery: args.discovery.clone(),
+            secret: context.secret.clone(),
+            tls_connector: context.tls_connector.clone(),
+            announce: Some((identity, local.port())),
+            drain: drain_rx.clone(),
+            ip_in_flight_share: ip_in_flight_share(args.max_in_flight_bytes),
+        },
+        ring_tx,
+        refresh_rx,
+        backends,
+    ));
 
     serve(
         listener,
