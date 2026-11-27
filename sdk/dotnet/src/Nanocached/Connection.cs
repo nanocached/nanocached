@@ -1143,9 +1143,26 @@ internal sealed class Connection
                 // retry, and have Close()'s drain reject the retry with the
                 // generic "connection closed" instead of this read's own
                 // reason (issue #633).
+                //
+                // A node's `En` answers only the oldest request: the node
+                // closes the connection right after it, so nothing
+                // pipelined behind was ever run. Those waiters are drained
+                // as not sent, so an Incr/CAS or a ttl=0 touch behind the
+                // rejected request keeps its redial and replay, as in the
+                // other SDKs (Go's poisonRejecting). Any other read failure
+                // keeps the generic "connection closed" drain.
                 bool dequeued = _pending.TryDequeue(out var failed);
                 Exception cause = _closeReason ?? error;
-                Close();
+                if (error is ServerRejectedException)
+                {
+                    CloseWithReason(new ConnectionLostException(
+                        "nanocached: connection closed by server after rejecting an earlier request",
+                        requestNotSent: true));
+                }
+                else
+                {
+                    Close();
+                }
                 if (dequeued)
                 {
                     // Close() must come first: the waiter's continuation
