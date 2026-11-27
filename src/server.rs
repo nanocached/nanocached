@@ -516,6 +516,11 @@ fn forward_batches_bytes(namespace: &Bytes, batches: &[&[ForwardBatch]]) -> usiz
 /// is not simply dropped: a push that waits already holds copies of its
 /// items (#1160), and those must stay in the budget. No key to forward, the
 /// usual case, leaves only the per-key figure. Returns what is still held.
+///
+/// Only ever narrows: what the batches hold beyond the frame's charge is
+/// not added. For an `o` that is the frame's own bytes, which its receive
+/// buffer is charged for; a `y` forwards the cache's values, and bounds
+/// what one push of them copies with `MAX_FORWARD_RUN_BYTES` instead.
 fn keep_forward_phase(
     frame_charge: &mut Option<FrameCharge>,
     keys: usize,
@@ -929,7 +934,9 @@ const KEY_TRANSFER_ATTEMPTS: u32 = 3;
 /// `run_migration` is between keys and sees `abort_requested` within one
 /// key's send; a send stuck on an unresponsive joiner can hold the slot
 /// for up to `KEY_TRANSFER_ATTEMPTS` × `OUTBOUND_IO_TIMEOUT` (30s), and
-/// that case is left to `MigrationGuard::new`'s generation check.
+/// that case is left to `MigrationGuard::new`'s generation check (which
+/// refuses the next generation's `M` until the slot clears) and to
+/// discovery resending that refused `M`.
 const MIGRATION_ABANDON_DRAIN_WAIT: Duration = Duration::from_secs(8);
 /// Issue #7: `handle_connection`'s read buffer grows (via `reserve`) to fit
 /// whatever request it's mid-receiving, up to `MAX_REQUEST_SIZE`, but never
@@ -940,6 +947,14 @@ const MIGRATION_ABANDON_DRAIN_WAIT: Duration = Duration::from_secs(8);
 /// another large request. Well above ordinary command sizes so typical
 /// traffic never churns an allocation on every drained buffer.
 const REQUEST_BUFFER_SHRINK_THRESHOLD: usize = 64 * 1024;
+#[cfg(test)]
+thread_local! {
+    /// Issue #2042: the most names and values one `ForwardQueues::push` on
+    /// this thread copied (`OwnedForwardedWrite::detached`), and their
+    /// total over every push.
+    static LARGEST_FORWARD_PUSH_COPY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FORWARD_PUSH_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 #[cfg(test)]
 thread_local! {
     /// How many times `handle_connection` on this thread rebuilt its
@@ -960,6 +975,18 @@ const MAX_PENDING_CLEAR_NAMESPACES: usize = 1024;
 /// frames is far more than any real set of namespaces cleared during
 /// one handoff and small against any task size.
 const MAX_PENDING_CLEAR_BYTES: usize = 16 * MAX_REQUEST_SIZE;
+
+/// Issue #2042: the most names and values one push into the forward
+/// queues (`ForwardQueues::push`) copies for a plain `y` (batch touch). The
+/// push copies its writes out of what they point into before it waits for
+/// room (issue #1160), and a `y` forwards the cache's values, which its
+/// frame does not bound: one frame of distinct keys could copy up to the
+/// whole cache for every target before the queue bound was consulted. A
+/// `y`'s forwards are queued in runs of at most this many bytes instead,
+/// each waiting for room like any push, so a connection holds at most one
+/// run outside the queues. Nothing is dropped; this is what an `o` frame's
+/// values (bounded by `MAX_REQUEST_SIZE`) already make a push copy.
+const MAX_FORWARD_RUN_BYTES: usize = MAX_REQUEST_SIZE;
 
 /// What one forward target's queue (`TargetQueue`) may hold, in the bytes
 /// its writes pin (`TargetQueue::bytes`), before a connection with a
@@ -4445,15 +4472,34 @@ async fn handle_connection(
                     {
                         let mut join_batches: Vec<ForwardBatch> = Vec::new();
                         let mut leave_batches: Vec<ForwardBatch> = Vec::new();
+                        // Issue #2042: a name repeated in the frame is
+                        // forwarded once. Every occurrence touched the same
+                        // entry with the same TTL, so all of them would
+                        // forward the same write, and each one used to be
+                        // copied out of the cache in full before the target's
+                        // queue coalesced them: 1,000 occurrences of a 200 KB
+                        // key copied 200 MB. The first occurrence that
+                        // touched is the one kept, not the last: under `G` a
+                        // later one can be a miss for the reply bound alone.
+                        let mut forwarded: HashSet<Bytes> = HashSet::new();
 
                         for (name, result) in forward_names.into_iter().zip(results.iter()) {
                             let MultiEntry::Value(value) = result else {
                                 continue;
                             };
+                            if forwarded.contains(&name) {
+                                continue;
+                            }
                             let key = Key::new(namespace.clone(), name);
                             let key_hash = hasher.hash(&key);
 
-                            for target in migration_targets_for_hashed(node_context, key_hash) {
+                            let join_targets = migration_targets_for_hashed(node_context, key_hash);
+                            let leave_targets = handoff_targets_for_hashed(node_context, key_hash);
+                            if join_targets.is_empty() && leave_targets.is_empty() {
+                                continue;
+                            }
+                            forwarded.insert(key.name.clone());
+                            for target in join_targets {
                                 ForwardBatch::add(
                                     &mut join_batches,
                                     target,
@@ -4461,7 +4507,7 @@ async fn handle_connection(
                                     value.clone(),
                                 );
                             }
-                            for target in handoff_targets_for_hashed(node_context, key_hash) {
+                            for target in leave_targets {
                                 ForwardBatch::add(
                                     &mut leave_batches,
                                     target,
@@ -4470,6 +4516,7 @@ async fn handle_connection(
                                 );
                             }
                         }
+                        drop(forwarded);
 
                         // Issue #1243: the batches are built and the cache is
                         // done with the frame; hold only what the waits for
@@ -4486,26 +4533,34 @@ async fn handle_connection(
                         let ttl = ForwardTtl::stamp(ttl);
                         for (batches, handoff) in [(join_batches, false), (leave_batches, true)] {
                             for batch in batches {
-                                let writes = batch.items.into_iter().map(|(name, value)| {
-                                    let key = Key::new(namespace.clone(), name);
-                                    if handoff {
-                                        OwnedForwardedWrite::HandoffSet {
-                                            key,
-                                            value,
-                                            ttl,
-                                            if_absent: false,
+                                // Issue #2042: queued a run at a time, unlike
+                                // an `o`'s batch: the values are the cache's,
+                                // not the frame's, so nothing else bounds
+                                // what one push copies (see
+                                // `MAX_FORWARD_RUN_BYTES`).
+                                let (target, runs) = batch.into_runs(MAX_FORWARD_RUN_BYTES);
+                                for run in runs {
+                                    let writes = run.into_iter().map(|(name, value)| {
+                                        let key = Key::new(namespace.clone(), name);
+                                        if handoff {
+                                            OwnedForwardedWrite::HandoffSet {
+                                                key,
+                                                value,
+                                                ttl,
+                                                if_absent: false,
+                                            }
+                                        } else {
+                                            OwnedForwardedWrite::Set { key, value, ttl }
                                         }
-                                    } else {
-                                        OwnedForwardedWrite::Set { key, value, ttl }
-                                    }
-                                });
-                                enqueue_forwards(
-                                    &config,
-                                    node_context.clone(),
-                                    batch.target,
-                                    writes,
-                                )
-                                .await;
+                                    });
+                                    enqueue_forwards(
+                                        &config,
+                                        node_context.clone(),
+                                        target.duplicate(),
+                                        writes,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
@@ -7189,11 +7244,15 @@ impl MigrationGuard {
                 // superseding the one running here. Either way the slot
                 // can't be handed over synchronously (only
                 // `run_migration`'s own unwind can safely drop it
-                // mid-transfer): ask it to stop and reject this `M`,
-                // trusting the caller (discovery, on `X`'s `abandon_
-                // migration` path) to wait for the slot to actually
-                // clear before it lets a same-name retry land — see
-                // `wait_for_migration_slot_to_clear`.
+                // mid-transfer): ask it to stop and reject this `M`.
+                // Discovery resends a refused `M` after a pause until the
+                // slot clears (`MIGRATE_REJECTED_RETRY_WINDOW` in
+                // `src/bin/nanocached-discovery.rs`); its `X` path also
+                // waits here for the unwind before acking — see
+                // `wait_for_migration_slot_to_clear`. Neither is ordered
+                // before the next same-name `M`: discovery can start the
+                // next generation while the abandon's `X` is still
+                // waiting, or after giving up on it.
                 if same_name {
                     existing.abort_requested.store(true, Ordering::SeqCst);
                     existing.forward_revoked.store(true, Ordering::SeqCst);
@@ -10101,14 +10160,13 @@ fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> AbandonO
 /// arrive here before `run_migration`'s unwind has actually cleared the
 /// slot. `MigrationGuard::new`'s generation check (see its own doc
 /// comment) correctly tells this apart from a same-generation retry and
-/// rejects it — but that rejection can bounce for longer than discovery's
-/// `send_migrate_with_retry` covers: `MIGRATE_SEND_ATTEMPTS` (3, in
-/// `src/bin/nanocached-discovery.rs`) retries back-to-back with no delay
-/// between them, nowhere close to the worst-case time `run_migration` can
-/// still be blocked inside one stuck send — up to `KEY_TRANSFER_ATTEMPTS`
-/// (3) × `OUTBOUND_IO_TIMEOUT` (10s) — before it even re-checks `abort_requested`.
-/// So instead of hoping the retries outlast that window, this wait closes
-/// the *common* case at the source: `run_migration` checks
+/// rejects it. Discovery resends a refused `M` every second for up to
+/// `MIGRATE_REJECTED_RETRY_WINDOW` (45 s, in
+/// `src/bin/nanocached-discovery.rs`), which outlasts the worst-case time
+/// `run_migration` can still be blocked inside one stuck send — up to
+/// `KEY_TRANSFER_ATTEMPTS` (3) × `OUTBOUND_IO_TIMEOUT` (10s) — before it
+/// even re-checks `abort_requested`; this wait still closes the *common*
+/// case at the source, so the next join's `M` usually needs no resend: `run_migration` checks
 /// `abort_requested` between keys, so unless it is mid-send to a joiner
 /// that has stopped answering, the slot is free within one key's send
 /// and the ack goes out with it already empty. The stuck-send case is
@@ -10117,7 +10175,8 @@ fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> AbandonO
 /// regardless, so `MIGRATION_ABANDON_DRAIN_WAIT` stays under that and a
 /// slot still held by a 30s stuck send is left to `MigrationGuard::new`'s
 /// generation check, which rejects the new-generation `M` with
-/// `Conflict` rather than mistaking it for a retry.
+/// `Conflict` rather than mistaking it for a retry, and to discovery's
+/// resends of that refused `M`.
 ///
 /// Bounded, never indefinite (this codebase's rule for every wait on
 /// another task), and it also stops at shutdown: this runs inside the
@@ -10891,8 +10950,9 @@ impl ForwardedWrite<'_> {
     }
 }
 
-/// The keys (and values) of one `MultiSet` bound for a single forward
-/// target — gathered so they are queued for it under one lock hold.
+/// The keys (and values) of one `MultiSet` or `MultiTouch` bound for a
+/// single forward target — gathered so they are queued for it under one
+/// lock hold (a `MultiTouch`'s a run at a time, `into_runs`).
 struct ForwardBatch {
     target: ForwardTarget,
     items: Vec<(Bytes, Bytes)>,
@@ -10925,6 +10985,28 @@ impl ForwardBatch {
                 items: vec![(name, value)],
             }),
         }
+    }
+
+    /// The batch's target and its items split, in order, into runs of at
+    /// most `max_bytes` of names and values each (an item larger than that
+    /// on its own is a run by itself), to be queued one run per push.
+    fn into_runs(self, max_bytes: usize) -> (ForwardTarget, Vec<Vec<(Bytes, Bytes)>>) {
+        let mut runs: Vec<Vec<(Bytes, Bytes)>> = Vec::new();
+        let mut run_bytes = 0usize;
+        for (name, value) in self.items {
+            let bytes = name.len().saturating_add(value.len());
+            match runs.last_mut() {
+                Some(run) if run_bytes.saturating_add(bytes) <= max_bytes => {
+                    run_bytes += bytes;
+                    run.push((name, value));
+                }
+                _ => {
+                    run_bytes = bytes;
+                    runs.push(vec![(name, value)]);
+                }
+            }
+        }
+        (self.target, runs)
     }
 }
 
@@ -11487,6 +11569,15 @@ impl ForwardQueues {
             })
             .collect();
         drop(copied_namespaces);
+        #[cfg(test)]
+        {
+            let copied: usize = writes
+                .iter()
+                .map(|write| entry_bytes(write) - FORWARD_ENTRY_OVERHEAD_BYTES)
+                .sum();
+            LARGEST_FORWARD_PUSH_COPY.with(|largest| largest.set(largest.get().max(copied)));
+            FORWARD_PUSH_COPIED.with(|total| total.set(total.get() + copied));
+        }
         let wanted = batch_bytes(&writes);
         let mut target = Some(target);
         loop {
@@ -23312,6 +23403,108 @@ mod tests {
         };
         assert_eq!(sorted(joiner), sorted(expected_joiner), "joiner");
         assert_eq!(sorted(peer), sorted(expected_peer), "promoted owner");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_touch_copies_a_repeated_key_into_the_forward_queues_once() {
+        // Issue #2042: every occurrence of a name in a plain `y` used to
+        // queue its own forward, and each was copied out of the cache in
+        // full before the target's queue coalesced them, so 1,000
+        // occurrences of a 200 KB key copied 200 MB. One forward per
+        // touched name now, holding the value once per peer.
+        const VALUE: &[u8] = &[b'v'; 1000];
+        const OCCURRENCES: usize = 100;
+        let set = [&b"S 4 1000\nkey1"[..], VALUE].concat();
+        let mut touch = format!("y 0 {OCCURRENCES}").into_bytes();
+        for _ in 0..OCCURRENCES {
+            touch.extend_from_slice(b" 4");
+        }
+        touch.extend_from_slice(b" 60\n");
+        touch.extend_from_slice(&b"key1".repeat(OCCURRENCES));
+        let mut touched = format!("Y {OCCURRENCES}").into_bytes();
+        touched.extend_from_slice(&b" S".repeat(OCCURRENCES));
+        touched.push(b'\n');
+
+        let (joiner, peer) = frames_forwarded_to_joiner_and_promoted_owner(&[
+            (&set, b"S\n", 1),
+            (&touch, &touched, 1),
+        ])
+        .await;
+        let (expected_joiner, expected_peer) = per_peer(vec![
+            set_forward(b"key1", VALUE),
+            set_forward_with_ttl(b"key1", VALUE, Duration::from_secs(60)),
+        ]);
+        assert_eq!(joiner, expected_joiner, "joiner");
+        assert_eq!(peer, expected_peer, "promoted owner");
+        // The set and the touch, each once for each of the two peers.
+        assert_eq!(FORWARD_PUSH_COPIED.get(), 2 * 2 * (4 + VALUE.len()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_batch_touch_queues_its_forwards_in_runs_the_run_bound_holds() {
+        // Issue #2042: the values a plain `y` forwards are the cache's, so
+        // its frame does not bound them, and the whole batch for a target
+        // was copied in one push before the queue's bound was consulted.
+        // Three distinct keys of 600 KB each now go in runs of at most
+        // `MAX_FORWARD_RUN_BYTES`, every key still forwarded.
+        const SIZE: usize = 600_000;
+        let mut exchanges: Vec<(Vec<u8>, Vec<u8>, usize)> = Vec::new();
+        for name in ["key1", "key2", "key3"] {
+            let mut set = format!("S 4 {SIZE}\n{name}").into_bytes();
+            set.resize(set.len() + SIZE, b'v');
+            exchanges.push((set, b"S\n".to_vec(), 1));
+        }
+        exchanges.push((
+            b"y 0 3 4 4 4 60\nkey1key2key3".to_vec(),
+            b"Y 3 S S S\n".to_vec(),
+            3,
+        ));
+        let exchanges: Vec<(&[u8], &[u8], usize)> = exchanges
+            .iter()
+            .map(|(request, reply, forwards)| (&request[..], &reply[..], *forwards))
+            .collect();
+
+        let (joiner, peer) = frames_forwarded_to_joiner_and_promoted_owner(&exchanges).await;
+        assert_eq!(joiner.len(), 6, "joiner");
+        assert_eq!(peer.len(), 6, "promoted owner");
+        let largest = LARGEST_FORWARD_PUSH_COPY.get();
+        assert!(
+            largest <= MAX_FORWARD_RUN_BYTES,
+            "one push copied {largest} bytes, over {MAX_FORWARD_RUN_BYTES}"
+        );
+        assert_eq!(FORWARD_PUSH_COPIED.get(), 2 * 2 * 3 * (4 + SIZE));
+    }
+
+    #[test]
+    fn a_forward_batch_splits_into_runs_of_at_most_the_bound() {
+        let target = ForwardTarget {
+            addr: "127.0.0.1:1".to_string(),
+            connection: Arc::new(AsyncMutex::new(None)),
+            token: String::new(),
+            revoked: Arc::new(AtomicBool::new(false)),
+            as_handoff: false,
+        };
+        let item = |name: &'static [u8], len: usize| {
+            (Bytes::from_static(name), Bytes::from(vec![0u8; len]))
+        };
+        let batch = ForwardBatch {
+            target,
+            items: vec![
+                item(b"a", 4),
+                item(b"b", 4),
+                item(b"c", 20),
+                item(b"d", 1),
+                item(b"e", 1),
+            ],
+        };
+        let (_, runs) = batch.into_runs(10);
+        let names: Vec<Vec<&[u8]>> = runs
+            .iter()
+            .map(|run| run.iter().map(|(name, _)| &name[..]).collect())
+            .collect();
+        // a and b (name and value, 5 bytes each) fill 10; c is over the bound
+        // alone and is a run by itself.
+        assert_eq!(names, [vec![&b"a"[..], b"b"], vec![b"c"], vec![b"d", b"e"]]);
     }
 
     #[tokio::test(flavor = "current_thread")]
