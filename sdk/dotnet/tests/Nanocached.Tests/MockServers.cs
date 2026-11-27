@@ -243,6 +243,13 @@ public sealed class MockNode : IDisposable
     }
     private volatile string _malformedValueBody = "x";
 
+    /// <summary>Answer the next G/g request with <paramref name="reply"/>
+    /// written verbatim instead of the real response — for a header the
+    /// node never emits, such as <c>V1\nx</c> with no space after the
+    /// marker.</summary>
+    public void AnswerRawToGetOnce(string reply) => _rawGetReply = reply;
+    private volatile string? _rawGetReply;
+
     /// <summary>Answer the next incr with this exact body instead of the
     /// real new value — for the strict-parse tests (a `+` sign or
     /// whitespace the node never emits).</summary>
@@ -609,6 +616,11 @@ public sealed class MockNode : IDisposable
                             await Wire.WriteAsync(stream, $"N {int.Parse(parts[^1]) + 1}\n");
                             break;
                         }
+                        if (Interlocked.Exchange(ref _rawGetReply, null) is string rawGetReply)
+                        {
+                            await Wire.WriteAsync(stream, rawGetReply);
+                            break;
+                        }
                         if (TakeMalformedValue())
                         {
                             await Wire.WriteAsync(stream, $"V {_malformedValueBody}\n");
@@ -744,6 +756,11 @@ public sealed class MockNode : IDisposable
                         if (tagged && TakeOne(ref _wrongTagReplies))
                         {
                             await Wire.WriteAsync(stream, $"N {int.Parse(parts[^1]) + 1}\n");
+                            break;
+                        }
+                        if (Interlocked.Exchange(ref _rawGetReply, null) is string rawGetReply)
+                        {
+                            await Wire.WriteAsync(stream, rawGetReply);
                             break;
                         }
                         if (TakeMalformedValue())
