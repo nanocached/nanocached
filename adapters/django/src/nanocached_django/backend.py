@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import concurrent.futures
 import enum
 import math
 import os
@@ -461,6 +462,32 @@ class _Bridge:
                 handle = self.handles[namespace] = client.namespace(namespace)
             return loop, handle
 
+    def submit(
+        self, namespace: str, make_coro: Callable[[Namespace], Coroutine[Any, Any, _T]]
+    ) -> concurrent.futures.Future[_T] | None:
+        """Schedules ``make_coro(handle)`` on the loop, atomically with
+        the ``snapshot`` read: ``None`` if a shutdown has the bridge torn
+        down. Submitting under ``lock`` is what keeps the submission from
+        landing on a loop ``shutdown`` is tearing down. Read outside the
+        lock and submitted afterwards, a shutdown in between could stop
+        the loop before the submission (its callback then sat in the
+        stopped loop's ready queue, ``loop.close()`` discarded it, and the
+        caller's ``.result()`` blocked forever) or close it first (a bare
+        "Event loop is closed" ``RuntimeError``). Under the lock, the
+        submission's callback is queued before ``shutdown`` queues
+        ``client.close()`` and ``loop.stop``, so the loop always runs it.
+        ``run_coroutine_threadsafe`` only queues a callback, and
+        ``make_coro`` only builds a coroutine object, so the lock is held
+        for no I/O."""
+        with self.lock:
+            loop, client = self.loop, self.client
+            if loop is None or client is None:
+                return None
+            handle = self.handles.get(namespace)
+            if handle is None:
+                handle = self.handles[namespace] = client.namespace(namespace)
+            return asyncio.run_coroutine_threadsafe(make_coro(handle), loop)
+
     def shutdown(self) -> None:
         with self.lock:
             if self.loop is not None and self.pid != os.getpid():
@@ -697,7 +724,10 @@ class NanocachedCache(BaseCache):
         under the lock also means a caller that arrives while
         ``_ensure_started()``'s own connect is still in flight (held
         under the same lock) waits for it to finish rather than racing
-        a still-``None`` handle.
+        a still-``None`` handle. The submission to the loop happens under
+        that same lock (``_Bridge.submit``), so a shutdown can never stop
+        or close the loop between the snapshot and the submission — see
+        ``submit`` for the hang that gap caused.
 
         If the snapshot lands mid-shutdown (``loop``/``handle`` still
         ``None`` right after ``_ensure_started()`` returns), retrying
@@ -707,9 +737,9 @@ class NanocachedCache(BaseCache):
         attempt fails loudly instead of spinning forever."""
         for _ in range(_RUN_RECONNECT_ATTEMPTS):
             self._ensure_started()
-            loop, handle = self._bridge.snapshot(self._namespace)
-            if loop is not None and handle is not None:
-                return asyncio.run_coroutine_threadsafe(make_coro(handle), loop).result()
+            future = self._bridge.submit(self._namespace, make_coro)
+            if future is not None:
+                return future.result()
         raise RuntimeError(
             "nanocached_django: backend was shut down concurrently with "
             "this operation and could not reconnect; retry the operation"

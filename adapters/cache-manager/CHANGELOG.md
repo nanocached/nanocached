@@ -18,6 +18,7 @@ changed. What 1.0.0 will promise is described on the
 
 ### Fixed
 
+- `mdel()` rejected as soon as one delete failed, while the other deletes of its 400-key chunk could still be in flight, and never sent the later chunks: deleting 1,000 keys with a failure in the first chunk left keys 401–1,000 in the cache. `mset()` with a negative `ttl` deletes through the same path. Every delete is now sent and settled first, and the call then rejects with the first failure, as the Django backend's `delete_many` and the JCache adapter's `removeAll` do. (#2081)
 - `set()`/`mset()` with a `ttl` of `Infinity`, or any value past the SDK's range, threw a `RangeError` from the SDK. It now writes with no expiry, as the Django backend does. (#1851)
 - The README said the value size limit is measured after compression when `compress` is on. The SDK checks the value before compressing it, so a value over the limit is rejected with `RangeError` even if it would compress to less; the README now says so. (#1603)
 - `mset()` sent the whole batch again after the SDK's `setMany` threw a plain `WrongNodeError`. That error comes after the SDK's own refresh and retry, with every other key already stored, so the resend wrote those keys again with the old values and could overwrite a newer write from another client, and the call still failed. The error now reaches the caller without a resend. (#1953)

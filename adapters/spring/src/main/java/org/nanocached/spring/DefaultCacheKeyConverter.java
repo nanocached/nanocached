@@ -5,7 +5,12 @@ import java.io.IOException;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.lang.reflect.Field;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import org.springframework.cache.interceptor.SimpleKey;
 
@@ -28,7 +33,13 @@ import org.springframework.cache.interceptor.SimpleKey;
  *       keys and a {@code @CacheEvict} built from separately obtained arguments would miss;
  *   <li>everything else is JDK serialization output — stable across JVMs for the simple parameter
  *       types method keys are made of, but bulky; prefer simple keys, or plug in a converter that
- *       knows the key type.
+ *       knows the key type. The same back-reference rule applies inside such a key ({@code
+ *       Pair(x, x)} versus {@code Pair(x, copyOf(x))}), so the stream replaces every {@code
+ *       String}, boxed primitive, {@code UUID}, {@code BigInteger} and {@code BigDecimal} with the
+ *       first {@code equals()}-equal value it wrote: a repeated value is a back-reference whether
+ *       or not it was the same instance. Other types keep plain JDK semantics — two separate but
+ *       equal instances of them (dates, collections, application classes) are written in full, the
+ *       same instance twice as a back-reference.
  * </ul>
  *
  * <p>The four families never collide because of their leading byte: a type-prefixed string starts
@@ -97,12 +108,54 @@ public final class DefaultCacheKeyConverter implements CacheKeyConverter {
                     + " CacheKeyConverter");
         }
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
+        try (ObjectOutputStream out = new SharingEqualValues(bytes)) {
             out.writeObject(key);
         } catch (IOException e) {
             throw new IllegalStateException("nanocached-spring: failed to serialize cache key", e);
         }
         return bytes.toByteArray();
+    }
+
+    /**
+     * The value classes whose serialized form depends only on {@code equals()}, so replacing one by
+     * an equal instance cannot change what the key means. Matched by exact class, so a subclass of
+     * {@code BigInteger} or {@code BigDecimal} (the two that are not final) is left alone.
+     */
+    private static final Set<Class<?>> SHARED_VALUE_CLASSES = Set.of(
+            String.class,
+            Long.class,
+            Integer.class,
+            Short.class,
+            Byte.class,
+            Double.class,
+            Float.class,
+            Boolean.class,
+            Character.class,
+            UUID.class,
+            BigInteger.class,
+            BigDecimal.class);
+
+    /**
+     * An {@link ObjectOutputStream} that writes the second of two {@code equals()}-equal simple
+     * values as a back-reference to the first, as it already does for the same instance — see the
+     * class doc. {@code replaceObject} runs before the stream looks the replacement up in its handle
+     * table, so the substituted instance is found there.
+     */
+    private static final class SharingEqualValues extends ObjectOutputStream {
+        private final Map<Object, Object> firstWritten = new HashMap<>();
+
+        SharingEqualValues(ByteArrayOutputStream bytes) throws IOException {
+            super(bytes);
+            enableReplaceObject(true);
+        }
+
+        @Override
+        protected Object replaceObject(Object obj) {
+            if (obj == null || !SHARED_VALUE_CLASSES.contains(obj.getClass())) {
+                return obj;
+            }
+            return firstWritten.computeIfAbsent(obj, value -> value);
+        }
     }
 
     /**
