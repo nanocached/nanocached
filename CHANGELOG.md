@@ -26,6 +26,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node: a join handoff `M` that reached a node after its drain had begun
+  but before the drain had fetched the roster (the first seconds of a
+  decommission, longer for an evicted node) was accepted, and its transfer
+  ran alongside the drain without being aborted, sending keys to the
+  joiner and marking copies dead while the drain handed the same cache to
+  the entrants. A draining node now refuses `M` from the shutdown signal
+  on, as it already did once the roster was fetched (#2088).
+
 - Discovery: an `M` send that stopped was always logged as "permanently
   failed to send M … after 3 attempts", including when it stopped because a
   newer generation of the same name had superseded the join, or because the
