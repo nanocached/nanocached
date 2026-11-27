@@ -527,10 +527,14 @@ fails or answers wrong-node gets the call rerouted with no replica touched,
 and these replica legs run outside the pipelined-order guarantee, like the
 retry paths. `touchMany` and `getManyAndTouch` do the same: primary frames
 first, then one plain frame per replica for the keys a primary answered. If
-the primary's connection still fails after the retry (it died and discovery
-still lists it), or fails after the request was sent, the other owners are
-sent the touch anyway before the connection error is thrown, so a read that
-falls back to a replica does not return the value the caller expired.
+the primary's connection fails after the request was sent, the primary may
+have expired the key, so the other owners are sent the touch anyway before
+the connection error is thrown, and a read that falls back to a replica does
+not return the value the caller expired. If the primary could not be reached
+at all, even after the retry (it died and discovery still lists it), nothing
+was sent: no other owner is touched, and the error has `requestWasSent`
+`false`, so the call can be sent again once discovery has dropped the dead
+node, and still finds the value.
 
 Against a node older than the release that added the command, both throw
 `ServerTooOldError`: such a node answers `En` and closes the connection (a node before 0.4.8 closes it without a reply).

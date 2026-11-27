@@ -5040,7 +5040,9 @@ async fn dispatch_request(
         // `finish_multi_get`/`retry_multi_get`; issue #221 made that
         // retry fall through the remaining owners (replicas) exactly
         // like `retry_get_on` does for single-key `Get`, instead of
-        // giving up after the fresh primary alone.
+        // giving up after the fresh primary alone; issue #2083 made a
+        // sub-batch that failed outright ask its primary last there, as
+        // `finish_get` does.
         Request::MultiGet { namespace, keys } => {
             let mut groups: AddrGroups<(Vec<usize>, Vec<Bytes>)> = AddrGroups::new(&ring);
             let mut missing = Vec::new();
@@ -5072,9 +5074,9 @@ async fn dispatch_request(
                 .backends
                 .enqueue_each(&context, requests, Expect::Multi)
                 .await;
-            let positions: Vec<Vec<usize>> = groups
+            let positions: Vec<(String, Vec<usize>)> = groups
                 .into_iter()
-                .map(|(_, (positions, _))| positions)
+                .map(|(owner, (positions, _))| (owner, positions))
                 .collect();
 
             tokio::spawn(async move {
@@ -5292,34 +5294,46 @@ async fn retry_get_on(
 /// failure: partial-result semantics mean a key that's still wrong after
 /// the retry degrades to its own `WrongNode` entry, same as every other
 /// key's independent outcome.
+///
+/// `positions` pairs each group's positions with the primary address it
+/// was sent to. A group that failed outright (transport, malformed reply)
+/// hands that address to the retry, which tries it last for those keys —
+/// `finish_get`'s failed-primary-last order (issue #2083): retried first,
+/// a black-holed primary cost a second `UPSTREAM_IO_TIMEOUT` before the
+/// replica got a chance. A per-key `W` names no failed node: the node
+/// answered, its roster view differs, and the fresh primary goes first.
 async fn finish_multi_get(
     context: &ProxyContext,
     namespace: &[u8],
     keys: &[Bytes],
     missing: Vec<usize>,
-    positions: Vec<Vec<usize>>,
+    positions: Vec<(String, Vec<usize>)>,
     pending: Vec<PendingReply>,
     tag: Option<u32>,
 ) -> DriverResult {
     let mut entries: Vec<Option<ProxyMultiEntry>> = vec![None; keys.len()];
-    let mut retry_positions = Vec::new();
+    let mut retry_positions: Vec<(usize, Option<&str>)> = Vec::new();
 
     for position in missing {
         entries[position] = Some(ProxyMultiEntry::WrongNode);
     }
 
-    for (group_positions, reply) in positions.into_iter().zip(pending) {
+    for ((addr, group_positions), reply) in positions.iter().zip(pending) {
         match reply.await {
             Ok(NodeReply::Multi(results)) if results.len() == group_positions.len() => {
-                for (position, entry) in group_positions.into_iter().zip(results) {
+                for (&position, entry) in group_positions.iter().zip(results) {
                     if matches!(entry, ProxyMultiEntry::WrongNode) {
-                        retry_positions.push(position);
+                        retry_positions.push((position, None));
                     } else {
                         entries[position] = Some(entry);
                     }
                 }
             }
-            _ => retry_positions.extend(group_positions),
+            _ => retry_positions.extend(
+                group_positions
+                    .iter()
+                    .map(|&position| (position, Some(addr.as_str()))),
+            ),
         }
         // Held to the cap as each group lands, not once all have: `entries`
         // never carries more than the cap plus the one group just added.
@@ -5376,17 +5390,25 @@ fn cap_multi_reply_values<'a>(entries: impl IntoIterator<Item = &'a mut ProxyMul
 /// can't loop indefinitely. Fills every position in `retry_positions` —
 /// with a real result or a final `WrongNode` once every owner is
 /// exhausted — so the caller never sees a gap.
+///
+/// A position paired with the address whose first-pass sub-batch failed
+/// has that address moved to the end of its fresh ranking (issue #2083),
+/// so its other owners are asked first, as `finish_get` asks them. It is
+/// still asked last rather than dropped, for the same reason as there: the
+/// failure may have been an idle-closed shared connection that `call`'s
+/// redial recovers. Matched by address, not by node index: the ring was
+/// refreshed, and two roster names can share one address.
 async fn retry_multi_get(
     context: &ProxyContext,
     namespace: &[u8],
     keys: &[Bytes],
-    retry_positions: &[usize],
+    retry_positions: &[(usize, Option<&str>)],
     entries: &mut [Option<ProxyMultiEntry>],
 ) {
     force_refresh(context).await;
 
     let Some(ring) = current_ring(context) else {
-        for &position in retry_positions {
+        for &(position, _) in retry_positions {
             entries[position] = Some(ProxyMultiEntry::WrongNode);
         }
         return;
@@ -5396,14 +5418,20 @@ async fn retry_multi_get(
     let mut unresolved: Vec<usize> = Vec::new();
     let mut top = Vec::new();
     let namespace_hash = NamespaceHash::of(namespace);
-    for &position in retry_positions {
+    for &(position, failed) in retry_positions {
         let key = &keys[position];
         ring.rank_owners(namespace_hash, key, ring.replication, &mut top);
         if top.is_empty() {
             entries[position] = Some(ProxyMultiEntry::WrongNode);
             continue;
         }
-        owners_by_position.insert(position, top.iter().map(|&(_, node)| node).collect());
+        let mut owners: Vec<usize> = top.iter().map(|&(_, node)| node).collect();
+        if let Some(failed) = failed {
+            // Stable: the other owners keep their order, the failed
+            // address's ranks go last.
+            owners.sort_by_key(|&node| ring.nodes[node].1 == failed);
+        }
+        owners_by_position.insert(position, owners);
         unresolved.push(position);
     }
 
@@ -9848,6 +9876,8 @@ mod tests {
             message,
             "invalid --discovery address \"10.0.0.2\" is not a host:port address: no port"
         );
+        // A link-local host with its scope id connects, so it is accepted.
+        assert!(args(&["--discovery", "[::1]:8357,[fe80::1%2]:8357"]).is_ok());
     }
 
     #[test]
@@ -10246,7 +10276,9 @@ mod tests {
         let chunk = Bytes::from(vec![b'x'; MAX_REQUEST_SIZE]);
         let context = bare_context();
         let keys = vec![Bytes::from_static(b"k"); 30];
-        let positions: Vec<Vec<usize>> = (0..3).map(|g| (g * 10..(g + 1) * 10).collect()).collect();
+        let positions: Vec<(String, Vec<usize>)> = (0..3)
+            .map(|g| (format!("node-{g}"), (g * 10..(g + 1) * 10).collect()))
+            .collect();
         let pending: Vec<PendingReply> = (0..3)
             .map(|_| {
                 let group = vec![ProxyMultiEntry::Value(chunk.clone()); 10];
@@ -20499,6 +20531,62 @@ mod tests {
         assert!(
             elapsed < UPSTREAM_IO_TIMEOUT + UPSTREAM_IO_TIMEOUT / 2,
             "elapsed {elapsed:?} suggests the dead primary was retried before the replica"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_multi_get_whose_primary_stops_answering_asks_the_replica_within_one_timeout() {
+        // Issue #2083: `retry_multi_get` retried every key of a failed
+        // sub-batch at rank 0 first — the primary that just timed out. A
+        // node that accepts and authenticates connections but answers
+        // nothing else (a stopped process) then cost a second full
+        // `UPSTREAM_IO_TIMEOUT` before the replica was asked, where a single
+        // `G` of the same key (`finish_get`) costs one.
+        let replica = MockNode::start().await;
+        let silent_primary = start_silent_after_handshake_node().await;
+        let ring = Arc::new(RingView::new(
+            vec![
+                ("node-silent".to_string(), silent_primary.clone()),
+                ("node-replica".to_string(), replica.addr.clone()),
+            ],
+            2,
+        ));
+        let keys: Vec<Bytes> = (0..64u8)
+            .map(|index| Bytes::from(format!("key-{index}")))
+            .filter(|key| ring.owners(b"", key)[0] == silent_primary)
+            .take(4)
+            .collect();
+        assert_eq!(keys.len(), 4, "too few keys primaried by the silent node");
+        for key in &keys {
+            replica
+                .store
+                .lock()
+                .unwrap()
+                .insert((Vec::new(), key.to_vec()), b"v".to_vec());
+        }
+        let context = context_with_ring(Some(ring));
+
+        let start = std::time::Instant::now();
+        let pending = context
+            .backends
+            .enqueue_each(
+                &context,
+                [(silent_primary.as_str(), frame_multi_get(b"", &keys))],
+                Expect::Multi,
+            )
+            .await;
+        let positions = vec![(silent_primary.clone(), (0..keys.len()).collect())];
+        let reply = finish_multi_get(&context, b"", &keys, Vec::new(), positions, pending, None)
+            .await
+            .unwrap_or_else(|_| panic!("expected the replica's values, got a fatal error"));
+        let elapsed = start.elapsed();
+
+        let mut expected = b"M 4 1 1 1 1\n".to_vec();
+        expected.extend_from_slice(b"vvvv");
+        assert_eq!(reply, expected);
+        assert!(
+            elapsed < UPSTREAM_IO_TIMEOUT + UPSTREAM_IO_TIMEOUT / 2,
+            "elapsed {elapsed:?} suggests the silent primary was retried before the replica"
         );
     }
 

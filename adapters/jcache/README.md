@@ -209,6 +209,12 @@ on one key were enough to exhaust it.)
 platform MBean server. Timings and evictions are not tracked — the wire
 protocol doesn't report server-side LRU evictions to the client.
 
+Operations are counted only while statistics are enabled, as in the
+specification's reference implementation: what a cache did while they
+were off never shows up after `enableStatistics(name, true)`, and
+disabling them keeps the counts gathered so far (the MBean's `clear()`
+resets them).
+
 Hits, misses, puts and removals follow the table in the JSR-107
 specification ("Statistics Effects of Cache Operations"), where a cell
 reads "yes" for both hits and misses it is the mapping that decides, as in
