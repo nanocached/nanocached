@@ -1374,9 +1374,10 @@ internal sealed class Connection
                 // the rest of the line so the failure carries its own type.
                 //
                 // Issue #939: only that exact line is a server that is too
-                // old. Any other E — a bare `E\n`, or the tagged `E <tag>\n`
-                // nanocached-proxy answers when an expiring touch's outcome
-                // is unknown or a request failed transiently — is a fatal
+                // old. Any other E — the bare `E\n` nanocached-proxy answers
+                // when an expiring touch's outcome is unknown or a request
+                // failed transiently (untagged even on a tagged connection),
+                // or an E that carries a tag — is a fatal
                 // error after the frame was written: the connection-lost
                 // error every other command gets, which a ttl=0 touch and
                 // Incr/CAS never resend.

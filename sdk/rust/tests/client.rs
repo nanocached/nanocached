@@ -194,8 +194,8 @@ struct NodeState {
     /// Issue #939: the raw bytes (`E\n`, `E 7\n`, `En\n`...) to answer
     /// every `t` and `y` frame with, then close the connection. Unlike
     /// `reject_touch` this need not be a node's `En`: the proxy answers a
-    /// bare `E` (tagged `E <tag>`) for a touch whose outcome it could not
-    /// tell.
+    /// bare `E` (untagged even on a tagged connection) for a touch whose
+    /// outcome it could not tell.
     touch_error_reply: Mutex<Option<Vec<u8>>>,
     /// Issue #1873: as `touch_error_reply`, for `i`: the raw bytes (the
     /// proxy's `E 7\n`, say) to answer every `i` frame with, unapplied,
@@ -5399,9 +5399,10 @@ async fn batch_touch_keeps_earlier_chunks_when_a_later_chunk_fails() {
 
 #[tokio::test]
 async fn an_e_that_is_not_en_to_an_expiring_touch_is_a_loss_after_the_send() {
-    // The proxy answers a bare `E` (tagged: `E <tag>`) to a touch whose
-    // outcome it could not tell; it is not a node that predates the
-    // command, and an expiring touch must not be sent again.
+    // The proxy answers a bare `E`, untagged even on a tagged connection,
+    // to a touch whose outcome it could not tell; it is not a node that
+    // predates the command, and an expiring touch must not be sent again.
+    // An `E` that carries a tag is read the same way.
     for reply in [&b"E\n"[..], &b"E 7\n"[..]] {
         let node = MockNode::start().await;
         let client = NanocachedClient::connect(options(node.port)).await.unwrap();

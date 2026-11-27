@@ -4,8 +4,9 @@ namespace Nanocached.Tests;
 
 /// <summary>
 /// issue #939 — only a node's <c>En</c> to a touch is "server too old".
-/// Any other <c>E</c> (a bare <c>E</c>, or the tagged <c>E &lt;tag&gt;</c>
-/// nanocached-proxy answers when an expiring touch's outcome is unknown)
+/// Any other <c>E</c> (the bare <c>E</c> nanocached-proxy answers when an
+/// expiring touch's outcome is unknown, untagged even on a tagged
+/// connection, or an <c>E</c> that carries a tag)
 /// is a connection lost after the frame was written: not resent for a
 /// ttl=0 touch, and never reported as an old server.
 /// </summary>
