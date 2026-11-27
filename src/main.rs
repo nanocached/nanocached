@@ -310,6 +310,13 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
     // dial, and discovery refuses port 0. `--port 0` makes the kernel pick
     // a port the registration would not carry, so the node would serve but
     // never join, with nothing but a retrying log line to say why.
+    if let Some(list) = &args.discovery {
+        for address in list.split(',').map(str::trim).filter(|a| !a.is_empty()) {
+            infra::check_host_port(address)
+                .map_err(|why| ArgsError::Invalid(format!("invalid --discovery address {why}")))?;
+        }
+    }
+
     if args.port == 0 && args.discovery.is_some() {
         return Err(ArgsError::Invalid(
             "--port 0 cannot be used with --discovery: the node must register the port it \
@@ -591,6 +598,31 @@ mod tests {
                  it listens on"
             );
         }
+    }
+
+    #[test]
+    fn a_discovery_address_without_a_port_is_refused_at_startup() {
+        let Err(ArgsError::Invalid(message)) = parse_args_from(args(&[
+            "--port",
+            "8356",
+            "--discovery",
+            "127.0.0.1:8357, 127.0.0.1",
+        ])) else {
+            panic!("an address without a port must be rejected");
+        };
+        assert_eq!(
+            message,
+            "invalid --discovery address \"127.0.0.1\" is not a host:port address: no port"
+        );
+        assert!(
+            parse_args_from(args(&[
+                "--port",
+                "8356",
+                "--discovery",
+                "127.0.0.1:8357,[::1]:8357"
+            ]))
+            .is_ok()
+        );
     }
 
     #[test]

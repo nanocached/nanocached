@@ -14,6 +14,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node and proxy: a `--discovery` address without a port (or with port 0,
+  a non-numeric port, or an unbracketed IPv6 host) was accepted at startup,
+  and every connect then failed with "invalid socket address", so the node
+  never joined and the proxy never had a roster. Each address is now checked
+  at startup and a bad one is a usage error naming it (#2050).
+
 - Node: a receive buffer that grew under the in-flight overdraft token kept
   it until its frame arrived, which only the client decided, so a client
   that stalled or trickled mid-frame made every other large upload that
