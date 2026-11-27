@@ -26,6 +26,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: when a primary's `m` sub-batch failed in transport (a node that
+  stopped answering on an established connection), the retry asked that same
+  primary first for every key and waited out a second `UPSTREAM_IO_TIMEOUT`
+  before trying the replica; a single `G` of the same key asks the other
+  owners first. The retry now asks a failed primary last, so an `m` costs one
+  timeout, like a `G`. A per-key `W` still retries the fresh primary first
+  (#2083).
 - Discovery: an `M` send that stopped was always logged as "permanently
   failed to send M … after 3 attempts", including when it stopped because a
   newer generation of the same name had superseded the join, or because the
