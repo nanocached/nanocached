@@ -366,10 +366,12 @@ forward can land after a later increment and rewind the counter &mdash;
 a counter incremented concurrently by several callers during that
 window can lose a few increments; so can one caller whose increments
 follow each other within a few milliseconds, while increments spaced well
-above that are practically exact. Separately, two clients incrementing the
-same key at the same time can leave a replica one or two increments behind
-the primary, because each writes its result to the replica on its own and
-the writes are not ordered.
+above that are practically exact. A sustained stream loses far more: with
+64 in flight at a time on one counter, a burst of 30,000 sent shortly after
+a join lost 44 to 79&nbsp;% of them, every one acknowledged. Separately,
+two clients incrementing the same key at the same time can leave a replica
+one or two increments behind the primary, because each writes its result to
+the replica on its own and the writes are not ordered.
 See <a href="architecture.html#accepted-behaviour">accepted
 behaviour</a>.</p>
 
@@ -513,7 +515,12 @@ and the plain <code>t</code> to the other owners only once the primary has
 answered. Sent together, a replica would expire its copy while the primary
 leg was still failing (unreachable, or <code>W</code> from a stale ring),
 and the retry over the refreshed ring would then ask that replica, now the
-primary, for a key it no longer holds. Those deferred legs run outside the
+primary, for a key it no longer holds. Once that retry has failed too,
+<code>nanocached-proxy</code> still sends the other owners their plain
+<code>t</code> before it answers the error (<code>R</code>, a
+<code>W</code> entry, or <code>E</code> when the primary may have applied
+it), so a replica does not keep a value the client asked to expire and
+serve it to a later read. Those deferred legs run outside the
 request order a pipelined connection otherwise keeps. A node that
 owns no copy of the key answers <code>W</code>. An owner that answers
 <code>N</code> has no live copy; the touch does not create one and
