@@ -16,10 +16,15 @@ clients with their own connections (their own ring views):
          answer exceeds acknowledged + maybe (more would be an increment
          applied twice or one nobody sent).
   is<i>  serial: a turn is four increments one after the other from one
-         client; each answer must follow the previous one by exactly one,
-         plus one for every maybe in between. An answer above that is a
-         phantom increment (asserted); an answer at or below the previous
-         one (is_rewind) is printed, not asserted.
+         client. An answer may exceed the highest answer the key has had so
+         far by one, plus one for every maybe since that answer; more is a
+         phantom increment (asserted). An answer at or below the previous
+         one (is_rewind) is printed, not asserted. So is one above the
+         previous answer by more than its maybes allow but within that bound
+         (is_restore): a lagging forward rewound the counter, and a later
+         forward carrying the newer value put it back (two forwards from one
+         old owner, or from two, landing out of order). Measuring against
+         the previous answer alone counted that return as a phantom.
 
 A value below the number of acknowledged increments (ia_short, is_short,
 with the missing amount in *_lost_min) and answers that repeat on one key
@@ -69,8 +74,9 @@ maybe = {c: [0] * a.n for c in "as"}
 rets = {c: [[] for _ in range(a.n)] for c in "as"}
 hist = [[] for _ in range(a.n)]   # serial keys: (time, answer or "err:<type>") in order, for lining up with node traces
 maybe_mark = [0] * a.n      # serial keys: failed increments already accounted for by the last answer
+best = [None] * a.n         # serial keys: (highest answer so far, maybe count when it came)
 counts = dict(ia_turns=0, is_turns=0, ops_err=0)
-anom = dict(counter_miss=0, not_numeric=0, is_phantom=0, is_rewind=0, is_skip=0)
+anom = dict(counter_miss=0, not_numeric=0, is_phantom=0, is_rewind=0, is_restore=0, is_skip=0)
 errors, examples = {}, {}
 
 rewind_at = {}    # is_rewind per 10 s of wall clock, "HH:MM:S0", for lining up with the rounds
@@ -128,6 +134,19 @@ async def incr_once(c, cls, i):
     if cls == "s": hist[i].append((now_s(), r))
     return r
 
+def classify_serial(prev, r, allowed, top, maybes):
+    """What a serial key's answer r says, against the previous answer prev
+    (with `allowed` increments failed since it), the highest answer so far
+    and the maybe count when it came (`top`), and the maybe count now: None
+    when it is the expected next value, else the anomaly to note."""
+    gap = r - prev
+    if gap <= 0: return "is_rewind"
+    # every increment that failed since the highest answer may have been applied
+    if r - top[0] - 1 - (maybes - top[1]) > 0: return "is_phantom"
+    if gap - 1 > allowed: return "is_restore"
+    if gap > 1: return "is_skip"
+    return None
+
 async def ia_turn(clients, i):
     counts["ia_turns"] += 1
     await asyncio.gather(*[incr_once(c, "a", i) for c in clients for _ in range(4 // len(clients))])
@@ -141,12 +160,13 @@ async def is_turn(clients, i):
         if r is None: continue
         # increments that failed since the previous answer may each have been applied
         allowed = maybe["s"][i] - maybe_mark[i]; maybe_mark[i] = maybe["s"][i]
+        top = best[i]
+        if top is None or r > top[0]: best[i] = (r, maybe["s"][i])
         if prev is None: continue
-        gap = r - prev
-        if gap <= 0: note("is_rewind", key=key("s", i), prev=prev, got=r)
+        kind = classify_serial(prev, r, allowed, top, maybe["s"][i])
+        if kind == "is_rewind": note(kind, key=key("s", i), prev=prev, got=r)
         # the key's recent answers and failures ride along, so the node traces can be lined up with them
-        elif gap - 1 > allowed: note("is_phantom", key=key("s", i), prev=prev, got=r, maybes=allowed, history=hist[i][-12:])
-        elif gap > 1: note("is_skip", key=key("s", i), prev=prev, got=r, history=hist[i][-12:])
+        elif kind: note(kind, key=key("s", i), prev=prev, got=r, top=top[0], history=hist[i][-12:])
 
 async def worker(w, clients):
     mine = list(range(w, a.n, a.workers))
