@@ -5933,6 +5933,56 @@ func TestHedgingOffByDefaultASlowPrimaryBoundsTheRead(t *testing.T) {
 	}
 }
 
+func TestAFailedHedgeLegStartsTheNextOwnerAtOnce(t *testing.T) {
+	// Issue #2117: with three owners and a silent primary, the hedge to
+	// the second owner fails at once (its node is gone): the third owner
+	// is asked right away, not after another full interval while the
+	// primary is still in flight. It used to start only once no leg was in
+	// flight, so the read took two intervals.
+	names := append(append([]string{}, testNames...), "9c1e4b7a-2d3f-4a5b-8c6d-7e8f9a0b1c2d")
+	nodes := map[string]*mockNode{}
+	listed := make([]discoveredNode, 0, len(names))
+	for _, name := range names {
+		nodes[name] = startMockNode(t, nil)
+		listed = append(listed, discoveredNode{Name: name, Address: nodes[name].address()})
+	}
+	discovery := startMockDiscovery(t, listed, 3)
+	hedgeAfter := 300 * time.Millisecond
+	client, err := Connect(Config{
+		Addresses:      []Address{addr(discovery.address())},
+		ReadHedgeAfter: hedgeAfter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	owners := newHashRing(names).Owners([]byte("k"), 3)
+	nodes[owners[0]].delayGets(2 * time.Second)
+	nodes[owners[1]].close()
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	value, ok, err := client.Get("k")
+	elapsed := time.Since(start)
+
+	if err != nil || !ok || value != "v" {
+		t.Fatalf("Get = %q, %v, %v", value, ok, err)
+	}
+	if got := nodes[owners[2]].getCount.Load(); got != 1 {
+		t.Fatalf("third owner got %d reads, want 1", got)
+	}
+	if elapsed < hedgeAfter-hedgeTimingTolerance {
+		t.Fatalf("elapsed = %v, want at least the %v hedge interval", elapsed, hedgeAfter)
+	}
+	if elapsed >= hedgeAfter*3/2 {
+		t.Fatalf("elapsed = %v, want the third owner asked as soon as the second failed (under %v)", elapsed, hedgeAfter*3/2)
+	}
+}
+
 func TestADeadPrimaryFailsOverImmediatelyWhenHedgingIsOn(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)
 	client, err := Connect(Config{
