@@ -1563,7 +1563,8 @@ internal sealed class Connection
     /// line the wire sends carries exactly one mandatory space right
     /// after the marker byte — the field delimiter, not part of any
     /// field's value — so <paramref name="stripLeadingSpace"/> (true by
-    /// default) strips exactly that one leading space, never more.
+    /// default) strips exactly that one leading space, never more, and
+    /// rejects a line that does not start with it.
     /// Issue #462: a blanket <c>.Trim()</c> here used to strip ANY amount
     /// of leading/trailing whitespace from the whole line, which silently
     /// absorbed a malicious server's extra padding around the first or
@@ -1586,7 +1587,17 @@ internal sealed class Connection
             if (b == (byte)'\n')
             {
                 string result = line.ToString();
-                return stripLeadingSpace && result.StartsWith(' ') ? result[1..] : result;
+                if (!stripLeadingSpace) return result;
+                // The delimiter is mandatory: `V5\n` is not `V 5\n`. A peer
+                // that leaves it out cannot be trusted to frame the next
+                // response either, so it poisons the connection, as in the
+                // Go, Java and Rust SDKs.
+                if (!result.StartsWith(' '))
+                {
+                    throw new ConnectionLostException(
+                        "nanocached: malformed response header line (connection desynced)");
+                }
+                return result[1..];
             }
             if (line.Length >= MaxHeaderLineLength)
             {
