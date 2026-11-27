@@ -7717,6 +7717,45 @@ describe("NanocachedClient hedged reads (issue #64)", () => {
     }
   });
 
+  it("a failed hedge leg starts the next owner at once", async () => {
+    // Issue #2120: with three owners and a silent primary, the hedge to the
+    // second owner fails at once (its node is gone): the third owner is
+    // asked right away, not after another full interval while the primary
+    // is still in flight. It used to start only once no leg was in flight,
+    // so the read took two intervals.
+    const threeNames = [...names, "9c1e4b7a-2d3f-4a5b-8c6d-7e8f9a0b1c2d"];
+    const mocks = await Promise.all(threeNames.map(() => startMockNode()));
+    const nodes = threeNames.map((name, i) => ({ name, mock: mocks[i] }));
+    const discovery = await startMockDiscovery(
+      nodes.map(({ name, mock }) => ({ name, address: mock.address })),
+      { replication: 3 },
+    );
+    const hedgeAfterMs = 300;
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: discovery.port }],
+      readHedgeAfterMs: hedgeAfterMs,
+    });
+    try {
+      await client.set("k", "v");
+      const owners = new HashRing(threeNames)
+        .owners(Buffer.from("k"), 3)
+        .map((owner) => nodes.find(({ name }) => name === owner)!);
+      owners[0].mock.delayGets(2000);
+      await owners[1].mock.close();
+      await waitFor(() => memberConnectionClosed(client, owners[1].name), "the client to see the FIN");
+
+      const [value, elapsed] = await timed(client.get("k"));
+
+      assert.equal(value, "v");
+      assert.equal(owners[2].mock.getCount(), 1);
+      assert.ok(elapsed >= hedgeAfterMs - TIMING_TOLERANCE_MS, `elapsed was ${elapsed}`);
+      assert.ok(elapsed < hedgeAfterMs * 1.5, `elapsed was ${elapsed}`);
+    } finally {
+      await client.close();
+      await Promise.all([discovery.close(), ...mocks.map((mock) => mock.close().catch(() => {}))]);
+    }
+  });
+
   it("a dead primary fails over immediately", async () => {
     const cluster = await startReplicatedCluster();
     const client = await NanocachedClient.connect({
