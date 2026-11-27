@@ -526,7 +526,11 @@ before a rerouted primary read it would turn a hit into a miss. A primary that
 fails or answers wrong-node gets the call rerouted with no replica touched,
 and these replica legs run outside the pipelined-order guarantee, like the
 retry paths. `touchMany` and `getManyAndTouch` do the same: primary frames
-first, then one plain frame per replica for the keys a primary answered.
+first, then one plain frame per replica for the keys a primary answered. If
+the primary's connection still fails after the retry (it died and discovery
+still lists it), or fails after the request was sent, the other owners are
+sent the touch anyway before the connection error is thrown, so a read that
+falls back to a replica does not return the value the caller expired.
 
 Against a node older than the release that added the command, both throw
 `ServerTooOldError`: such a node answers `En` and closes the connection (a node before 0.4.8 closes it without a reply).

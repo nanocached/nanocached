@@ -1362,15 +1362,20 @@ func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error
 		}, c.applyReconnecting, true)
 	})
 	if err != nil && errors.Is(err, ErrConnectionLost) && !errors.Is(err, ErrWrongNode) {
-		c.deleteOtherOwnersAfterLostPrimary(namespace, keyBytes)
+		c.sendToOtherOwnersAfterLostPrimary(namespace, keyBytes, func(conn *connection) error {
+			_, err := conn.deleteNS(namespace, keyBytes)
+			return err
+		})
 	}
 	return existed, err
 }
 
-// deleteOtherOwnersAfterLostPrimary sends a delete whose primary leg still
-// failed with a lost connection after the refresh and retry (a dead primary
-// discovery still lists) to the key's other owners before the caller gets
-// the error. Without it no owner would receive the delete: a read falls back
+// sendToOtherOwnersAfterLostPrimary runs op (a delete, or the plain touch
+// of an expiring touch, issue #2057) against the other owners of a
+// primary-first write whose primary leg still failed with a lost connection
+// after the refresh and retry (a dead primary discovery still lists, or,
+// for an expiring touch, a reply lost after the send) before the caller
+// gets the error. Without it no owner would receive the delete: a read falls back
 // to a replica on the dead primary and finds the value, and once discovery
 // drops the primary that replica is promoted with it. A delete is safe to
 // apply at any time, and the caller still gets the error, so existed is
@@ -1381,7 +1386,7 @@ func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error
 // with FireAndForgetReplicas (as in the other SDKs): the caller learns of
 // the failure only once the delete has reached every owner it can. A failed
 // leg is counted in Stats().ReplicaWriteFailures.
-func (c *Client) deleteOtherOwnersAfterLostPrimary(namespace, key []byte) {
+func (c *Client) sendToOtherOwnersAfterLostPrimary(namespace, key []byte, op func(*connection) error) {
 	names := c.ownerNames(namespace, key)
 	if len(names) < 2 {
 		return
@@ -1391,10 +1396,7 @@ func (c *Client) deleteOtherOwnersAfterLostPrimary(namespace, key []byte) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := c.applyReconnecting(name, func(conn *connection) error {
-				_, err := conn.deleteNS(namespace, key)
-				return err
-			}); err != nil {
+			if err := c.applyReconnecting(name, op); err != nil {
 				c.stats.replicaWriteFailures.Add(1)
 			}
 		}()

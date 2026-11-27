@@ -19,6 +19,7 @@
 //! to orphan.
 
 use std::env;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
@@ -45,7 +46,10 @@ fn sibling_binary(name: &str) -> Result<PathBuf, String> {
 }
 
 fn main() -> ExitCode {
-    let mut args = env::args().skip(1);
+    // `args_os`, not `args`: the options after `start` are passed through
+    // untouched, and `env::args()` panics on one that is not UTF-8 (the
+    // binary it runs reports that as a usage error instead).
+    let mut args = env::args_os().skip(1);
 
     let component = match args.next() {
         Some(component) if component == "-h" || component == "--help" => {
@@ -59,11 +63,15 @@ fn main() -> ExitCode {
         }
     };
 
-    let binary_name = match component.as_str() {
-        "node" => "nanocached-node",
-        "discovery" => "nanocached-discovery",
-        other => {
-            eprintln!("unknown component: {other}\n\n{}", usage());
+    let binary_name = match component.to_str() {
+        Some("node") => "nanocached-node",
+        Some("discovery") => "nanocached-discovery",
+        _ => {
+            eprintln!(
+                "unknown component: {}\n\n{}",
+                component.to_string_lossy(),
+                usage()
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -71,11 +79,19 @@ fn main() -> ExitCode {
     match args.next() {
         Some(action) if action == "start" => {}
         Some(action) => {
-            eprintln!("unknown action: {action}\n\n{}", usage());
+            eprintln!(
+                "unknown action: {}\n\n{}",
+                action.to_string_lossy(),
+                usage()
+            );
             return ExitCode::FAILURE;
         }
         None => {
-            eprintln!("missing action for {component}\n\n{}", usage());
+            eprintln!(
+                "missing action for {}\n\n{}",
+                component.to_string_lossy(),
+                usage()
+            );
             return ExitCode::FAILURE;
         }
     }
@@ -92,7 +108,7 @@ fn main() -> ExitCode {
 }
 
 #[cfg(unix)]
-fn run(binary_path: &PathBuf, args: impl Iterator<Item = String>) -> ExitCode {
+fn run(binary_path: &PathBuf, args: impl Iterator<Item = OsString>) -> ExitCode {
     use std::os::unix::process::CommandExt;
 
     // `exec` only returns on failure; on success it replaces this process.
@@ -102,7 +118,7 @@ fn run(binary_path: &PathBuf, args: impl Iterator<Item = String>) -> ExitCode {
 }
 
 #[cfg(not(unix))]
-fn run(binary_path: &PathBuf, args: impl Iterator<Item = String>) -> ExitCode {
+fn run(binary_path: &PathBuf, args: impl Iterator<Item = OsString>) -> ExitCode {
     match Command::new(binary_path).args(args).status() {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(_) => ExitCode::FAILURE,

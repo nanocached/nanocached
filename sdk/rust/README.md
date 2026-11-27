@@ -114,6 +114,13 @@ the delete anyway before the call returns `Error::ConnectionLost`: a read
 that falls back to them then misses instead of returning the deleted
 value.
 
+An expiring touch (`touch`, `get_and_touch`, `touch_many` or
+`get_many_and_touch` with `Some(0)`) follows the same order and the same
+rule: when the primary leg ends in a connection error, including a reply
+lost after the request was sent (which is not resent), the other owners
+are sent the plain touch before the error is returned, so a read that
+falls back to them misses instead of returning the expired value.
+
 ## Counters (`incr`/`decr`)
 
 `incr` atomically adds a signed delta to an integer counter stored at a

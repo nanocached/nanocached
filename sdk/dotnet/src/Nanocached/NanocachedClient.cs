@@ -2159,7 +2159,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// theirs only after the primary has answered, not alongside it, so a
     /// primary that cannot be reached or answers <c>W</c> is rerouted while
     /// the surviving owner still holds the entry; those legs therefore run
-    /// outside the pipelined-order guarantee, as the retry paths do. Throws
+    /// outside the pipelined-order guarantee, as the retry paths do. When
+    /// the primary's leg still ends in a connection failure (issue #2056),
+    /// the other owners are sent the touch before the
+    /// <see cref="ConnectionLostException"/> is thrown. Throws
     /// <see cref="ServerTooOldException"/> against a node that predates the
     /// command.</para></summary>
     public Task<bool> TouchAsync(string key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
@@ -2201,8 +2204,45 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         {
             // issue #901: the touch may already have been applied and
             // expired the key — surface the connection loss, never resend.
+            await ExpireOnOtherOwnersAsync(namespaceBytes, key).ConfigureAwait(false);
             throw error.Unwrap();
         }
+        catch (ConnectionLostException) when (!replaySafe && _ring is not null)
+        {
+            await ExpireOnOtherOwnersAsync(namespaceBytes, key).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <summary>Issue #2056: the primary leg of a touch with a TTL of 0
+    /// ended in a connection-level failure — the frame may have been
+    /// applied and the reply lost, or the primary is dead but still
+    /// listed (until discovery's liveness timeout), so the retry after
+    /// the forced refresh failed too. The deferred fan-out of
+    /// <see cref="WriteAsync{T}"/> never sent the other owners theirs, so
+    /// a read falling back to them would return the value the caller
+    /// expired, and one of them would be promoted with it. They get the
+    /// plain touch now, all at once and awaited (even with
+    /// <c>FireAndForgetReplicas</c>), before the caller's error is thrown;
+    /// a failed leg counts in <c>ReplicaWriteFailures</c>. The same rule
+    /// as a delete's (issue #2007). Nothing to do outside a
+    /// cluster.</summary>
+    private async Task ExpireOnOtherOwnersAsync(byte[] namespaceBytes, byte[] key)
+    {
+        if (_ring is null) return;
+        await Task.WhenAll(OwnerNames(namespaceBytes, key).Skip(1).Select(async name =>
+        {
+            try
+            {
+                await ApplyReconnectingAsync(name, connection => connection.TouchAsync(namespaceBytes, key, 0))
+                    .ConfigureAwait(false);
+            }
+            catch (Exception error) when (error is NanocachedException or IOException
+                or System.Net.Sockets.SocketException or ObjectDisposedException)
+            {
+                Interlocked.Increment(ref _replicaWriteFailures);
+            }
+        })).ConfigureAwait(false);
     }
 
     /// <summary>Reads a value and replaces its TTL in one step (issue
@@ -2283,7 +2323,13 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         {
             // issue #901: the value may already have been consumed by the
             // node — surface the connection loss, never resend.
+            await ExpireOnOtherOwnersAsync(namespaceBytes, key).ConfigureAwait(false);
             throw error.Unwrap();
+        }
+        catch (ConnectionLostException) when (!replaySafe && _ring is not null)
+        {
+            await ExpireOnOtherOwnersAsync(namespaceBytes, key).ConfigureAwait(false);
+            throw;
         }
         return raw is null || !_compress ? raw : Compression.DecompressValue(raw, _inflateBudget);
     }
@@ -2577,6 +2623,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         /// applied, so a resend would report them missing (and, with
         /// <c>get</c>, lose the values it consumed).</summary>
         public readonly HashSet<int> Lost = new();
+        /// <summary>Issue #2056: for a <c>ttl == 0</c> call, the positions
+        /// whose latest primary leg ended in a connection-level failure
+        /// (sent and lost, or unreachable), each with the owner that
+        /// failed — the deferred fan-out sends their other owners the
+        /// touch too, awaited.</summary>
+        public readonly Dictionary<int, string> Failed = new();
         public Exception? LastCause;
         public ServerTooOldException? Rejected;
     }
@@ -2668,7 +2720,9 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         // issue #934: with a TTL of 0 the two passes sent the primary's
         // sub-frames only. Now that every primary has answered or been
         // given up on, expire the copies on the other owners — once, on
-        // the ring in force now, for exactly the keys a primary answered.
+        // the ring in force now, for the keys a primary answered and
+        // (issue #2056) those whose primary leg ended in a connection
+        // failure.
         if (ttlSeconds == 0)
         {
             await MultiTouchReplicaFanOutAsync(namespaceBytes, keyBytes, state).ConfigureAwait(false);
@@ -2692,11 +2746,20 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// primary may still have a replica copy through fire-and-forget
     /// replication, and the caller's intent is expire-everywhere) is sent
     /// the plain touch on each of its other owners of the ring in force
-    /// now, grouped into one leg per owner. A key still <c>W</c>, lost or
+    /// now, grouped into one leg per owner. A key still <c>W</c> or
     /// rejected gets no replica leg: a reroute or the caller must still
     /// find the value on the surviving owner. A replica's failure is
     /// counted in <see cref="_replicaWriteFailures"/> and never fails the
     /// batch.
+    ///
+    /// <para>Issue #2056: a key whose primary leg ended in a connection
+    /// failure (sent and lost, or still unreachable after the refresh —
+    /// a dead primary discovery still lists) is sent the touch on its
+    /// other owners too, as a delete is (issue #2007): otherwise a read
+    /// falling back to them returns the value the caller expired, and one
+    /// of them is promoted with it. Those legs are awaited even with
+    /// <c>FireAndForgetReplicas</c>, so they have been answered when the
+    /// caller gets the error.</para>
     ///
     /// <para>These legs run after the primary answered, outside the
     /// pipelined-order guarantee, the same class as the retry
@@ -2704,16 +2767,22 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     private async Task MultiTouchReplicaFanOutAsync(
         byte[] namespaceBytes, byte[][] keyBytes, MultiTouchState state)
     {
-        var legs = new Dictionary<string, TouchLeg>();
-        int[] answered;
-        lock (state) answered = state.Results.Keys.OrderBy(idx => idx).ToArray();
-        foreach (int idx in answered)
+        var answeredLegs = new Dictionary<string, TouchLeg>();
+        var failedLegs = new Dictionary<string, TouchLeg>();
+        (int Idx, string Skip, bool Failed)[] targets;
+        lock (state)
         {
-            string answerer;
-            lock (state) answerer = state.Answerer[idx];
+            targets = state.Results.Keys.Select(idx => (idx, state.Answerer[idx], false))
+                .Concat(state.Failed.Select(p => (p.Key, p.Value, true)))
+                .OrderBy(t => t.Item1)
+                .ToArray();
+        }
+        foreach ((int idx, string skip, bool failed) in targets)
+        {
+            Dictionary<string, TouchLeg> legs = failed ? failedLegs : answeredLegs;
             foreach (string name in OwnerNames(namespaceBytes, keyBytes[idx]))
             {
-                if (name == answerer) continue;
+                if (name == skip) continue;
                 if (!legs.TryGetValue(name, out TouchLeg? leg))
                 {
                     leg = new TouchLeg(name, get: false);
@@ -2723,9 +2792,15 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 leg.IsPrimary.Add(false);
             }
         }
-        if (legs.Count == 0) return;
-        await RunTouchLegsAsync(
-            namespaceBytes, legs.Values, keyBytes, 0, new List<int>(), state).ConfigureAwait(false);
+        await Task.WhenAll(
+            answeredLegs.Count == 0
+                ? Task.CompletedTask
+                : RunTouchLegsAsync(namespaceBytes, answeredLegs.Values, keyBytes, 0, new List<int>(), state),
+            failedLegs.Count == 0
+                ? Task.CompletedTask
+                : RunTouchLegsAsync(
+                    namespaceBytes, failedLegs.Values, keyBytes, 0, new List<int>(), state, allowBackground: false))
+            .ConfigureAwait(false);
     }
 
     /// <summary>One or more <c>y</c> sub-frames against <paramref name="slot"/>'s
@@ -2776,7 +2851,11 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             IReadOnlyList<string> names = OwnerNames(namespaceBytes, keyBytes[idx]);
             if (names.Count == 0)
             {
-                lock (state) state.WrongNode.Add(idx);
+                lock (state)
+                {
+                    state.WrongNode.Add(idx);
+                    state.Failed.Remove(idx);
+                }
                 retry.Add(idx);
                 continue;
             }
@@ -2805,13 +2884,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// <see cref="MultiTouchReplicaFanOutAsync"/>.</summary>
     private async Task RunTouchLegsAsync(
         byte[] namespaceBytes, IEnumerable<TouchLeg> legs, byte[][] keyBytes, long? ttlSeconds, List<int> retry,
-        MultiTouchState state)
+        MultiTouchState state, bool allowBackground = true)
     {
         var running = new List<Task>();
         foreach (TouchLeg leg in legs)
         {
             bool pureReplica = !leg.IsPrimary.Contains(true);
-            bool background = _fireAndForgetReplicas && pureReplica && _backgroundReplicaPermits.Wait(0);
+            bool background = allowBackground && _fireAndForgetReplicas && pureReplica
+                && _backgroundReplicaPermits.Wait(0);
             Task RunLegAsync() => RunMultiTouchLegAsync(namespaceBytes, leg, keyBytes, ttlSeconds, retry, state);
 
             // Fire-and-forget replica writes: mirrors MultiSetPassAsync's
@@ -2923,6 +3003,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 {
                     state.Results[idx] = entry!.Value;
                     state.Answerer[idx] = leg.Owner;
+                    state.Failed.Remove(idx);
                 }
             }
             else
@@ -2931,6 +3012,8 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 {
                     if (entry is null) state.WrongNode.Remove(idx);
                     else state.WrongNode.Add(idx);
+                    if (entry is null && failure is ConnectionLostException) state.Failed[idx] = leg.Owner;
+                    else state.Failed.Remove(idx);
                     if (entry is null && i < sentEnd)
                     {
                         // issue #901: sent, then the connection was lost.
