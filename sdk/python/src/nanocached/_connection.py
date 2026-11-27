@@ -80,6 +80,18 @@ def _parse_strict_uint(field: bytes) -> int:
     return int(field)
 
 
+def _header_fields(header: bytes) -> list[bytes]:
+    """The fields of a `V`/`I`/`M`/`O`/`Y` header line as readuntil
+    returns it (everything after the marker, `\\n` included). The one
+    mandatory space after the marker is checked, not dropped blindly:
+    `VX5\\n` is not `V 5\\n`, and a peer that leaves it out cannot be
+    trusted to frame the next response either, so this raises (and
+    poisons the connection), as in the Go, Java and Rust SDKs."""
+    if header[0:1] != b" ":
+        raise NanocachedError("nanocached: malformed response header line (connection desynced)")
+    return header[1:-1].split(b" ")
+
+
 # Bounds the sum of every hit's declared length across one multi-get
 # (`M`) reply (issue #207, follow-up to #179's Java fix, PR #201). Each
 # individual length is already capped at _MAX_VALUE_LENGTH above, but
@@ -1149,7 +1161,7 @@ class Connection:
             # Untagged: `V <length>\n<value>`. Tagged: `V <length> <tag>\n<value>`
             # (echoed response tags).
             header = await self._reader.readuntil(b"\n")
-            fields = header[1:-1].split(b" ")
+            fields = _header_fields(header)
             # A get-and-touch's reply (issue #825) carries `Incremented`'s
             # optional TTL field between the length and the tag; a plain
             # get's never does. Told apart by field count against the
@@ -1193,7 +1205,7 @@ class Connection:
             # the only marker whose "value" isn't just the raw stored
             # bytes.
             header = await self._reader.readuntil(b"\n")
-            fields = header[1:-1].split(b" ")
+            fields = _header_fields(header)
             min_fields = 2 if self._tagged else 1
             if len(fields) not in (min_fields, min_fields + 1):
                 raise NanocachedError("nanocached: invalid incr header in response")
@@ -1237,7 +1249,7 @@ class Connection:
             # body bytes next, in request order), "-" (a clean miss), or
             # "W" (this key's own wrong-node).
             header = await self._reader.readuntil(b"\n")
-            fields = header[1:-1].split(b" ")
+            fields = _header_fields(header)
             if len(fields) < 1:
                 raise NanocachedError("nanocached: invalid multi-get header in response")
             try:
@@ -1366,7 +1378,7 @@ class Connection:
         is already bounded by the header line's own length cap
         (readuntil's internal limit)."""
         header = await self._reader.readuntil(b"\n")
-        fields = header[1:-1].split(b" ")
+        fields = _header_fields(header)
         if len(fields) < 1:
             raise NanocachedError(f"nanocached: invalid {what} header in response")
         try:
