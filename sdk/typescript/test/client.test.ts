@@ -10294,3 +10294,34 @@ describe("a request in flight when close() runs does not wait for a discovery di
     });
   }
 });
+
+describe("a roster address with an IPv6 host", () => {
+  // Discovery writes an IPv6 host in brackets (`[::1]:8356`); an older one
+  // wrote it bare (`::1:8356`). Both must be dialable, so a client keeps
+  // working while its discovery servers are upgraded.
+  const name = "5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6";
+  for (const form of ["bracketed", "bare"] as const) {
+    it(`reaches a node listed with a ${form} IPv6 host`, async (t) => {
+      let node: Awaited<ReturnType<typeof startMockNode>>;
+      try {
+        node = await startMockNode({ host: "::1" });
+      } catch (error) {
+        t.skip(`no IPv6 loopback: ${String(error)}`);
+        return;
+      }
+      const address = form === "bracketed" ? `[::1]:${node.port}` : `::1:${node.port}`;
+      const discovery = await startMockDiscovery([{ name, address }]);
+      try {
+        const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }] });
+        try {
+          await client.set("k", address);
+          assert.equal(await client.get("k"), address);
+        } finally {
+          await client.close();
+        }
+      } finally {
+        await Promise.all([node.close(), discovery.close()]);
+      }
+    });
+  }
+});
