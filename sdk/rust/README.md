@@ -116,10 +116,15 @@ value.
 
 An expiring touch (`touch`, `get_and_touch`, `touch_many` or
 `get_many_and_touch` with `Some(0)`) follows the same order and the same
-rule: when the primary leg ends in a connection error, including a reply
-lost after the request was sent (which is not resent), the other owners
-are sent the plain touch before the error is returned, so a read that
-falls back to them misses instead of returning the expired value.
+rule, with one difference: the other owners are sent the plain touch
+before the error is returned only when the primary's reply was lost after
+the request was sent (which is not resent, and the primary may have
+expired the key), so a read that falls back to them misses instead of
+returning the expired value. A primary still unreachable after the retry
+was never sent the touch, so no other owner is touched either: the
+`Error::ConnectionLost` invites a resend, and once discovery has dropped
+the primary that resend still finds the value. A batch applies this per
+key.
 
 ## Counters (`incr`/`decr`)
 
@@ -575,8 +580,9 @@ state the order is unchanged. Separately, a read whose answer came from
 one owner normally leaves its other legs running; past 256 legs left
 running that way a read waits for its own remaining legs instead, which
 bounds what a client can accumulate against a cluster that is slow
-throughout. Legs of reads still in flight do not count towards that
-limit.
+throughout. A read the caller cancels (a `tokio::time::timeout` around
+`get`, say) also leaves its legs running, and they count the same way.
+Legs of reads still in flight do not count towards that limit.
 
 ## Transient retries and `Error::Retryable`
 

@@ -11,6 +11,7 @@ changed. What 1.0.0 will promise is described on the
 
 ### Fixed
 
+- **Key format change:** two `equals()`-equal `Serializable` keys could get different wire keys when one held the same `String`, boxed primitive, `UUID`, `BigInteger` or `BigDecimal` instance twice and the other two equal copies: JDK serialization writes a repeated instance as a back-reference. A key object `Pair(s, s)` (alone or as a `SimpleKey` argument) was stored under one key and looked up or evicted under another when the equal key was built from separately parsed values, so the lookup missed, `evictIfPresent` returned `false` and `@CacheEvict` left the stale value in place. A value of those types equal to one already written is now always written as a back-reference, so such keys encode the same. An entry cached under a key that held two separate equal values of those types becomes a miss once. (#2097)
 - A TTL of `ChronoUnit.FOREVER.getDuration()` (set through the builder's `defaultTtl` / `ttl` or the Boot starter's `nanocached.cache.default-ttl` / `ttl.<name>`) overflowed while being rounded up to whole seconds and was sent as a 1-second TTL. The rounding now saturates at `Long.MAX_VALUE` seconds. (#1886)
 
 - The README said the value size limit is measured after serialization and optional compression. The SDK checks the serialized value before compressing it, so a value over the limit is rejected even if it would compress to less; the README now says so. (#1603)
