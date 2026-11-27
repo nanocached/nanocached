@@ -366,10 +366,12 @@ forward can land after a later increment and rewind the counter &mdash;
 a counter incremented concurrently by several callers during that
 window can lose a few increments; so can one caller whose increments
 follow each other within a few milliseconds, while increments spaced well
-above that are practically exact. Separately, two clients incrementing the
-same key at the same time can leave a replica one or two increments behind
-the primary, because each writes its result to the replica on its own and
-the writes are not ordered.
+above that are practically exact. A sustained stream loses far more: with
+64 in flight at a time on one counter, a burst of 30,000 sent shortly after
+a join lost 44 to 79&nbsp;% of them, every one acknowledged. Separately,
+two clients incrementing the same key at the same time can leave a replica
+one or two increments behind the primary, because each writes its result to
+the replica on its own and the writes are not ordered.
 See <a href="architecture.html#accepted-behaviour">accepted
 behaviour</a>.</p>
 
