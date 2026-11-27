@@ -1159,8 +1159,9 @@ export function tryParseResponse(
     // Told apart from other unexpected bytes so a touch can report "server
     // too old" (issue #825); every other command still fails the same way.
     // Only the node's `En` (the server-type byte `n` right after the `E`)
-    // is that: the proxy's bare `E\n` / `E <tag>\n` means the request failed
-    // or its outcome is unknown (issue #939), which is not a protocol
+    // is that: the proxy's bare `E\n` (untagged even on a tagged
+    // connection; an `E` with a tag is read the same way) means the request
+    // failed or its outcome is unknown (issue #939), which is not a protocol
     // mismatch. It poisons the connection like any other unexpected reply,
     // so the waiters see a `ConnectionLostError` with `requestWasSent` true
     // — never resent where the command is not idempotent.

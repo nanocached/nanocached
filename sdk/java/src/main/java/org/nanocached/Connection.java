@@ -1511,7 +1511,8 @@ final class Connection {
             //
             // Only the node's `En` (the `n` server-type byte right after
             // the `E`) is that (issue #939). The proxy answers a bare `E`
-            // (`E\n`, or `E <tag>\n` on a tagged connection) when it
+            // (`E\n`, untagged even on a tagged connection; an `E` that
+            // carries a tag is read the same way) when it
             // could not tell whether a request was applied -- a ttl=0 touch
             // it had already forwarded, say -- and that is a connection
             // failure after the frame was written, which is what every
