@@ -5908,6 +5908,43 @@ class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_a_failed_hedge_leg_starts_the_next_owner_at_once(self):
+        # With three owners and a silent primary, the hedge to the second
+        # owner fails at once (its node is gone): the third owner is asked
+        # right away, not after another full interval while the primary is
+        # still in flight. It used to start only once no leg was in flight,
+        # so the read took two intervals.
+        names = [*NAMES, "9c1e4b7a-2d3f-4a5b-8c6d-7e8f9a0b1c2d"]
+        nodes = {name: await MockNode().start() for name in names}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=3
+        ).start()
+        hedge_after = 0.3
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", discovery.port)], read_hedge_after=hedge_after
+        )
+        try:
+            await client.set("k", "v")
+            primary, second, third = HashRing(names).owners(b"k", 3)
+            nodes[primary].delay_gets(2.0)
+            await nodes[second].close()
+            await wait_for(
+                lambda: client._members[second].connection.closed,
+                "the client to see the FIN",
+            )
+
+            value, elapsed = await self.timed(client.get("k"))
+
+            self.assertEqual(value, "v")
+            self.assertEqual(nodes[third].get_count, 1)
+            self.assertGreaterEqual(elapsed, hedge_after - self.TIMING_TOLERANCE_S, elapsed)
+            self.assertLess(elapsed, 1.5 * hedge_after, elapsed)
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
     async def test_a_dead_primary_fails_over_immediately(self):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect(
