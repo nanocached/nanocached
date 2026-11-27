@@ -14,6 +14,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node and proxy: a `--discovery` address without a port (or with port 0,
+  a non-numeric port, or an unbracketed IPv6 host) was accepted at startup,
+  and every connect then failed with "invalid socket address", so the node
+  never joined and the proxy never had a roster. Each address is now checked
+  at startup and a bad one is a usage error naming it (#2050).
+
 - Node: handoff tombstones were bounded by count only (65,536) and eviction
   removes entries only, so a burst of relayed deletes of distinct large keys
   during a join or decommission window pushed `used_bytes` far past
