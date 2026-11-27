@@ -11,7 +11,9 @@
 # generates no GitHub events, so none of the release workflows would trigger.
 # SDK tags go first: every adapter's published manifest depends on the SDK
 # release of the same version, so the SDK must exist on its registry before
-# anyone can install the adapter.
+# anyone can install the adapter. (The three Maven adapters are the
+# exception: they publish with the SDK, from the sdk/java tag, as one Central
+# Portal deployment; their own tags publish nothing.)
 #
 # Releases only a commit that is already the tip of origin/main, in a clean
 # tree (untracked files count), and whose CI run on main is green: a tag push
