@@ -142,7 +142,9 @@ miss. So the receive buffers of one source address (an IPv6 source counts
 per /64, as for <code>--max-connections-per-ip</code>) are charged against
 that source's share first: a quarter of the budget, the same share the
 proxy gives a source. A source at its share waits for its own connections'
-buffers, not for anyone else's, and replies are not charged to the share,
+buffers, not for anyone else's (a connection that does not get its growth
+by its 60&nbsp;second frame deadline is closed, as with the whole budget),
+and replies are not charged to the share,
 so its replies and everyone else's still have the rest of the budget. A
 single request whose buffer alone needs more than the quarter is not
 refused for it: it takes the whole share and grows against the rest of the

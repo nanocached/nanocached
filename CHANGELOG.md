@@ -57,11 +57,11 @@ framework adapters at one version, whether or not a component changed.
   cannot get its share in time is closed. They now say how cheaply
   unfinished uploads can pin the whole budget (one partial 1 MiB request at
   the 1 MiB minimum; about 130 connections at the 256 MiB default), after
-  which every value-carrying reply elsewhere is closed after 10 s. One
-  source can pin about 2 MiB × `--max-connections-per-ip`, and the docs
-  say to size the budget so that what is left beyond that covers the other
-  clients, or to lower the per-IP cap. The behaviour is listed as accepted in
-  `docs/architecture.html` (#2128).
+  which every value-carrying reply elsewhere is closed after 10 s, and list
+  the behaviour as accepted in `docs/architecture.html` (#2128). The
+  per-source bound they described (about 2 MiB ×
+  `--max-connections-per-ip`) is now a quarter of the budget (#2155,
+  above).
 
 - Node (`trace` feature only): the trace writer's queue was bounded in
   lines but not in bytes, and a trace line held whole key and namespace
