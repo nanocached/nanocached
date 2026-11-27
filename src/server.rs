@@ -5204,6 +5204,18 @@ fn unconfirmed_completed_joiner(node_context: &NodeContext) -> Option<(String, A
         })
 }
 
+/// Issue #1158: `run_decommission` has fixed the drain's rings
+/// (`LeaveState`), and nothing they were computed from may change. Read
+/// it right before acting, not before an await (issue #2149). Before it is
+/// set, the drain has fetched no rings yet and the node is still serving.
+fn is_leaving(node_context: &NodeContext) -> bool {
+    node_context
+        .leaving
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
+}
+
 /// `abandon_migration` for a `G` verdict (issue #571): takes the slot only
 /// if it is still the very instance the heartbeat asked about
 /// (`identity`, see `unconfirmed_completed_joiner`) and still a completed
@@ -5828,13 +5840,8 @@ async fn register_with_discovery(
                             // Issue #1158: set once `run_decommission` has
                             // fixed the handoff's rings. From then on the
                             // heartbeat is liveness only — see below.
-                            let leaving = node_context
-                                .leaving
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .is_some();
                             let pending_joiner = match &role {
-                                DiscoveryRole::Primary(_) if !leaving => {
+                                DiscoveryRole::Primary(_) if !is_leaving(&node_context) => {
                                     unconfirmed_completed_joiner(&node_context)
                                 }
                                 _ => None,
@@ -5883,6 +5890,15 @@ async fn register_with_discovery(
                                 };
                                 match verdict {
                                     Ok(Ok(PendingJoinerVerdict::Known)) => {}
+                                    // Issue #2149: `leaving` is read again
+                                    // here, not taken from the top of the
+                                    // tick: the drain can have fixed its
+                                    // rings while this ack was in flight,
+                                    // and the abandon reverts `known_ring`.
+                                    // The verdict line is read either way
+                                    // (the frames are positional).
+                                    Ok(Ok(PendingJoinerVerdict::Gone))
+                                        if is_leaving(&node_context) => {}
                                     Ok(Ok(PendingJoinerVerdict::Gone)) => {
                                         departed_ring = abandon_departed_joiner(
                                             &node_context,
@@ -5909,9 +5925,16 @@ async fn register_with_discovery(
                             // what this node serves mid-drain and could start
                             // a re-replication for a node that is leaving
                             // cleanly anyway.
+                            //
+                            // Issue #2149: read here, after the ack and the
+                            // verdict, not at the top of the tick: the drain
+                            // installs `LeaveState` while the heartbeats run,
+                            // so it can land while this ack is in flight.
+                            // Before that, the drain has fetched no rings, so
+                            // the node is still serving and keeps adopting.
                             if let Some((members, replication)) = roster
                                 && matches!(role, DiscoveryRole::Primary(_))
-                                && !leaving
+                                && !is_leaving(&node_context)
                             {
                                 let published = members.clone();
                                 note_published_roster(
@@ -33839,6 +33862,229 @@ mod tests {
             received.len() >= 4,
             "the node must keep heartbeating while it drains, got {received:?}"
         );
+    }
+
+    /// Issue #2149: the `LeaveState` a drain installs, over `{name, peer}`.
+    fn installed_leave_state(name: &str) -> LeaveState {
+        let ring = Arc::new(HashRing::new(vec![name.to_string(), "peer".to_string()]));
+        LeaveState {
+            before_ring: Arc::clone(&ring),
+            after_ring: ring,
+            replication: 1,
+            addresses: HashMap::new(),
+            tokens: HashMap::new(),
+            connections: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Issue #2149: a discovery that promotes the node's `J`, then answers
+    /// each `H` with `ack` (plus `G\n` when the heartbeat names a pending
+    /// joiner). The first `H` reaching it is the moment the drain installs
+    /// its `LeaveState` on the node: after the tick read `leaving`, before
+    /// the ack is back. Records each `H` header line.
+    fn discovery_installing_leave_on_first_heartbeat(
+        listener: TcpListener,
+        leaving: Arc<Mutex<Option<LeaveState>>>,
+        name: &'static str,
+        ack: &'static [u8],
+    ) -> (
+        Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let headers: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&headers);
+        let task = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(connection);
+            let read_frame = async |reader: &mut tokio::io::BufReader<TcpStream>| {
+                let line = read_peer_line(reader).await.ok()?;
+                let fields: Vec<usize> = line
+                    .trim_end()
+                    .split(' ')
+                    .skip(1)
+                    .map(|field| field.parse().unwrap())
+                    .collect();
+                // `J <name> <port> <token>` / `H <name> <repl> <token> [<joiner>]`.
+                let body_len = fields[0] + fields[2] + fields.get(3).copied().unwrap_or(0);
+                let mut body = vec![0u8; body_len];
+                reader.read_exact(&mut body).await.ok()?;
+                Some((line.trim_end().to_string(), fields.len()))
+            };
+            let Some(_) = read_frame(&mut reader).await else {
+                return;
+            };
+            reader.get_mut().write_all(b"R\n").await.unwrap();
+            let mut first = true;
+            while let Some((header, fields)) = read_frame(&mut reader).await {
+                seen.lock().unwrap().push(header);
+                if first {
+                    first = false;
+                    *leaving.lock().unwrap() = Some(installed_leave_state(name));
+                }
+                let mut reply = ack.to_vec();
+                if fields == 4 {
+                    reply.extend_from_slice(b"G\n");
+                }
+                if reader.get_mut().write_all(&reply).await.is_err() {
+                    return;
+                }
+            }
+        });
+        (headers, task)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_roster_in_an_ack_that_was_in_flight_when_the_drain_fixed_its_rings_is_not_adopted() {
+        // Issue #2149: the tick read `leaving` before its heartbeat went
+        // out, and the drain installed `LeaveState` while the ack was on
+        // its way. The roster in that ack must not be adopted, as for any
+        // later tick (issue #1158). The control is
+        // `a_heartbeat_ack_roster_from_the_primary_updates_known_ring`: the
+        // same ack, nothing installed, and the roster is adopted.
+        let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary.local_addr().unwrap().to_string();
+        let known_ring: KnownRing = Arc::new(Mutex::new(None));
+        let node_context = test_node_context(
+            "test-node",
+            "tk-test-node",
+            Arc::clone(&known_ring),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.promoted.store(false, Ordering::SeqCst);
+        let (headers, discovery) = discovery_installing_leave_on_first_heartbeat(
+            primary,
+            Arc::clone(&node_context.leaving),
+            "test-node",
+            b"A 2 3\n9 14\ntest-node127.0.0.1:8356\n6 14\nnode-b127.0.0.1:9002\n",
+        );
+        let (rereplication_tx, mut rereplication_rx) = mpsc::channel::<RereplicationTask>(4);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![primary_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            NodeContext {
+                rereplication_tx,
+                ..node_context
+            },
+            mpsc::channel::<RereplicationTask>(4).1,
+            shutdown_rx,
+            mpsc::channel(1).0,
+        ));
+        for _ in 0..400 {
+            if headers.lock().unwrap().len() >= 3 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        discovery.abort();
+
+        assert!(
+            headers.lock().unwrap().len() >= 3,
+            "the node must keep heartbeating while it drains"
+        );
+        assert_eq!(member_names(&known_ring), None);
+        assert!(rereplication_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_gone_verdict_in_an_ack_that_was_in_flight_when_the_drain_fixed_its_rings_is_not_acted_on()
+     {
+        // Issue #2149: the tick named the pending joiner (`leaving` was
+        // unset when it read it), and the drain installed `LeaveState`
+        // while the ack was on its way. The `G` is read, so the next frame
+        // is parsed in step, but the slot is not abandoned: that would
+        // revert `known_ring` under the drain's rings. Later ticks no
+        // longer ask (issue #1158). The control is
+        // `a_pending_joiner_discovery_reports_gone_is_abandoned_and_its_marks_restored`.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+        let (node_context, after_ring, _pre_completion_ring) =
+            completed_unconfirmed_context(&["key-3"]);
+        node_context.promoted.store(false, Ordering::SeqCst);
+        let (headers, discovery) = discovery_installing_leave_on_first_heartbeat(
+            listener,
+            Arc::clone(&node_context.leaving),
+            "ready-node",
+            b"A\n",
+        );
+        let (rereplication_tx, mut rereplication_rx) = mpsc::channel::<RereplicationTask>(4);
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let revoked = Arc::clone(
+            &node_context
+                .active_migration
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .forward_revoked,
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            // A cache that answers: the abandon this test rules out would
+            // otherwise wait forever on the context's unanswered channel.
+            NodeContext {
+                request_tx: request_tx.clone(),
+                rereplication_tx,
+                ..node_context.clone()
+            },
+            mpsc::channel::<RereplicationTask>(4).1,
+            shutdown_rx,
+            mpsc::channel(1).0,
+        ));
+        for _ in 0..400 {
+            if headers.lock().unwrap().len() >= 3 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        discovery.abort();
+
+        let headers = headers.lock().unwrap().clone();
+        assert!(headers.len() >= 3, "got {headers:?}");
+        assert!(
+            headers[0].ends_with(" 8"),
+            "the first heartbeat must name the 8-byte joiner, got {headers:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .skip(1)
+                .all(|header| header.split(' ').count() == 4),
+            "once the drain has fixed its rings the heartbeat must stop asking, got {headers:?}"
+        );
+        assert!(node_context.active_migration.lock().unwrap().is_some());
+        assert!(!revoked.load(Ordering::SeqCst));
+        assert!(Arc::ptr_eq(
+            &node_context
+                .known_ring
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .ring,
+            &after_ring
+        ));
+        assert!(rereplication_rx.try_recv().is_err());
+        drop(request_tx);
+        cache_task.await.unwrap();
     }
 
     /// Issue #266: a fake discovery server serving both protocols
