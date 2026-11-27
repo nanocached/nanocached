@@ -1098,6 +1098,21 @@ describe("NanocachedClient reconnect-on-use", () => {
     }
   });
 
+  it("a discovery `N` header whose byte after the marker is not a space is rejected", async () => {
+    // `NX1 1\n` is not `N 1 1\n`: the byte after `N` was skipped unchecked.
+    const discovery = await startMockDiscovery([{ name: "a", address: "127.0.0.1:1" }]);
+    try {
+      const { connectAndIdentify, connectAndListProxies } = await import("../src/identify.js");
+      discovery.answerListHeaderOnce("NX1 1\n");
+      await assert.rejects(connectAndIdentify({ host: "127.0.0.1", port: discovery.port }), /invalid node-list header/);
+      discovery.setProxies([{ name: "p", address: "127.0.0.1:1" }]);
+      discovery.answerListHeaderOnce("NX1\n");
+      await assert.rejects(connectAndListProxies({ host: "127.0.0.1", port: discovery.port }), /invalid proxy-list header/);
+    } finally {
+      await discovery.close();
+    }
+  });
+
   it("an oversized node-list response fails instead of buffering unbounded memory", async () => {
     // Regression: bounds a malicious discovery server's memory pressure
     // with an aggregate cap on the whole `N ...` response (16 MiB),
