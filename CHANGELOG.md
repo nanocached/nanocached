@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: the roster was taken from whichever discovery replica answered
+  first, not from the first one configured, so a healthy but slower first
+  replica lost to a later one, and replicas that briefly disagreed could
+  flip the proxy's ring from one refresh to the next. Every replica is
+  still asked at once, but a later one's roster is used only once every
+  replica listed before it has failed or gone 1 s without answering, as
+  the SDKs and nodes keep to the configured order (#2048).
+
 - Node: a receive buffer that grew under the in-flight overdraft token kept
   it until its frame arrived, which only the client decided, so a client
   that stalled or trickled mid-frame made every other large upload that
