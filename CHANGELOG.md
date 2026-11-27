@@ -14,6 +14,17 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node: during a forwarding window (a join, a decommission or a
+  re-replication), a plain `y` (batch touch) queued a forward for every
+  occurrence of a key, and each one copied the cached value in full before
+  the target's queue coalesced them, so a 3 KB frame naming a 200 KB key
+  1,000 times grew the node by about 210 MB, and a larger value or frame
+  could run it out of memory. A frame of distinct keys likewise copied
+  every value it forwarded in one go before the queue's bound applied. A
+  repeated key is now forwarded once, and a `y`'s forwards are queued in
+  runs of at most 1 MiB of keys and values, each waiting for room in the
+  target's queue like any other write (#2042).
+
 - Node: a receive buffer that grew under the in-flight overdraft token kept
   it until its frame arrived, which only the client decided, so a client
   that stalled or trickled mid-frame made every other large upload that
