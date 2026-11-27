@@ -33,6 +33,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node: a put-if-absent handoff (`U … A`, a re-replication's copy) that a
+  node refused, because it held a newer value or a tombstone of a later
+  delete, was still relayed to its joiner whose join discovery had not
+  confirmed yet. A joiner that held nothing stored that older value and
+  then refused the node's own transfer of the newer one, so it kept the
+  older value (or got back a deleted key). Only a handoff the node stored
+  is relayed now, as for a decommission's entrant (#2087).
+
 - Proxy: when a primary's `m` sub-batch failed in transport (a node that
   stopped answering on an established connection), the retry asked that same
   primary first for every key and waited out a second `UPSTREAM_IO_TIMEOUT`
