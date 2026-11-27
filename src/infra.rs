@@ -256,6 +256,41 @@ fn load_private_key(path: &str) -> io::Result<PrivateKeyDer<'static>> {
     })
 }
 
+/// Checks that `addr` is a `host:port` address a connect can use: a
+/// non-empty host (a bracketed one if it is an IPv6 address, so the
+/// port's `:` is unambiguous) and a port from 1 to 65535. Used on the
+/// `--discovery` lists at startup, where an address without a port was
+/// otherwise accepted and only failed every connect attempt later
+/// ("invalid socket address"), leaving a node that never joined or a proxy
+/// that never had a roster, with nothing but a retrying log line to say
+/// why. A host name is not resolved here: DNS may not be up yet at start.
+pub fn check_host_port(addr: &str) -> Result<(), String> {
+    let invalid = |why: &str| format!("{addr:?} is not a host:port address: {why}");
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return Err(invalid("no port"));
+    };
+    match port.parse::<u16>() {
+        Ok(0) => return Err(invalid("port 0")),
+        Ok(_) => {}
+        Err(_) => return Err(invalid("the port is not a number from 1 to 65535")),
+    }
+    if host.is_empty() {
+        return Err(invalid("no host"));
+    }
+    if host.contains(':') {
+        let bracketed = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .is_some_and(|inner| inner.parse::<Ipv6Addr>().is_ok());
+        if !bracketed {
+            return Err(invalid(
+                "an IPv6 host must be in brackets, as in [::1]:8357",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parses the host portion of a `host:port` address into a TLS server name
 /// for certificate verification, accepting either a DNS name or IP address.
 /// A bracketed IPv6 host (`[::1]:8356`, required so the port's `:` is
@@ -1458,6 +1493,45 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("rather than treated as unset"), "{error}");
+    }
+
+    #[test]
+    fn check_host_port_accepts_host_port_and_rejects_what_a_connect_cannot_use() {
+        for good in [
+            "127.0.0.1:8357",
+            "discovery.internal:8357",
+            "[::1]:8357",
+            "[fe80::1]:1",
+            "localhost:65535",
+        ] {
+            assert_eq!(check_host_port(good), Ok(()), "{good}");
+        }
+        for (bad, why) in [
+            ("127.0.0.1", "no port"),
+            ("discovery.internal", "no port"),
+            ("127.0.0.1:", "the port is not a number from 1 to 65535"),
+            ("127.0.0.1:x", "the port is not a number from 1 to 65535"),
+            (
+                "127.0.0.1:65536",
+                "the port is not a number from 1 to 65535",
+            ),
+            ("127.0.0.1:0", "port 0"),
+            (":8357", "no host"),
+            (
+                "::1:8357",
+                "an IPv6 host must be in brackets, as in [::1]:8357",
+            ),
+            (
+                "[::1:8357",
+                "an IPv6 host must be in brackets, as in [::1]:8357",
+            ),
+        ] {
+            assert_eq!(
+                check_host_port(bad),
+                Err(format!("{bad:?} is not a host:port address: {why}")),
+                "{bad}"
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -25,6 +25,30 @@ framework adapters at one version, whether or not a component changed.
   to 45 s, without using up the three attempts kept for connection and ack
   failures, and with no `X` after it if the join ends meanwhile (#2045).
 
+- Node and proxy: a `--discovery` address without a port (or with port 0,
+  a non-numeric port, or an unbracketed IPv6 host) was accepted at startup,
+  and every connect then failed with "invalid socket address", so the node
+  never joined and the proxy never had a roster. Each address is now checked
+  at startup and a bad one is a usage error naming it (#2050).
+
+- Node: handoff tombstones were bounded by count only (65,536) and eviction
+  removes entries only, so a burst of relayed deletes of distinct large keys
+  during a join or decommission window pushed `used_bytes` far past
+  `--max-memory`, and the next stores evicted the live set until the
+  tombstones expired two minutes later: on a 4 MiB node, 64 deletes of
+  512 KiB keys charged 33.9 MB and the next set evicted all but one of 1,000
+  entries. Tombstones are now also held to an eighth of `--max-memory`,
+  forgetting the oldest first and always keeping the newest; at the default
+  256 MiB the count stays the bound for keys up to about 260 bytes (#2044).
+
+- Node: a repeated handoff delete of the same key (a forwarded `d`/`D`
+  relayed as `u` during a join or decommission window) queued a fresh copy
+  of the key on every repeat while the tombstone kept the first one, so
+  each repeat held an uncharged copy until it expired two minutes later; a
+  joiner sent 1,000 deletes of one 512 KiB key grew from 3 MB to 504 MB of
+  RSS. A repeat now queues the key the tombstone already holds and only
+  refreshes its stamp (#2043).
+
 - All binaries (`nanocached-node`, `nanocached-proxy`,
   `nanocached-discovery`, `ncd`, `verify-staged-join`): a command-line
   argument that is not valid UTF-8, such as a `--tls-cert` path with a stray
