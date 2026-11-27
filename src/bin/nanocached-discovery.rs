@@ -413,6 +413,7 @@ const MAX_FANOUT_CONCURRENCY: usize = 64;
 /// Issue #1100: how many nodes `P` may admit, and send the join's `M` to,
 /// while one join is pending (see `hand_off_from_late_member`). Each is an
 /// outbound dial of up to `MIGRATE_SEND_ATTEMPTS` x `OUTBOUND_IO_TIMEOUT`
+/// (plus `MIGRATE_REJECTED_RETRY_WINDOW` of resends if the node refuses it)
 /// and a join the pending slot has to wait for, and a `P` costs its sender
 /// a few dozen bytes — so without a bound one source rotating names during
 /// a join (60 s or more) grows that work as far as `MAX_REGISTRY_SIZE`.
@@ -659,7 +660,66 @@ const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
 /// reaps it. Retrying the send absorbs exactly that class of hiccup,
 /// mirroring `run_migration`'s own `KEY_TRANSFER_ATTEMPTS` on the node
 /// side (same fixed-attempt-count, fresh-connection-each-time shape).
+/// A rejection (`R`) is retried on its own schedule instead, see
+/// `MIGRATE_REJECTED_RETRY_WINDOW`.
 const MIGRATE_SEND_ATTEMPTS: u32 = 3;
+/// Issue #2045: how long `send_migrate_with_retry` keeps resending an `M`
+/// the node refused with `R`, from the first refusal, at
+/// `MIGRATE_REJECTED_RETRY_INTERVAL`. The usual cause is the node's one
+/// migration slot still held by a handoff being unwound: a join abandoned
+/// moments ago whose joiner re-registered under the same name (the node
+/// answers the new generation's `M` by asking the old transfer to stop and
+/// refusing until it has), or one whose `X` this process gave up on. The
+/// node's `X` handler waits up to 8 s for that unwind, but a transfer stuck
+/// on an unresponsive joiner holds the slot for up to its 3 key attempts ×
+/// 10 s; three back-to-back attempts covered none of it, so the member never
+/// got the `M` and the join waited out its migration timeout. 45 s covers
+/// the stuck case and stays under `MIGRATION_TIMEOUT_BASE`, the earliest the
+/// sweep reaps the join — which it cannot do while a sweep-started fan-out
+/// is still running, so the window bounds the send by itself instead of
+/// relying on the join ending. The other refusals (a leaving node, a token
+/// mismatch, a slot taken by another name's handoff) are retried the same
+/// way: the first two end with the node leaving or being evicted, and the
+/// third is the same slot-clearing wait.
+const MIGRATE_REJECTED_RETRY_WINDOW: Duration = Duration::from_secs(45);
+/// Issue #2045: the pause between two `M`s refused with `R`, see
+/// `MIGRATE_REJECTED_RETRY_WINDOW`.
+const MIGRATE_REJECTED_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Timing of `send_migrate_with_retry`: the bound on each dial and ack read
+/// (`OUTBOUND_IO_TIMEOUT`), and the retry schedule for an `M` refused with
+/// `R`. Tests shorten them.
+#[derive(Clone, Copy, Debug)]
+struct MigrateSendTiming {
+    io_timeout: Duration,
+    rejected_retry_interval: Duration,
+    rejected_retry_window: Duration,
+}
+
+const MIGRATE_SEND_TIMING: MigrateSendTiming = MigrateSendTiming {
+    io_timeout: OUTBOUND_IO_TIMEOUT,
+    rejected_retry_interval: MIGRATE_REJECTED_RETRY_INTERVAL,
+    rejected_retry_window: MIGRATE_REJECTED_RETRY_WINDOW,
+};
+
+/// The error `send_migrate` returns when the node answers `M` with `R`
+/// (`MigrationRejected`): the node did not take this `M` (issue #2045).
+#[derive(Debug)]
+struct MigrateRejected;
+
+impl std::fmt::Display for MigrateRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("node refused M with R")
+    }
+}
+
+impl std::error::Error for MigrateRejected {}
+
+fn is_migrate_rejected(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<MigrateRejected>())
+}
 const AUTH_SECRET_ENV_VAR: &str = "NANOCACHED_AUTH_SECRET";
 /// Upper bound on a `name`/`joining_name` field's length, enforced at
 /// parse time (`parse_string_fields`).
@@ -1302,8 +1362,12 @@ enum JoinStatus {
     /// holds — by now possibly the newer generation's — and abort that
     /// one, or, if it already completed, restore its handed-off copies
     /// under a member. An `M` of this send's that did land needs no
-    /// cancel: the newer generation's own `M` aborts it on the node
-    /// (`MigrationGuard::new`'s generation check).
+    /// cancel: on a node where it is still transferring, the newer
+    /// generation's own `M` asks it to stop (`MigrationGuard::new`'s
+    /// generation check) and is itself refused with `R` until that
+    /// transfer has unwound, so the newer generation's send resends it
+    /// after a pause (issue #2045, `MIGRATE_REJECTED_RETRY_WINDOW`); a
+    /// completed one is replaced by the newer `M` directly.
     Superseded,
 }
 
@@ -2805,7 +2869,7 @@ async fn try_begin_next_join(
                 &joined_roster,
                 replication,
                 generation,
-                OUTBOUND_IO_TIMEOUT,
+                MIGRATE_SEND_TIMING,
                 || {
                     join_status(
                         &registry,
@@ -2893,10 +2957,13 @@ fn credit_migrate_send_result(
 /// tries up to `MIGRATE_SEND_ATTEMPTS` times, logging each failed attempt,
 /// with a fresh connection every time (`send_migrate` owns its own
 /// connect) since a failed write/read leaves the previous connection's
-/// state unknown. This only bounds the *send* — the handoff itself,
-/// reported back asynchronously via `C`, stays a separate, unretried
-/// concern (see `send_migrate`'s own docs). `status` says whether the
-/// join this `M` is for is still the pending one; checked before every
+/// state unknown. An `M` the node refused with `R` is not one of those
+/// attempts: it is resent every `timing.rejected_retry_interval` for up to
+/// `timing.rejected_retry_window` from the first refusal (issue #2045, see
+/// `MIGRATE_REJECTED_RETRY_WINDOW`). This only bounds the *send* — the
+/// handoff itself, reported back asynchronously via `C`, stays a separate,
+/// unretried concern (see `send_migrate`'s own docs). `status` says whether
+/// the join this `M` is for is still the pending one; checked before every
 /// attempt (issue #1030, see the loop) and again once an attempt is
 /// acked. Returns `Ok(None)` if the join completed before an attempt went
 /// out (issue #1870).
@@ -2913,10 +2980,10 @@ async fn send_migrate_with_retry(
     joined: &[(String, String)],
     replication: usize,
     generation: u64,
-    io_timeout: Duration,
+    timing: MigrateSendTiming,
     status: impl Fn() -> JoinStatus,
 ) -> io::Result<Option<usize>> {
-    let mut last_error = None;
+    let io_timeout = timing.io_timeout;
     // An `X` of this send's own, for an `M` that may have landed or did.
     let cancel = || async move {
         if let Err(error) = send_cancel(
@@ -2935,8 +3002,16 @@ async fn send_migrate_with_retry(
             );
         }
     };
+    // Failed attempts so far (refusals with `R` are not counted).
+    let mut failures = 0;
+    // Whether a failed attempt may have reached the node with only its ack
+    // lost. An `M` refused with `R` did not: the node did not take it.
+    let mut may_have_landed = false;
+    // When the node first refused this `M` with `R` (issue #2045).
+    let mut first_rejected_at: Option<Instant> = None;
 
-    for attempt in 1..=MIGRATE_SEND_ATTEMPTS {
+    loop {
+        let attempt = failures + 1;
         // Issue #1030: an abandon (`abandon_current_join`, which sends `X`
         // to every ready member) can land between two attempts. A retry
         // after it would reach the node after its `X` — a no-op there,
@@ -2966,7 +3041,7 @@ async fn send_migrate_with_retry(
             )));
         }
         if join_status == JoinStatus::Ended {
-            if attempt > 1 {
+            if may_have_landed {
                 cancel().await;
             }
             return Err(io::Error::other(format!(
@@ -3019,17 +3094,41 @@ async fn send_migrate_with_retry(
                 }
                 return Ok(Some(entries));
             }
+            // Issue #2045: the node did not take this `M` — most often its
+            // migration slot is still held by a handoff being unwound (see
+            // `MIGRATE_REJECTED_RETRY_WINDOW`). Resent after a pause until
+            // the slot clears, rather than three times within milliseconds.
+            Err(error) if is_migrate_rejected(&error) => {
+                let first_rejected_at = *first_rejected_at.get_or_insert_with(|| {
+                    eprintln!(
+                        "WARN {ready_name} refused M for {joining_name} (generation \
+                         {generation}) with R; resending every {:?} for up to {:?}",
+                        timing.rejected_retry_interval, timing.rejected_retry_window
+                    );
+                    Instant::now()
+                });
+                if first_rejected_at.elapsed() >= timing.rejected_retry_window {
+                    return Err(io::Error::other(format!(
+                        "{ready_name} kept refusing M for {joining_name} (generation \
+                         {generation}) with R for {:?}",
+                        timing.rejected_retry_window
+                    )));
+                }
+                tokio::time::sleep(timing.rejected_retry_interval).await;
+            }
             Err(error) => {
                 eprintln!(
                     "WARN failed to send M to {ready_name} (attempt \
                      {attempt}/{MIGRATE_SEND_ATTEMPTS}): {error}"
                 );
-                last_error = Some(error);
+                may_have_landed = true;
+                failures += 1;
+                if failures >= MIGRATE_SEND_ATTEMPTS {
+                    return Err(error);
+                }
             }
         }
     }
-
-    Err(last_error.expect("the loop above runs at least once"))
 }
 
 /// Builds the exact bytes `send_migrate` puts on the wire for `M`:
@@ -3159,6 +3258,9 @@ async fn send_migrate(
     infra::write_all_within(&mut stream, &message, io_timeout).await?;
 
     let line = read_ack_line(&mut stream, io_timeout).await?;
+    if line == "R" {
+        return Err(io::Error::other(MigrateRejected));
+    }
     let entries = line
         .strip_prefix("A ")
         .and_then(|rest| rest.parse::<usize>().ok())
@@ -3835,7 +3937,7 @@ fn hand_off_from_late_member(
             &roster,
             replication,
             generation,
-            OUTBOUND_IO_TIMEOUT,
+            MIGRATE_SEND_TIMING,
             || {
                 join_status(
                     &registry,
@@ -3881,7 +3983,8 @@ fn late_handoffs_exhausted(current_join: &CurrentJoin) -> bool {
 /// the next `Waiting` node (if any) with `try_begin_next_join`. Issue
 /// #1029: that fan-out used to run in here, before the ack, so a ready
 /// node that was slow to answer its `M` (up to three attempts of 10 s
-/// each) held the `A` past the reporter's own 10 s wait for it; the
+/// each, and resends for up to `MIGRATE_REJECTED_RETRY_WINDOW` of an `M`
+/// it refuses) held the `A` past the reporter's own 10 s wait for it; the
 /// reporter then logged a false "reporting completion failed" WARN and
 /// its join-flip re-replication waited for the retry.
 ///
@@ -5315,7 +5418,12 @@ async fn sweep_expired(
     // They now run on this `JoinSet` instead, at most one at a time (a new
     // one starts only once `fanouts` is empty), so sweep-initiated fan-outs
     // stay serialized with each other exactly as before and cannot pile up;
-    // only the rest of the tick no longer waits on them. A state-based
+    // only the rest of the tick no longer waits on them. An `M` fan-out can
+    // also run for `MIGRATE_REJECTED_RETRY_WINDOW` resending to a member
+    // that refuses it (issue #2045), on top of the attempts above; the
+    // window is shorter than the shortest migration timeout, and the
+    // reaper, which waits here for the fan-out to end, is held back by at
+    // most that much. A state-based
     // trigger skipped because one is still running simply fires again on
     // the next tick; the one edge-based trigger (a member evicted this tick)
     // is remembered in `evicted_members` until it can be acted on.
@@ -6563,7 +6671,9 @@ async fn handle_connection(
                 .await;
                 // Ack first, then start the next waiting node (issue
                 // #1029): the `M` fan-out below can take up to three
-                // 10 s attempts against a slow ready node, and the
+                // 10 s attempts against a slow ready node (and resends for
+                // up to `MIGRATE_REJECTED_RETRY_WINDOW` against one that
+                // refuses it), and the
                 // reporter waits only about 10 s for this ack. The
                 // fan-out runs whether or not the ack was delivered — a
                 // reporter that gave up on it has still handed off.
@@ -15481,7 +15591,7 @@ mod tests {
             &[],
             2,
             9,
-            OUTBOUND_IO_TIMEOUT,
+            MIGRATE_SEND_TIMING,
             || JoinStatus::Current,
         )
         .await;
@@ -15525,7 +15635,7 @@ mod tests {
             &[],
             2,
             9,
-            OUTBOUND_IO_TIMEOUT,
+            MIGRATE_SEND_TIMING,
             || JoinStatus::Current,
         )
         .await;
@@ -15537,6 +15647,188 @@ mod tests {
         );
 
         node_task.abort();
+    }
+
+    /// The first bytes of every connection a stub node accepted.
+    type RecordedFrames = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+    /// A stub ready node for the issue #2045 tests: answers the first
+    /// `refusals` connections' `M` with `R`, every later one with `A 7`,
+    /// and records the first bytes of every connection.
+    fn spawn_refusing_node(
+        listener: TcpListener,
+        refusals: usize,
+    ) -> (tokio::task::JoinHandle<()>, RecordedFrames) {
+        let frames: RecordedFrames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&frames);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0u8; 256];
+                let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+                let frame = buffer[..bytes_read].to_vec();
+                let reply: &[u8] = if frame.starts_with(b"X ") {
+                    b"A\n"
+                } else if recorded.lock().unwrap().len() < refusals {
+                    b"R\n"
+                } else {
+                    b"A 7\n"
+                };
+                recorded.lock().unwrap().push(frame);
+                let _ = stream.write_all(reply).await;
+            }
+        });
+        (task, frames)
+    }
+
+    /// Issue #2045: the node refuses `M` with `R` while its migration slot
+    /// is still held by a handoff being unwound (a join abandoned moments
+    /// ago whose joiner re-registered under the same name). The send used
+    /// to spend its three attempts within milliseconds, all refused, and
+    /// the member never got the `M`; it now resends after a pause, past
+    /// `MIGRATE_SEND_ATTEMPTS` refusals, until the node takes it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_migrate_with_retry_resends_an_m_refused_with_r_until_the_node_takes_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let refusals = MIGRATE_SEND_ATTEMPTS as usize + 2;
+        let (node_task, frames) = spawn_refusing_node(listener, refusals);
+
+        let started = Instant::now();
+        let result = send_migrate_with_retry(
+            "ready-token",
+            "ready-node",
+            &address,
+            &None,
+            &None,
+            "joining-node",
+            "127.0.0.1:9",
+            "joiner-token",
+            &[],
+            2,
+            9,
+            MigrateSendTiming {
+                rejected_retry_interval: Duration::from_millis(50),
+                rejected_retry_window: Duration::from_secs(10),
+                ..MIGRATE_SEND_TIMING
+            },
+            || JoinStatus::Current,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        node_task.abort();
+
+        assert!(
+            matches!(result, Ok(Some(7))),
+            "expected the M to be taken once the node stops refusing, got {result:?}"
+        );
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), refusals + 1);
+        assert!(frames.iter().all(|frame| frame.starts_with(b"M ")));
+        assert!(
+            elapsed >= Duration::from_millis(50) * refusals as u32,
+            "the refused M must be resent after a pause, took {elapsed:?}"
+        );
+    }
+
+    /// Issue #2045: a node that keeps refusing is given up on once
+    /// `rejected_retry_window` has passed — the send is bounded by itself,
+    /// since a sweep-started fan-out holds back the reaper that would end
+    /// the join. No `X` follows: a refused `M` never landed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_migrate_with_retry_gives_up_on_a_node_that_keeps_refusing_after_the_window() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (node_task, frames) = spawn_refusing_node(listener, usize::MAX);
+
+        let started = Instant::now();
+        let result = send_migrate_with_retry(
+            "ready-token",
+            "ready-node",
+            &address,
+            &None,
+            &None,
+            "joining-node",
+            "127.0.0.1:9",
+            "joiner-token",
+            &[],
+            2,
+            9,
+            MigrateSendTiming {
+                rejected_retry_interval: Duration::from_millis(20),
+                rejected_retry_window: Duration::from_millis(300),
+                ..MIGRATE_SEND_TIMING
+            },
+            || JoinStatus::Current,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        node_task.abort();
+
+        let error = result.expect_err("a node that never takes the M is given up on");
+        assert!(error.to_string().contains("kept refusing M"), "{error}");
+        assert!(
+            elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(5),
+            "expected to give up at the window, took {elapsed:?}"
+        );
+        let frames = frames.lock().unwrap();
+        assert!(frames.len() > MIGRATE_SEND_ATTEMPTS as usize);
+        assert!(
+            frames.iter().all(|frame| frame.starts_with(b"M ")),
+            "only M may be sent, no X"
+        );
+    }
+
+    /// Issue #2045: the join is abandoned while its `M` is being refused.
+    /// The resends stop, and with no `X`: no attempt landed (the abandon's
+    /// own `X` fan-out covers the node).
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_migrate_with_retry_sends_no_cancel_when_abandoned_while_refused() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (node_task, frames) = spawn_refusing_node(listener, usize::MAX);
+
+        let checks = std::sync::atomic::AtomicU32::new(0);
+        let result = send_migrate_with_retry(
+            "ready-token",
+            "ready-node",
+            &address,
+            &None,
+            &None,
+            "joining-node",
+            "127.0.0.1:9",
+            "joiner-token",
+            &[],
+            2,
+            9,
+            MigrateSendTiming {
+                rejected_retry_interval: Duration::from_millis(20),
+                rejected_retry_window: Duration::from_secs(10),
+                ..MIGRATE_SEND_TIMING
+            },
+            || {
+                if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                    JoinStatus::Current
+                } else {
+                    JoinStatus::Ended
+                }
+            },
+        )
+        .await;
+        // Let a stray `X`, if one were sent, reach the stub.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        node_task.abort();
+
+        let error = result.expect_err("an abandoned join's M is not resent");
+        assert!(error.to_string().contains("abandoned"), "{error}");
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(
+            frames.iter().all(|frame| frame.starts_with(b"M ")),
+            "no X may follow M that were only refused"
+        );
     }
 
     /// Issue #1030: the join is abandoned between two `M` attempts. The
@@ -15581,7 +15873,7 @@ mod tests {
             &[],
             2,
             9,
-            OUTBOUND_IO_TIMEOUT,
+            MIGRATE_SEND_TIMING,
             || {
                 if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                     JoinStatus::Current
@@ -15660,7 +15952,7 @@ mod tests {
             &[],
             2,
             9,
-            OUTBOUND_IO_TIMEOUT,
+            MIGRATE_SEND_TIMING,
             || {
                 let status = join_status(&registry, &current_join, "joining-node", 9, &promoted);
                 if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -15737,7 +16029,7 @@ mod tests {
             &[],
             2,
             9,
-            OUTBOUND_IO_TIMEOUT,
+            MIGRATE_SEND_TIMING,
             || {
                 let status = join_status(&registry, &current_join, "joining-node", 9, &promoted);
                 if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
@@ -15809,7 +16101,7 @@ mod tests {
             &[],
             2,
             9,
-            OUTBOUND_IO_TIMEOUT,
+            MIGRATE_SEND_TIMING,
             || {
                 if checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                     JoinStatus::Current
@@ -16029,7 +16321,10 @@ mod tests {
             &[],
             2,
             9,
-            Duration::from_millis(200),
+            MigrateSendTiming {
+                io_timeout: Duration::from_millis(200),
+                ..MIGRATE_SEND_TIMING
+            },
             || join_status(&registry, &current_join, "node-b", 9, &promoted),
         )
         .await;

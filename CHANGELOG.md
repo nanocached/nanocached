@@ -14,6 +14,17 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Discovery: a join started for a name right after that name's previous
+  join was abandoned (the joiner re-registered while the abandon's `X` was
+  still waiting, or after discovery gave up on it) sent its `M` to a member
+  whose old handoff was still unwinding. The member refused it with `R`
+  until the old transfer stopped, and discovery's three attempts all landed
+  within milliseconds, so that member never got the `M` and the join waited
+  out its migration timeout (60 s or more) before it was abandoned and
+  started again. An `M` refused with `R` is now resent every second for up
+  to 45 s, without using up the three attempts kept for connection and ack
+  failures, and with no `X` after it if the join ends meanwhile (#2045).
+
 - Node and proxy: a `--discovery` address without a port (or with port 0,
   a non-numeric port, or an unbracketed IPv6 host) was accepted at startup,
   and every connect then failed with "invalid socket address", so the node
