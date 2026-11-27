@@ -14,6 +14,18 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- `nanocached-discovery`: a node or proxy registered from an IPv6
+  address is listed (in `L`, `Q`, `T`, the heartbeat ack and `M`) with
+  its host in brackets, `[2001:db8::1]:8356`. It used to be written bare,
+  `2001:db8::1:8356`, which is not a `host:port` most parsers take. An IPv4
+  peer on a dual-stack listener (`::ffff:10.0.0.5`) is now listed as plain
+  IPv4, `10.0.0.5:8356`. Nodes and proxies accept both forms, so the
+  documented roll-out order still holds. **Clients:** a Python, TypeScript
+  or Rust SDK client from an earlier release cannot dial a bracketed
+  address (#2150, #2151, #2152). If clients reach nodes or proxies over
+  IPv6, upgrade them before discovery. The Go, Java and .NET SDKs take
+  either form (#2153).
+
 - `ci`: the four Maven modules (the Java SDK and the `spring`, `jcache` and
   `spring-boot-starter` adapters) are published as one Central Portal
   deployment, from the `sdk/java` tag, instead of one deployment per module.
@@ -51,6 +63,16 @@ framework adapters at one version, whether or not a component changed.
   few connections receives one frame at a time). At the 1 MiB minimum a
   single partial ~1 MiB request still fills the budget, as one request's
   buffer is all of it (#2155).
+
+- `nanocached-node`: a draining node no longer acts on a heartbeat ack that
+  was in flight when the drain fixed its rings. The heartbeat read
+  `leaving` once per tick, before the heartbeat went out, and used it after
+  the ack came back, so a roster in that ack could still replace
+  `known_ring` (and queue a re-replication), and a `G` verdict could abandon
+  the pending joiner's slot and revert `known_ring` under the drain's rings.
+  Both now read `leaving` right before acting. The window between the
+  shutdown signal and `leaving` is unchanged: the drain has fetched no rings
+  there yet and the node is still serving (#2149).
 
 - Docs: the in-flight byte budget's docs (`docs/deployment-operations.html`,
   `docs/getting-started.html`, `--help`) said only that a connection that

@@ -1306,6 +1306,43 @@ mod tests {
     }
 
     #[test]
+    fn server_name_from_addr_takes_the_bare_ipv6_host_an_older_discovery_wrote() {
+        let name = server_name_from_addr("::1:8356").unwrap();
+        assert_eq!(name, ServerName::try_from("::1").unwrap());
+        let name = server_name_from_addr("2001:db8::1:8356").unwrap();
+        assert_eq!(name, ServerName::try_from("2001:db8::1").unwrap());
+    }
+
+    /// A roster address with an IPv6 host is dialed whether discovery wrote
+    /// it in brackets (`[::1]:p`) or bare, as an older discovery did
+    /// (`::1:p`): nodes and proxies keep reaching each other while the
+    /// discovery servers are upgraded. Skipped without an IPv6 loopback.
+    #[tokio::test]
+    async fn connect_client_stream_dials_a_bracketed_or_a_bare_ipv6_address() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            eprintln!("skipped: no IPv6 loopback");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let accepter = tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        for address in [format!("[::1]:{port}"), format!("::1:{port}")] {
+            let dialed = connect_client_stream(
+                &address,
+                None,
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(dialed.is_ok(), "{address}: {:?}", dialed.err());
+        }
+        accepter.abort();
+    }
+
+    #[test]
     fn server_name_from_addr_drops_the_scope_id_of_a_link_local_host() {
         let name = server_name_from_addr("[fe80::1%2]:8356").unwrap();
         assert_eq!(name, ServerName::try_from("fe80::1").unwrap());

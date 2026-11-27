@@ -9979,5 +9979,52 @@ class RedialAfterCloseTests(unittest.IsolatedAsyncioTestCase):
             await node_server.wait_closed()
 
 
+class RosterAddressTests(unittest.IsolatedAsyncioTestCase):
+    """A roster address is ``host:port``. Discovery writes an IPv6 host in
+    brackets (``[::1]:8356``), as every IPv6 ``host:port`` is written; an
+    older discovery wrote it bare (``::1:8356``). Both must be dialable,
+    so a client keeps working while its discovery servers are upgraded."""
+
+    def test_split_host_port_takes_a_bracketed_or_a_bare_ipv6_host(self):
+        from nanocached._identify import split_host_port
+
+        cases = {
+            "[::1]:8356": ("::1", 8356),
+            "::1:8356": ("::1", 8356),
+            "[2001:db8::1]:8356": ("2001:db8::1", 8356),
+            "2001:db8::1:8356": ("2001:db8::1", 8356),
+            "[::ffff:10.0.0.5]:8356": ("::ffff:10.0.0.5", 8356),
+            "::ffff:10.0.0.5:8356": ("::ffff:10.0.0.5", 8356),
+            "127.0.0.1:8356": ("127.0.0.1", 8356),
+            "node-a.example.com:8356": ("node-a.example.com", 8356),
+        }
+        for address, expected in cases.items():
+            with self.subTest(address=address):
+                self.assertEqual(split_host_port(address), expected)
+
+    async def test_connects_to_a_node_listed_at_an_ipv6_address_either_way(self):
+        try:
+            node = await MockNode().start(host="::1")
+        except OSError as error:
+            self.skipTest(f"no IPv6 loopback: {error}")
+        try:
+            for address in (f"[::1]:{node.port}", f"::1:{node.port}"):
+                with self.subTest(address=address):
+                    discovery = await MockDiscovery([(NAMES[0], address)]).start()
+                    try:
+                        client = await asyncio.wait_for(
+                            NanocachedClient.connect([("127.0.0.1", discovery.port)]), 5
+                        )
+                        try:
+                            await asyncio.wait_for(client.set("k", address), 5)
+                            self.assertEqual(await asyncio.wait_for(client.get("k"), 5), address)
+                        finally:
+                            await client.close()
+                    finally:
+                        await discovery.close()
+        finally:
+            await node.close()
+
+
 if __name__ == "__main__":
     unittest.main()

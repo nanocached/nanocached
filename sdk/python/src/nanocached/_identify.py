@@ -114,6 +114,11 @@ def split_host_port(address: str) -> tuple[str, int]:
     port_number = int(port)
     if port_number > 65535:
         raise NanocachedError(f"nanocached: invalid node address from discovery server: {address}")
+    # Discovery writes an IPv6 host in brackets (`[::1]:8356`); an older
+    # one wrote it bare (`::1:8356`), which the last ':' still splits.
+    # The resolver and the TLS server name take the host without brackets.
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
     return host, port_number
 
 

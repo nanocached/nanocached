@@ -3531,13 +3531,27 @@ enum JoinRejection {
     TooManyWaitingTotal,
 }
 
-/// The source a registered `address` (`{peer_ip}:{port}`) counts under for
-/// `MAX_WAITING_PER_SOURCE_IP`: the same key the per-IP connection caps use
-/// (`infra::per_ip_key`, an IPv6 address's /64 prefix), so one IPv6 /64
-/// can't hold a distinct allowance per address and walk around the cap.
-/// `rsplit_once` finds the *last* `:`, which is the port separator even for
-/// an IPv6 address that itself contains colons. An address that is not an
-/// IP literal is compared as the text it is.
+/// The address discovery records for a node or proxy registering from
+/// `peer_ip` and serving on `port`, and lists in `L`, `Q`, `T` and `M`.
+/// Written as a `SocketAddr` displays it, so an IPv6 host is in brackets
+/// (`[2001:db8::1]:8356`) and the port's `:` is unambiguous; before, it was
+/// written bare (`2001:db8::1:8356`), which every consumer still accepts by
+/// splitting on the last `:`. An IPv4 peer that reached a dual-stack
+/// listener shows up as `::ffff:10.0.0.5`; it is written as the IPv4
+/// address it is (`10.0.0.5:8356`). Built from the IP alone, so the scope
+/// id of the accepted socket (meaningful only on this host) is not in it.
+fn registered_address(peer_ip: IpAddr, port: u16) -> String {
+    SocketAddr::new(peer_ip.to_canonical(), port).to_string()
+}
+
+/// The source a registered `address` (see `registered_address`) counts
+/// under for `MAX_WAITING_PER_SOURCE_IP`: the same key the per-IP
+/// connection caps use (`infra::per_ip_key`, an IPv6 address's /64 prefix),
+/// so one IPv6 /64 can't hold a distinct allowance per address and walk
+/// around the cap. `rsplit_once` finds the *last* `:`, which is the port
+/// separator in both the bracketed form and the bare one an older
+/// discovery wrote, and the brackets are trimmed. An address that is not
+/// an IP literal is compared as the text it is.
 fn waiting_source_key(address: &str) -> String {
     let host = address.rsplit_once(':').map_or(address, |(host, _)| host);
     match host.trim_matches(['[', ']']).parse::<IpAddr>() {
@@ -3598,10 +3612,9 @@ async fn start_join(
         // for a name already registered here (the token check above just
         // confirmed it's the same node) reuses its existing entry rather
         // than adding one, so it must not double-count against its own
-        // cap. `address` is `{peer_ip}:{port}` (addresses derived from the registration connection), so the source
-        // is recovered by trimming the port back off; `rsplit_once` finds
-        // the *last* `:`, which lands on the port separator even for an
-        // IPv6 address that itself contains colons.
+        // cap. `address` is `registered_address` (derived from the
+        // registration connection), so the source is recovered by trimming
+        // the port back off — see `waiting_source_key`.
         if !guard.contains_key(name) {
             // Issue: join-queue starvation — checked before the per-source
             // cap below so a source still under its own `
@@ -6388,7 +6401,7 @@ async fn handle_connection(
                 // Issue #122. Accepted during the startup grace too, like
                 // `P` — that is exactly when a restarted replica needs
                 // re-announces to refill this map.
-                let addr = format!("{peer_ip}:{port}");
+                let addr = registered_address(peer_ip, port);
                 let mut limited = false;
                 let accepted = {
                     let mut proxies = registry
@@ -6485,7 +6498,7 @@ async fn handle_connection(
                 continue;
             }
             Ok(DiscoveryCommand::Join { name, port, token }) => {
-                let addr = format!("{peer_ip}:{port}");
+                let addr = registered_address(peer_ip, port);
 
                 let promoted = start_join(
                     &registry,
@@ -6582,7 +6595,7 @@ async fn handle_connection(
                 token,
                 rejoin_capable,
             }) => {
-                let addr = format!("{peer_ip}:{port}");
+                let addr = registered_address(peer_ip, port);
 
                 // A node that was evicted and now announces itself again
                 // holds a cache the cluster has moved on from: its keys
@@ -7765,6 +7778,124 @@ mod tests {
         }
 
         assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn registered_address_brackets_an_ipv6_host_and_unmaps_an_ipv4_one() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+
+        assert_eq!(registered_address(ip("10.0.0.5"), 8356), "10.0.0.5:8356");
+        assert_eq!(registered_address(ip("::1"), 8356), "[::1]:8356");
+        assert_eq!(
+            registered_address(ip("2001:db8::1"), 8356),
+            "[2001:db8::1]:8356"
+        );
+        // An IPv4 peer on a dual-stack listener.
+        assert_eq!(
+            registered_address(ip("::ffff:10.0.0.5"), 8356),
+            "10.0.0.5:8356"
+        );
+        // Each form still yields the same per-source key.
+        assert_eq!(waiting_source_key("[2001:db8::1]:8356"), "2001:db8::");
+        assert_eq!(waiting_source_key("2001:db8::1:8356"), "2001:db8::");
+    }
+
+    /// Runs one `handle_connection` for a peer at `peer_ip`, writes
+    /// `frame` and reads until `expected.len()` bytes have arrived.
+    async fn exchange_from(peer_ip: IpAddr, frame: &[u8], expected: &[u8]) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let registry: Registry = Arc::new(RegistryState::default());
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_connection(
+                MaybeTls::Plain(stream),
+                peer_ip,
+                registry,
+                current_join,
+                ConnectionConfig {
+                    idle_timeout: Duration::from_secs(5),
+                    list_ready_at: Instant::now(),
+                    replication: 2,
+                    auth_secret: None,
+                    tls_acceptor: None,
+                    tls_connector: None,
+                    announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+                },
+                shutdown_rx,
+                Arc::new(std::sync::Mutex::new(None)),
+            )
+            .await;
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(frame).await.unwrap();
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 256];
+        timeout(Duration::from_secs(5), async {
+            while received.len() < expected.len() {
+                let bytes_read = client.read(&mut chunk).await.unwrap();
+                assert!(
+                    bytes_read > 0,
+                    "connection closed before the response arrived"
+                );
+                received.extend_from_slice(&chunk[..bytes_read]);
+            }
+        })
+        .await
+        .expect("timed out waiting for the response");
+        received
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_joining_from_an_ipv6_address_is_listed_with_its_host_in_brackets() {
+        let expected =
+            b"R\nA 1 2\n6 18\nnode-a[2001:db8::1]:8356\nN 1 2\n6 18\nnode-a[2001:db8::1]:8356\n";
+        let received = exchange_from(
+            "2001:db8::1".parse().unwrap(),
+            b"J 6 8356 9\nnode-atk-node-aH 6 0 9\nnode-atk-node-aL\n",
+            expected,
+        )
+        .await;
+
+        assert_eq!(
+            String::from_utf8_lossy(&received),
+            String::from_utf8_lossy(expected)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_node_joining_from_an_ipv4_mapped_address_is_listed_as_ipv4() {
+        let expected = b"R\nA 1 2\n6 13\nnode-a10.0.0.5:8356\nN 1 2\n6 13\nnode-a10.0.0.5:8356\n";
+        let received = exchange_from(
+            "::ffff:10.0.0.5".parse().unwrap(),
+            b"J 6 8356 9\nnode-atk-node-aH 6 0 9\nnode-atk-node-aL\n",
+            expected,
+        )
+        .await;
+
+        assert_eq!(
+            String::from_utf8_lossy(&received),
+            String::from_utf8_lossy(expected)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_proxy_announcing_from_an_ipv6_address_is_listed_with_its_host_in_brackets() {
+        let expected = b"R\nN 1\n7 18\nproxy-a[2001:db8::1]:8358\n";
+        let received = exchange_from(
+            "2001:db8::1".parse().unwrap(),
+            b"Y 7 8358 8\nproxy-atk-proxyQ\n",
+            expected,
+        )
+        .await;
+
+        assert_eq!(
+            String::from_utf8_lossy(&received),
+            String::from_utf8_lossy(expected)
+        );
     }
 
     /// Drives one `handle_connection` over a real socket, writes `frame`,

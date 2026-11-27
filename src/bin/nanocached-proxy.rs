@@ -9454,6 +9454,31 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    /// A roster address with an IPv6 host is dialed whether discovery wrote
+    /// it in brackets (`[::1]:p`) or bare, as an older discovery did
+    /// (`::1:p`), so the proxy keeps reaching its nodes while the discovery
+    /// servers are upgraded. Skipped without an IPv6 loopback.
+    #[tokio::test]
+    async fn connect_upstream_dials_a_bracketed_or_a_bare_ipv6_address() {
+        let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+            eprintln!("skipped: no IPv6 loopback");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let accepter = tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        for address in [format!("[::1]:{port}"), format!("::1:{port}")] {
+            let dialed = timeout(Duration::from_secs(5), connect_upstream(&address, &None))
+                .await
+                .expect("dial timed out");
+            assert!(dialed.is_ok(), "{address}: {:?}", dialed.err());
+        }
+        accepter.abort();
+    }
+
     // A node's M reply may carry more than the 1 MiB request bound (a few
     // large hits in one batch). It used to be rejected as a protocol
     // error, which poisoned the shared backend connection for every client.
