@@ -7230,7 +7230,11 @@ impl MigrationGuard {
             // restore its handed-off copies and revert `known_ring` under a
             // joiner discovery may already list as a member. Rejected and
             // left alone. A remnant is no handoff any more and is replaced
-            // as before.
+            // as before. Issue #2125: a restarted discovery whose clock
+            // went back can send a genuinely new join's `M` at a lower
+            // generation too. Nothing here tells it from the stale send, so
+            // that join is refused until its abandon's `X` clears this slot
+            // (accepted, see `next_join_generation`).
             let older_generation = match (existing.generation, generation) {
                 (Some(existing_generation), Some(generation)) => generation < existing_generation,
                 _ => false,

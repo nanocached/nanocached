@@ -24,6 +24,13 @@ framework adapters at one version, whether or not a component changed.
   operations), seven a month, and one version cost four of them. The adapter
   tags no longer publish to Maven (#2077).
 
+- Docs: the accepted-behaviour list in `docs/architecture.html` now
+  covers discovery restarted with its clock set back. A member holding a
+  finished but unconfirmed handoff for the same joiner refuses the first
+  join after the restart, which then waits out one migration timeout. No
+  code change: the member cannot tell that join from a stale resend it
+  must refuse (#2125).
+
 ### Fixed
 
 - Proxy: when a primary's `m` sub-batch failed in transport (a node that
