@@ -89,6 +89,13 @@ no-arg convenience call) always fails fast: `getDefaultProperties()` is
 empty, so there is no `nanocached.addresses` to connect with unless you
 call the 3-arg overload with your own `Properties`.
 
+`CacheManager.getProperties()` returns the properties the manager was
+created with (a copy, defaults included), except `nanocached.secret`:
+the secret is used once, to connect, and is not handed to whatever else
+holds the manager — framework diagnostics or a library logging its
+configuration would otherwise print the credential every cluster client
+authenticates with.
+
 Each `CacheManager` **owns** its `NanocachedClient` — created on
 `getCacheManager` and closed together with the manager (or the whole
 provider) — unlike `nanocached-spring`, where the application supplies
