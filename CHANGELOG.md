@@ -277,6 +277,17 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- Docs: the accepted-behaviour item on increments rewound by a lagging
+  forward described one to three lost increments for concurrent callers
+  and, for one caller sending four increments about 1 ms apart, one lost
+  increment on about a fifth of the counters. A counter incremented in a
+  sustained stream loses far more: with 64 increments in flight on one
+  counter, a 30,000-increment burst sent 6 s after a join ended at 8,542 to
+  16,662 through the proxy and 6,209 to 8,520 through the Rust SDK, every
+  increment acknowledged, because each result the old owner forwards back
+  rewinds the counter by the increments sent since. The accepted-behaviour list, the proxy ordering section, the
+  SDKs page and the protocol page now give that scale (#2047).
+
 - Docs: the proxy ordering section now says that a delete (`D`/`d`) is in
   the connection's order like an expiring touch: a later request on the key
   waits a round trip to the primary, and the delete's reply takes the
