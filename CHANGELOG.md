@@ -26,6 +26,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Docs: the in-flight byte budget's docs (`docs/deployment-operations.html`,
+  `docs/getting-started.html`, `--help`) said only that a connection that
+  cannot get its share in time is closed. They now say how cheaply
+  unfinished uploads can pin the whole budget (one partial 1 MiB request at
+  the 1 MiB minimum; about 130 connections at the 256 MiB default), after
+  which every value-carrying reply elsewhere is closed after 10 s. They
+  recommend a budget above 2 MiB × `--max-connections-per-ip` for a node
+  untrusted clients can reach. The behaviour is listed as accepted in
+  `docs/architecture.html` (#2128).
+
 - Discovery: an `M` send that stopped was always logged as "permanently
   failed to send M … after 3 attempts", including when it stopped because a
   newer generation of the same name had superseded the join, or because the

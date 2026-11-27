@@ -947,6 +947,22 @@ here.</p>
   (allocator share included), so resident memory tracks the bound for
   tiny entries and namespaces; transient allocations (snapshots, in-flight
   requests, forward queues) are outside it. Leave headroom for those.</li>
+  <li>Unfinished uploads can pin the whole in-flight byte budget. A
+  receive buffer stays charged until its frame has arrived (up to the
+  60&nbsp;s frame deadline), and a connection part-way through a request
+  close to 1&nbsp;MiB pins about 2&nbsp;MiB. While the budget is pinned, a
+  value-carrying reply on any other connection waits and is closed after
+  10&nbsp;s. At the 1&nbsp;MiB minimum one partial request is enough, and
+  at the 256&nbsp;MiB default about 130 connections from one source
+  address. Keeping part of the budget back for replies would change how
+  receive buffers, multi-key frames and the overdraft slot wait for each
+  other, an arrangement that earlier fixes tuned to avoid connections
+  waiting on each other for good. So the budget stays shared, and sizing
+  is the remedy: above 2&nbsp;MiB &times;
+  <code>--max-connections-per-ip</code> for a node untrusted clients can
+  reach, with an auth secret limiting it to clients that hold the secret
+  (see <a href="deployment-operations.html#memory-budget">Sizing a node
+  process</a>).</li>
   <li>Replica-leg writes, read-repair writes and node-list refreshes fail
   silently, so that a dead replica never fails a write; the per-client
   counters (<code>stats()</code>) are the signal.</li>
