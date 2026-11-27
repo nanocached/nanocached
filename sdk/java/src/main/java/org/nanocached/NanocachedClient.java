@@ -2985,8 +2985,11 @@ public final class NanocachedClient implements AutoCloseable {
      * like a set, and the primary's answer is returned; with {@code ttlSeconds == 0} the other
      * owners are sent it only after the primary has answered (issue #934), so a primary that has to
      * be rerouted never finds its replicas have already expired the entry. When the primary's
-     * connection fails for good (after the retry, or after the request was sent), the other owners
-     * are sent it before that {@link NanocachedException.ConnectionLost} is thrown.
+     * connection is lost after the request was sent, the other owners are sent it before that
+     * {@link NanocachedException.ConnectionLost} is thrown. When the request never reached the
+     * primary even after the retry (a primary dead but still listed by discovery), no other owner
+     * is sent it either and the error is {@link NanocachedException.ConnectionLost#notSent()
+     * notSent}: a resend once discovery has dropped the primary still finds the entry.
      *
      * @throws NanocachedException.ServerTooOld against a node that predates the command
      */
@@ -3017,7 +3020,7 @@ public final class NanocachedClient implements AutoCloseable {
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         } catch (NanocachedException.ConnectionLost primaryFailure) {
-            if (expiring) applyOnOtherOwners(namespace, key, op, primaryFailure);
+            if (expiring && !primaryFailure.notSent()) applyOnOtherOwners(namespace, key, op, primaryFailure);
             throw primaryFailure;
         }
     }
@@ -3092,8 +3095,9 @@ public final class NanocachedClient implements AutoCloseable {
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         } catch (NanocachedException.ConnectionLost primaryFailure) {
-            // The other owners are sent the plain touch, as after an answer.
-            if (expiring) {
+            // The other owners are sent the plain touch, as after an answer,
+            // only when the request may have reached the primary (see touch).
+            if (expiring && !primaryFailure.notSent()) {
                 applyOnOtherOwners(
                         namespace,
                         key,
@@ -3152,8 +3156,10 @@ public final class NanocachedClient implements AutoCloseable {
      * failure instead of being read as missing, every other key having been touched. In a cluster
      * it goes to every owner of a key, the primary's answer being the key's; with {@code ttlSeconds
      * == 0} the primaries are sent theirs first and the other owners afterwards, for the keys a
-     * primary answered (issue #934). A replica's failure or {@code W} is counted in {@link
-     * ClientStats#replicaWriteFailures()} and never fails the batch. Larger batches are
+     * primary answered (issue #934) and the keys whose primary frame was sent and whose reply was
+     * lost; a key whose primary was never sent the touch is sent to no other owner. A replica's
+     * failure or {@code W} is counted in {@link ClientStats#replicaWriteFailures()} and never fails
+     * the batch. Larger batches are
      * transparently split into more than one {@code y} sub-frame per node (see {@link
      * #MAX_BATCH_KEYS}). If some keys' primaries are still wrong-node after one bounded
      * refresh-and-retry this throws a plain {@link NanocachedException.WrongNode}, and a key whose
@@ -3165,7 +3171,9 @@ public final class NanocachedClient implements AutoCloseable {
      * keys that were never sent and keys whose frame was sent and whose outcome is unknown (the
      * node may have expired them already), and the exception cannot tell the two apart. Do not send
      * the batch again, or the keys that failed, with {@code 0}: a resend reports a key the first
-     * attempt expired as missing.
+     * attempt expired as missing. The one exception is a {@link
+     * NanocachedException.ConnectionLost#notSent() notSent} error: no failed key's frame left, so
+     * none of them was expired and they may be sent again.
      *
      * @throws NanocachedException.ServerTooOld against a node that predates the command
      */
@@ -3511,11 +3519,19 @@ public final class NanocachedClient implements AutoCloseable {
         final Set<Integer> lost = ConcurrentHashMap.newKeySet();
 
         /**
-         * Issue #2053: the node whose primary leg last failed each position with a connection error
-         * (lost after the send, or never sent), cleared once it is answered or {@code W}. A ttl 0
-         * call that ends with the position still failed sends its other owners the touch anyway.
+         * Issue #2053: the node each position of {@link #lost} was sent to. A ttl 0 call sends
+         * those positions' other owners the touch anyway, since the node may have expired them. A
+         * position whose primary leg never left is not here and its other owners are sent nothing:
+         * nothing was expired, and the resend its not-sent error invites must still find the value.
          */
-        final Map<Integer, String> failedOn = new ConcurrentHashMap<>();
+        final Map<Integer, String> lostOn = new ConcurrentHashMap<>();
+
+        /**
+         * The failure that put a position in {@link #lost}, kept apart from {@link #lastCause} so a
+         * later not-sent failure (the second pass, another leg) cannot replace it: the caller's
+         * error must not claim nothing was sent while some keys may have been expired.
+         */
+        final AtomicReference<NanocachedException> lostCause = new AtomicReference<>();
 
         volatile boolean rejected;
     }
@@ -3614,20 +3630,18 @@ public final class NanocachedClient implements AutoCloseable {
         }
         if (expiring) {
             multiTouchReplicas(namespace, keys, wireTtl, state.answeredBy, true, state);
-            // Issue #2053: a position whose primary leg failed for good with
-            // a connection error (its reply lost, or still unreachable after
-            // the second pass: a dead primary that discovery still lists)
-            // got no replica leg, so a read falling back to a replica would
-            // return the value the caller expired, and the replica would be
-            // promoted with it. Its other owners are sent the touch now,
-            // awaited even with fireAndForgetReplicas, before the caller
-            // raises the connection error. A `W` or `En` position is not in
-            // `failedOn` and keeps its own path.
-            Set<Integer> stillFailed = new java.util.HashSet<>(retry);
-            stillFailed.addAll(state.lost);
-            Map<Integer, String> failed = new java.util.HashMap<>(state.failedOn);
-            failed.keySet().retainAll(stillFailed);
-            if (!failed.isEmpty()) multiTouchReplicas(namespace, keys, wireTtl, failed, false, state);
+            // Issue #2053: a position whose primary frame was sent and whose
+            // reply was lost got no replica leg, so a read falling back to
+            // a replica would return the value the caller expired, and the
+            // replica would be promoted with it. Its other owners are sent
+            // the touch now, awaited even with fireAndForgetReplicas, before
+            // the caller raises the connection error. Per key: a position
+            // whose primary leg never left (still unreachable after the
+            // second pass: a dead primary that discovery still lists), a
+            // `W` or an `En` is not in `lostOn` and touches no other owner.
+            if (!state.lostOn.isEmpty()) {
+                multiTouchReplicas(namespace, keys, wireTtl, new java.util.HashMap<>(state.lostOn), false, state);
+            }
         }
         for (Map.Entry<Integer, Connection.MultiEntry> result : state.results.entrySet()) {
             answers[result.getKey()] = result.getValue();
@@ -3644,7 +3658,11 @@ public final class NanocachedClient implements AutoCloseable {
                 break;
             }
         }
-        return new MultiTouchOutcome(answers, unresolved, wrongNode, state.lastCause.get(), state.rejected);
+        // A sent-and-lost key's failure wins over a later not-sent one, so
+        // the error's notSent() stays false when some keys may be expired.
+        NanocachedException cause = state.lostCause.get();
+        if (cause == null || state.rejected) cause = state.lastCause.get();
+        return new MultiTouchOutcome(answers, unresolved, wrongNode, cause, state.rejected);
     }
 
     /**
@@ -3759,8 +3777,9 @@ public final class NanocachedClient implements AutoCloseable {
      * plain touch to its other owners on the ring in force now, grouped by owner into one leg each.
      * Those are the positions whose primary answered (a hit, a touch or a miss: a miss may still
      * have a replica copy, and the caller's intent is to expire it everywhere), and, issue #2053,
-     * the ones whose primary leg failed for good with a connection error. A position whose primary
-     * answered {@code W} or {@code En} is in neither, so no replica is touched for it. A replica's
+     * the ones whose primary frame was sent and whose reply was lost. A position whose primary
+     * answered {@code W} or {@code En}, or whose primary leg never left, is in neither, so no
+     * replica is touched for it. A replica's
      * failure is counted in {@link #replicaWriteFailures} and never fails the batch, exactly as for
      * the concurrent fan-out. With {@code detachable} a leg may run as a fire-and-forget write;
      * without it every leg is awaited.
@@ -3885,24 +3904,18 @@ public final class NanocachedClient implements AutoCloseable {
             } else if (answered) {
                 state.results.put(idx, entry);
                 state.answeredBy.put(idx, leg.owner);
-                state.failedOn.remove(idx);
             } else {
                 if (entry == null) {
                     state.wrongNode.remove(idx);
-                    if (failure instanceof NanocachedException.ConnectionLost
-                            && !(failure instanceof NanocachedException.ServerRejected)) {
-                        state.failedOn.put(idx, leg.owner);
-                    } else {
-                        state.failedOn.remove(idx);
-                    }
                     if (i < sentEnd) {
                         // Issue #901: sent, then the connection was lost.
                         state.lost.add(idx);
+                        state.lostOn.put(idx, leg.owner);
+                        state.lostCause.set(failure);
                         continue;
                     }
                 } else {
                     state.wrongNode.add(idx);
-                    state.failedOn.remove(idx);
                 }
                 retry.add(idx);
             }
@@ -3933,10 +3946,12 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * After a delete's (or, issue #2053, an expiring touch's) primary leg has failed for good with a
-     * connection error (the refresh and retry included: a dead primary that discovery still lists;
-     * for the touch also a reply lost after the request was sent, which is not resent), sends
-     * {@code op} to the other owners before the caller sees {@code primaryFailure}. Otherwise every replica would keep the
+     * After a delete's primary leg has failed for good with a connection error (the refresh and
+     * retry included: a dead primary that discovery still lists), or an expiring touch's (issue
+     * #2053) reply was lost after the request was sent (which is not resent), sends {@code op} to
+     * the other owners before the caller sees {@code primaryFailure}. An expiring touch whose
+     * request never reached the primary does not call this: nothing was expired, and the resend
+     * its {@code notSent} error invites must still find the value. Otherwise every replica would keep the
      * value, a plain read falling back to a replica on the dead primary would return it, and once
      * discovery dropped the primary the replica would be promoted holding it. A delete can be
      * applied at any time, so this cannot undo anything; the caller still gets the error, so what
@@ -5893,7 +5908,7 @@ public final class NanocachedClient implements AutoCloseable {
      * the primary then turned out to be unreachable or answered {@code W}, the retry over the
      * refreshed ring would reach that replica as the new primary, find the key gone and report a
      * miss, and the value would be lost. A primary that fails sends no replica leg here (the
-     * caller sends them once the retry has failed too, issue #2053). The
+     * caller sends them when the primary's reply was lost after the send, issue #2053). The
      * replica legs therefore run after the primary's answer, outside the pipelined-order guarantee,
      * the same class as the existing retry paths.
      */
