@@ -14114,6 +14114,28 @@ mod tests {
         assert_eq!(n, 0, "the proxy must close the connection after the E");
     }
 
+    /// The proxy's `E` is bare on a tagged connection too (issue #2112):
+    /// a frame it could not parse has no tag to echo, and like the node's
+    /// `En` it answers the oldest request still waiting before the close.
+    /// Pinned here for the client's own protocol error; the upstream-failure
+    /// `E` is pinned by the tagged tests further down.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_malformed_frame_on_a_tagged_connection_gets_a_bare_e_then_eof() {
+        let (_nodes, proxy) = cluster(1).await;
+        let (mut stream, buf) = connect_and_auth_tagged(&proxy).await;
+        assert!(buf.is_empty());
+
+        // An empty key is malformed.
+        stream.write_all(b"G 0 7\n").await.unwrap();
+
+        let mut response = Vec::new();
+        timeout(UPSTREAM_IO_TIMEOUT, stream.read_to_end(&mut response))
+            .await
+            .expect("the proxy must close the connection after the E")
+            .expect("the close after the E must be a FIN, not a reset");
+        assert_eq!(response, b"E\n");
+    }
+
     /// Issue #1941: the repeat-`A` branch closed without the bounded drain
     /// a malformed frame from an authenticated client gets, so frames
     /// pipelined behind the second `A` were still unread at the close,

@@ -26,6 +26,10 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Docs: the protocol page said the proxy answers `E <tag>` on a tagged
+  connection. It always sends the bare `E\n`, untagged, like the node's `En`,
+  as the answer to the oldest request still waiting, and then closes the
+  connection. Every SDK already reads it that way (#2112).
 - Discovery: an `M` send that stopped was always logged as "permanently
   failed to send M … after 3 attempts", including when it stopped because a
   newer generation of the same name had superseded the join, or because the
