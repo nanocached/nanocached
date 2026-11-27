@@ -163,15 +163,17 @@ framework adapters at one version, whether or not a component changed.
   still waits until those legs are enqueued. A `W` is retried as before
   (#2016).
 
-- Proxy: a `ttl=0` touch (`t`, `t … G`, `y`) whose primary leg failed for
-  good — its re-fan found the primary still unreachable, or the primary
-  dropped the connection after the frame may have reached it — was answered
-  `R`, `W` or `E` and no other owner was sent the touch, so a later `G` that
-  fell back to a replica returned the value the client had expired, and the
-  replica kept it once promoted. The other owners now get their plain
-  touch before the client gets the error, as for a delete. A first attempt
-  that is re-fanned still sends them nothing until the primary has answered
-  (#2046).
+- Proxy: a `ttl=0` touch (`t`, `t … G`, `y`) whose primary dropped the
+  connection after the frame may have reached it was answered `E` and no
+  other owner was sent the touch, so a later `G` that fell back to a replica
+  returned the value the client had expired, and the replica kept it once
+  promoted. The other owners now get their plain touch before the client
+  gets the `E`; in a `y` answered `E`, so do the keys whose primary leg never
+  left. A primary leg whose frame never left (the re-fan, or the batch's
+  retry pass, found the primary still unreachable) is answered `R` or `W`
+  as before and touches no other owner, so the resend those answers invite
+  still finds the value. A first attempt that is re-fanned still sends the
+  other owners nothing until the primary has answered (#2046, #2074).
 
 - Node: a decommission that retried a key's transfer after a refused or
   failed attempt resent the value and TTL it had read before the first try.
