@@ -2160,9 +2160,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// primary that cannot be reached or answers <c>W</c> is rerouted while
     /// the surviving owner still holds the entry; those legs therefore run
     /// outside the pipelined-order guarantee, as the retry paths do. When
-    /// the primary's leg still ends in a connection failure (issue #2056),
-    /// the other owners are sent the touch before the
-    /// <see cref="ConnectionLostException"/> is thrown. Throws
+    /// the primary's reply is lost after the request was sent (issue
+    /// #2056), the other owners are sent the touch before the
+    /// <see cref="ConnectionLostException"/> is thrown. A primary still
+    /// unreachable after the retry was never sent it, so no other owner is
+    /// touched either (issue #2142): a resend once discovery has dropped
+    /// the primary still finds the entry. Throws
     /// <see cref="ServerTooOldException"/> against a node that predates the
     /// command.</para></summary>
     public Task<bool> TouchAsync(string key, long? ttlSeconds, CancellationToken cancellationToken = default) =>
@@ -2207,26 +2210,27 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             await ExpireOnOtherOwnersAsync(namespaceBytes, key).ConfigureAwait(false);
             throw error.Unwrap();
         }
-        catch (ConnectionLostException) when (!replaySafe && _ring is not null)
-        {
-            await ExpireOnOtherOwnersAsync(namespaceBytes, key).ConfigureAwait(false);
-            throw;
-        }
     }
 
     /// <summary>Issue #2056: the primary leg of a touch with a TTL of 0
-    /// ended in a connection-level failure — the frame may have been
-    /// applied and the reply lost, or the primary is dead but still
-    /// listed (until discovery's liveness timeout), so the retry after
-    /// the forced refresh failed too. The deferred fan-out of
-    /// <see cref="WriteAsync{T}"/> never sent the other owners theirs, so
-    /// a read falling back to them would return the value the caller
-    /// expired, and one of them would be promoted with it. They get the
-    /// plain touch now, all at once and awaited (even with
-    /// <c>FireAndForgetReplicas</c>), before the caller's error is thrown;
-    /// a failed leg counts in <c>ReplicaWriteFailures</c>. The same rule
-    /// as a delete's (issue #2007). Nothing to do outside a
-    /// cluster.</summary>
+    /// was sent and its reply lost (<see cref="UnsafeToReplayException"/>,
+    /// the <see cref="ConnectionLostException.RequestNotSent"/> boundary
+    /// Incr/CAS use), so the primary may have expired the entry. The
+    /// deferred fan-out of <see cref="WriteAsync{T}"/> never sent the
+    /// other owners theirs, so a read falling back to them would return
+    /// the value the caller expired, and one of them would be promoted
+    /// with it. They get the plain touch now, all at once and awaited
+    /// (even with <c>FireAndForgetReplicas</c>), before the caller's error
+    /// is thrown; a failed leg counts in <c>ReplicaWriteFailures</c>. The
+    /// same rule as a delete's (issue #2007). Nothing to do outside a
+    /// cluster.
+    ///
+    /// <para>Not called for a primary leg that was never sent (issue
+    /// #2142: the primary is dead but still listed, so the retry's dial
+    /// failed too): nothing was expired, the caller gets a not-sent
+    /// <see cref="ConnectionLostException"/>, and the resend it invites,
+    /// once discovery has dropped the primary, must still find the value
+    /// on the replica.</para></summary>
     private async Task ExpireOnOtherOwnersAsync(byte[] namespaceBytes, byte[] key)
     {
         if (_ring is null) return;
@@ -2326,11 +2330,6 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             await ExpireOnOtherOwnersAsync(namespaceBytes, key).ConfigureAwait(false);
             throw error.Unwrap();
         }
-        catch (ConnectionLostException) when (!replaySafe && _ring is not null)
-        {
-            await ExpireOnOtherOwnersAsync(namespaceBytes, key).ConfigureAwait(false);
-            throw;
-        }
         return raw is null || !_compress ? raw : Compression.DecompressValue(raw, _inflateBudget);
     }
 
@@ -2380,7 +2379,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// fan-out after the primaries have answered, for the keys they
     /// answered, so a primary that must be rerouted has expired nothing on
     /// its replicas; that fan-out runs outside the pipelined-order
-    /// guarantee, as the retry paths do.</para>
+    /// guarantee, as the retry paths do. The keys whose primary reply was
+    /// lost after the send are sent to their other owners too before the
+    /// error is thrown; a key whose primary was never sent the touch is
+    /// sent to no other owner.</para>
     ///
     /// <para><b>With <paramref name="ttlSeconds"/> 0 the batch is not
     /// simply resendable (issue #938)</b>: the keys of the failure are the
@@ -2623,13 +2625,19 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         /// applied, so a resend would report them missing (and, with
         /// <c>get</c>, lose the values it consumed).</summary>
         public readonly HashSet<int> Lost = new();
-        /// <summary>Issue #2056: for a <c>ttl == 0</c> call, the positions
-        /// whose latest primary leg ended in a connection-level failure
-        /// (sent and lost, or unreachable), each with the owner that
-        /// failed — the deferred fan-out sends their other owners the
-        /// touch too, awaited.</summary>
+        /// <summary>Issue #2056: each position in <see cref="Lost"/> with
+        /// the primary that lost it — the deferred fan-out sends their
+        /// other owners the touch too, awaited. A position whose primary
+        /// leg was never sent is not here (issue #2142): nothing was
+        /// expired, and the resend must still find the value.</summary>
         public readonly Dictionary<int, string> Failed = new();
         public Exception? LastCause;
+        /// <summary>Issue #2142: the failure that put a position in
+        /// <see cref="Lost"/>, kept apart from <see cref="LastCause"/> so a
+        /// later not-sent failure (another primary unreachable in the
+        /// retry pass) cannot make the batch's error claim nothing was
+        /// sent.</summary>
+        public Exception? LostCause;
         public ServerTooOldException? Rejected;
     }
 
@@ -2721,8 +2729,8 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         // sub-frames only. Now that every primary has answered or been
         // given up on, expire the copies on the other owners — once, on
         // the ring in force now, for the keys a primary answered and
-        // (issue #2056) those whose primary leg ended in a connection
-        // failure.
+        // (issue #2056) those whose primary leg was sent and lost — not
+        // those whose primary leg never left (issue #2142).
         if (ttlSeconds == 0)
         {
             await MultiTouchReplicaFanOutAsync(namespaceBytes, keyBytes, state).ConfigureAwait(false);
@@ -2735,8 +2743,8 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             retry.AddRange(state.Lost);
             retry.Sort();
             return new MultiTouchOutcome(
-                answers, retry, state.Lost.Count == 0 && retry.Any(state.WrongNode.Contains), state.LastCause,
-                state.Rejected);
+                answers, retry, state.Lost.Count == 0 && retry.Any(state.WrongNode.Contains),
+                state.LostCause ?? state.LastCause, state.Rejected);
         }
     }
 
@@ -2752,14 +2760,17 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// counted in <see cref="_replicaWriteFailures"/> and never fails the
     /// batch.
     ///
-    /// <para>Issue #2056: a key whose primary leg ended in a connection
-    /// failure (sent and lost, or still unreachable after the refresh —
-    /// a dead primary discovery still lists) is sent the touch on its
-    /// other owners too, as a delete is (issue #2007): otherwise a read
-    /// falling back to them returns the value the caller expired, and one
-    /// of them is promoted with it. Those legs are awaited even with
-    /// <c>FireAndForgetReplicas</c>, so they have been answered when the
-    /// caller gets the error.</para>
+    /// <para>Issue #2056: a key whose primary chunk was sent and its reply
+    /// lost (<c>state.Lost</c>) is sent the touch on its other owners too,
+    /// as a delete is (issue #2007): the primary may have expired it, and
+    /// otherwise a read falling back to them returns the value the caller
+    /// expired, and one of them is promoted with it. Those legs are
+    /// awaited even with <c>FireAndForgetReplicas</c>, so they have been
+    /// answered when the caller gets the error. A key whose primary chunk
+    /// never left (still unreachable after the refresh — a dead primary
+    /// discovery still lists) gets no leg (issue #2142): nothing was
+    /// expired, and the resend the not-sent error invites must still find
+    /// the value.</para>
     ///
     /// <para>These legs run after the primary answered, outside the
     /// pipelined-order guarantee, the same class as the retry
@@ -2851,11 +2862,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             IReadOnlyList<string> names = OwnerNames(namespaceBytes, keyBytes[idx]);
             if (names.Count == 0)
             {
-                lock (state)
-                {
-                    state.WrongNode.Add(idx);
-                    state.Failed.Remove(idx);
-                }
+                lock (state) state.WrongNode.Add(idx);
                 retry.Add(idx);
                 continue;
             }
@@ -3003,7 +3010,6 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 {
                     state.Results[idx] = entry!.Value;
                     state.Answerer[idx] = leg.Owner;
-                    state.Failed.Remove(idx);
                 }
             }
             else
@@ -3012,12 +3018,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 {
                     if (entry is null) state.WrongNode.Remove(idx);
                     else state.WrongNode.Add(idx);
-                    if (entry is null && failure is ConnectionLostException) state.Failed[idx] = leg.Owner;
-                    else state.Failed.Remove(idx);
                     if (entry is null && i < sentEnd)
                     {
                         // issue #901: sent, then the connection was lost.
                         state.Lost.Add(idx);
+                        state.Failed[idx] = leg.Owner;
+                        state.LostCause = failure;
                         continue;
                     }
                 }
@@ -4663,7 +4669,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// <item>a failure (connection-level, or any
     /// <see cref="NanocachedException"/> other than
     /// <see cref="WrongNodeException"/>) hedges onward immediately, with
-    /// no wait;</item>
+    /// no wait, even while other legs are still in flight;</item>
     /// <item><see cref="WrongNodeException"/> propagates as in
     /// <see cref="ReadAsync{T}"/>.</item>
     /// </list>
@@ -4789,11 +4795,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             catch (Exception error) when (error is NanocachedException)
             {
                 lastError = error;
-                if (pending.Count == 0 && nextIndex < names.Count)
+                if (nextIndex < names.Count)
                 {
-                    // Everything in flight so far failed: the next owner
-                    // gets its turn right away, not after waiting out the
-                    // rest of the interval.
+                    // A failed leg is replaced by the next owner right
+                    // away, even while other legs (a silent primary) are
+                    // still in flight, not after waiting out the rest of
+                    // the interval.
                     pending.Add(StartLeg(nextIndex));
                     nextIndex++;
                 }

@@ -33,6 +33,7 @@ from nanocached import (
     WrongNodeError,
     content_digest,
 )
+from nanocached._client import _FORCED_REFRESH_MIN_INTERVAL
 from nanocached._hashring import HashRing
 
 NAMES = [
@@ -779,6 +780,25 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
                 await client.set("k", "v")
                 node.answer_plus_prefixed_length_once()
                 with self.assertRaises(NanocachedError):
+                    await client.get("k")
+
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_a_header_whose_byte_after_the_marker_is_not_a_space_poisons_the_connection(self):
+        # The space after the marker is mandatory: `VX1\nx` is not the
+        # one-byte hit `V 1\nx`, whatever byte stands in for the space.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                node.answer_raw_to_get_once(b"VX1\nx")
+                with self.assertRaisesRegex(NanocachedError, "malformed response header"):
                     await client.get("k")
 
                 self.assertEqual(await client.get("k"), "v")
@@ -2728,10 +2748,11 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
-    async def test_an_expiring_touch_whose_primary_stays_unreachable_expires_the_replica(self):
-        # Issue #2055: the primary is dead but discovery still lists it, so
-        # the retry fails too. The replica is sent the plain `t ... 0`
-        # before the error is raised, so a read falling back to it misses.
+    async def test_an_expiring_touch_whose_primary_stays_unreachable_leaves_the_replica(self):
+        # The primary is dead but discovery still lists it, so the retry
+        # fails too and the touch never left. No other owner is touched and
+        # the error is the not-sent kind, so the resend it invites, once
+        # discovery has dropped the primary, still finds the value.
         for get in (False, True):
             with self.subTest(get=get):
                 nodes, discovery = await self.start_cluster()
@@ -2741,12 +2762,23 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
                     replica = nodes[replica_name]
                     await client.set("k", "precious")
                     await nodes[primary_name].close()
+                    await wait_for(
+                        lambda: client._members[primary_name].connection.closed,
+                        "the client to see the primary's connection close",
+                    )
                     call = client.get_and_touch if get else client.touch
-                    with self.assertRaises((ConnectionError, OSError)):
+                    with self.assertRaises((ConnectionError, OSError)) as raised:
                         await call("k", 0)
-                    self.assertEqual(replica.touches, [(b"", b"k", 0, False)])
+                    self.assertNotIsInstance(raised.exception, ConnectionLostError)
+                    self.assertEqual(replica.touches, [])
+                    self.assertEqual(replica.store[b"k"], b"precious")
+                    discovery.nodes = [(replica_name, replica.address)]
+                    # Past the forced-refresh spacing, so the resend's
+                    # refresh learns the new roster.
+                    await asyncio.sleep(_FORCED_REFRESH_MIN_INTERVAL + 0.05)
+                    self.assertEqual(await call("k", 0), "precious" if get else True)
+                    self.assertEqual(replica.touches, [(b"", b"k", 0, get)])
                     self.assertNotIn(b"k", replica.store)
-                    self.assertIsNone(await client.get("k"))
                 finally:
                     await self.stop(client, discovery, nodes)
 
@@ -2780,14 +2812,14 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
             replica = nodes[replica_name]
             await client.set("k", "v")
             await wait_for(lambda: b"k" in replica.store, "the replica write")
-            await nodes[primary_name].close()
+            nodes[primary_name].apply_and_drop_next_touch()
             gate = replica.hold_touch_replies()
             task = asyncio.ensure_future(client.touch("k", 0))
             await wait_for(lambda: replica.touches, "the replica to receive the touch")
             await asyncio.sleep(0.1)
             self.assertFalse(task.done(), "touch raised before its fallback touch was answered")
             gate.set()
-            with self.assertRaises((ConnectionError, OSError)):
+            with self.assertRaises(ConnectionLostError):
                 await task
             self.assertEqual(client._background_replica_writes, set())
         finally:
@@ -3764,10 +3796,11 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await self.stop(client, discovery, nodes)
 
-    async def test_an_expiring_batch_whose_primary_stays_unreachable_expires_the_replica(self):
-        # Issue #2055: as for a single key, the replica is sent one plain
-        # `y ... 0` for the keys whose primary stayed unreachable before
-        # the error is raised.
+    async def test_an_expiring_batch_whose_primary_stays_unreachable_leaves_the_replica(self):
+        # As for a single key: the keys whose primary stayed unreachable
+        # never left, so the replica is sent nothing, the error is the
+        # not-sent kind, and the resend after discovery dropped the
+        # primary still finds every value.
         for get in (False, True):
             with self.subTest(get=get):
                 nodes, discovery = await self.start_cluster()
@@ -3777,15 +3810,25 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
                     replica = nodes[NAMES[1]]
                     await client.set_many({key: f"v-{key}" for key in keys})
                     await nodes[NAMES[0]].close()
-                    call = client.get_many_and_touch if get else client.touch_many
-                    with self.assertRaises((ConnectionError, OSError)):
-                        await call(keys, 0)
-                    self.assertEqual(
-                        [(sorted(f[1]), f[2], f[3]) for f in replica.multi_touch_frames],
-                        [(sorted(k.encode() for k in keys), 0, False)],
+                    await wait_for(
+                        lambda: client._members[NAMES[0]].connection.closed,
+                        "the client to see the primary's connection close",
                     )
+                    call = client.get_many_and_touch if get else client.touch_many
+                    with self.assertRaises((ConnectionError, OSError)) as raised:
+                        await call(keys, 0)
+                    self.assertNotIsInstance(raised.exception, ConnectionLostError)
+                    self.assertEqual(replica.multi_touch_frames, [])
+                    self.assertEqual(len(replica.store), 4)
+                    discovery.nodes = [(NAMES[1], replica.address)]
+                    # Past the forced-refresh spacing, so the resend's
+                    # refresh learns the new roster.
+                    await asyncio.sleep(_FORCED_REFRESH_MIN_INTERVAL + 0.05)
+                    expected = (
+                        {key: f"v-{key}" for key in keys} if get else dict.fromkeys(keys, True)
+                    )
+                    self.assertEqual(await call(keys, 0), expected)
                     self.assertEqual(replica.store, {})
-                    self.assertEqual(await client.get_many(keys), {})
                 finally:
                     await self.stop(client, discovery, nodes)
 
@@ -3818,14 +3861,14 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
             replica = nodes[NAMES[1]]
             await client.set_many({key: f"v-{key}" for key in keys})
             await wait_for(lambda: len(replica.store) == 4, "the replica writes")
-            await nodes[NAMES[0]].close()
+            nodes[NAMES[0]].apply_and_drop_next_touch()
             gate = replica.hold_touch_replies()
             task = asyncio.ensure_future(client.touch_many(keys, 0))
             await wait_for(lambda: replica.multi_touch_frames, "the replica to receive the batch")
             await asyncio.sleep(0.1)
             self.assertFalse(task.done(), "touch_many raised before its fallback was answered")
             gate.set()
-            with self.assertRaises((ConnectionError, OSError)):
+            with self.assertRaises(ConnectionLostError):
                 await task
             self.assertEqual(client._background_replica_writes, set())
         finally:
@@ -5908,6 +5951,43 @@ class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
             for node in nodes.values():
                 await node.close()
 
+    async def test_a_failed_hedge_leg_starts_the_next_owner_at_once(self):
+        # With three owners and a silent primary, the hedge to the second
+        # owner fails at once (its node is gone): the third owner is asked
+        # right away, not after another full interval while the primary is
+        # still in flight. It used to start only once no leg was in flight,
+        # so the read took two intervals.
+        names = [*NAMES, "9c1e4b7a-2d3f-4a5b-8c6d-7e8f9a0b1c2d"]
+        nodes = {name: await MockNode().start() for name in names}
+        discovery = await MockDiscovery(
+            [(name, node.address) for name, node in nodes.items()], replication=3
+        ).start()
+        hedge_after = 0.3
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", discovery.port)], read_hedge_after=hedge_after
+        )
+        try:
+            await client.set("k", "v")
+            primary, second, third = HashRing(names).owners(b"k", 3)
+            nodes[primary].delay_gets(2.0)
+            await nodes[second].close()
+            await wait_for(
+                lambda: client._members[second].connection.closed,
+                "the client to see the FIN",
+            )
+
+            value, elapsed = await self.timed(client.get("k"))
+
+            self.assertEqual(value, "v")
+            self.assertEqual(nodes[third].get_count, 1)
+            self.assertGreaterEqual(elapsed, hedge_after - self.TIMING_TOLERANCE_S, elapsed)
+            self.assertLess(elapsed, 1.5 * hedge_after, elapsed)
+        finally:
+            await client.close()
+            await discovery.close()
+            for node in nodes.values():
+                await node.close()
+
     async def test_a_dead_primary_fails_over_immediately(self):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect(
@@ -6760,7 +6840,7 @@ class TolerantBootstrapTests(unittest.IsolatedAsyncioTestCase):
 
                 # Once the interval has passed the next failure refreshes
                 # again: a node that did come back must still be found.
-                await asyncio.sleep(client_module._FORCED_REFRESH_MIN_INTERVAL + 0.05)
+                await asyncio.sleep(_FORCED_REFRESH_MIN_INTERVAL + 0.05)
                 before = discovery.list_count
                 with self.assertRaises(ConnectionError):
                     await client.incr(key)

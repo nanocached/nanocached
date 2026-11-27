@@ -450,12 +450,15 @@ read that falls back to them then misses instead of returning the deleted
 value.
 
 A touch with a TTL of 0 (`TouchAsync`, `GetAndTouchAsync`,
-`TouchManyAsync`, `GetManyAndTouchAsync`) follows the same order and the
-same rule: when the primary's leg ends in a connection failure (still
-unreachable after the retry, or the connection was lost after the request
-was sent, which is not resent), the other owners are sent the touch, and
-it is waited for even with `FireAndForgetReplicas`, before the call
-throws `ConnectionLostException`.
+`TouchManyAsync`, `GetManyAndTouchAsync`) follows the same order, with a
+narrower rule: only when the connection was lost after the request was
+sent (which is not resent, since the primary may have expired the key)
+are the other owners sent the touch, and it is waited for even with
+`FireAndForgetReplicas`, before the call throws `ConnectionLostException`.
+A primary still unreachable after the retry was never sent the touch, so
+no other owner is touched either: once discovery drops the dead primary,
+sending the touch again still finds the value. In a batch this is decided
+per key.
 
 ## Fire-and-forget replica writes
 

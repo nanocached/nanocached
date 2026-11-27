@@ -3000,8 +3000,9 @@ func (c *Client) readFromOwner(slot string, op func(*connection) ([]byte, bool, 
 //     a replica's miss is merely provisional (it may simply lack the
 //     copy) and does not finalize the read on its own;
 //   - a connection-level failure (or any error other than ErrWrongNode)
-//     hedges onward immediately (no wait for the interval) and is
-//     remembered as the last error;
+//     hedges onward immediately (no wait for the interval, even while
+//     other legs are still in flight) and is remembered as the last
+//     error;
 //   - ErrWrongNode propagates exactly as read()'s sequential path does.
 //
 // If every owner answers with a miss or fails, but at least one
@@ -3165,6 +3166,10 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 					return nil, false, res.err
 				}
 				lastError = res.err
+				// A failed leg is replaced by the next owner, if any,
+				// right away, even while other legs (a silent primary)
+				// are still in flight.
+				tryStartNext()
 			case res.ok || names[res.index] == primaryName:
 				finishHedge(pending, nextIndex)
 				return res.value, res.ok, nil
