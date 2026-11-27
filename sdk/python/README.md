@@ -114,9 +114,13 @@ the retry (dead but still listed by discovery), the other owners are sent the
 delete anyway before the connection error is raised, so a read that falls
 back to a replica does not return the deleted value.
 An expiring touch (`touch`, `get_and_touch`, `touch_many` or
-`get_many_and_touch` with `ttl_seconds=0`) has the same shape: when the
-primary's reply is lost or the primary is still unreachable after the retry,
-the other owners are sent the touch before the connection error is raised.
+`get_many_and_touch` with `ttl_seconds=0`) is ordered the same way. When the
+primary's reply is lost after the request was sent, the primary may have
+expired the key, so the other owners are sent the touch before
+`ConnectionLostError` is raised. When the primary is still unreachable after
+the retry, the touch never left: no other owner is touched and the error is a
+not-sent one, so a retry once discovery has dropped the primary still finds
+the value.
 
 ## Namespaces
 
