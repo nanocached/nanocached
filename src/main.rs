@@ -389,7 +389,12 @@ Usage: nanocached-node [options]
                                (288 for o; m, o, y) until it is answered
                                (default {} — 256 MiB, minimum {} — 1 MiB).
                                A connection that cannot get its share
-                               in time is closed, like a stalled one
+                               in time is closed, like a stalled one.
+                               Unfinished uploads pin about 2 MiB per
+                               connection, so one source can pin about
+                               2 MiB times --max-connections-per-ip;
+                               where untrusted clients connect, size it
+                               so what is left covers the others
   --max-connections <n>       accepted client connections at once
                                (default {}); over the cap new
                                connections get a Busy reply
