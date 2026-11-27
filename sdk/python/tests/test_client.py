@@ -2728,17 +2728,86 @@ class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.stop(client, discovery, nodes)
 
-    async def test_an_expiring_touch_touches_no_replica_when_the_primary_stays_unreachable(self):
+    async def test_an_expiring_touch_whose_primary_stays_unreachable_expires_the_replica(self):
+        # Issue #2055: the primary is dead but discovery still lists it, so
+        # the retry fails too. The replica is sent the plain `t ... 0`
+        # before the error is raised, so a read falling back to it misses.
+        for get in (False, True):
+            with self.subTest(get=get):
+                nodes, discovery = await self.start_cluster()
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    primary_name, replica_name = self.owners_of("k")
+                    replica = nodes[replica_name]
+                    await client.set("k", "precious")
+                    await nodes[primary_name].close()
+                    call = client.get_and_touch if get else client.touch
+                    with self.assertRaises((ConnectionError, OSError)):
+                        await call("k", 0)
+                    self.assertEqual(replica.touches, [(b"", b"k", 0, False)])
+                    self.assertNotIn(b"k", replica.store)
+                    self.assertIsNone(await client.get("k"))
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_touch_whose_reply_was_lost_still_expires_the_replica(self):
+        # Issue #2055: the primary applied the touch and the reply was lost,
+        # which is not resent (issue #901). The replica is still expired.
+        for get in (False, True):
+            with self.subTest(get=get):
+                nodes, discovery = await self.start_cluster()
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    primary_name, replica_name = self.owners_of("k")
+                    replica = nodes[replica_name]
+                    await client.set("k", "precious")
+                    nodes[primary_name].apply_and_drop_next_touch()
+                    call = client.get_and_touch if get else client.touch
+                    with self.assertRaises(ConnectionLostError):
+                        await call("k", 0)
+                    self.assertEqual(replica.touches, [(b"", b"k", 0, False)])
+                    self.assertNotIn(b"k", replica.store)
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_touch_awaits_its_fallback_replica_touch_with_fire_and_forget(self):
+        nodes, discovery = await self.start_cluster()
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", discovery.port)], fire_and_forget_replicas=True
+        )
+        try:
+            primary_name, replica_name = self.owners_of("k")
+            replica = nodes[replica_name]
+            await client.set("k", "v")
+            await wait_for(lambda: b"k" in replica.store, "the replica write")
+            await nodes[primary_name].close()
+            gate = replica.hold_touch_replies()
+            task = asyncio.ensure_future(client.touch("k", 0))
+            await wait_for(lambda: replica.touches, "the replica to receive the touch")
+            await asyncio.sleep(0.1)
+            self.assertFalse(task.done(), "touch raised before its fallback touch was answered")
+            gate.set()
+            with self.assertRaises((ConnectionError, OSError)):
+                await task
+            self.assertEqual(client._background_replica_writes, set())
+        finally:
+            await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_touch_whose_primary_keeps_answering_wrong_node_touches_no_replica(
+        self,
+    ):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
         try:
             primary_name, replica_name = self.owners_of("k")
             await client.set("k", "precious")
-            await nodes[primary_name].close()
-            with self.assertRaises((ConnectionError, OSError)):
-                await client.touch("k", 0)
-            with self.assertRaises((ConnectionError, OSError)):
-                await client.get_and_touch("k", 0)
+            primary = nodes[primary_name]
+            for call in (client.touch, client.get_and_touch):
+                # `W` on the first attempt and on the retry.
+                primary.answer_wrong_node_once()
+                primary.answer_wrong_node_once()
+                with self.assertRaises(WrongNodeError):
+                    await call("k", 0)
             self.assertEqual(nodes[replica_name].touches, [])
             self.assertEqual(nodes[replica_name].store[b"k"], b"precious")
         finally:
@@ -3695,19 +3764,70 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await self.stop(client, discovery, nodes)
 
-    async def test_an_expiring_batch_touches_no_replica_when_the_primary_stays_unreachable(self):
+    async def test_an_expiring_batch_whose_primary_stays_unreachable_expires_the_replica(self):
+        # Issue #2055: as for a single key, the replica is sent one plain
+        # `y ... 0` for the keys whose primary stayed unreachable before
+        # the error is raised.
+        for get in (False, True):
+            with self.subTest(get=get):
+                nodes, discovery = await self.start_cluster()
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    keys = self.keys_by_primary(NAMES[0], 4)
+                    replica = nodes[NAMES[1]]
+                    await client.set_many({key: f"v-{key}" for key in keys})
+                    await nodes[NAMES[0]].close()
+                    call = client.get_many_and_touch if get else client.touch_many
+                    with self.assertRaises((ConnectionError, OSError)):
+                        await call(keys, 0)
+                    self.assertEqual(
+                        [(sorted(f[1]), f[2], f[3]) for f in replica.multi_touch_frames],
+                        [(sorted(k.encode() for k in keys), 0, False)],
+                    )
+                    self.assertEqual(replica.store, {})
+                    self.assertEqual(await client.get_many(keys), {})
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_batch_whose_reply_was_lost_still_expires_the_replica(self):
+        for get in (False, True):
+            with self.subTest(get=get):
+                nodes, discovery = await self.start_cluster()
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    keys = self.keys_by_primary(NAMES[0], 4)
+                    replica = nodes[NAMES[1]]
+                    await client.set_many({key: f"v-{key}" for key in keys})
+                    nodes[NAMES[0]].apply_and_drop_next_touch()
+                    call = client.get_many_and_touch if get else client.touch_many
+                    with self.assertRaises(ConnectionLostError):
+                        await call(keys, 0)
+                    self.assertEqual(len(nodes[NAMES[0]].multi_touch_frames), 1)
+                    self.assertEqual(len(replica.multi_touch_frames), 1)
+                    self.assertEqual(replica.store, {})
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+    async def test_an_expiring_batch_awaits_its_fallback_replica_frame_with_fire_and_forget(self):
         nodes, discovery = await self.start_cluster()
-        client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+        client = await NanocachedClient.connect(
+            [("127.0.0.1", discovery.port)], fire_and_forget_replicas=True
+        )
         try:
             keys = self.keys_by_primary(NAMES[0], 4)
+            replica = nodes[NAMES[1]]
             await client.set_many({key: f"v-{key}" for key in keys})
+            await wait_for(lambda: len(replica.store) == 4, "the replica writes")
             await nodes[NAMES[0]].close()
+            gate = replica.hold_touch_replies()
+            task = asyncio.ensure_future(client.touch_many(keys, 0))
+            await wait_for(lambda: replica.multi_touch_frames, "the replica to receive the batch")
+            await asyncio.sleep(0.1)
+            self.assertFalse(task.done(), "touch_many raised before its fallback was answered")
+            gate.set()
             with self.assertRaises((ConnectionError, OSError)):
-                await client.touch_many(keys, 0)
-            with self.assertRaises((ConnectionError, OSError)):
-                await client.get_many_and_touch(keys, 0)
-            self.assertEqual(nodes[NAMES[1]].multi_touch_frames, [])
-            self.assertEqual(len(nodes[NAMES[1]].store), 4)
+                await task
+            self.assertEqual(client._background_replica_writes, set())
         finally:
             await self.stop(client, discovery, nodes)
 
