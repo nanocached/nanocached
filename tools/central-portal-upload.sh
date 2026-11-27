@@ -92,7 +92,10 @@ call_portal() { # <curl arguments>; leaves the response body in $response
 call_portal --connect-timeout 30 --max-time 900 --request POST \
     --url-query "name=$deployment_name" --url-query "publishingType=AUTOMATIC" \
     --form "bundle=@$bundle;type=application/octet-stream" \
-    "$portal/api/v1/publisher/upload" || exit 1
+    "$portal/api/v1/publisher/upload" || {
+    echo "::error::the upload failed; the Portal may still have received it, so check $portal/publishing/deployments before re-running this job (a second upload is a second release event)"
+    exit 1
+}
 deployment_id="$(tr -d '[:space:]' <"$response")"
 if [ -z "$deployment_id" ]; then
     echo "::error::the Portal accepted the upload but returned no deployment id"
@@ -129,7 +132,7 @@ while :; do
         esac
     fi
     if [ "$SECONDS" -ge "$deadline" ]; then
-        echo "::error::deployment $deployment_id is still '${last:-unknown}' after ${deadline_after}s; check $portal/publishing/deployments"
+        echo "::error::deployment $deployment_id is still '${last:-unknown}' after ${deadline_after}s; check $portal/publishing/deployments before re-running this job (it may still publish, and a second upload is a second release event)"
         exit 1
     fi
     sleep "$poll"
