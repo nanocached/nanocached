@@ -9848,6 +9848,8 @@ mod tests {
             message,
             "invalid --discovery address \"10.0.0.2\" is not a host:port address: no port"
         );
+        // A link-local host with its scope id connects, so it is accepted.
+        assert!(args(&["--discovery", "[::1]:8357,[fe80::1%2]:8357"]).is_ok());
     }
 
     #[test]
