@@ -7254,7 +7254,7 @@ impl MigrationGuard {
                 // `run_migration`'s own unwind can safely drop it
                 // mid-transfer): ask it to stop and reject this `M`.
                 // Discovery resends a refused `M` after a pause until the
-                // slot clears (`MIGRATE_REJECTED_RETRY_WINDOW` in
+                // slot clears (`MIGRATE_SEND_WINDOW` in
                 // `src/bin/nanocached-discovery.rs`); its `X` path also
                 // waits here for the unwind before acking — see
                 // `wait_for_migration_slot_to_clear`. Neither is ordered
@@ -10169,7 +10169,7 @@ fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> AbandonO
 /// slot. `MigrationGuard::new`'s generation check (see its own doc
 /// comment) correctly tells this apart from a same-generation retry and
 /// rejects it. Discovery resends a refused `M` every second for up to
-/// `MIGRATE_REJECTED_RETRY_WINDOW` (45 s, in
+/// `MIGRATE_SEND_WINDOW` (45 s, in
 /// `src/bin/nanocached-discovery.rs`), which outlasts the worst-case time
 /// `run_migration` can still be blocked inside one stuck send — up to
 /// `KEY_TRANSFER_ATTEMPTS` (3) × `OUTBOUND_IO_TIMEOUT` (10s) — before it

@@ -61,6 +61,14 @@ framework adapters at one version, whether or not a component changed.
   started again. An `M` refused with `R` is now resent every second for up
   to 45 s, without using up the three attempts kept for connection and ack
   failures, and with no `X` after it if the join ends meanwhile (#2045).
+  The 45 s count from the start of the send, not from the first `R`, so
+  connection and ack failures before the first refusal (10 s each) no longer
+  push the send past the 60 s migration timeout. Waiting for a dial permit
+  counts against the same 45 s, and an attempt still in flight when they
+  run out is cut off. While the `M` fan-out runs, the sweep cannot reap
+  the join. A paused send no longer holds its dial permit, so with more
+  than 64 members, or with members admitted mid-join, the sends queued
+  behind refusing members dial during the pauses (#2102).
 
 - Node and proxy: a `--discovery` address without a port (or with port 0,
   a non-numeric port, or an unbracketed IPv6 host) was accepted at startup,
