@@ -17,8 +17,8 @@ nanocached cluster.
   operations, with all of its routing, replication and retries (hedged
   reads and read repair apply to single-key `get` only, not to batches).
   `mget`/`mset` use the SDK's batched `getMany`/`setMany`: one wire
-  round trip per involved node. `mdel` remains a `Promise.all` loop —
-  the wire has no multi-key delete.
+  round trip per involved node. `mdel` remains a loop of concurrent
+  `del` calls — the wire has no multi-key delete.
 - **Values are JSON-serialized** (`JSON.stringify`/`JSON.parse`), the
   convention `cache-manager`'s own stores use (its Redis store does the
   same).
@@ -152,8 +152,10 @@ client directly, for anything this store doesn't itself surface —
   on refresh-ahead actually firing before expiry, this store cannot
   provide that; use `wrap()` for its cache-aside behavior only.
 - **`mget`/`mset`** ride the wire's batched multi-get/multi-set — one round
-  trip per involved node; **`mdel`** is a concurrent
-  `Promise.all` loop over `del`. `mget` preserves key order in its result
+  trip per involved node; **`mdel`** is a concurrent loop over `del`,
+  at most 400 at a time. If a delete fails, `mdel` still sends and waits
+  for every other delete, then rejects with the failure, so every key
+  except the failed ones is gone when it rejects. `mget` preserves key order in its result
   (including `undefined` holes for misses — and a hole for a key the
   node could not fit: the values in one batch reply total at most
   16 MiB, and a hit past that budget is answered as a miss, so an `mget`

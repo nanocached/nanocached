@@ -507,8 +507,9 @@ state the order is unchanged. Separately, a read whose answer came from
 one owner normally leaves its other legs running; past 256 legs left
 running that way a read waits for its own remaining legs instead, which
 bounds what a client can accumulate against a cluster that is slow
-throughout. Legs of reads still in flight do not count towards that
-limit. Hedge legs run on a pool of their own (daemon threads named
+throughout. A read whose thread is interrupted also leaves its legs
+running, and they count the same way. Legs of reads still in flight do
+not count towards that limit. Hedge legs run on a pool of their own (daemon threads named
 `nanocached-hedge-leg`, idle ones retiring after a minute), so legs held
 by an owner that has stopped answering do not take the threads replica
 writes run on.

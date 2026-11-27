@@ -445,6 +445,10 @@ function readNodeListHeader(buf: Buffer): ListHeader<{ nodes: DiscoveredNode[]; 
   }
 
   // `N <count> <r>\n` (client-side replication) — the replication factor rides along.
+  // The space after `N` is checked, not skipped: `NX1 2\n` is not `N 1 2\n`.
+  if (buf[1] !== 0x20 /* ' ' */) {
+    throw new NanocachedError("nanocached: invalid node-list header in discovery response");
+  }
   const header = buf.subarray(2, headerEnd).toString("ascii").split(" ");
   if (header.length !== 2) {
     throw new NanocachedError("nanocached: invalid node-list header in discovery response");
@@ -493,6 +497,9 @@ function readProxyListHeader(buf: Buffer): ListHeader<DiscoveredNode[]> | null {
     );
   }
 
+  if (buf[1] !== 0x20 /* ' ' */) {
+    throw new NanocachedError("nanocached: invalid proxy-list header in discovery response");
+  }
   const count = parseStrictInteger(buf.subarray(2, headerEnd).toString("ascii"));
   if (count === undefined || count > MAX_NODE_COUNT) {
     throw new NanocachedError("nanocached: invalid proxy count in discovery response");

@@ -1360,8 +1360,9 @@ func (c *connection) readOneResponse() (marker byte, value []byte, tag uint32, t
 	// touch can report ErrServerTooOld (issue #825); an ErrProtocol like
 	// any other unexpected marker for everything else.
 	//
-	// Any other `E` — a bare `E\n`, or the `E <tag>\n` nanocached-proxy
-	// answers when a request's outcome is unknown (issue #939) — is not a
+	// Any other `E` — the bare `E\n` nanocached-proxy answers when a
+	// request's outcome is unknown (issue #939), untagged even on a tagged
+	// connection, or an `E` that does carry a tag — is not a
 	// node refusing the command, so it must neither read as "server too
 	// old" nor as an ErrProtocol a redial would resend: it is a connection
 	// lost after the frame was written, which idempotent requests replay as
