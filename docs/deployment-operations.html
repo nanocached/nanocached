@@ -140,13 +140,17 @@ on any other connection gets no room. That connection is closed after
 10&nbsp;seconds, and the client sees a dropped connection rather than a
 miss. At the 1&nbsp;MiB minimum, a single partial request (or 16
 connections sending about 64&nbsp;KiB each) does this. At the 256&nbsp;MiB
-default it takes about 130 connections and 130&nbsp;MiB of partial
-uploads, which one source address can still open under the default
-<code>--max-connections-per-ip</code> of 256. To keep one source from
-holding the whole budget, set <code>--max-in-flight-bytes</code> above
-2&nbsp;MiB &times; <code>--max-connections-per-ip</code> (512&nbsp;MiB at
-the default cap), or lower the per-IP cap. Size the process for that
-budget, since it is memory the node may really use. Treat the minimum as a
+default it takes about 130 such connections, which one source address can
+open under the default <code>--max-connections-per-ip</code> of 256. The
+charges must add up to the whole budget: while some room is left, a reply
+is still sent, charged what room there is. One source address can pin
+about 2&nbsp;MiB &times; <code>--max-connections-per-ip</code> (about
+500&nbsp;MiB at the default cap), and what the budget has beyond that is
+all the other clients share. So size <code>--max-in-flight-bytes</code>
+for that remainder, or lower the per-IP cap. Several sources together are
+bounded only by <code>--max-connections</code> (about 2&nbsp;GiB at the
+default 1,024). Size the process for the budget, since it is memory the
+node may really use. Treat the minimum as a
 setting for tests and tiny nodes, not for a node reachable by untrusted
 clients. With an auth secret set, only clients holding it can do this: a
 connection that has not authenticated may send at most 4096 bytes.</p>

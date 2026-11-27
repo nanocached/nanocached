@@ -206,9 +206,10 @@ and clustered production use identical code. See
     <code>o</code>) before its key lists are built, until its reply is
     written; a connection that cannot get its share in time is
     closed. Unfinished uploads can pin the whole budget (about 2&nbsp;MiB
-    per connection part-way through a 1&nbsp;MiB request), so keep it
-    above 2&nbsp;MiB &times; <code>--max-connections-per-ip</code> on a
-    node untrusted clients can reach (see
+    per connection part-way through a 1&nbsp;MiB request, so one source
+    can pin about 2&nbsp;MiB &times; <code>--max-connections-per-ip</code>);
+    on a node untrusted clients can reach, size it so what is left beyond
+    that covers the other clients, or lower the per-IP cap (see
     <a href="deployment-operations.html#memory-budget">Sizing a node
     process</a>)</td><td>—</td></tr>
     <tr><td>Idle connection timeout</td><td>60 s</td><td>60 s</td></tr>

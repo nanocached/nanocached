@@ -954,13 +954,16 @@ here.</p>
   value-carrying reply on any other connection waits and is closed after
   10&nbsp;s. At the 1&nbsp;MiB minimum one partial request is enough, and
   at the 256&nbsp;MiB default about 130 connections from one source
-  address. Keeping part of the budget back for replies would change how
+  address; one source can pin about 2&nbsp;MiB &times;
+  <code>--max-connections-per-ip</code>, several together up to about
+  2&nbsp;MiB &times; <code>--max-connections</code>. Keeping part of the budget back for replies would change how
   receive buffers, multi-key frames and the overdraft slot wait for each
   other, an arrangement that earlier fixes tuned to avoid connections
   waiting on each other for good. So the budget stays shared, and sizing
-  is the remedy: above 2&nbsp;MiB &times;
-  <code>--max-connections-per-ip</code> for a node untrusted clients can
-  reach, with an auth secret limiting it to clients that hold the secret
+  is the remedy: a budget whose remainder beyond what one source can pin
+  covers the other clients, or a lower per-IP cap, for a node untrusted
+  clients can reach, with an auth secret limiting it to clients that hold
+  the secret
   (see <a href="deployment-operations.html#memory-budget">Sizing a node
   process</a>).</li>
   <li>Replica-leg writes, read-repair writes and node-list refreshes fail
