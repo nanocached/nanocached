@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Node: a repeated handoff delete of the same key (a forwarded `d`/`D`
+  relayed as `u` during a join or decommission window) queued a fresh copy
+  of the key on every repeat while the tombstone kept the first one, so
+  each repeat held an uncharged copy until it expired two minutes later; a
+  joiner sent 1,000 deletes of one 512 KiB key grew from 3 MB to 504 MB of
+  RSS. A repeat now queues the key the tombstone already holds and only
+  refreshes its stamp (#2043).
+
 - All binaries (`nanocached-node`, `nanocached-proxy`,
   `nanocached-discovery`, `ncd`, `verify-staged-join`): a command-line
   argument that is not valid UTF-8, such as a `--tls-cert` path with a stray

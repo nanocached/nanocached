@@ -1197,21 +1197,30 @@ impl Cache {
     /// Records `key` as handoff-deleted at `now` — see `handoff_delete`.
     fn tombstone(&mut self, key: &Key, now: Instant) {
         self.prune_tombstones(now);
-        if self.handoff_tombstones.len() >= MAX_HANDOFF_TOMBSTONES {
-            self.forget_oldest_tombstone();
-        }
-        // The key is sliced out of the connection's receive buffer; kept
-        // as is, a tombstone would pin that whole (pipelined) chunk for
-        // its two-minute life — the same reason `insert_into` and
-        // `ensure_namespace` copy theirs. One copy, shared by both
-        // containers.
-        let key = Key::new(
-            Bytes::copy_from_slice(&key.namespace),
-            Bytes::copy_from_slice(&key.name),
-        );
-        if self.handoff_tombstones.insert(key.clone(), now).is_none() {
+        let key = if let Some((stored, _)) = self.handoff_tombstones.get_key_value(key) {
+            // A re-delete refreshes the stamp and queues the key the map
+            // already holds: a copy of its own would sit in the order queue
+            // uncharged until it surfaced, one per repeat (issue #2043).
+            let stored = stored.clone();
+            self.handoff_tombstones.insert(stored.clone(), now);
+            stored
+        } else {
+            if self.handoff_tombstones.len() >= MAX_HANDOFF_TOMBSTONES {
+                self.forget_oldest_tombstone();
+            }
+            // The key is sliced out of the connection's receive buffer;
+            // kept as is, a tombstone would pin that whole (pipelined)
+            // chunk for its two-minute life — the same reason
+            // `insert_into` and `ensure_namespace` copy theirs. One copy,
+            // shared by both containers.
+            let key = Key::new(
+                Bytes::copy_from_slice(&key.namespace),
+                Bytes::copy_from_slice(&key.name),
+            );
             self.used_bytes += tombstone_bytes(&key);
-        }
+            self.handoff_tombstones.insert(key.clone(), now);
+            key
+        };
         self.tombstone_order.push_back((now, key));
         // Re-deletes leave stale items behind the live ones; compact once
         // they are the majority so the order queue stays bounded too.
@@ -5132,6 +5141,46 @@ mod tests {
         // Expired: the sweep prunes it and gives the charge back, with no
         // handoff delete needed to trigger that.
         cache.sweep_at(deleted_at + HANDOFF_TOMBSTONE_TTL, true, None);
+        assert!(cache.handoff_tombstones.is_empty());
+        assert!(cache.tombstone_order.is_empty());
+        assert_eq!(cache.used_bytes, 0);
+    }
+
+    #[test]
+    fn a_re_delete_queues_the_tombstones_own_key_rather_than_a_fresh_copy() {
+        // Issue #2043: every handoff delete copied the key, and on a repeat
+        // the map kept its first copy, so the new one lived only in the
+        // order queue, uncharged: 1,000 re-deletes of a 512 KiB key held
+        // 1,000 such copies (500 MiB) against a 512 KiB charge.
+        let mut cache = Cache::new(UNBOUNDED);
+        let k = key(&vec![b'k'; 512 * 1024]);
+        let t0 = Instant::now();
+        for i in 0..1_000_u64 {
+            cache.handoff_delete_at(&k, t0 + Duration::from_millis(i));
+        }
+        assert_eq!(cache.handoff_tombstones.len(), 1);
+        assert_eq!(cache.used_bytes, tombstone_bytes(&k));
+        let (stored, stamp) = cache
+            .handoff_tombstones
+            .get_key_value(&k)
+            .expect("one tombstone");
+        assert_eq!(*stamp, t0 + Duration::from_millis(999), "the latest stamp");
+        assert_eq!(cache.tombstone_order.len(), 1_000);
+        let copies = cache
+            .tombstone_order
+            .iter()
+            .filter(|(_, queued)| queued.name.as_ptr() != stored.name.as_ptr())
+            .count();
+        assert_eq!(copies, 0, "order items holding a key copy of their own");
+        // The stale items are skipped as they surface; the live one expires
+        // with its own stamp and gives the charge back.
+        cache.sweep_at(t0 + HANDOFF_TOMBSTONE_TTL, true, None);
+        assert_eq!(cache.handoff_tombstones.len(), 1);
+        cache.sweep_at(
+            t0 + Duration::from_millis(999) + HANDOFF_TOMBSTONE_TTL,
+            true,
+            None,
+        );
         assert!(cache.handoff_tombstones.is_empty());
         assert!(cache.tombstone_order.is_empty());
         assert_eq!(cache.used_bytes, 0);
