@@ -103,6 +103,13 @@ the adapter's own, not the thread's context loader — which cannot see
 application classes in a child loader (a web application, a devtools
 restart); pass the application's loader there.
 
+`CacheManager.getProperties()` returns the properties the manager was
+created with (a copy, defaults included), except `nanocached.secret`:
+the secret is used once, to connect, and is not handed to whatever else
+holds the manager — framework diagnostics or a library logging its
+configuration would otherwise print the credential every cluster client
+authenticates with.
+
 Each `CacheManager` **owns** its `NanocachedClient` — created on
 `getCacheManager` and closed together with the manager (or the whole
 provider) — unlike `nanocached-spring`, where the application supplies
@@ -215,6 +222,12 @@ on one key were enough to exhaust it.)
 `javax.cache:type=CacheStatistics,CacheManager=...,Cache=...` on the
 platform MBean server. Timings and evictions are not tracked — the wire
 protocol doesn't report server-side LRU evictions to the client.
+
+Operations are counted only while statistics are enabled, as in the
+specification's reference implementation: what a cache did while they
+were off never shows up after `enableStatistics(name, true)`, and
+disabling them keeps the counts gathered so far (the MBean's `clear()`
+resets them).
 
 Hits, misses, puts and removals follow the table in the JSR-107
 specification ("Statistics Effects of Cache Operations"), where a cell

@@ -516,17 +516,21 @@ answered. Sent together, a replica would expire its copy while the primary
 leg was still failing (unreachable, or <code>W</code> from a stale ring),
 and the retry over the refreshed ring would then ask that replica, now the
 primary, for a key it no longer holds. When the primary may have applied
-the touch but its answer was lost, the frame is not sent again and the
-client is answered <code>E</code>; <code>nanocached-proxy</code> still
-sends the other owners their plain <code>t</code> before the
-<code>E</code>, so a replica does not keep a value the client asked to
-expire and serve it to a later read. When the retry never reached the
-primary either, nothing was expired: the answer is <code>R</code> (to a
-client that asked for it) or a <code>W</code> entry, and no other owner is
-touched, so the resend it invites still finds the value. The exception is a
-<code>y</code> answered <code>E</code> as a whole, which promises no safe
-resend: its keys whose primary leg never left have their other owners
-expired too. Those deferred legs run outside the
+the touch but its answer was lost, the frame is not sent again: an SDK
+raises its connection-lost error and <code>nanocached-proxy</code> answers
+<code>E</code>. Both still send the other owners their plain <code>t</code>
+first, so a replica does not keep a value the client asked to expire and
+serve it to a later read. When the retry never reached the primary either,
+nothing was expired: an SDK raises its connection error (marked not sent
+where the SDK's errors carry that), and
+<code>nanocached-proxy</code> answers <code>R</code> (to a client that
+asked for it) or a <code>W</code> entry. No other owner is touched, so the
+resend it invites still finds the value. The exception is a
+<code>y</code> that <code>nanocached-proxy</code> answers <code>E</code>
+as a whole, which promises no safe resend: its keys whose primary leg
+never left have their other owners expired too. An SDK decides each key
+of a batch on its own: only the keys whose primary leg was sent and lost
+have their other owners expired. Those deferred legs run outside the
 request order a pipelined connection otherwise keeps. A node that
 owns no copy of the key answers <code>W</code>. An owner that answers
 <code>N</code> has no live copy; the touch does not create one and
@@ -787,9 +791,13 @@ waiting, and whatever was sent behind it is never answered.
 <code>nanocached-proxy</code> reads it that way on its connections to the
 nodes, which is what lets it answer a refused expiring touch, <code>i</code>,
 <code>k</code> or <code>x</code> with <code>R</code> (to a client that asked
-for it) instead of the fatal <code>E</code> of an unknown outcome. To its own
-clients the proxy tags its errors, <code>E &lt;tag&gt;\n</code>, as the table
-below shows.</p>
+for it) instead of the fatal <code>E</code> of an unknown outcome. The
+proxy&rsquo;s own <code>E</code> to its clients has the same shape: always the
+bare <code>E\n</code>, untagged, even on a tagged connection, and the proxy
+then closes the connection. It answers a connection&rsquo;s requests in the
+order they were sent, so the <code>E</code> is the answer to the oldest request
+still waiting, and nothing sent behind it is answered. A request the proxy
+could not parse has no tag it could echo.</p>
 
 <p>Every request ends its header with a tag and every reply echoes it:</p>
 <pre class="session"><code>&gt; A 1 T\n\0
@@ -867,8 +875,9 @@ window is the same one the pre-tags protocol always had.</p>
     empty key), or it was over the request-size limit. Usually followed
     by the server closing the connection. <code>nanocached-proxy</code>
     answers a failed <code>A</code> <code>En\n</code> like a node and every
-    other such error with a bare <code>E\n</code> (<code>E &lt;tag&gt;\n</code>
-    in tagged mode).</td></tr>
+    other such error, and a request whose outcome it cannot know, with a bare
+    <code>E\n</code>, untagged in tagged mode too (see
+    <a href="#tags">tags</a>).</td></tr>
   </tbody>
 </table>
 </div>

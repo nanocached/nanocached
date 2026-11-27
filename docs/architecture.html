@@ -884,6 +884,26 @@ here.</p>
   it. Closing the gap would need a version on every write, a wire change;
   the read itself returning the value being deleted is the same race as a
   read just before the delete.</li>
+  <li>Discovery can be restarted with its clock set back to before the
+  previous process&rsquo;s first join, for example by an NTP step or a VM
+  restored from a snapshot. If a member still holds a handoff for the same
+  joiner that it finished but never saw confirmed, it refuses the first
+  join after the restart. That happens when the old discovery stopped
+  between the member&rsquo;s completion report and the roster that names
+  the joiner, or when its cancel never reached the member. The join waits
+  out its migration timeout (60&nbsp;s or more) and is abandoned. The
+  abandon&rsquo;s cancel clears the old handoff and restores its copies,
+  and the next join of that name goes through. The cost is about a minute
+  of join delay, and no data is lost.
+  Discovery keeps no state across restarts, so it numbers joins from the
+  wall clock, and after the step the new join gets a lower number than
+  the handoff the member holds. The member refuses a same-name handoff
+  with a lower number because a stale resend from a join that discovery
+  has already replaced looks exactly the same. Letting that resend replace
+  a finished newer handoff would restore copies the member already handed
+  over, under a joiner that may already be listed. Telling the two apart
+  would need discovery to keep state across restarts or a wire change.
+  Accepted 2026-11-27 (found by reading the code, not reproduced).</li>
 </ul>
 <p><strong>Data model and operations</strong></p>
 <ul>
@@ -947,6 +967,25 @@ here.</p>
   (allocator share included), so resident memory tracks the bound for
   tiny entries and namespaces; transient allocations (snapshots, in-flight
   requests, forward queues) are outside it. Leave headroom for those.</li>
+  <li>Unfinished uploads can pin the whole in-flight byte budget. A
+  receive buffer stays charged until its frame has arrived (up to the
+  60&nbsp;s frame deadline), and a connection part-way through a request
+  close to 1&nbsp;MiB pins about 2&nbsp;MiB. While the budget is pinned, a
+  value-carrying reply on any other connection waits and is closed after
+  10&nbsp;s. At the 1&nbsp;MiB minimum one partial request is enough, and
+  at the 256&nbsp;MiB default about 130 connections from one source
+  address; one source can pin about 2&nbsp;MiB &times;
+  <code>--max-connections-per-ip</code>, several together up to about
+  2&nbsp;MiB &times; <code>--max-connections</code>. Keeping part of the budget back for replies would change how
+  receive buffers, multi-key frames and the overdraft slot wait for each
+  other, an arrangement that earlier fixes tuned to avoid connections
+  waiting on each other for good. So the budget stays shared, and sizing
+  is the remedy: a budget whose remainder beyond what one source can pin
+  covers the other clients, or a lower per-IP cap, for a node untrusted
+  clients can reach, with an auth secret limiting it to clients that hold
+  the secret
+  (see <a href="deployment-operations.html#memory-budget">Sizing a node
+  process</a>).</li>
   <li>Replica-leg writes, read-repair writes and node-list refreshes fail
   silently, so that a dead replica never fails a write; the per-client
   counters (<code>stats()</code>) are the signal.</li>

@@ -1373,8 +1373,9 @@ func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error
 // sendToOtherOwnersAfterLostPrimary runs op (a delete, or the plain touch
 // of an expiring touch, issue #2057) against the other owners of a
 // primary-first write whose primary leg still failed with a lost connection
-// after the refresh and retry (a dead primary discovery still lists, or,
-// for an expiring touch, a reply lost after the send) before the caller
+// after the refresh and retry (for a delete, also a dead primary discovery
+// still lists; for an expiring touch, only a reply lost after the send, see
+// expireOtherOwnersAfterLostPrimary) before the caller
 // gets the error. Without it no owner would receive the delete: a read falls back
 // to a replica on the dead primary and finds the value, and once discovery
 // drops the primary that replica is promoted with it. A delete is safe to
@@ -2999,8 +3000,9 @@ func (c *Client) readFromOwner(slot string, op func(*connection) ([]byte, bool, 
 //     a replica's miss is merely provisional (it may simply lack the
 //     copy) and does not finalize the read on its own;
 //   - a connection-level failure (or any error other than ErrWrongNode)
-//     hedges onward immediately (no wait for the interval) and is
-//     remembered as the last error;
+//     hedges onward immediately (no wait for the interval, even while
+//     other legs are still in flight) and is remembered as the last
+//     error;
 //   - ErrWrongNode propagates exactly as read()'s sequential path does.
 //
 // If every owner answers with a miss or fails, but at least one
@@ -3164,6 +3166,10 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 					return nil, false, res.err
 				}
 				lastError = res.err
+				// A failed leg is replaced by the next owner, if any,
+				// right away, even while other legs (a silent primary)
+				// are still in flight.
+				tryStartNext()
 			case res.ok || names[res.index] == primaryName:
 				finishHedge(pending, nextIndex)
 				return res.value, res.ok, nil

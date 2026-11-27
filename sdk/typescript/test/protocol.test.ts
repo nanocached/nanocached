@@ -658,6 +658,16 @@ describe("tryParseResponse", () => {
     }
   });
 
+  it("throws when the byte after a V/I/M/O/Y marker isn't a space", () => {
+    // The space after the marker is mandatory: `VX5\n` is not `V 5\n`.
+    for (const wire of ["VX5\nhello", "V5\nhello", "IX1\n7", "MX1 -\n", "OX1 S\n", "YX1 S\n"]) {
+      assert.throws(() => tryParseResponse(Buffer.from(wire)), /malformed response header/, wire);
+    }
+    for (const wire of ["VX5 7\nhello", "MX1 - 7\n"]) {
+      assert.throws(() => tryParseResponse(Buffer.from(wire), true), /malformed response header/, wire);
+    }
+  });
+
   it("parses a value response", () => {
     const parsed = tryParseResponse(Buffer.from("V 5\nhello"));
     assert.equal(parsed?.consumed, 9);

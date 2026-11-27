@@ -1620,6 +1620,12 @@ impl DrainState {
     fn evicted(&self) -> bool {
         self.0.load(Ordering::SeqCst) == Self::EVICTED
     }
+
+    /// Issue #2088: the drain has begun (evicted or not), so the node
+    /// takes on no new join handoff.
+    fn begun(&self) -> bool {
+        self.0.load(Ordering::SeqCst) != 0
+    }
 }
 
 /// Issue #124: a decommission in progress. The mirror of
@@ -2039,7 +2045,11 @@ pub(crate) async fn run_with_hooks(
     let metrics_task = match &metrics_address {
         Some(metrics_address) => {
             let metrics_listener = TcpListener::bind(metrics_address.as_str()).await?;
-            println!("INFO metrics endpoint listening on {metrics_address}");
+            // The bound address, so `--metrics-port 0` logs the port taken.
+            println!(
+                "INFO metrics endpoint listening on {}",
+                metrics_listener.local_addr()?
+            );
             // Issue #327: a dedicated, small cap on the metrics port's own
             // accepted connections — independent of, and much smaller
             // than, `connection_limit`/`limits.max_connections` above,
@@ -3451,11 +3461,20 @@ async fn handle_connection(
                 // new join handoff — its own drain-out is moving the
                 // very entries a join would want it to send. Rejecting
                 // lets discovery's retry land once this node has left.
-                if node_context
-                    .leaving
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .is_some()
+                //
+                // Issue #2088: from the moment the drain begins, not only
+                // once `leaving` is set. `run_decommission` aborts the
+                // active migration first and fetches the roster next, and
+                // sets `leaving` only after both, which can take seconds
+                // (longer for an evicted node, whose fetch keeps retrying).
+                // An `M` accepted in between started a transfer that
+                // nothing aborted, running alongside the drain.
+                if node_context.drain.begun()
+                    || node_context
+                        .leaving
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_some()
                 {
                     write_response(&mut stream, &Response::MigrationRejected.encode()).await?;
                     continue;
@@ -3511,6 +3530,21 @@ async fn handle_connection(
                         // the lot: one per key kept discovery waiting
                         // past its ack timeout on a large restore.
                         unmark_migrated_many(&node_context.request_tx, restore).await;
+                        // Issue #2088: the drain may have begun since the
+                        // check above, after its first step looked for a
+                        // migration to abort and found none. Looked at
+                        // again with the slot held: either this sees the
+                        // drain, or the drain's look at the slot comes
+                        // after it and finds this migration. Dropping the
+                        // guard clears the slot. The restored copies stay
+                        // restored: their join was abandoned either way,
+                        // and the drain hands them on.
+                        if node_context.drain.begun() {
+                            drop(guard);
+                            write_response(&mut stream, &Response::MigrationRejected.encode())
+                                .await?;
+                            continue;
+                        }
                         guard
                     }
                     // A discovery retry of `M` for the handoff already
@@ -4121,7 +4155,24 @@ async fn handle_connection(
                 // unconditional overwrite: if the joiner already holds a
                 // value it keeps it, and if it holds nothing it finally
                 // gets this key instead of missing it permanently.
+                //
+                // Issue #2087: but only a put-if-absent handoff this node
+                // stored. One it refused (`StoredUnchanged`) carries a value
+                // older than what is here: this node holds a live copy, or a
+                // tombstone of a delete made after the sender read the key.
+                // Relayed anyway, it reached a joiner that held nothing yet,
+                // which stored it and then refused this node's own transfer
+                // of the newer value (sent put-if-absent too), or got back a
+                // key deleted here. Not relaying leaves the joiner this
+                // node's state: the live copy comes with the transfer, or
+                // came with it or with the write's own relay if the snapshot
+                // was past the key (a copy here that the join's old ring does
+                // not make this node's to send is the old owners' to send),
+                // and a deleted key stays deleted. A dead copy awaiting the sweep
+                // does not refuse the handoff (`handoff_set_if_absent_at`),
+                // so that case is stored and relayed as before.
                 if let Some(node_context) = &config.node_context
+                    && (!if_absent || matches!(response, Response::Stored))
                     && let Some(target) = unconfirmed_join_target_for(node_context, &key)
                 {
                     let forward = if if_absent {
@@ -7230,7 +7281,11 @@ impl MigrationGuard {
             // restore its handed-off copies and revert `known_ring` under a
             // joiner discovery may already list as a member. Rejected and
             // left alone. A remnant is no handoff any more and is replaced
-            // as before.
+            // as before. Issue #2125: a restarted discovery whose clock
+            // went back can send a genuinely new join's `M` at a lower
+            // generation too. Nothing here tells it from the stale send, so
+            // that join is refused until its abandon's `X` clears this slot
+            // (accepted, see `next_join_generation`).
             let older_generation = match (existing.generation, generation) {
                 (Some(existing_generation), Some(generation)) => generation < existing_generation,
                 _ => false,
@@ -7254,7 +7309,7 @@ impl MigrationGuard {
                 // `run_migration`'s own unwind can safely drop it
                 // mid-transfer): ask it to stop and reject this `M`.
                 // Discovery resends a refused `M` after a pause until the
-                // slot clears (`MIGRATE_REJECTED_RETRY_WINDOW` in
+                // slot clears (`MIGRATE_SEND_WINDOW` in
                 // `src/bin/nanocached-discovery.rs`); its `X` path also
                 // waits here for the unwind before acking — see
                 // `wait_for_migration_slot_to_clear`. Neither is ordered
@@ -8337,8 +8392,8 @@ async fn run_decommission(
     // (then aborts) it on override rather than discarding it.
     let mut shutdown_rx = node_context.shutdown_rx.clone();
 
-    // 1. No new joins (the flag isn't set yet, so flip abort first) and
-    // wind down the active one.
+    // 1. No new joins (the `M` arm refuses them from `DrainState::begin`
+    // on, before this task was spawned) and wind down the active one.
     if let Some(active) = node_context
         .active_migration
         .lock()
@@ -10169,7 +10224,7 @@ fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> AbandonO
 /// slot. `MigrationGuard::new`'s generation check (see its own doc
 /// comment) correctly tells this apart from a same-generation retry and
 /// rejects it. Discovery resends a refused `M` every second for up to
-/// `MIGRATE_REJECTED_RETRY_WINDOW` (45 s, in
+/// `MIGRATE_SEND_WINDOW` (45 s, in
 /// `src/bin/nanocached-discovery.rs`), which outlasts the worst-case time
 /// `run_migration` can still be blocked inside one stuck send — up to
 /// `KEY_TRANSFER_ATTEMPTS` (3) × `OUTBOUND_IO_TIMEOUT` (10s) — before it
@@ -24431,6 +24486,129 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_put_if_absent_handoff_refused_here_does_not_reach_the_joiner_ahead_of_the_transfer()
+    {
+        // Issue #2087: S holds k = v2 and its handoff to joiner J is in
+        // flight, past its key snapshot but before the send. A
+        // re-replication's `U … A k v1` reaches S, which refuses it (it
+        // holds v2), but the relay sent it on to J regardless; J, holding
+        // nothing, stored v1 and then refused S's own transfer of v2, which
+        // is put-if-absent too. J must end with S's value.
+        let s_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let j_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let s_addr = s_listener.local_addr().unwrap().to_string();
+        let j_addr = j_listener.local_addr().unwrap().to_string();
+
+        let (s_tx, s_rx) = mpsc::channel(64);
+        let (j_tx, j_rx) = mpsc::channel(64);
+        let s_cache = tokio::spawn(run_cache(s_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let j_cache = tokio::spawn(run_cache(j_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        send_command(
+            &s_tx,
+            Command::Set {
+                key: key(b"key-a"),
+                value: Bytes::from_static(b"v2"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        // A fake discovery for the transfer's `C` report.
+        let discovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = discovery_listener.local_addr().unwrap().to_string();
+        let discovery_task = tokio::spawn(async move {
+            let (mut connection, _) = discovery_listener.accept().await.unwrap();
+            let mut buffer = [0u8; 256];
+            let _ = connection.read(&mut buffer).await.unwrap();
+            connection.write_all(b"A\n").await.unwrap();
+        });
+
+        let mut s_ctx = two_node_context("s", s_tx.clone());
+        s_ctx.discovery_addr = discovery_addr;
+        let j_ctx = two_node_context("j", j_tx.clone());
+
+        // R=2 over {s, j}: both own every key, before and after the join.
+        let joined = vec![("s".to_string(), s_addr.clone())];
+        let (before_ring, after_ring) = migration_rings(&s_ctx, "j", &joined);
+        let after_ring = Arc::new(after_ring);
+        let migration_guard = MigrationGuard::new(
+            Arc::clone(&s_ctx.active_migration),
+            "j".to_string(),
+            j_addr.clone(),
+            "tk-j".to_string(),
+            Arc::clone(&after_ring),
+            2,
+            None,
+            &joined,
+            &s_ctx.known_ring,
+            &s_ctx.ring_history,
+        )
+        .unwrap_new();
+        let keys = list_keys(&s_tx).await;
+
+        let s_tasks = serve_test_node(s_listener, s_ctx.clone(), s_tx.clone()).await;
+        let j_tasks = serve_test_node(j_listener, j_ctx, j_tx.clone()).await;
+
+        // The transfer peeks v2 and stops before sending it.
+        s_ctx.gates.transfer.hold();
+        let transfer = tokio::spawn(run_migration(
+            s_ctx.clone(),
+            "j".to_string(),
+            j_addr.clone(),
+            "tk-j".to_string(),
+            None,
+            2,
+            before_ring,
+            after_ring,
+            migration_guard,
+            keys,
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut client = TcpStream::connect(&s_addr).await.unwrap();
+        client.write_all(b"U 0 5 2 4 A\ntk-skey-av1").await.unwrap();
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .expect("a reply within 5 s")
+            .unwrap();
+        assert_eq!(
+            &reply, b"S\n",
+            "a refused put-if-absent handoff is still acked"
+        );
+        // Let a relay, if any, land on J.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        s_ctx.gates.transfer.release();
+        timeout(Duration::from_secs(10), transfer)
+            .await
+            .expect("the transfer finishes")
+            .unwrap();
+
+        match send_command(&j_tx, Command::PeekEntry { key: key(b"key-a") }).await {
+            Response::Entries(entries) => {
+                assert_eq!(entries.len(), 1, "the joiner holds the key");
+                assert_eq!(
+                    &entries[0].1[..],
+                    b"v2",
+                    "the joiner must end with this node's value, not the refused v1"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        drop(client);
+        for task in s_tasks.into_iter().chain(j_tasks) {
+            task.abort();
+        }
+        discovery_task.abort();
+        drop(s_tx);
+        drop(j_tx);
+        s_cache.abort();
+        j_cache.abort();
+    }
+
     /// A node of a two-node test cluster: accepts on `listener`, serves
     /// every connection with `node_context`, runs the forward tasks it
     /// spawns. The tasks stop when dropped.
@@ -30303,6 +30481,89 @@ mod tests {
                 .load(Ordering::SeqCst),
             "a benign retry must not abort the handoff"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn migrate_command_is_refused_once_the_drain_has_begun_before_leaving_is_set() {
+        // Issue #2088: the drain begins on the shutdown signal, and
+        // `leaving` is set only after the migration wait and the roster
+        // fetch. An `M` in between was accepted and its transfer ran
+        // alongside the drain, never aborted.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: key(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        let mut node_context = two_node_context("ready-node", request_tx.clone());
+        node_context.token = "tk-ready-node".to_string();
+        node_context.drain.begin();
+        assert!(node_context.leaving.lock().unwrap().is_none());
+        let active_migration = Arc::clone(&node_context.active_migration);
+
+        let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(1);
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        let joining_name = "joiner-107";
+        let joining_addr = "127.0.0.1:1";
+        let joining_token = "tok-joiner-107";
+        let token = "tk-ready-node";
+        let mut migrate_message = format!(
+            "M {} {} {} 0 1 {}\n",
+            joining_name.len(),
+            joining_addr.len(),
+            joining_token.len(),
+            token.len()
+        )
+        .into_bytes();
+        migrate_message.extend_from_slice(token.as_bytes());
+        migrate_message.extend_from_slice(joining_name.as_bytes());
+        migrate_message.extend_from_slice(joining_addr.as_bytes());
+        migrate_message.extend_from_slice(joining_token.as_bytes());
+        client.write_all(&migrate_message).await.unwrap();
+
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .expect("a reply within 5 s")
+            .unwrap();
+        assert_eq!(&reply, b"R\n", "a draining node refuses a new join handoff");
+        assert!(
+            migration_rx.try_recv().is_err(),
+            "no transfer may be started"
+        );
+        assert!(
+            active_migration.lock().unwrap().is_none(),
+            "the migration slot stays free"
+        );
+
+        drop(client);
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -65,6 +65,15 @@ export interface MockNode {
    * last read — this is a running high-water mark, not reset by
    * reading it). */
   maxConcurrentDeletes(): number;
+  /** Makes every later `d` request for one of `keys` answer "W" (wrong
+   * node) without deleting anything — a failing leg of an `mdel`. The
+   * "W" is written in the same order as every other `d` reply (after
+   * `delayDeletes`'s delay too), since this mock's replies are untagged
+   * and the client matches them to requests by order. */
+  failDeletesFor(keys: Iterable<string>): void;
+  /** How many `d` requests this server has received, failing ones
+   * included. */
+  deleteRequests(): number;
   close(): Promise<void>;
 }
 
@@ -106,6 +115,8 @@ export async function startMockNode(): Promise<MockNode> {
   let deleteDelayMs = 0;
   let activeDeletes = 0;
   let peakConcurrentDeletes = 0;
+  const failingDeletes = new Set<string>();
+  let deleteRequests = 0;
   // Issue #439: connection-drop simulation for `m`/`o`, independent of
   // the wrongNodeCounts (stale-routing) simulation above.
   const multiGetDrop = { ok: 0, drop: 0 };
@@ -217,10 +228,12 @@ export async function startMockNode(): Promise<MockNode> {
             // an unbounded client-side `Promise.all` never shows up here
             // as more than `MAX_BATCH_KEYS` requests in flight at once.
             activeDeletes++;
+            deleteRequests++;
             if (activeDeletes > peakConcurrentDeletes) peakConcurrentDeletes = activeDeletes;
             const respond = () => {
               activeDeletes--;
-              socket.write(storeFor(namespace).delete(key) ? "D\n" : "N\n");
+              if (failingDeletes.has(key)) socket.write("W\n");
+              else socket.write(storeFor(namespace).delete(key) ? "D\n" : "N\n");
             };
             if (deleteDelayMs > 0) setTimeout(respond, deleteDelayMs);
             else respond();
@@ -378,6 +391,10 @@ export async function startMockNode(): Promise<MockNode> {
       deleteDelayMs = ms;
     },
     maxConcurrentDeletes: () => peakConcurrentDeletes,
+    failDeletesFor: (keys) => {
+      for (const key of keys) failingDeletes.add(key);
+    },
+    deleteRequests: () => deleteRequests,
     close: () =>
       new Promise<void>((resolve, reject) => {
         for (const socket of sockets) socket.destroy();

@@ -20,8 +20,9 @@ type primaryFirstCluster struct {
 	primary   *mockNode
 	replica   *mockNode
 	// replicaName is the roster entry of the replica, for shrinking the
-	// roster to it.
+	// roster to it; primaryName the primary's.
 	replicaName string
+	primaryName string
 }
 
 func startPrimaryFirstCluster(t *testing.T, key string) *primaryFirstCluster {
@@ -32,6 +33,7 @@ func startPrimaryFirstCluster(t *testing.T, key string) *primaryFirstCluster {
 	return &primaryFirstCluster{
 		nodes: nodes, discovery: discovery, client: client,
 		primary: nodes[owners[0]], replica: nodes[owners[1]], replicaName: owners[1],
+		primaryName: owners[0],
 	}
 }
 
@@ -43,6 +45,34 @@ func (pc *primaryFirstCluster) killPrimaryAndShrinkTheRosterToTheReplica(t *test
 	pc.primary.close()
 	time.Sleep(100 * time.Millisecond) // the client's read loop sees the FIN
 	pc.discovery.setNodes([]discoveredNode{{Name: pc.replicaName, Address: pc.replica.address()}})
+}
+
+// killPrimaryButKeepItListed makes the primary unreachable while discovery
+// still lists it, and waits for the client to see its connection to the
+// primary close: a request written to a socket the client still thinks is
+// open would count as sent (its reply lost), not as never sent.
+func (pc *primaryFirstCluster) killPrimaryButKeepItListed(t *testing.T) {
+	t.Helper()
+	pc.primary.close()
+	waitFor(t, func() bool { return pc.client.memberConnectionClosed(pc.primaryName) },
+		"the client to see its connection to the primary close")
+}
+
+// dropThePrimaryFromTheRoster tells discovery the dead primary is gone and
+// waits out the forced-refresh spacing, so the next failure's refresh
+// learns the new roster and promotes the replica.
+func (pc *primaryFirstCluster) dropThePrimaryFromTheRoster() {
+	pc.discovery.setNodes([]discoveredNode{{Name: pc.replicaName, Address: pc.replica.address()}})
+	time.Sleep(forcedRefreshMinInterval + 50*time.Millisecond)
+}
+
+// memberConnectionClosed reports whether the client's connection to the
+// cluster member name is closed (or absent).
+func (c *Client) memberConnectionClosed(name string) bool {
+	c.mu.Lock()
+	m := c.members[name]
+	c.mu.Unlock()
+	return m == nil || m.connection == nil || m.connection.isClosed()
 }
 
 type expiringSingleCall struct {
@@ -203,26 +233,41 @@ func TestExpiringTouchWhosePrimaryReplyWasLostStillExpiresTheReplica(t *testing.
 	}
 }
 
-// Issue #2057: the primary is dead but still in the roster, so the retry
-// fails too. The replica is sent the touch before the error is returned, and
-// a Get falling back to it misses.
-func TestExpiringTouchWhosePrimaryStaysUnreachableStillExpiresTheReplica(t *testing.T) {
+// The primary is dead but still in the roster, so the retry's dial is
+// refused too and the touch never left. No other owner is touched and the
+// error is the not-sent kind, so the resend it invites, once discovery has
+// dropped the primary, still finds the value on the replica.
+func TestExpiringTouchWhosePrimaryStaysUnreachableLeavesTheReplica(t *testing.T) {
 	for _, call := range expiringSingleCalls {
 		t.Run(call.name, func(t *testing.T) {
 			pc := startPrimaryFirstCluster(t, "k")
 			if err := pc.client.Set("k", "v", 0); err != nil {
 				t.Fatal(err)
 			}
-			pc.primary.close()
-			time.Sleep(100 * time.Millisecond) // the client's read loop sees the FIN
-			if _, _, err := call.do(pc.client, "k", 0); !errors.Is(err, ErrConnectionLost) {
-				t.Fatalf("%s err = %v, want ErrConnectionLost", call.name, err)
+			waitFor(t, func() bool { return pc.replica.hasKey("k") }, "the replica to store the value")
+			pc.killPrimaryButKeepItListed(t)
+			_, _, err := call.do(pc.client, "k", 0)
+			if !errors.Is(err, ErrConnectionLost) || !errors.Is(err, errRequestNotSent) {
+				t.Fatalf("%s err = %v, want ErrConnectionLost marked not sent", call.name, err)
 			}
-			if got := pc.replica.touchesSeen(); len(got) != 1 || got[0].get {
-				t.Fatalf("replica touches = %v, want exactly one plain t ... 0", got)
+			if got := pc.replica.touchesSeen(); len(got) != 0 {
+				t.Fatalf("replica touches = %v although the primary was never sent the touch, want none", got)
 			}
-			if value, ok, err := pc.client.Get("k"); err != nil || ok {
-				t.Fatalf("Get after the failed touch = %q, %v, %v, want a miss", value, ok, err)
+			if !pc.replica.hasKey("k") {
+				t.Fatal("the replica's copy was expired")
+			}
+
+			pc.dropThePrimaryFromTheRoster()
+			found, value, err := call.do(pc.client, "k", 0)
+			if err != nil || !found || (call.name == "GetAndTouch" && value != "v") {
+				t.Fatalf("%s resent after the primary left the roster = %v, %q, %v, want found with the value",
+					call.name, found, value, err)
+			}
+			if got := pc.replica.touchesSeen(); len(got) != 1 || got[0].get != (call.name == "GetAndTouch") {
+				t.Fatalf("replica touches = %v, want exactly the resent primary leg", got)
+			}
+			if pc.replica.hasKey("k") {
+				t.Fatal("the replica still holds the value after the resend")
 			}
 		})
 	}
@@ -239,8 +284,7 @@ func TestExpiringTouchAwaitsItsFallbackReplicaTouchWithFireAndForget(t *testing.
 		t.Fatal(err)
 	}
 	waitFor(t, func() bool { return replica.hasKey("k") }, "the replica to store the value")
-	primary.close()
-	time.Sleep(100 * time.Millisecond)
+	primary.applyThenCloseTouchTimes(1) // sent, and the reply lost
 	replica.touchDelay.Store(int64(200 * time.Millisecond))
 	if _, err := client.Touch("k", 0); !errors.Is(err, ErrConnectionLost) {
 		t.Fatalf("Touch err = %v, want ErrConnectionLost", err)
@@ -411,24 +455,90 @@ func TestExpiringBatchTouchWhosePrimaryReplyWasLostStillExpiresTheReplica(t *tes
 	}
 }
 
-// Issue #2057: the primary is dead but still in the roster; both passes fail
-// on it and the replica is still sent the keys before the error is returned.
-func TestExpiringBatchTouchWhosePrimaryStaysUnreachableStillExpiresTheReplica(t *testing.T) {
+// As for a single key: the keys whose primary stayed unreachable on both
+// passes never left, so the replica is sent nothing, the error is the
+// not-sent kind, and the resend after discovery dropped the primary still
+// finds every value.
+func TestExpiringBatchTouchWhosePrimaryStaysUnreachableLeavesTheReplica(t *testing.T) {
 	for _, call := range expiringBatchCalls {
 		t.Run(call.name, func(t *testing.T) {
 			pc, keys := startPrimaryFirstBatch(t, 2)
-			pc.primary.close()
-			time.Sleep(100 * time.Millisecond) // the client's read loop sees the FIN
-			if _, _, err := call.do(pc.client, keys, 0); !errors.Is(err, ErrConnectionLost) {
-				t.Fatalf("%s err = %v, want ErrConnectionLost", call.name, err)
+			waitFor(t, func() bool { return pc.replica.hasKey(keys[0]) && pc.replica.hasKey(keys[1]) },
+				"the replica to store the values")
+			pc.killPrimaryButKeepItListed(t)
+			_, _, err := call.do(pc.client, keys, 0)
+			if !errors.Is(err, ErrConnectionLost) || !errors.Is(err, errRequestNotSent) {
+				t.Fatalf("%s err = %v, want ErrConnectionLost marked not sent", call.name, err)
 			}
-			got := pc.replica.yFramesSeen()
-			if len(got) != 1 || len(got[0].keys) != 2 || got[0].get {
-				t.Fatalf("replica frames = %+v, want one plain y ... 0 holding both keys", got)
+			if got := pc.replica.yFramesSeen(); len(got) != 0 {
+				t.Fatalf("replica frames = %+v although the primary was never sent the batch, want none", got)
 			}
-			values, err := pc.client.GetMany(keys)
-			if err != nil || len(values) != 0 {
-				t.Fatalf("GetMany after the failed touch = %v, %v, want no hits", values, err)
+			for _, key := range keys {
+				if !pc.replica.hasKey(key) {
+					t.Fatalf("the replica's copy of %q was expired", key)
+				}
+			}
+
+			pc.dropThePrimaryFromTheRoster()
+			found, values, err := call.do(pc.client, keys, 0)
+			if err != nil || len(found) != len(keys) {
+				t.Fatalf("%s resent after the primary left the roster = %v, %v, want every key found", call.name, found, err)
+			}
+			for _, key := range keys {
+				if !found[key] {
+					t.Fatalf("%s: %s not found after the resend", call.name, key)
+				}
+				if call.name == "GetManyAndTouch" && values[key] != "v-"+key {
+					t.Fatalf("%s: value of %s = %q, want %q", call.name, key, values[key], "v-"+key)
+				}
+				if pc.replica.hasKey(key) {
+					t.Fatalf("the replica still holds %q after the resend", key)
+				}
+			}
+		})
+	}
+}
+
+// The rule is per key: in one batch, the keys whose primary was sent the
+// frame and lost the reply have their other owners expired, while the keys
+// whose primary never got it touch no other owner. The batch's error is the
+// sent-and-lost one (not marked never sent), since some keys may have been
+// expired.
+func TestExpiringBatchTouchExpiresOnlyTheReplicasOfTheKeysWhosePrimaryWasSent(t *testing.T) {
+	for _, call := range expiringBatchCalls {
+		t.Run(call.name, func(t *testing.T) {
+			nodes, discovery := startBatchTouchCluster(t, 2, [2]mockNodeOpts{})
+			client := connectCluster(t, discovery, Config{})
+			lostKeys := keysWithPrimary(testNames[0], 2, "lost")
+			neverSentKeys := keysWithPrimary(testNames[1], 2, "unsent")
+			lostPrimary, deadPrimary := nodes[testNames[0]], nodes[testNames[1]]
+			keys := append(append([]string{}, lostKeys...), neverSentKeys...)
+			if _, err := client.SetMany(valuesFor(keys), 0); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, func() bool { return lostPrimary.hasKey(neverSentKeys[0]) && lostPrimary.hasKey(neverSentKeys[1]) },
+				"the replica copies of the never-sent keys")
+			deadPrimary.close()
+			waitFor(t, func() bool { return client.memberConnectionClosed(testNames[1]) },
+				"the client to see its connection to the dead primary close")
+			lostPrimary.applyThenCloseTouchTimes(1)
+
+			_, _, err := call.do(client, keys, 0)
+			if !errors.Is(err, ErrConnectionLost) || errors.Is(err, errRequestNotSent) {
+				t.Fatalf("%s err = %v, want ErrConnectionLost not marked never sent", call.name, err)
+			}
+			for _, frame := range lostPrimary.yFramesSeen() {
+				for _, key := range frame.keys {
+					if key == neverSentKeys[0] || key == neverSentKeys[1] {
+						t.Fatalf("frames on the never-sent keys' replica = %+v, want none holding %v",
+							lostPrimary.yFramesSeen(), neverSentKeys)
+					}
+				}
+			}
+			for _, key := range neverSentKeys {
+				if !lostPrimary.hasKey(key) {
+					t.Fatalf("the replica copy of never-sent key %q was expired", key)
+				}
 			}
 		})
 	}
@@ -445,8 +555,7 @@ func TestExpiringBatchTouchAwaitsItsFallbackReplicaFrameWithFireAndForget(t *tes
 	}
 	waitFor(t, func() bool { return replica.hasKey(keys[0]) && replica.hasKey(keys[1]) },
 		"the replica to store the values")
-	primary.close()
-	time.Sleep(100 * time.Millisecond)
+	primary.applyThenCloseTouchTimes(1) // sent, and the reply lost
 	replica.touchDelay.Store(int64(200 * time.Millisecond))
 	if _, err := client.TouchMany(keys, 0); !errors.Is(err, ErrConnectionLost) {
 		t.Fatalf("TouchMany err = %v, want ErrConnectionLost", err)

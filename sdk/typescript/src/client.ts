@@ -171,6 +171,15 @@ function isSwallowable(error: unknown): boolean {
   return !PROGRAMMING_ERROR_CONSTRUCTORS.some((ctor) => error instanceof ctor);
 }
 
+/** Whether `error` proves its request never left this client (issue
+ * #225): a `ConnectionLostError` with `requestWasSent === false`, the
+ * classification every non-idempotent call (incr/decr, CAS, an expiring
+ * touch) relies on to decide that a resend is safe. Any other connection
+ * error may have been applied. */
+function wasNeverSent(error: unknown): boolean {
+  return error instanceof ConnectionLostError && error.requestWasSent === false;
+}
+
 /** `connectAndIdentify` for the paths that dial a member after the client
  * is up (a redial, a refresh's dial of a freshly listed node). An address
  * that does not complete the `A` handshake — it answers with something that
@@ -235,11 +244,11 @@ interface MultiTouchState {
   /** Which node answered each key in `results` as its primary (issue #934),
    * so the deferred ttl-0 replica fan-out skips exactly that node. */
   answeredBy: Map<number, string>;
-  /** The node whose primary leg last failed each key with a connection
-   * error (lost after the frame was written, or never sent), cleared once
-   * the key is answered or `W` (issue #2052): an expiring call that ends
-   * with the key still failed sends its other owners the touch anyway. */
-  failedOn: Map<number, string>;
+  /** The node each key in `lost` had its frame written to (issue #2052):
+   * the call sends those keys' other owners the touch before it throws,
+   * since that node may have expired them. A key whose primary leg never
+   * left is not here, and no other owner is touched for it (issue #2140). */
+  lostOn: Map<number, string>;
 }
 
 /** Snapshot of counters for failures this client swallows by design
@@ -1771,8 +1780,11 @@ export class NanocachedClient {
    * the send throws `ConnectionLostError`, as `incr` does. In a cluster it
    * goes to every owner, like a `set`, and the primary's answer is
    * returned; with `0` the other owners are sent it once the primary has
-   * answered, or, when the primary's connection failed for good, before
-   * that error is thrown. Throws `ServerTooOldError` against a node that
+   * answered, or, when the primary's reply was lost after the send, before
+   * that error is thrown. A primary still unreachable after the retry was
+   * never sent it, so no other owner is either, and the error has
+   * `requestWasSent: false`: a resend once discovery has dropped the
+   * primary still finds the key. Throws `ServerTooOldError` against a node that
    * predates the command. */
   async touch(key: string | Uint8Array, ttlSeconds: number | null): Promise<boolean> {
     return this.touchInNamespace(EMPTY_NAMESPACE, key, ttlSeconds);
@@ -1816,8 +1828,9 @@ export class NanocachedClient {
    * retried — except with `ttlSeconds === 0`, where a primary whose
    * connection fails after the frame was written is not resent (issue
    * #901) and the call throws that connection error, every other key
-   * having been touched (and, in a cluster, the failed keys' other owners
-   * having been sent the touch). In a cluster it goes to every owner of a key, the
+   * having been touched (and, in a cluster, the lost keys' other owners
+   * having been sent the touch; a key whose primary was never sent it is
+   * sent to no other owner). In a cluster it goes to every owner of a key, the
    * primary's answer being the key's. A replica's failure or `W` is
    * counted in `stats().replicaWriteFailures` and never fails the batch.
    * Larger batches are transparently split into more than one `y`
@@ -2073,16 +2086,21 @@ export class NanocachedClient {
     await this.applyOnOtherOwners(key, namespace, (connection) => connection.delete(key, namespace));
   }
 
-  /** An expiring `touch`/`getAndTouch` whose primary leg finally failed with
-   * a connection error (its reply lost, so not resent, or still unreachable
-   * after the retry: a dead primary that discovery still lists) sent no
-   * other owner the touch (issue #2052): a read falling back to a replica
-   * would return the value the caller expired, and the replica would be
-   * promoted with it. They are sent the plain `t ... 0` here, before the
-   * caller sees `error`. A `W` or `En` is not a connection error and leaves
-   * them alone, as before. */
+  /** An expiring `touch`/`getAndTouch` whose primary's reply was lost after
+   * the request was sent (so not resent) sent no other owner the touch
+   * (issue #2052), though the primary may have expired the key: a read
+   * falling back to a replica would return the value the caller expired,
+   * and the replica would be promoted with it. They are sent the plain
+   * `t ... 0` here, before the caller sees `error`.
+   *
+   * A primary leg that never left (`wasNeverSent`: the primary is dead but
+   * still listed, so the retry's dial failed too) leaves them alone (issue
+   * #2140): nothing was expired, the caller gets a not-sent error that
+   * invites a resend, and that resend, once discovery has dropped the
+   * primary, must still find the value on the replica. A `W` or `En` is
+   * not a connection error and leaves them alone too. */
   private async expireOnOtherOwnersAfterFailure(error: unknown, key: string | Uint8Array, namespace: Uint8Array): Promise<void> {
-    if (this.target.kind !== "cluster" || this.closed || !isConnectionError(error)) return;
+    if (this.target.kind !== "cluster" || this.closed || !isConnectionError(error) || wasNeverSent(error)) return;
     await this.applyOnOtherOwners(key, namespace, (connection) => connection.touch(key, 0, namespace));
   }
 
@@ -2316,7 +2334,7 @@ export class NanocachedClient {
       lost: new Set(),
       lostCause: undefined,
       answeredBy: new Map(),
-      failedOn: new Map(),
+      lostOn: new Map(),
     };
     // With `get`, the hits other primaries already returned ride along
     // (issue #924): a `ttlSeconds === 0` call consumed them.
@@ -2340,17 +2358,17 @@ export class NanocachedClient {
     // before any of the outcomes below, whichever way the call ends.
     if (ttlSeconds === 0) {
       await this.multiTouchReplicaFanOut(namespace, keyBytes, state.answeredBy, true);
-      // Issue #2052: a key whose primary leg finally failed with a
-      // connection error (its reply lost, or still unreachable after the
-      // second pass: a dead primary that discovery still lists) got no
-      // replica leg, so a read falling back to a replica would return the
-      // value the caller expired, and the replica would be promoted with
-      // it. Its other owners are sent the touch now, awaited even with
-      // fireAndForgetReplicas, before the error below is thrown. A `W` or
-      // `En` key is not in `failedOn` and keeps its own path.
-      const stillFailed = new Set([...state.lost, ...retryIndices]);
-      const failed = new Map([...state.failedOn].filter(([index]) => stillFailed.has(index)));
-      if (failed.size > 0 && !this.closed) await this.multiTouchReplicaFanOut(namespace, keyBytes, failed, false);
+      // Issue #2052: a key whose primary's reply was lost after its frame
+      // was written got no replica leg, so a read falling back to a replica
+      // would return the value the primary may have expired, and the
+      // replica would be promoted with it. Its other owners are sent the
+      // touch now, awaited even with fireAndForgetReplicas, before the
+      // error below is thrown. A key whose primary leg never left (still
+      // unreachable after the second pass: a dead primary that discovery
+      // still lists) gets nothing (issue #2140): nothing was expired, and
+      // the resend the not-sent error invites must still find the value.
+      // A `W` or `En` key keeps its own path.
+      if (state.lostOn.size > 0 && !this.closed) await this.multiTouchReplicaFanOut(namespace, keyBytes, state.lostOn, false);
     }
     if (finalRejection) throw tooOld();
     if (retryIndices.length === 0 && state.lost.size === 0) return collect(state.results);
@@ -2514,11 +2532,7 @@ export class NanocachedClient {
         if (error !== undefined && holdsPrimary) {
           state.lastCause = error;
           if (wasRejectedByServer(error)) state.rejected = true;
-          else if (
-            ttlSeconds === 0 &&
-            isConnectionError(error) &&
-            !(error instanceof ConnectionLostError && error.requestWasSent === false)
-          ) {
+          else if (ttlSeconds === 0 && isConnectionError(error) && !wasNeverSent(error)) {
             lostIsFinal = true;
             state.lostCause = error;
           }
@@ -2531,17 +2545,13 @@ export class NanocachedClient {
           } else if (answered) {
             state.results.set(index, entries[i]);
             state.answeredBy.set(index, leg.name);
-            state.failedOn.delete(index);
           } else {
-            if (i < resolved) {
-              state.wrongNode.add(index);
-              state.failedOn.delete(index);
-            } else {
+            if (i < resolved) state.wrongNode.add(index);
+            else {
               state.wrongNode.delete(index);
-              if (isConnectionError(error)) state.failedOn.set(index, leg.name);
-              else state.failedOn.delete(index);
               if (lostIsFinal && i < sentEnd) {
                 state.lost.add(index);
+                state.lostOn.set(index, leg.name);
                 continue;
               }
             }
@@ -2591,8 +2601,8 @@ export class NanocachedClient {
    * which is skipped). For the keys whose primary answered `S`/`V` or `N`
    * (an `N` primary may still have a replica copy through fire-and-forget
    * replication, and the caller meant "expire everywhere"), or whose
-   * primary leg finally failed with a connection error (issue #2052).
-   * Keys still `W` or rejected get no replica leg. Failures are swallowed
+   * primary's reply was lost after the frame was written (issue #2052).
+   * Keys still `W`, rejected or never sent get no replica leg. Failures are swallowed
    * into stats().replicaWriteFailures as in `multiTouchPass`; with
    * `detachable` a leg is eligible for fireAndForgetReplicas, without it
    * every leg is awaited. */
@@ -3632,8 +3642,8 @@ export class NanocachedClient {
    *   waited for, so hedging never turns a hit into a miss; a miss is
    *   accepted only once every owner has answered or failed;
    * - a failure (anything but `WrongNodeError`) hedges onward
-   *   immediately — the same fall-through condition `readFromOwners`
-   *   uses;
+   *   immediately, even while other legs are still in flight — the same
+   *   fall-through condition `readFromOwners` uses;
    * - `WrongNodeError` propagates exactly as in `readFromOwners`.
    *
    * The losing legs are never cancelled — there is nothing to cancel a
@@ -3768,6 +3778,12 @@ export class NanocachedClient {
           throw winner.error;
         }
         lastError = winner.error;
+        if (nextIndex < names.length) {
+          // A failed leg is replaced by the next owner right away, even
+          // while other legs (a silent primary) are still in flight.
+          pending.push({ promise: start(nextIndex), index: nextIndex });
+          nextIndex++;
+        }
       } else if (winner.value !== null || names[winner.index] === primaryName) {
         await resolveLosers(pending);
         return winner.value;
@@ -3777,8 +3793,8 @@ export class NanocachedClient {
       }
 
       if (pending.length === 0 && nextIndex < names.length) {
-        // Everything so far failed or missed provisionally: the next
-        // owner gets its turn right away, no waiting for the interval.
+        // Everything so far missed provisionally: the next owner gets
+        // its turn right away, no waiting for the interval.
         pending.push({ promise: start(nextIndex), index: nextIndex });
         nextIndex++;
       }
@@ -3854,8 +3870,9 @@ export class NanocachedClient {
      * exactly that replica, which would answer `N` for a key that existed.
      * Those legs run after the primary's answer, outside the pipelined-order
      * guarantee, the same class as the retry paths. A primary that fails
-     * gets no replica leg here; the caller sends the other owners the touch
-     * once the retry has failed too (issue #2052). */
+     * gets no replica leg here; when its reply was lost after the send, the
+     * caller sends the other owners the touch once the retry is over
+     * (issue #2052). */
     replicasAfterPrimary = false,
     /** The value bytes `op` sends when they are the caller's own buffer
      * (an uncompressed `set`), for a background leg to copy. */
@@ -4389,10 +4406,7 @@ export class NanocachedClient {
       // for a dead primary is therefore bounded by discovery's liveness
       // timeout. A second failure after a fresh refresh propagates.
       const retryable =
-        error instanceof WrongNodeError ||
-        (options?.nonIdempotent
-          ? error instanceof ConnectionLostError && error.requestWasSent === false
-          : isConnectionError(error));
+        error instanceof WrongNodeError || (options?.nonIdempotent ? wasNeverSent(error) : isConnectionError(error));
       if (!retryable || this.target.kind === "single") throw error;
       // In proxy mode a request's own timeout is not resent: the proxy
       // accepted the frame and never answered, so a redial would stall for
@@ -4423,7 +4437,7 @@ export class NanocachedClient {
       return await dial();
     } catch (error) {
       if (!isConnectionError(error)) throw error;
-      if (error instanceof ConnectionLostError && error.requestWasSent === false) throw error;
+      if (wasNeverSent(error)) throw error;
       const message = error instanceof Error ? error.message : String(error);
       throw new ConnectionLostError(`nanocached: ${message}`, { requestWasSent: false });
     }

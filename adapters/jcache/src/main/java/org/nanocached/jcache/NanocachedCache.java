@@ -1228,6 +1228,10 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
         synchronized (this) {
             configuration.setStatisticsEnabled(enabled);
         }
+        // The MBean alone is not the switch: the operations record into
+        // `statistics` unconditionally, so a cache that ran with statistics
+        // off would show those operations once they were turned on.
+        statistics.setEnabled(enabled);
         if (enabled) {
             registerStatisticsMBean();
         } else {
