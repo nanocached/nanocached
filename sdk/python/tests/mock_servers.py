@@ -477,15 +477,18 @@ class MockNode:
         of the same name."""
         self._silent = True
 
-    async def start(self, port: int = 0, recv_buffer: int | None = None) -> MockNode:
+    async def start(
+        self, port: int = 0, recv_buffer: int | None = None, host: str = "127.0.0.1"
+    ) -> MockNode:
         """``port`` pins the listener — for a node that comes back on the
         address discovery already advertised (issue #67 tests).
         ``recv_buffer`` sets SO_RCVBUF on the listener before it listens,
         which accepted connections inherit — for a node that stops
         reading, so the kernel absorbs only a few KB of what a client
-        writes."""
+        writes. ``host`` is the address to listen on (``"::1"`` for a node
+        reached over IPv6)."""
         if recv_buffer is None:
-            self._server = await asyncio.start_server(self._serve, "127.0.0.1", port)
+            self._server = await asyncio.start_server(self._serve, host, port)
         else:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, recv_buffer)
