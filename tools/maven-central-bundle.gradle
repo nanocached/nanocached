@@ -1,0 +1,30 @@
+// Gradle init script for the Maven Central release: gives every build that
+// publishes a `centralBundle` repository, a local directory, so that
+//
+//   ./gradlew --init-script <this file> publishAllPublicationsToCentralBundleRepository
+//
+// run in each of the four Maven builds collects their signed artifacts in one
+// Maven repository layout. tools/central-portal-upload.sh then uploads that
+// directory to the Central Portal as ONE deployment: the free tier counts
+// release events (publish operations), and `publishToMavenCentral` in each
+// build would make four of them per version.
+//
+// CENTRAL_BUNDLE_DIR: the directory (absolute path) to collect into.
+
+def bundleDir = System.getenv('CENTRAL_BUNDLE_DIR')
+if (!bundleDir) {
+    throw new GradleException('CENTRAL_BUNDLE_DIR is not set')
+}
+
+allprojects {
+    plugins.withId('maven-publish') {
+        publishing {
+            repositories {
+                maven {
+                    name = 'centralBundle'
+                    url = uri(bundleDir)
+                }
+            }
+        }
+    }
+}

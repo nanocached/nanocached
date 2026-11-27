@@ -92,10 +92,17 @@ jobs:
             go mod download "github.com/nanocached/nanocached/sdk/go@$ver" || true
           curl -sf "https://proxy.golang.org/github.com/nanocached/nanocached/sdk/go/@v/$ver.info"
 
-  java:
+  # All four Maven modules (the Java SDK and the spring, jcache and
+  # spring-boot-starter adapters) publish here, from the sdk/java tag, as ONE
+  # Central Portal deployment: the free tier counts release events, seven a
+  # month, and one deployment per module made a version cost four. The
+  # adapter tags publish nothing to Maven. tools/release-all.sh tags one
+  # commit that carries the version in every manifest, which the first step
+  # re-checks, so all four come from the same commit.
+  maven-central:
     if: startsWith(github.ref_name, 'sdk/java/v')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     # The Maven Central credentials and the signing key live in the `release`
     # environment, which needs a reviewer's approval and only accepts the
     # release tags, so pushing a tag is not enough to reach them.
@@ -103,10 +110,22 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Verify tag matches manifest version
+      - name: Verify tag matches every Maven module's version
         run: |
           ver="${GITHUB_REF_NAME#sdk/java/v}"
-          grep -q "^version = '$ver'$" sdk/java/build.gradle
+          if ! printf '%s' "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            echo "::error::'$ver' is not a version (X.Y.Z or X.Y.Z-pre)"
+            exit 1
+          fi
+          for d in sdk/java adapters/spring adapters/jcache adapters/spring-boot-starter; do
+            grep -q "^version = '$ver'$" "$d/build.gradle" || { echo "::error::$d is not at $ver"; exit 1; }
+          done
+          # The adapters' POMs name the SDK (and the starter the spring
+          # adapter) at the pinned version; it must be the one in the bundle.
+          grep -q "org.nanocached:nanocached:$ver'" adapters/spring/build.gradle
+          grep -q "org.nanocached:nanocached:$ver'" adapters/jcache/build.gradle
+          grep -q "org.nanocached:nanocached-spring:$ver'" adapters/spring-boot-starter/build.gradle
+          echo "VER=$ver" >> "$GITHUB_ENV"
 
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
@@ -117,14 +136,27 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
-      - name: Publish to Maven Central
-        working-directory: sdk/java
-        run: ./gradlew publishToMavenCentral --no-daemon
+      # Each build signs its publication and writes it into one local Maven
+      # repository. The adapters' settings.gradle include the sibling SDK
+      # build (and, for the starter, the spring adapter) so they compile
+      # against the same commit; the generated POMs still name the published
+      # coordinates at this version.
+      - name: Collect the signed artifacts
+        run: |
+          export CENTRAL_BUNDLE_DIR="$RUNNER_TEMP/central-bundle"
+          for d in sdk/java adapters/spring adapters/jcache adapters/spring-boot-starter; do
+            (cd "$d" && ./gradlew --no-daemon --init-script "$GITHUB_WORKSPACE/tools/maven-central-bundle.gradle" \
+              publishAllPublicationsToCentralBundleRepository)
+          done
         env:
-          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
-          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_SIGNING_KEY }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_SIGNING_KEY_PASSWORD }}
+
+      - name: Publish to Maven Central as one deployment
+        run: tools/central-portal-upload.sh "$RUNNER_TEMP/central-bundle" "nanocached $VER"
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
 
   typescript:
     if: startsWith(github.ref_name, 'sdk/typescript/v')
@@ -349,62 +381,3 @@ jobs:
             --api-key "$NUGET_API_KEY" \
             --source https://api.nuget.org/v3/index.json
 
-  adapter-maven:
-    if: startsWith(github.ref_name, 'adapter/spring/v') || startsWith(github.ref_name, 'adapter/jcache/v') || startsWith(github.ref_name, 'adapter/spring-boot-starter/v')
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    # The Maven Central credentials and the signing key live in the `release`
-    # environment, which needs a reviewer's approval and only accepts the
-    # release tags, so pushing a tag is not enough to reach them.
-    environment: release
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Resolve adapter and version from the tag
-        id: tag
-        run: |
-          rest="${GITHUB_REF_NAME#adapter/}"
-          name="${rest%/v*}"
-          ver="${rest#*/v}"
-          # A tag name may hold shell syntax (`git check-ref-format` accepts
-          # `adapter/keyv/v1";id${IFS}x;"`), so nothing later may see a
-          # value that has not passed this check.
-          if ! printf '%s' "$name" | grep -Eq '^(spring|jcache|spring-boot-starter)$'; then
-            echo "::error::'$name' is not an adapter this job releases"
-            exit 1
-          fi
-          if ! printf '%s' "$ver" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
-            echo "::error::'$ver' is not a version (X.Y.Z or X.Y.Z-pre)"
-            exit 1
-          fi
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "ver=$ver" >> "$GITHUB_OUTPUT"
-
-      - name: Verify tag matches manifest version
-        env:
-          NAME: ${{ steps.tag.outputs.name }}
-          VER: ${{ steps.tag.outputs.ver }}
-        run: |
-          grep -q "^version = '$VER'$" "adapters/$NAME/build.gradle"
-
-      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
-        with:
-          distribution: temurin
-          java-version: 17
-          # The newest release of the line, not the runner's cached JDK (#1960).
-          check-latest: true
-
-      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
-
-      # The adapter's settings.gradle includes the sibling SDK build (and,
-      # for the starter, the spring adapter) so the build compiles against
-      # the same commit; the generated POM still names the published
-      # coordinates at this version.
-      - name: Publish to Maven Central
-        working-directory: adapters/${{ steps.tag.outputs.name }}
-        run: ./gradlew publishToMavenCentral --no-daemon
-        env:
-          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
-          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
-          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.MAVEN_SIGNING_KEY }}
-          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.MAVEN_SIGNING_KEY_PASSWORD }}

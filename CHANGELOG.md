@@ -12,6 +12,18 @@ framework adapters at one version, whether or not a component changed.
 
 ## [Unreleased]
 
+### Changed
+
+- `ci`: the four Maven modules (the Java SDK and the `spring`, `jcache` and
+  `spring-boot-starter` adapters) are published as one Central Portal
+  deployment, from the `sdk/java` tag, instead of one deployment per module.
+  Each build collects its signed artifacts into one local repository
+  (`tools/maven-central-bundle.gradle`), and
+  `tools/central-portal-upload.sh` uploads it once and waits until it
+  validates. The Central free tier counts release events (publish
+  operations), seven a month, and one version cost four of them. The adapter
+  tags no longer publish to Maven (#2077).
+
 ### Fixed
 
 - Discovery: an `M` send that stopped was always logged as "permanently

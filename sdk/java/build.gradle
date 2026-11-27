@@ -8,6 +8,10 @@ group = 'org.nanocached'
 version = '0.6.2'
 
 mavenPublishing {
+    // The release does not use this task: CI publishes the four Maven
+    // modules together as one Central Portal deployment
+    // (tools/maven-central-bundle.gradle, tools/central-portal-upload.sh),
+    // and running it here would spend a release event on this module alone.
     publishToMavenCentral(true)
     signAllPublications()
     coordinates('org.nanocached', 'nanocached', version.toString())
