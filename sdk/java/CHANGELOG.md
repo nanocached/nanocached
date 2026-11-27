@@ -21,6 +21,7 @@ There is no `sdk/java/v0.4.3` tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- With `readHedgeAfter` and three or more owners, a hedge leg that failed at once (its node gone) while the primary was still silent did not start the next owner: that waited for the next hedge interval, so with replication 3, a 300 ms interval and the second owner's node down, a hit from the third owner took 639 ms. A failed leg now starts the next owner right away, as documented. A replica's provisional miss is unchanged: the next owner starts at once only when no other leg is in flight. (#2118)
 - `getManyAndTouch`, `getManyAndTouchBytes` and their `Namespace` forms with `ttlSeconds` 0 threw `DecompressionFailed` (or, for the text form, `UncheckedIOException`) when one hit could not be decompressed or was not valid UTF-8, after the touch had already expired every hit, so every value was lost. With 0 such a hit is now left out and the rest returned, or carried by the partial exception; other TTLs keep the strict behavior (#1946).
 - In a cluster `delete` sent the other owners their delete at the same time as the primary. When the primary failed or answered `W`, the retry reached a replica that had already deleted its copy and returned `false` for a key that existed. The other owners are now sent the delete only after the primary has answered, as for an expiring touch (#934).
 - Keep-alive skipped every connection idle for less than its 30 s interval,
