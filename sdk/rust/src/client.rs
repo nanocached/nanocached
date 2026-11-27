@@ -1112,7 +1112,20 @@ impl LateHedgeLegs {
 }
 
 impl HedgeLegGuard {
+    /// Releases this leg's late and detached counts, once: the leg has
+    /// finished. Done before the outcome is sent, so a read woken by the
+    /// outcome never finds the leg still running (see `HedgeReadLegs`).
+    fn finish(&self) {
+        if self.late.state.swap(2, Ordering::SeqCst) == 1 {
+            self.late.counts.release(&self.late.node);
+        }
+        if self.late.detached.swap(2, Ordering::SeqCst) == 1 {
+            self.late.counts.detached.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     fn send(mut self, result: Result<Option<Vec<u8>>>, panicked: bool) {
+        self.finish();
         self.sent = true;
         let _ = self.tx.send(HedgeOutcome {
             index: self.index,
@@ -1124,12 +1137,7 @@ impl HedgeLegGuard {
 
 impl Drop for HedgeLegGuard {
     fn drop(&mut self) {
-        if self.late.state.swap(2, Ordering::SeqCst) == 1 {
-            self.late.counts.release(&self.late.node);
-        }
-        if self.late.detached.swap(2, Ordering::SeqCst) == 1 {
-            self.late.counts.detached.fetch_sub(1, Ordering::SeqCst);
-        }
+        self.finish();
         if !self.sent {
             // Dropped without a result and not by `catch_unwind`'s path
             // (that one sends): the task was cancelled, e.g. by the runtime
@@ -1141,6 +1149,28 @@ impl Drop for HedgeLegGuard {
                 )),
                 panicked: false,
             });
+        }
+    }
+}
+
+/// The legs one `read_hedged` call has started. However the call ends —
+/// with an answer, with an error return (`AlreadyClosed` from a later
+/// `spawn_hedge_leg`), or with the caller dropping its future, e.g. a
+/// `tokio::time::timeout` around `get`, also while `resolve_hedge_losers`
+/// waits for the losers — dropping this counts every leg still running in
+/// `LateHedgeLegs::detached` (issue #2079). Counting only once the read had
+/// decided left the legs of cancelled reads running uncounted, so reads
+/// kept detaching their losers past `MAX_INFLIGHT_HEDGE_LOSER_LEGS`. A leg
+/// that has finished is skipped (`LateHedgeLegs::detach`).
+struct HedgeReadLegs<'a> {
+    counts: &'a LateHedgeLegs,
+    legs: Vec<Arc<LateHedgeLeg>>,
+}
+
+impl Drop for HedgeReadLegs<'_> {
+    fn drop(&mut self) {
+        for leg in &self.legs {
+            self.counts.detach(leg);
         }
     }
 }
@@ -5054,13 +5084,18 @@ impl NanocachedClient {
         // name: `owners` below may put a silent owner last.
         let primary = owners[0].clone();
         let owners = self.inner.late_hedge.demote(owners);
-        // One entry per started leg, by index: see `LateHedgeLeg`.
-        let mut legs: Vec<Arc<LateHedgeLeg>> = Vec::with_capacity(owners.len());
+        // One entry per started leg, by index: see `LateHedgeLeg`. Every
+        // leg still running when this method ends, however it ends, is
+        // counted as detached (`HedgeReadLegs`).
+        let mut legs = HedgeReadLegs {
+            counts: &self.inner.late_hedge,
+            legs: Vec::with_capacity(owners.len()),
+        };
         let owned_namespace: Arc<[u8]> = Arc::from(namespace.to_vec());
         let owned_key: Arc<[u8]> = Arc::from(key.to_vec());
         let (tx, mut rx) = mpsc::unbounded_channel::<HedgeOutcome>();
 
-        legs.push(
+        legs.legs.push(
             self.spawn_hedge_leg(
                 Arc::clone(&owned_namespace),
                 Arc::clone(&owned_key),
@@ -5085,7 +5120,10 @@ impl NanocachedClient {
             // late — the last owner started has no owner after it, but its
             // silence counts like any other's. With every owner started
             // and every leg counted, only the legs are waited for.
-            let uncounted = legs.iter().any(|leg| leg.state.load(Ordering::SeqCst) == 0);
+            let uncounted = legs
+                .legs
+                .iter()
+                .any(|leg| leg.state.load(Ordering::SeqCst) == 0);
             let outcome = if next_index < owners.len() || uncounted {
                 match tokio::time::timeout(hedge_after, rx.recv()).await {
                     Ok(Some(outcome)) => outcome,
@@ -5097,11 +5135,11 @@ impl NanocachedClient {
                         // The hedge interval elapsed with no answer yet:
                         // every leg still running is late; then one more
                         // owner, if any, right away.
-                        for leg in &legs {
+                        for leg in &legs.legs {
                             self.inner.late_hedge.add(leg);
                         }
                         if next_index < owners.len() {
-                            legs.push(
+                            legs.legs.push(
                                 self.spawn_hedge_leg(
                                     Arc::clone(&owned_namespace),
                                     Arc::clone(&owned_key),
@@ -5129,20 +5167,20 @@ impl NanocachedClient {
                 // Issue #1164: a leg that panicked is surfaced to the
                 // caller, not hedged around.
                 Err(error) if outcome.panicked => {
-                    self.resolve_hedge_losers(&mut rx, in_flight, &legs).await;
+                    self.resolve_hedge_losers(&mut rx, in_flight).await;
                     return Err(error);
                 }
                 Ok(Some(value)) => {
-                    self.resolve_hedge_losers(&mut rx, in_flight, &legs).await;
+                    self.resolve_hedge_losers(&mut rx, in_flight).await;
                     return Ok(Some(value));
                 }
                 Ok(None) if owners[outcome.index] == primary => {
-                    self.resolve_hedge_losers(&mut rx, in_flight, &legs).await;
+                    self.resolve_hedge_losers(&mut rx, in_flight).await;
                     return Ok(None);
                 }
                 Ok(None) => replica_missed = true,
                 Err(Error::WrongNode) => {
-                    self.resolve_hedge_losers(&mut rx, in_flight, &legs).await;
+                    self.resolve_hedge_losers(&mut rx, in_flight).await;
                     return Err(Error::WrongNode);
                 }
                 Err(error) => last_error = Some(error),
@@ -5154,7 +5192,7 @@ impl NanocachedClient {
             // instead of waiting out the rest of the interval.
             if in_flight == 0 {
                 if next_index < owners.len() {
-                    legs.push(
+                    legs.legs.push(
                         self.spawn_hedge_leg(
                             Arc::clone(&owned_namespace),
                             Arc::clone(&owned_key),
@@ -5200,16 +5238,13 @@ impl NanocachedClient {
         &self,
         rx: &mut mpsc::UnboundedReceiver<HedgeOutcome>,
         in_flight: usize,
-        legs: &[Arc<LateHedgeLeg>],
     ) {
         if in_flight == 0 {
             return;
         }
-        let late = &self.inner.late_hedge;
-        if late.detached.load(Ordering::SeqCst) < self.inner.hedge_loser_cap {
-            for leg in legs {
-                late.detach(leg);
-            }
+        // Under the cap the legs are left running; `read_hedged`'s
+        // `HedgeReadLegs` counts them as it returns.
+        if self.inner.late_hedge.detached.load(Ordering::SeqCst) < self.inner.hedge_loser_cap {
             return;
         }
         for _ in 0..in_flight {
