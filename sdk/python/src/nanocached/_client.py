@@ -144,8 +144,6 @@ class _MultiTouchState:
     frame was written, so the node may have expired them already;
     ``lost_cause`` is that failure, kept apart from ``last_cause`` so a
     later not-sent failure in the retry pass cannot replace it.
-    ``unreachable`` holds the indices whose primary leg's latest outcome
-    was a connection failure (sent or not; not ``W``, not ``En``).
     Single-threaded (asyncio), so no locking."""
 
     __slots__ = (
@@ -155,7 +153,6 @@ class _MultiTouchState:
         "lost_cause",
         "rejected",
         "results",
-        "unreachable",
         "wrong_node",
     )
 
@@ -169,7 +166,6 @@ class _MultiTouchState:
         self.lost_cause: BaseException | None = None
         self.rejected = False
         self.lost: set[int] = set()
-        self.unreachable: set[int] = set()
 
 
 @dataclass(frozen=True)
@@ -1572,11 +1568,13 @@ class NanocachedClient:
         primary that is unreachable or answers wrong-node has touched no
         replica when the call is rerouted. Those replica touches run after
         the primary's answer, outside the pipelined-order guarantee, like
-        the retry paths. A ``0`` TTL whose primary still fails with a
-        connection error (a lost reply, or a primary still unreachable
-        after the retry) raises, but only once the other owners have been
-        sent the touch. Raises ServerTooOldError against a node that
-        predates the command."""
+        the retry paths. A ``0`` TTL whose primary reply was lost after the
+        send raises ConnectionLostError, but only once the other owners
+        have been sent the touch. A primary still unreachable after the
+        retry was never sent it, so no other owner is touched either and
+        the error is a not-sent one: a resend once discovery has dropped
+        the primary still finds the key. Raises ServerTooOldError against
+        a node that predates the command."""
         return await self._touch(b"", key, ttl_seconds)
 
     async def _touch(self, namespace: bytes, key: str | bytes, ttl_seconds: int | None) -> bool:
@@ -1673,16 +1671,21 @@ class NanocachedClient:
         self, namespace: bytes, key: bytes, ttl_seconds: int | None, error: BaseException
     ) -> None:
         """A ``0``-TTL touch sends the other owners theirs only once the
-        primary has answered (issue #934). When the primary leg finally
-        fails with a connection error instead (its reply was lost after
-        the send, which is not resent, or the primary is dead but still
-        listed, so the retry failed too), no other owner would ever be
-        sent the touch: a read falling back to a replica would return the
-        value the caller expired, and the replica would be promoted with
-        it. They are sent the plain ``t ... 0`` before the error is
-        raised (issue #2055), as a delete does. A ``W`` (WrongNodeError)
-        or an ``En`` leaves them alone."""
-        if ttl_seconds != 0 or not isinstance(error, (ConnectionError, OSError)):
+        primary has answered (issue #934). When the primary's reply is
+        lost after the send instead (ConnectionLostError, which is not
+        resent), the primary may have expired the key, and no other owner
+        would ever be sent the touch: a read falling back to a replica
+        would return the value the caller expired, and the replica would
+        be promoted with it. They are sent the plain ``t ... 0`` before
+        the error is raised (issue #2055), as a delete does.
+
+        A primary leg that was never sent (the primary is dead but still
+        listed, so the retry's dial failed too) leaves them alone (issue
+        #2135): nothing was expired, the caller gets a not-sent error that
+        invites a resend, and that resend, once discovery has dropped the
+        primary, must still find the value on the replica. A ``W``
+        (WrongNodeError) or an ``En`` leaves them alone too."""
+        if ttl_seconds != 0 or not isinstance(error, ConnectionLostError):
             return
 
         def op(connection: Connection) -> Awaitable[bool]:
@@ -2439,9 +2442,10 @@ class NanocachedClient:
         be reached on both passes raises that connection error — every
         other key was still touched, and since a touch is idempotent the
         whole batch may simply be sent again, so nothing partial is
-        attached. With ``ttl_seconds == 0`` the keys whose primary failed
-        that way (lost or unreachable) are still sent to their other
-        owners before the error is raised. Raises ServerTooOldError
+        attached. With ``ttl_seconds == 0`` the keys whose primary reply
+        was lost after the send are still sent to their other owners
+        before the error is raised; a key whose primary was never sent the
+        touch is sent to no other owner. Raises ServerTooOldError
         against a node that predates the command."""
         return await self._touch_many(b"", keys, ttl_seconds)
 
@@ -2801,7 +2805,6 @@ class NanocachedClient:
                     if not answered:
                         self._replica_write_failures += 1
                     continue
-                state.unreachable.discard(idx)
                 if answered:
                     state.results[idx] = entries[pos]
                     state.answered_by[idx] = name
@@ -2810,11 +2813,6 @@ class NanocachedClient:
                         state.wrong_node.add(idx)
                     else:
                         state.wrong_node.discard(idx)
-                        if error is not None and not _rejected_by_server(error):
-                            # A connection failure, before or after the
-                            # frame left (issue #2055): see
-                            # _multi_touch_replica_fan_out().
-                            state.unreachable.add(idx)
                         # Only the chunk whose frame was written may have
                         # been applied (issue #1600): the chunks after it
                         # never left, so they are retried like any other
@@ -2857,13 +2855,16 @@ class NanocachedClient:
         after the primary's answer, outside the pipelined-order guarantee,
         the same class as the retry paths.
 
-        A key whose primary leg finally failed with a connection error
-        (lost after the send, or unreachable on both passes) is sent to
-        every owner but the current primary too (issue #2055): otherwise
-        no other owner would be, and a read falling back to a replica
+        A key whose primary reply was lost after the frame was written
+        (``state.lost``) is sent to every owner but the current primary
+        too (issue #2055): the primary may have expired it, and otherwise
+        no other owner would be, so a read falling back to a replica
         would return the value the caller expired. Those legs are awaited
         even with fire_and_forget_replicas, so the caller's error comes
-        only once they have been answered, as for a delete."""
+        only once they have been answered, as for a delete. A key whose
+        primary leg never left (unreachable on both passes) gets no leg
+        (issue #2135): nothing was expired, and the resend the not-sent
+        error invites must still find the value."""
         # (owner, awaited) -> key indices.
         legs: dict[tuple[str, bool], list[int]] = {}
         for idx in sorted(state.answered_by):
@@ -2871,7 +2872,7 @@ class NanocachedClient:
             for name in self._owner_names(namespace, key_bytes_list[idx]):
                 if name != answered_by:
                     legs.setdefault((name, False), []).append(idx)
-        for idx in sorted(state.unreachable - state.answered_by.keys()):
+        for idx in sorted(state.lost):
             for name in self._owner_names(namespace, key_bytes_list[idx])[1:]:
                 legs.setdefault((name, True), []).append(idx)
         if not legs:
@@ -3538,7 +3539,9 @@ class NanocachedClient:
           waited for, so hedging never turns a hit into a miss; it is
           accepted only once every owner has answered or failed;
         - a failure (connection-level or a NanocachedError other than
-          WrongNodeError) just hedges onward immediately;
+          WrongNodeError) just hedges onward immediately: the next owner,
+          if any, starts right away, even while other legs are still in
+          flight;
         - WrongNodeError propagates as in _read().
 
         An owner with _HEDGE_SUSPECT_LATE_LEGS late legs outstanding (see
@@ -3683,6 +3686,7 @@ class NanocachedClient:
                 hit_value: object = None
                 wrong_node: WrongNodeError | None = None
                 primary_missed = False
+                failed = 0
                 for task in done:
                     index = legs[task]
                     try:
@@ -3691,6 +3695,7 @@ class NanocachedClient:
                         wrong_node = error
                     except (NanocachedError, ConnectionError, OSError) as error:
                         last_error = error
+                        failed += 1
                     else:
                         if value is not None:
                             hit_value = value
@@ -3707,9 +3712,18 @@ class NanocachedClient:
                 if primary_missed:
                     await resolve_losers(pending)
                     return None
+                # A failed leg hedges onward at once: each one is replaced
+                # by the next owner right away, even while other legs (a
+                # silent primary) are still in flight, rather than waiting
+                # out another interval.
+                for _ in range(failed):
+                    if next_index >= len(names):
+                        break
+                    pending.add(start(next_index))
+                    next_index += 1
                 if not pending and next_index < len(names):
-                    # Everything so far failed or missed provisionally: the
-                    # next owner gets its turn right away.
+                    # Everything so far missed provisionally: the next
+                    # owner gets its turn right away.
                     pending.add(start(next_index))
                     next_index += 1
         except asyncio.CancelledError:

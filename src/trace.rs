@@ -26,11 +26,32 @@
 //! but writing without blocking needs the descriptor in non-blocking mode,
 //! which std does not offer, and a blocking write is what the queue exists to
 //! avoid. `tests/e2e/incrtrace.py` takes the kills as an input instead.
+//!
+//! The queue is bounded in bytes as well as in lines. A key or namespace
+//! name may be close to a megabyte, so `name` shows at most `NAME_BYTES` of
+//! one, and `Sink::emit` cuts any line longer than `LINE_BYTES` before it is
+//! queued: a stalled stderr costs the node at most `QUEUE_LINES` ×
+//! `LINE_BYTES` (32 MiB), and under a megabyte with ordinary key names, at
+//! about 100 bytes a line.
 
-/// Lines the queue holds while the writer is behind. About 100 bytes each,
-/// so a stalled stderr costs the node under a megabyte.
+/// Lines the queue holds while the writer is behind.
 #[cfg(feature = "trace")]
 const QUEUE_LINES: usize = 8192;
+
+/// The longest line queued, in bytes; a longer one is cut at a character
+/// boundary and ends in `LINE_CUT`. Well above what the trace sites write
+/// once `name` has cut the names in them.
+#[cfg(feature = "trace")]
+const LINE_BYTES: usize = 4096;
+
+/// What a cut line ends in.
+#[cfg(feature = "trace")]
+const LINE_CUT: &str = "...(cut)";
+
+/// The most bytes of a name that `name` shows; the rest is replaced by a
+/// count of the bytes left out.
+#[cfg(feature = "trace")]
+const NAME_BYTES: usize = 256;
 
 /// How long `finish` waits for the writer to catch up at shutdown.
 #[cfg(feature = "trace")]
@@ -71,7 +92,7 @@ impl Sink {
     /// Queues `line`, or counts it as dropped when the queue is full. Never
     /// blocks.
     pub(crate) fn emit(&self, line: String) {
-        if self.queue.try_send(Message::Line(line)).is_err() {
+        if self.queue.try_send(Message::Line(capped(line))).is_err() {
             self.dropped
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -100,6 +121,24 @@ impl Sink {
         let _ =
             answered.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
     }
+}
+
+/// `line`, or, past `LINE_BYTES`, its start cut at a character boundary and
+/// marked, in a new allocation of that size: truncating in place would keep
+/// the long line's whole buffer in the queue.
+#[cfg(feature = "trace")]
+fn capped(line: String) -> String {
+    if line.len() <= LINE_BYTES {
+        return line;
+    }
+    let mut cut = LINE_BYTES - LINE_CUT.len();
+    while !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut short = String::with_capacity(cut + LINE_CUT.len());
+    short.push_str(&line[..cut]);
+    short.push_str(LINE_CUT);
+    short
 }
 
 #[cfg(feature = "trace")]
@@ -177,9 +216,18 @@ fn matches_prefix(prefixes: &[u8], name: &[u8]) -> bool {
         .any(|prefix| !prefix.is_empty() && name.starts_with(prefix))
 }
 
+/// A key or namespace name for a trace line: at most `NAME_BYTES` of it,
+/// then the count of the bytes left out.
 #[cfg(feature = "trace")]
 pub(crate) fn name(name: &[u8]) -> String {
-    String::from_utf8_lossy(name).into_owned()
+    if name.len() <= NAME_BYTES {
+        return String::from_utf8_lossy(name).into_owned();
+    }
+    format!(
+        "{}...(+{} bytes)",
+        String::from_utf8_lossy(&name[..NAME_BYTES]),
+        name.len() - NAME_BYTES
+    )
 }
 
 /// The first eight characters of a peer token, for the handoff trace lines.
@@ -206,7 +254,7 @@ macro_rules! trace {
 
 #[cfg(all(test, feature = "trace"))]
 mod tests {
-    use super::{Sink, matches_prefix, short_token};
+    use super::{LINE_BYTES, NAME_BYTES, Sink, capped, matches_prefix, name, short_token};
     use std::io::Write;
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
@@ -345,6 +393,52 @@ mod tests {
             .map(|index| format!("TRACE line {index}\n"))
             .collect();
         assert_eq!(output.text(), expected);
+    }
+
+    #[test]
+    fn a_long_name_is_cut_and_says_how_much_was_left_out() {
+        assert_eq!(name(b"chaos-1"), "chaos-1");
+        let exact = vec![b'k'; NAME_BYTES];
+        assert_eq!(name(&exact).len(), NAME_BYTES);
+        let long = vec![b'k'; 1024 * 1024];
+        let shown = name(&long);
+        assert!(shown.starts_with(&"k".repeat(NAME_BYTES)));
+        assert!(shown.ends_with(&format!("...(+{} bytes)", 1024 * 1024 - NAME_BYTES)));
+        assert!(shown.len() < NAME_BYTES + 32);
+    }
+
+    #[test]
+    fn a_long_line_is_cut_into_a_small_allocation_at_a_character_boundary() {
+        let short = "TRACE short".to_string();
+        assert_eq!(capped(short.clone()), short);
+        // A megabyte line of two-byte characters: what is queued must be a
+        // small buffer, not the megabyte one truncated.
+        let cut = capped(format!("TRACE {}", "é".repeat(512 * 1024)));
+        assert!(cut.len() <= LINE_BYTES, "{} bytes", cut.len());
+        assert!(
+            cut.capacity() <= LINE_BYTES,
+            "{} bytes kept",
+            cut.capacity()
+        );
+        assert!(cut.ends_with("...(cut)"));
+    }
+
+    #[test]
+    fn lines_longer_than_the_cap_are_written_cut() {
+        let output = StuckOutput::default();
+        output.open();
+        let sink = Sink::new(output.clone(), 4);
+        for _ in 0..4 {
+            sink.emit(format!("TRACE {}", "k".repeat(1024 * 1024)));
+        }
+        sink.finish(Duration::from_secs(10));
+        let text = output.text();
+        assert_eq!(text.lines().count(), 4, "every line is written");
+        assert!(
+            text.lines()
+                .all(|line| line.len() <= LINE_BYTES && line.ends_with("...(cut)")),
+            "a line longer than the cap was written whole"
+        );
     }
 
     #[test]

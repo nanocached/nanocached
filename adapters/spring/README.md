@@ -178,15 +178,27 @@ simple keys, or plug in a converter that knows your key type. A `String`
 key (or `SimpleKey` argument) that is not well-formed
 UTF-16 (a lone surrogate) is rejected with `IllegalArgumentException`
 rather than being encoded as `?`, which would make it the same key as
-another. Two consequences of JDK serialization: equal collections of different classes (`ArrayList` versus
+another. One consequence of JDK serialization: equal collections of different classes (`ArrayList` versus
 `List.of`, `HashSet` versus `TreeSet`) serialize differently and are
 therefore different keys, although Spring would consider them equal —
 use the same collection type for `@Cacheable` and `@CacheEvict`, or a
-converter that canonicalizes your key type; and an object that holds one
-instance in two places (a key object whose two fields reference the same
-`String`) serializes the second as a back-reference, so it is a different
-key from an equal object holding two equal copies — a converter that knows
-your key type avoids this too.
+converter that canonicalizes your key type.
+
+JDK serialization also writes an object it has already written as a
+reference to the first copy. For a
+`String`, boxed primitive, `UUID`, `BigInteger` or `BigDecimal` inside
+such a key, the adapter writes every value `equals()`-equal to one
+already written as such a reference, whether or not it is the same
+instance, so a key object whose two fields hold one `String` matches an
+equal one holding two separately parsed copies (and a `@CacheEvict` built
+from the latter removes the former). A key that repeated such a value as
+two separate instances is sent differently than before this change, so
+its existing entry becomes a miss once. Other types keep plain JDK
+serialization: two separate but equal instances (dates, collections,
+your own classes) are written in full, the same instance twice as a
+reference, so equal keys can still encode differently; so can a key whose
+own `equals` is not structural (a `HashMap` built in a different
+insertion order) — a converter that knows your key type avoids this.
 
 Values are deserialized with the class loader given to
 `classLoader(...)` on the builder (the Boot starter passes the

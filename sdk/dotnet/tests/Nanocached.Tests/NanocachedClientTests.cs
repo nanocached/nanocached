@@ -429,6 +429,21 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task AHeaderWithNoSpaceAfterTheMarkerPoisonsTheConnection()
+    {
+        // The space after the marker is mandatory: `V1\nx` is not the
+        // one-byte hit `V 1\nx`. It poisons the connection like any other
+        // malformed header, and the idempotent get is retried on a new one.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v");
+        node.AnswerRawToGetOnce("V1\nx");
+        Assert.Equal("v", await client.GetAsync("k"));
+        Assert.Equal(2, node.ConnectionCount);
+    }
+
+    [Fact]
     public async Task AMismatchedResponseKindPoisonsTheConnection()
     {
         // A well-formed response of the wrong kind (`S` answering a G)
@@ -6271,6 +6286,43 @@ public class NanocachedClientTests
         Assert.True(stopwatch.ElapsedMilliseconds >= 200 - HedgeTimingToleranceMillis,
             $"elapsed {stopwatch.ElapsedMilliseconds}ms should have waited out the primary's 200ms delay");
         Assert.Equal(0, cluster.Nodes[replica].GetCount);
+    }
+
+    [Fact]
+    public async Task AFailedHedgeLegStartsTheNextOwnerAtOnce()
+    {
+        // Issue #2119: with three owners and a silent primary, the hedge to
+        // the second owner fails at once (its node is gone): the third
+        // owner is asked right away, not after another full interval while
+        // the primary is still in flight. It used to start only once no leg
+        // was in flight, so the read took two intervals.
+        string[] names = [.. Names, "9c1e4b7a-2d3f-4a5b-8c6d-7e8f9a0b1c2d"];
+        var nodes = names.ToDictionary(name => name, _ => new MockNode());
+        var discovery = new MockDiscovery(
+            nodes.Select(pair => (pair.Key, pair.Value.Address)).ToList(), 3);
+        using Cluster cluster = new(nodes, discovery);
+        const int hedgeAfterMillis = 300;
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadHedgeAfter = TimeSpan.FromMilliseconds(hedgeAfterMillis),
+        });
+        await client.SetAsync("k", "v");
+        IReadOnlyList<string> owners = new HashRing(names).Owners(Bytes("k"), 3);
+        nodes[owners[0]].DelayGets(2000);
+        nodes[owners[1]].Dispose();
+        await Task.Delay(50); // let the FIN land
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        string? value = await client.GetAsync("k");
+        stopwatch.Stop();
+
+        Assert.Equal("v", value);
+        Assert.Equal(1, nodes[owners[2]].GetCount);
+        Assert.True(stopwatch.ElapsedMilliseconds >= hedgeAfterMillis - HedgeTimingToleranceMillis,
+            $"elapsed {stopwatch.ElapsedMilliseconds}ms: the second owner is asked after one interval");
+        Assert.True(stopwatch.ElapsedMilliseconds < hedgeAfterMillis * 3 / 2,
+            $"elapsed {stopwatch.ElapsedMilliseconds}ms: the third owner should be asked as soon as the second failed");
     }
 
     [Fact]

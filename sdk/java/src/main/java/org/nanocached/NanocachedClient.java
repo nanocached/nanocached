@@ -2985,8 +2985,11 @@ public final class NanocachedClient implements AutoCloseable {
      * like a set, and the primary's answer is returned; with {@code ttlSeconds == 0} the other
      * owners are sent it only after the primary has answered (issue #934), so a primary that has to
      * be rerouted never finds its replicas have already expired the entry. When the primary's
-     * connection fails for good (after the retry, or after the request was sent), the other owners
-     * are sent it before that {@link NanocachedException.ConnectionLost} is thrown.
+     * connection is lost after the request was sent, the other owners are sent it before that
+     * {@link NanocachedException.ConnectionLost} is thrown. When the request never reached the
+     * primary even after the retry (a primary dead but still listed by discovery), no other owner
+     * is sent it either and the error is {@link NanocachedException.ConnectionLost#notSent()
+     * notSent}: a resend once discovery has dropped the primary still finds the entry.
      *
      * @throws NanocachedException.ServerTooOld against a node that predates the command
      */
@@ -3017,7 +3020,7 @@ public final class NanocachedClient implements AutoCloseable {
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         } catch (NanocachedException.ConnectionLost primaryFailure) {
-            if (expiring) applyOnOtherOwners(namespace, key, op, primaryFailure);
+            if (expiring && !primaryFailure.notSent()) applyOnOtherOwners(namespace, key, op, primaryFailure);
             throw primaryFailure;
         }
     }
@@ -3092,8 +3095,9 @@ public final class NanocachedClient implements AutoCloseable {
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         } catch (NanocachedException.ConnectionLost primaryFailure) {
-            // The other owners are sent the plain touch, as after an answer.
-            if (expiring) {
+            // The other owners are sent the plain touch, as after an answer,
+            // only when the request may have reached the primary (see touch).
+            if (expiring && !primaryFailure.notSent()) {
                 applyOnOtherOwners(
                         namespace,
                         key,
@@ -3152,8 +3156,10 @@ public final class NanocachedClient implements AutoCloseable {
      * failure instead of being read as missing, every other key having been touched. In a cluster
      * it goes to every owner of a key, the primary's answer being the key's; with {@code ttlSeconds
      * == 0} the primaries are sent theirs first and the other owners afterwards, for the keys a
-     * primary answered (issue #934). A replica's failure or {@code W} is counted in {@link
-     * ClientStats#replicaWriteFailures()} and never fails the batch. Larger batches are
+     * primary answered (issue #934) and the keys whose primary frame was sent and whose reply was
+     * lost; a key whose primary was never sent the touch is sent to no other owner. A replica's
+     * failure or {@code W} is counted in {@link ClientStats#replicaWriteFailures()} and never fails
+     * the batch. Larger batches are
      * transparently split into more than one {@code y} sub-frame per node (see {@link
      * #MAX_BATCH_KEYS}). If some keys' primaries are still wrong-node after one bounded
      * refresh-and-retry this throws a plain {@link NanocachedException.WrongNode}, and a key whose
@@ -3511,11 +3517,19 @@ public final class NanocachedClient implements AutoCloseable {
         final Set<Integer> lost = ConcurrentHashMap.newKeySet();
 
         /**
-         * Issue #2053: the node whose primary leg last failed each position with a connection error
-         * (lost after the send, or never sent), cleared once it is answered or {@code W}. A ttl 0
-         * call that ends with the position still failed sends its other owners the touch anyway.
+         * Issue #2053: the node each position of {@link #lost} was sent to. A ttl 0 call sends
+         * those positions' other owners the touch anyway, since the node may have expired them. A
+         * position whose primary leg never left is not here and its other owners are sent nothing:
+         * nothing was expired, and the resend its not-sent error invites must still find the value.
          */
-        final Map<Integer, String> failedOn = new ConcurrentHashMap<>();
+        final Map<Integer, String> lostOn = new ConcurrentHashMap<>();
+
+        /**
+         * The failure that put a position in {@link #lost}, kept apart from {@link #lastCause} so a
+         * later not-sent failure (the second pass, another leg) cannot replace it: the caller's
+         * error must not claim nothing was sent while some keys may have been expired.
+         */
+        final AtomicReference<NanocachedException> lostCause = new AtomicReference<>();
 
         volatile boolean rejected;
     }
@@ -3614,20 +3628,18 @@ public final class NanocachedClient implements AutoCloseable {
         }
         if (expiring) {
             multiTouchReplicas(namespace, keys, wireTtl, state.answeredBy, true, state);
-            // Issue #2053: a position whose primary leg failed for good with
-            // a connection error (its reply lost, or still unreachable after
-            // the second pass: a dead primary that discovery still lists)
-            // got no replica leg, so a read falling back to a replica would
-            // return the value the caller expired, and the replica would be
-            // promoted with it. Its other owners are sent the touch now,
-            // awaited even with fireAndForgetReplicas, before the caller
-            // raises the connection error. A `W` or `En` position is not in
-            // `failedOn` and keeps its own path.
-            Set<Integer> stillFailed = new java.util.HashSet<>(retry);
-            stillFailed.addAll(state.lost);
-            Map<Integer, String> failed = new java.util.HashMap<>(state.failedOn);
-            failed.keySet().retainAll(stillFailed);
-            if (!failed.isEmpty()) multiTouchReplicas(namespace, keys, wireTtl, failed, false, state);
+            // Issue #2053: a position whose primary frame was sent and whose
+            // reply was lost got no replica leg, so a read falling back to
+            // a replica would return the value the caller expired, and the
+            // replica would be promoted with it. Its other owners are sent
+            // the touch now, awaited even with fireAndForgetReplicas, before
+            // the caller raises the connection error. Per key: a position
+            // whose primary leg never left (still unreachable after the
+            // second pass: a dead primary that discovery still lists), a
+            // `W` or an `En` is not in `lostOn` and touches no other owner.
+            if (!state.lostOn.isEmpty()) {
+                multiTouchReplicas(namespace, keys, wireTtl, new java.util.HashMap<>(state.lostOn), false, state);
+            }
         }
         for (Map.Entry<Integer, Connection.MultiEntry> result : state.results.entrySet()) {
             answers[result.getKey()] = result.getValue();
@@ -3644,7 +3656,11 @@ public final class NanocachedClient implements AutoCloseable {
                 break;
             }
         }
-        return new MultiTouchOutcome(answers, unresolved, wrongNode, state.lastCause.get(), state.rejected);
+        // A sent-and-lost key's failure wins over a later not-sent one, so
+        // the error's notSent() stays false when some keys may be expired.
+        NanocachedException cause = state.lostCause.get();
+        if (cause == null || state.rejected) cause = state.lastCause.get();
+        return new MultiTouchOutcome(answers, unresolved, wrongNode, cause, state.rejected);
     }
 
     /**
@@ -3759,8 +3775,9 @@ public final class NanocachedClient implements AutoCloseable {
      * plain touch to its other owners on the ring in force now, grouped by owner into one leg each.
      * Those are the positions whose primary answered (a hit, a touch or a miss: a miss may still
      * have a replica copy, and the caller's intent is to expire it everywhere), and, issue #2053,
-     * the ones whose primary leg failed for good with a connection error. A position whose primary
-     * answered {@code W} or {@code En} is in neither, so no replica is touched for it. A replica's
+     * the ones whose primary frame was sent and whose reply was lost. A position whose primary
+     * answered {@code W} or {@code En}, or whose primary leg never left, is in neither, so no
+     * replica is touched for it. A replica's
      * failure is counted in {@link #replicaWriteFailures} and never fails the batch, exactly as for
      * the concurrent fan-out. With {@code detachable} a leg may run as a fire-and-forget write;
      * without it every leg is awaited.
@@ -3885,24 +3902,18 @@ public final class NanocachedClient implements AutoCloseable {
             } else if (answered) {
                 state.results.put(idx, entry);
                 state.answeredBy.put(idx, leg.owner);
-                state.failedOn.remove(idx);
             } else {
                 if (entry == null) {
                     state.wrongNode.remove(idx);
-                    if (failure instanceof NanocachedException.ConnectionLost
-                            && !(failure instanceof NanocachedException.ServerRejected)) {
-                        state.failedOn.put(idx, leg.owner);
-                    } else {
-                        state.failedOn.remove(idx);
-                    }
                     if (i < sentEnd) {
                         // Issue #901: sent, then the connection was lost.
                         state.lost.add(idx);
+                        state.lostOn.put(idx, leg.owner);
+                        state.lostCause.set(failure);
                         continue;
                     }
                 } else {
                     state.wrongNode.add(idx);
-                    state.failedOn.remove(idx);
                 }
                 retry.add(idx);
             }
@@ -3933,12 +3944,14 @@ public final class NanocachedClient implements AutoCloseable {
     }
 
     /**
-     * After a delete's (or, issue #2053, an expiring touch's) primary leg has failed for good with a
-     * connection error (the refresh and retry included: a dead primary that discovery still lists;
-     * for the touch also a reply lost after the request was sent, which is not resent), sends
-     * {@code op} to the other owners before the caller sees {@code primaryFailure}. Otherwise every replica would keep the
-     * value, a plain read falling back to a replica on the dead primary would return it, and once
-     * discovery dropped the primary the replica would be promoted holding it. A delete can be
+     * After a delete's primary leg has failed for good with a connection error (the refresh and
+     * retry included: a dead primary that discovery still lists), or an expiring touch's (issue
+     * #2053) reply was lost after the request was sent (which is not resent), sends {@code op} to
+     * the other owners before the caller sees {@code primaryFailure}. Otherwise every replica would
+     * keep the value, a plain read falling back to a replica on the dead primary would return it,
+     * and once discovery dropped the primary the replica would be promoted holding it. An expiring
+     * touch whose request never reached the primary does not call this: nothing was expired, and
+     * the resend its {@code notSent} error invites must still find the value. A delete can be
      * applied at any time, so this cannot undo anything; the caller still gets the error, so what
      * {@code delete} reports is unchanged. A {@code W} is not a connection error and does not get
      * here. The legs run concurrently on the replica-writer pool and are always awaited, even with
@@ -5541,106 +5554,124 @@ public final class NanocachedClient implements AutoCloseable {
 
         RuntimeException lastError = null;
         boolean replicaMissed = false;
+        // Issue #2093: set once resolveLosers has dealt with the legs this
+        // read leaves behind. Any other exit -- the caller's thread
+        // interrupted, the settle bound, a hedge refused by close() --
+        // still leaves them running, so the finally below counts them as
+        // detached.
+        boolean resolved = false;
 
-        while (pendingCount > 0) {
-            int index;
-            try {
-                // The hedge interval is waited out while there is another
-                // owner to start, and once more for a leg not yet counted
-                // as late -- the last owner started has no owner after it,
-                // but its silence counts like any other's. With every
-                // owner started and every leg counted, the settle bound
-                // below applies.
-                boolean uncounted = false;
-                for (Integer started : legFutures.keySet()) {
-                    if (!lateCounted.contains(started)) {
-                        uncounted = true;
-                        break;
+        try {
+            while (pendingCount > 0) {
+                int index;
+                try {
+                    // The hedge interval is waited out while there is another
+                    // owner to start, and once more for a leg not yet counted
+                    // as late -- the last owner started has no owner after it,
+                    // but its silence counts like any other's. With every
+                    // owner started and every leg counted, the settle bound
+                    // below applies.
+                    boolean uncounted = false;
+                    for (Integer started : legFutures.keySet()) {
+                        if (!lateCounted.contains(started)) {
+                            uncounted = true;
+                            break;
+                        }
                     }
+                    if (nextIndex < names.size() || uncounted) {
+                        index = settlement.await(readHedgeAfterNanos);
+                    } else {
+                        // Every owner is in flight: wait for one to report, but
+                        // not for ever (issue #1265).
+                        long boundMillis = hedgeSettleBoundMillis();
+                        index = settlement.await(TimeUnit.MILLISECONDS.toNanos(boundMillis));
+                        if (index < 0) {
+                            // Not resolveLosers: that joins the legs, and these
+                            // are the ones that did not report.
+                            throw new NanocachedException(
+                                    "nanocached: a hedged read leg did not report an outcome within "
+                                            + boundMillis
+                                            + " ms");
+                        }
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new NanocachedException(
+                            "nanocached: interrupted while waiting for a hedged read", interrupted);
                 }
-                if (nextIndex < names.size() || uncounted) {
-                    index = settlement.await(readHedgeAfterNanos);
+
+                if (index < 0) {
+                    // Hedge interval elapsed with no answer: every leg still
+                    // unanswered is late, which is what marks its owner as
+                    // silent; then one more owner, if any, without waiting for
+                    // any leg already in flight.
+                    for (Map.Entry<Integer, CompletableFuture<Void>> leg : legFutures.entrySet()) {
+                        if (lateCounted.add(leg.getKey())) {
+                            countLateLeg(names.get(leg.getKey()), leg.getValue());
+                        }
+                    }
+                    if (nextIndex < names.size()) {
+                        legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
+                        pendingCount++;
+                        nextIndex++;
+                    }
+                    continue;
+                }
+
+                pendingCount--;
+                // This leg just produced an outcome, so it's already finished
+                // -- discard it from hedgedReads up front (issue #276), before
+                // deciding anything below, exactly as the WrongNode/bug/hit
+                // branches need an accurate count of what's still genuinely in
+                // flight when they call resolveLosers.
+                CompletableFuture<Void> finishedLeg = legFutures.remove(index);
+                if (finishedLeg != null) {
+                    hedgedReads.remove(finishedLeg);
+                }
+                LegOutcome<T> outcome = settlement.take(index);
+                if (outcome.wrongNode != null) {
+                    resolved = true;
+                    resolveLosers(legFutures.values());
+                    throw outcome.wrongNode;
+                } else if (outcome.bug != null) {
+                    resolved = true;
+                    resolveLosers(legFutures.values());
+                    throw outcome.bug;
+                } else if (outcome.fatal != null) {
+                    // Issue #1150: an Error is not ours to wrap or swallow.
+                    resolved = true;
+                    resolveLosers(legFutures.values());
+                    throw outcome.fatal;
+                } else if (outcome.failure != null) {
+                    lastError = outcome.failure;
+                    if (nextIndex < names.size()) {
+                        // Issue #2118: a failed leg is replaced by the next
+                        // owner right away, even while other legs (a silent
+                        // primary) are still in flight.
+                        legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
+                        pendingCount++;
+                        nextIndex++;
+                    }
+                } else if (outcome.value != null || names.get(index).equals(primary)) {
+                    resolved = true;
+                    resolveLosers(legFutures.values());
+                    return outcome.value;
                 } else {
-                    // Every owner is in flight: wait for one to report, but
-                    // not for ever (issue #1265).
-                    long boundMillis = hedgeSettleBoundMillis();
-                    index = settlement.await(TimeUnit.MILLISECONDS.toNanos(boundMillis));
-                    if (index < 0) {
-                        // Not resolveLosers: that joins the legs, and these
-                        // are the ones that did not report.
-                        throw new NanocachedException("nanocached: a hedged read leg did not report an outcome within "
-                                + boundMillis
-                                + " ms");
-                    }
+                    replicaMissed = true;
                 }
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                throw new NanocachedException("nanocached: interrupted while waiting for a hedged read", interrupted);
-            }
 
-            if (index < 0) {
-                // Hedge interval elapsed with no answer: every leg still
-                // unanswered is late, which is what marks its owner as
-                // silent; then one more owner, if any, without waiting for
-                // any leg already in flight.
-                for (Map.Entry<Integer, CompletableFuture<Void>> leg : legFutures.entrySet()) {
-                    if (lateCounted.add(leg.getKey())) {
-                        countLateLeg(names.get(leg.getKey()), leg.getValue());
-                    }
-                }
-                if (nextIndex < names.size()) {
+                if (pendingCount == 0 && nextIndex < names.size()) {
+                    // Everything started so far has missed provisionally: the
+                    // next owner gets its turn right away, rather than waiting
+                    // out another full interval.
                     legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
                     pendingCount++;
                     nextIndex++;
                 }
-                continue;
             }
-
-            pendingCount--;
-            // This leg just produced an outcome, so it's already finished
-            // -- discard it from hedgedReads up front (issue #276), before
-            // deciding anything below, exactly as the WrongNode/bug/hit
-            // branches need an accurate count of what's still genuinely in
-            // flight when they call resolveLosers.
-            CompletableFuture<Void> finishedLeg = legFutures.remove(index);
-            if (finishedLeg != null) {
-                hedgedReads.remove(finishedLeg);
-            }
-            LegOutcome<T> outcome = settlement.take(index);
-            if (outcome.wrongNode != null) {
-                resolveLosers(legFutures.values());
-                throw outcome.wrongNode;
-            } else if (outcome.bug != null) {
-                resolveLosers(legFutures.values());
-                throw outcome.bug;
-            } else if (outcome.fatal != null) {
-                // Issue #1150: an Error is not ours to wrap or swallow.
-                resolveLosers(legFutures.values());
-                throw outcome.fatal;
-            } else if (outcome.failure != null) {
-                lastError = outcome.failure;
-                if (nextIndex < names.size()) {
-                    // Issue #2118: a failed leg is replaced by the next
-                    // owner right away, even while other legs (a silent
-                    // primary) are still in flight.
-                    legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
-                    pendingCount++;
-                    nextIndex++;
-                }
-            } else if (outcome.value != null || names.get(index).equals(primary)) {
-                resolveLosers(legFutures.values());
-                return outcome.value;
-            } else {
-                replicaMissed = true;
-            }
-
-            if (pendingCount == 0 && nextIndex < names.size()) {
-                // Everything started so far has missed provisionally: the
-                // next owner gets its turn right away, rather than waiting
-                // out another full interval.
-                legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
-                pendingCount++;
-                nextIndex++;
+        } finally {
+            if (!resolved) {
+                detachLegs(legFutures.values());
             }
         }
 
@@ -5707,14 +5738,7 @@ public final class NanocachedClient implements AutoCloseable {
             return;
         }
         if (detachedHedgeLegs.get() < maxInFlightHedgeLoserLegs) {
-            for (CompletableFuture<Void> future : losers) {
-                if (!future.isDone()) {
-                    detachedHedgeLegs.incrementAndGet();
-                    // Runs exactly once, right away if the leg finished
-                    // between the check and here.
-                    future.whenComplete((ignoredResult, ignoredError) -> detachedHedgeLegs.decrementAndGet());
-                }
-            }
+            detachLegs(losers);
             return;
         }
         for (CompletableFuture<Void> future : losers) {
@@ -5724,6 +5748,21 @@ public final class NanocachedClient implements AutoCloseable {
             } catch (RuntimeException ignored) {
                 // A losing leg's own failure is irrelevant now -- this
                 // read already decided its outcome via a different leg.
+            }
+        }
+    }
+
+    /**
+     * Counts each of {@code legs} still running in {@link #detachedHedgeLegs} until it finishes:
+     * {@link #readHedged} has returned or thrown and left it running.
+     */
+    private void detachLegs(Collection<CompletableFuture<Void>> legs) {
+        for (CompletableFuture<Void> future : legs) {
+            if (!future.isDone()) {
+                detachedHedgeLegs.incrementAndGet();
+                // Runs exactly once, right away if the leg finished
+                // between the check and here.
+                future.whenComplete((ignoredResult, ignoredError) -> detachedHedgeLegs.decrementAndGet());
             }
         }
     }
@@ -5901,7 +5940,7 @@ public final class NanocachedClient implements AutoCloseable {
      * the primary then turned out to be unreachable or answered {@code W}, the retry over the
      * refreshed ring would reach that replica as the new primary, find the key gone and report a
      * miss, and the value would be lost. A primary that fails sends no replica leg here (the
-     * caller sends them once the retry has failed too, issue #2053). The
+     * caller sends them when the primary's reply was lost after the send, issue #2053). The
      * replica legs therefore run after the primary's answer, outside the pipelined-order guarantee,
      * the same class as the existing retry paths.
      */
