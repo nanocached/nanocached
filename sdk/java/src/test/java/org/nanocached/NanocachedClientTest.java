@@ -6629,6 +6629,48 @@ class NanocachedClientTest {
     }
 
     @Test
+    void theLegsOfAnInterruptedHedgedReadCountAgainstTheHedgeCap() throws Exception {
+        // Issue #2093: a read whose thread is interrupted while it waits
+        // leaves its legs running, never cancelled, exactly like a decided
+        // read's losers, so they must count against the cap. They were
+        // counted only once a read decided: the interrupted read left both
+        // legs running with the counter at 0.
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client =
+                    connectWithReadHedgeAfter(cluster.discovery().port(), 30)) {
+                client.set("k", "v");
+                for (MockNode node : cluster.nodes().values()) {
+                    node.delayGets(1500);
+                }
+
+                java.util.concurrent.atomic.AtomicReference<Throwable> thrown =
+                        new java.util.concurrent.atomic.AtomicReference<>();
+                Thread reader = new Thread(() -> {
+                    try {
+                        client.get("k");
+                    } catch (Throwable error) {
+                        thrown.set(error);
+                    }
+                });
+                reader.start();
+                Thread.sleep(150);
+                reader.interrupt();
+                reader.join(5_000);
+                assertFalse(reader.isAlive(), "the interrupted read should have returned");
+                assertTrue(thrown.get() instanceof NanocachedException, "got " + thrown.get());
+                assertTrue(thrown.get().getCause() instanceof InterruptedException, "got " + thrown.get());
+                assertEquals(2, client.detachedHedgeLegs.get(), "both legs are still running and counted");
+
+                long deadline = System.nanoTime() + 5_000_000_000L;
+                while (client.detachedHedgeLegs.get() > 0 && System.nanoTime() < deadline) {
+                    Thread.sleep(10);
+                }
+                assertEquals(0, client.detachedHedgeLegs.get(), "the detached legs release their counts");
+            }
+        }
+    }
+
+    @Test
     void theLastOwnerStartedIsCountedLateToo() throws Exception {
         // Once the final owner's leg has started there is no owner left to
         // hedge to, but its silence counts like any other's: the hedge

@@ -5541,98 +5541,116 @@ public final class NanocachedClient implements AutoCloseable {
 
         RuntimeException lastError = null;
         boolean replicaMissed = false;
+        // Issue #2093: set once resolveLosers has dealt with the legs this
+        // read leaves behind. Any other exit -- the caller's thread
+        // interrupted, the settle bound, a hedge refused by close() --
+        // still leaves them running, so the finally below counts them as
+        // detached.
+        boolean resolved = false;
 
-        while (pendingCount > 0) {
-            int index;
-            try {
-                // The hedge interval is waited out while there is another
-                // owner to start, and once more for a leg not yet counted
-                // as late -- the last owner started has no owner after it,
-                // but its silence counts like any other's. With every
-                // owner started and every leg counted, the settle bound
-                // below applies.
-                boolean uncounted = false;
-                for (Integer started : legFutures.keySet()) {
-                    if (!lateCounted.contains(started)) {
-                        uncounted = true;
-                        break;
+        try {
+            while (pendingCount > 0) {
+                int index;
+                try {
+                    // The hedge interval is waited out while there is another
+                    // owner to start, and once more for a leg not yet counted
+                    // as late -- the last owner started has no owner after it,
+                    // but its silence counts like any other's. With every
+                    // owner started and every leg counted, the settle bound
+                    // below applies.
+                    boolean uncounted = false;
+                    for (Integer started : legFutures.keySet()) {
+                        if (!lateCounted.contains(started)) {
+                            uncounted = true;
+                            break;
+                        }
                     }
+                    if (nextIndex < names.size() || uncounted) {
+                        index = settlement.await(readHedgeAfterNanos);
+                    } else {
+                        // Every owner is in flight: wait for one to report, but
+                        // not for ever (issue #1265).
+                        long boundMillis = hedgeSettleBoundMillis();
+                        index = settlement.await(TimeUnit.MILLISECONDS.toNanos(boundMillis));
+                        if (index < 0) {
+                            // Not resolveLosers: that joins the legs, and these
+                            // are the ones that did not report.
+                            throw new NanocachedException(
+                                    "nanocached: a hedged read leg did not report an outcome within "
+                                            + boundMillis
+                                            + " ms");
+                        }
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new NanocachedException(
+                            "nanocached: interrupted while waiting for a hedged read", interrupted);
                 }
-                if (nextIndex < names.size() || uncounted) {
-                    index = settlement.await(readHedgeAfterNanos);
+
+                if (index < 0) {
+                    // Hedge interval elapsed with no answer: every leg still
+                    // unanswered is late, which is what marks its owner as
+                    // silent; then one more owner, if any, without waiting for
+                    // any leg already in flight.
+                    for (Map.Entry<Integer, CompletableFuture<Void>> leg : legFutures.entrySet()) {
+                        if (lateCounted.add(leg.getKey())) {
+                            countLateLeg(names.get(leg.getKey()), leg.getValue());
+                        }
+                    }
+                    if (nextIndex < names.size()) {
+                        legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
+                        pendingCount++;
+                        nextIndex++;
+                    }
+                    continue;
+                }
+
+                pendingCount--;
+                // This leg just produced an outcome, so it's already finished
+                // -- discard it from hedgedReads up front (issue #276), before
+                // deciding anything below, exactly as the WrongNode/bug/hit
+                // branches need an accurate count of what's still genuinely in
+                // flight when they call resolveLosers.
+                CompletableFuture<Void> finishedLeg = legFutures.remove(index);
+                if (finishedLeg != null) {
+                    hedgedReads.remove(finishedLeg);
+                }
+                LegOutcome<T> outcome = settlement.take(index);
+                if (outcome.wrongNode != null) {
+                    resolved = true;
+                    resolveLosers(legFutures.values());
+                    throw outcome.wrongNode;
+                } else if (outcome.bug != null) {
+                    resolved = true;
+                    resolveLosers(legFutures.values());
+                    throw outcome.bug;
+                } else if (outcome.fatal != null) {
+                    // Issue #1150: an Error is not ours to wrap or swallow.
+                    resolved = true;
+                    resolveLosers(legFutures.values());
+                    throw outcome.fatal;
+                } else if (outcome.failure != null) {
+                    lastError = outcome.failure;
+                } else if (outcome.value != null || names.get(index).equals(primary)) {
+                    resolved = true;
+                    resolveLosers(legFutures.values());
+                    return outcome.value;
                 } else {
-                    // Every owner is in flight: wait for one to report, but
-                    // not for ever (issue #1265).
-                    long boundMillis = hedgeSettleBoundMillis();
-                    index = settlement.await(TimeUnit.MILLISECONDS.toNanos(boundMillis));
-                    if (index < 0) {
-                        // Not resolveLosers: that joins the legs, and these
-                        // are the ones that did not report.
-                        throw new NanocachedException("nanocached: a hedged read leg did not report an outcome within "
-                                + boundMillis
-                                + " ms");
-                    }
+                    replicaMissed = true;
                 }
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                throw new NanocachedException("nanocached: interrupted while waiting for a hedged read", interrupted);
-            }
 
-            if (index < 0) {
-                // Hedge interval elapsed with no answer: every leg still
-                // unanswered is late, which is what marks its owner as
-                // silent; then one more owner, if any, without waiting for
-                // any leg already in flight.
-                for (Map.Entry<Integer, CompletableFuture<Void>> leg : legFutures.entrySet()) {
-                    if (lateCounted.add(leg.getKey())) {
-                        countLateLeg(names.get(leg.getKey()), leg.getValue());
-                    }
-                }
-                if (nextIndex < names.size()) {
+                if (pendingCount == 0 && nextIndex < names.size()) {
+                    // Everything started so far has failed or missed
+                    // provisionally: the next owner gets its turn right away,
+                    // rather than waiting out another full interval.
                     legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
                     pendingCount++;
                     nextIndex++;
                 }
-                continue;
             }
-
-            pendingCount--;
-            // This leg just produced an outcome, so it's already finished
-            // -- discard it from hedgedReads up front (issue #276), before
-            // deciding anything below, exactly as the WrongNode/bug/hit
-            // branches need an accurate count of what's still genuinely in
-            // flight when they call resolveLosers.
-            CompletableFuture<Void> finishedLeg = legFutures.remove(index);
-            if (finishedLeg != null) {
-                hedgedReads.remove(finishedLeg);
-            }
-            LegOutcome<T> outcome = settlement.take(index);
-            if (outcome.wrongNode != null) {
-                resolveLosers(legFutures.values());
-                throw outcome.wrongNode;
-            } else if (outcome.bug != null) {
-                resolveLosers(legFutures.values());
-                throw outcome.bug;
-            } else if (outcome.fatal != null) {
-                // Issue #1150: an Error is not ours to wrap or swallow.
-                resolveLosers(legFutures.values());
-                throw outcome.fatal;
-            } else if (outcome.failure != null) {
-                lastError = outcome.failure;
-            } else if (outcome.value != null || names.get(index).equals(primary)) {
-                resolveLosers(legFutures.values());
-                return outcome.value;
-            } else {
-                replicaMissed = true;
-            }
-
-            if (pendingCount == 0 && nextIndex < names.size()) {
-                // Everything started so far has failed or missed
-                // provisionally: the next owner gets its turn right away,
-                // rather than waiting out another full interval.
-                legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
-                pendingCount++;
-                nextIndex++;
+        } finally {
+            if (!resolved) {
+                detachLegs(legFutures.values());
             }
         }
 
@@ -5699,14 +5717,7 @@ public final class NanocachedClient implements AutoCloseable {
             return;
         }
         if (detachedHedgeLegs.get() < maxInFlightHedgeLoserLegs) {
-            for (CompletableFuture<Void> future : losers) {
-                if (!future.isDone()) {
-                    detachedHedgeLegs.incrementAndGet();
-                    // Runs exactly once, right away if the leg finished
-                    // between the check and here.
-                    future.whenComplete((ignoredResult, ignoredError) -> detachedHedgeLegs.decrementAndGet());
-                }
-            }
+            detachLegs(losers);
             return;
         }
         for (CompletableFuture<Void> future : losers) {
@@ -5716,6 +5727,21 @@ public final class NanocachedClient implements AutoCloseable {
             } catch (RuntimeException ignored) {
                 // A losing leg's own failure is irrelevant now -- this
                 // read already decided its outcome via a different leg.
+            }
+        }
+    }
+
+    /**
+     * Counts each of {@code legs} still running in {@link #detachedHedgeLegs} until it finishes:
+     * {@link #readHedged} has returned or thrown and left it running.
+     */
+    private void detachLegs(Collection<CompletableFuture<Void>> legs) {
+        for (CompletableFuture<Void> future : legs) {
+            if (!future.isDone()) {
+                detachedHedgeLegs.incrementAndGet();
+                // Runs exactly once, right away if the leg finished
+                // between the check and here.
+                future.whenComplete((ignoredResult, ignoredError) -> detachedHedgeLegs.decrementAndGet());
             }
         }
     }
