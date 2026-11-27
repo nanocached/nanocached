@@ -84,4 +84,31 @@ public class ServerRejectedTouchTests
 
         Assert.Equal(1, FramesSeen(node, op));
     }
+
+    /// <summary>A node's <c>En</c> answers only the oldest request and the
+    /// node closes the connection right after, so an incr pipelined behind
+    /// the rejected touch was never run: it must be drained as not sent and
+    /// replayed on the redial, not reported as possibly applied.</summary>
+    [Fact]
+    public async Task AnIncrPipelinedBehindATouchAnsweredEnIsReplayed()
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress(node.Port));
+        await client.SetAsync("k", "1", 100);
+        node.DelayTouches(500);
+        node.RejectTouchLikeAnOldServer();
+
+        Task touch = client.TouchAsync("k", 30);
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (node.TouchFrames.Count == 0)
+        {
+            Assert.True(DateTime.UtcNow < deadline, "the touch frame never reached the node");
+            await Task.Delay(5);
+        }
+        Task<long?> incr = client.IncrAsync("k", 1);
+
+        await Assert.ThrowsAsync<ServerTooOldException>(() => touch);
+        Assert.Equal(2, await incr.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.Equal(1, node.IncrRequestCount);
+    }
 }
