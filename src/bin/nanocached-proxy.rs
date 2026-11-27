@@ -8761,7 +8761,10 @@ where
 // ─── main ────────────────────────────────────────────────────────────
 
 fn main() -> ExitCode {
-    let args = match parse_args_from(std::env::args().skip(1)) {
+    let args = match infra::command_line_args()
+        .map_err(ArgsError::Invalid)
+        .and_then(|raw| parse_args_from(raw.into_iter()))
+    {
         Ok(args) => args,
         Err(ArgsError::Help(message)) => {
             println!("{message}");

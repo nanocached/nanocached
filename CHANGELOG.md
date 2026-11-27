@@ -14,6 +14,14 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- All binaries (`nanocached-node`, `nanocached-proxy`,
+  `nanocached-discovery`, `ncd`, `verify-staged-join`): a command-line
+  argument that is not valid UTF-8, such as a `--tls-cert` path with a stray
+  byte, made the process panic with exit code 101 and a backtrace. It is now
+  a usage error ("command-line argument is not valid UTF-8: ...") with exit
+  code 1, like any other invalid option; `ncd` passes the arguments through
+  untouched and lets the binary it runs report it (#2049).
+
 - Node: a receive buffer that grew under the in-flight overdraft token kept
   it until its frame arrived, which only the client decided, so a client
   that stalled or trickled mid-frame made every other large upload that
