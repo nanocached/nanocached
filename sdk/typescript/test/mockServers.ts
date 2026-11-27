@@ -305,10 +305,10 @@ export function unreachablePort(): number {
   return port;
 }
 
-function listen(server: Server, port = 0): Promise<number> {
+function listen(server: Server, port = 0, host = "127.0.0.1"): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, "127.0.0.1", () => {
+    server.listen(port, host, () => {
       const address = server.address();
       if (address === null || typeof address === "string") {
         reject(new Error("mock server bound to a non-TCP address"));
@@ -373,6 +373,9 @@ export async function startMockNode(
      * node that comes back on the address discovery already advertised
      * (issue #67 tests). */
     port?: number;
+    /** Listen on this address instead of `127.0.0.1` (`"::1"` for a node
+     * reached over IPv6). `address` stays the IPv4 form. */
+    host?: string;
     /** Delay every `A` reply (accept or reject) by `ms` — a node that's
      * slow to answer identify, not merely slow to reply to G/S/D (issue
      * #226: refreshNodeList must dial several such nodes concurrently, not
@@ -1358,7 +1361,7 @@ export async function startMockNode(
   });
 
   const { sockets, close } = trackAndClose(server);
-  const port = await listen(server, options.port ?? 0);
+  const port = await listen(server, options.port ?? 0, options.host);
 
   return {
     port,

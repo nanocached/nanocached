@@ -517,6 +517,12 @@ function splitHostPort(address: string): { host: string; port: number } {
     throw new NanocachedError(`nanocached: invalid node address from discovery server: ${address}`);
   }
 
+  // Discovery writes an IPv6 host in brackets (`[::1]:8356`); an older one
+  // wrote it bare (`::1:8356`), which the last ':' above still splits.
+  // net.connect and the TLS server name take the host without brackets.
+  if (host.startsWith("[") && host.endsWith("]")) {
+    return { host: host.slice(1, -1), port };
+  }
   return { host, port };
 }
 
