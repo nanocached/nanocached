@@ -71,9 +71,17 @@ CacheManager manager = provider.getCacheManager(URI.create("nanocached:my-app"),
 
 MutableConfiguration<String, User> config = new MutableConfiguration<>();
 config.setTypes(String.class, User.class);
-config.setExpiryPolicyFactory(CreatedExpiryPolicy.factoryOf(new Duration(TimeUnit.MINUTES, 10)));
+// ModifiedExpiryPolicy: 10 minutes from every create and every update.
+config.setExpiryPolicyFactory(ModifiedExpiryPolicy.factoryOf(new Duration(TimeUnit.MINUTES, 10)));
 Cache<String, User> users = manager.createCache("users", config);
 ```
+
+For entries that expire, pick a policy whose `getExpiryForUpdate()` is
+not `null` (`ModifiedExpiryPolicy`, `TouchedExpiryPolicy`):
+`CreatedExpiryPolicy` and `AccessedExpiryPolicy` return `null` for an
+update, which this adapter cannot honour and treats as eternal, so every
+overwritten entry would never expire — see the honest-subset section
+below.
 
 A property that cannot be parsed, or that the client rejects, fails
 `getCacheManager` with a `CacheException` naming the property; booleans
@@ -88,6 +96,12 @@ config-file pointer. `getCachingProvider().getCacheManager()` (the true
 no-arg convenience call) always fails fast: `getDefaultProperties()` is
 empty, so there is no `nanocached.addresses` to connect with unless you
 call the 3-arg overload with your own `Properties`.
+
+Cached values are deserialized with the class loader passed to
+`getCacheManager`. Passing `null` gives the provider's default loader —
+the adapter's own, not the thread's context loader — which cannot see
+application classes in a child loader (a web application, a devtools
+restart); pass the application's loader there.
 
 `CacheManager.getProperties()` returns the properties the manager was
 created with (a copy, defaults included), except `nanocached.secret`:
