@@ -122,7 +122,10 @@ pub(crate) const MIN_MAX_IN_FLIGHT_BYTES: usize = MAX_REQUEST_SIZE;
 /// same (issue #1869, `charge_growth`): it grows uncharged under the token
 /// until its frame has been answered, so the overshoot is one frame then,
 /// for no longer than its client keeps sending (issue #1995,
-/// `OVERDRAFT_RECEIVE_GRACE`).
+/// `OVERDRAFT_RECEIVE_GRACE`). Issue #2155: a receive buffer's growth is
+/// charged against its source IP's share of the budget first
+/// (`ReceiveShare`), so that one source's unfinished frames cannot pin all
+/// of it.
 #[derive(Clone)]
 pub(crate) struct InFlightBudget {
     permits: Arc<Semaphore>,
@@ -143,6 +146,111 @@ pub(crate) struct InFlightBudget {
     /// that pins bytes itself and finds nothing left to wait for takes it
     /// and runs uncharged (`charge_within_room`, `charge_growth`).
     overdraft: Arc<Semaphore>,
+    /// The per-source-IP shares of this budget that receive buffers are
+    /// charged against first (`ReceiveShare`, `charge_receive_growth`).
+    receive_shares: ReceiveShares,
+}
+
+/// A source IP's receive buffers may pin at most
+/// `1 / IP_IN_FLIGHT_SHARE_DIVISOR` of the node-wide in-flight budget, the
+/// proxy's per-IP share. Without it the receive buffers of one source's
+/// unfinished uploads could pin the whole budget, and every reply that
+/// carries a value, on every other client's connection, then waited for a
+/// byte until `WRITE_TIMEOUT` closed it: at the 1 MiB minimum sixteen
+/// connections with 65 KB of an `S` each were enough, and at the default
+/// about 130, which one source may open (`--max-connections-per-ip`).
+const IP_IN_FLIGHT_SHARE_DIVISOR: usize = 4;
+
+/// One source IP's share of a node-wide budget of `total` bytes.
+fn ip_in_flight_share(total: usize) -> usize {
+    (total / IP_IN_FLIGHT_SHARE_DIVISOR).max(1)
+}
+
+type ReceiveShares = Arc<Mutex<HashMap<std::net::IpAddr, std::sync::Weak<ReceiveShare>>>>;
+
+/// What the receive buffers of one source IP's connections are charged
+/// against before the node-wide budget: `ip_in_flight_share` bytes, kept
+/// (like the per-IP connection cap, with an IPv6 source counted per /64)
+/// while the IP has a live connection and dropped with the last of them.
+/// It bounds receive buffers only: replies and multi-key frame charges go
+/// to the node-wide budget alone, so a source that fills its share still
+/// gets its replies, and so does everyone else.
+///
+/// There is no exemption for other nodes or the proxy. The node cannot
+/// tell them from clients (they all authenticate with the one shared
+/// secret, and an exemption by address would cover any client on the
+/// same host), and they do not need one: a connection's receive buffer
+/// holds one frame at a time, about 2 MiB at most, and a node or a proxy
+/// keeps a handful of connections to each node (a shared forward
+/// connection per target, one migration or re-replication stream, the
+/// proxy's backend connection), far under a quarter of any budget but the
+/// smallest. A buffer that alone needs more than the share is charged the
+/// share and goes on growing against the node-wide budget as before, so a
+/// frame is never refused for it.
+struct ReceiveShare {
+    permits: Arc<Semaphore>,
+    bytes: usize,
+    /// What this IP's receive buffers are charged (`ReceiveTally`), the
+    /// share's counterpart of `InFlightBudget::pinned`.
+    pinned: Arc<AtomicUsize>,
+    shares: ReceiveShares,
+    ip: std::net::IpAddr,
+}
+
+impl ReceiveShare {
+    /// The `room` of the share: what is left once the bytes this IP's
+    /// buffers are charged are counted, not only the holder's own.
+    fn room(&self, own: usize) -> usize {
+        let pinned = self.pinned.load(Ordering::Relaxed).max(own);
+        self.bytes.saturating_sub(pinned)
+    }
+
+    async fn charge_exact(&self, cost: usize) -> tokio::sync::OwnedSemaphorePermit {
+        let permits = u32::try_from(cost).unwrap_or(u32::MAX);
+        Arc::clone(&self.permits)
+            .acquire_many_owned(permits)
+            .await
+            .expect("a receive share is never closed")
+    }
+
+    fn try_charge_exact(&self, cost: usize) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let permits = u32::try_from(cost).unwrap_or(u32::MAX);
+        Arc::clone(&self.permits)
+            .try_acquire_many_owned(permits)
+            .ok()
+    }
+
+    /// What a buffer charged `node_charged` node-wide is charged here:
+    /// all of it, up to the whole share.
+    fn charged_for(&self, node_charged: usize) -> usize {
+        node_charged.min(self.bytes)
+    }
+}
+
+impl Drop for ReceiveShare {
+    /// Forgets the IP once its last connection is gone, so the map does
+    /// not grow with every address that ever connected. A connection that
+    /// arrived in between has already replaced the dead entry.
+    fn drop(&mut self) {
+        let mut shares = self
+            .shares
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if shares
+            .get(&self.ip)
+            .is_some_and(|entry| entry.strong_count() == 0)
+        {
+            shares.remove(&self.ip);
+        }
+    }
+}
+
+/// What `charge_receive_growth` hands back: the node-wide charge, and the
+/// share's charge that goes with it (`None` with the overdraft token, or
+/// when the buffer already holds the whole share).
+struct ReceiveGrowth {
+    node: Charge,
+    share: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// What `charge_within_room` hands back: budget bytes, or the overdraft
@@ -159,6 +267,98 @@ impl InFlightBudget {
             bytes,
             pinned: Arc::new(AtomicUsize::new(0)),
             overdraft: Arc::new(Semaphore::new(1)),
+            receive_shares: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The receive share (`ReceiveShare`) of the source IP `ip`, shared by
+    /// all of that IP's connections.
+    fn receive_share(&self, ip: std::net::IpAddr) -> Arc<ReceiveShare> {
+        let ip = infra::per_ip_key(ip);
+        let mut shares = self
+            .receive_shares
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // An entry whose holders are all gone but whose `Drop` has not
+        // taken the lock yet no longer upgrades: it is replaced here.
+        if let Some(share) = shares.get(&ip).and_then(std::sync::Weak::upgrade) {
+            return share;
+        }
+        let bytes = ip_in_flight_share(self.bytes);
+        let share = Arc::new(ReceiveShare {
+            permits: Arc::new(Semaphore::new(bytes)),
+            bytes,
+            pinned: Arc::new(AtomicUsize::new(0)),
+            shares: Arc::clone(&self.receive_shares),
+            ip,
+        });
+        shares.insert(ip, Arc::downgrade(&share));
+        share
+    }
+
+    /// Charges a receive buffer's growth to `want` bytes, on top of the
+    /// `own` it is already charged node-wide, against its source IP's
+    /// `share` first and then the node-wide budget (`charge_growth`). The
+    /// share is charged `ReceiveShare::charged_for` of the buffer's
+    /// charge, so a buffer that alone needs more than the share holds all
+    /// of it and goes on growing against the node-wide budget.
+    ///
+    /// The share comes first so that an IP at its share waits on its own
+    /// connections and never in the node-wide queue ahead of other
+    /// sources. Waiting for it has the shape of issue #1869 inside one IP:
+    /// connections from one source that each hold part of the share and
+    /// each need more would wait for each other until the frame deadline.
+    /// So a buffer already charged waits for the share's bytes or for the
+    /// node-wide overdraft token, whichever comes first, as it does for
+    /// the node-wide bytes; with the token it grows uncharged under the
+    /// same bounds (`OVERDRAFT_RECEIVE_GRACE`, the rebuild once its frame
+    /// has been answered), so the overshoot is still one frame node-wide.
+    /// A buffer charged nothing holds nothing anyone waits for and waits
+    /// for the share's bytes.
+    async fn charge_receive_growth(
+        &self,
+        share: &ReceiveShare,
+        want: usize,
+        own: usize,
+    ) -> ReceiveGrowth {
+        let own_share = share.charged_for(own);
+        let share_cost = share.charged_for(want).saturating_sub(own_share);
+        let mut share_charge = None;
+        if share_cost > 0 {
+            if own_share == 0 || share.room(own_share) >= share_cost {
+                share_charge = Some(share.charge_exact(share_cost).await);
+            } else {
+                tokio::select! {
+                    token = Arc::clone(&self.overdraft).acquire_owned() => {
+                        let token = token.expect("the overdraft token is never closed");
+                        // As in `charge_growth`: leave the token to others
+                        // if the share's bytes can be had now, and keep it
+                        // rather than go back to wait for them.
+                        match share.try_charge_exact(share_cost) {
+                            Some(more) if share.room(own_share) >= share_cost => {
+                                share_charge = Some(more);
+                            }
+                            _ => {
+                                return ReceiveGrowth {
+                                    node: Charge::Overdraft(token),
+                                    share: None,
+                                };
+                            }
+                        }
+                    }
+                    more = share.charge_exact(share_cost) => share_charge = Some(more),
+                }
+            }
+        }
+        let node = self.charge_growth(want - own, own).await;
+        if matches!(node, Charge::Overdraft(_)) {
+            // The growth runs uncharged under the token, on the share as
+            // well as node-wide: the share's charge follows the buffer's.
+            share_charge = None;
+        }
+        ReceiveGrowth {
+            node,
+            share: share_charge,
         }
     }
 
@@ -361,6 +561,14 @@ impl ReceiveTally {
     fn new(budget: &InFlightBudget) -> Self {
         Self {
             pinned: Arc::clone(&budget.pinned),
+            mine: 0,
+        }
+    }
+
+    /// The same, for a source IP's `ReceiveShare`.
+    fn for_share(share: &ReceiveShare) -> Self {
+        Self {
+            pinned: Arc::clone(&share.pinned),
             mine: 0,
         }
     }
@@ -3258,6 +3466,12 @@ async fn handle_connection(
     let mut receive_charge: Option<tokio::sync::OwnedSemaphorePermit> = None;
     let mut receive_charged = 0usize;
     let mut receive_tally = ReceiveTally::new(&config.in_flight_bytes);
+    // The same buffer's charge against its source IP's share of the
+    // budget (`ReceiveShare`): `ReceiveShare::charged_for(receive_charged)`
+    // bytes, held and released with `receive_charge`.
+    let receive_share = config.in_flight_bytes.receive_share(address.ip());
+    let mut receive_share_charge: Option<tokio::sync::OwnedSemaphorePermit> = None;
+    let mut receive_share_tally = ReceiveTally::for_share(&receive_share);
     // The overdraft token, while the buffer has grown uncharged under it
     // for the frame still arriving at its front (issue #1869,
     // `InFlightBudget::charge_growth`); that frame takes it over once it
@@ -4940,6 +5154,8 @@ async fn handle_connection(
         if received.capacity() <= REQUEST_BUFFER_SHRINK_THRESHOLD {
             receive_tally.set(0);
             receive_charge = None;
+            receive_share_tally.set(0);
+            receive_share_charge = None;
             receive_charged = 0;
             receive_overdraft = None;
         }
@@ -4958,6 +5174,10 @@ async fn handle_connection(
         // connection are free; a connection that cannot get the growth
         // by its frame deadline is closed, like one that trickled.
         //
+        // The growth is charged to the connection's source IP's share
+        // first (`InFlightBudget::charge_receive_growth`), so that one
+        // source's unfinished frames cannot pin more than its share.
+        //
         // Issue #1869: a growth the room cannot cover may instead take the
         // overdraft token (`InFlightBudget::charge_growth`), and the frame
         // still arriving then grows uncharged until it is complete. What
@@ -4971,11 +5191,13 @@ async fn handle_connection(
                 .in_flight_bytes
                 .clamp(grown.saturating_sub(REQUEST_BUFFER_SHRINK_THRESHOLD));
             if want > receive_charged && receive_overdraft.is_none() {
-                let charge = timeout(
+                let growth = timeout(
                     remaining,
-                    config
-                        .in_flight_bytes
-                        .charge_growth(want - receive_charged, receive_charged),
+                    config.in_flight_bytes.charge_receive_growth(
+                        &receive_share,
+                        want,
+                        receive_charged,
+                    ),
                 )
                 .await
                 .map_err(|_| {
@@ -4984,17 +5206,16 @@ async fn handle_connection(
                         "in-flight byte budget exhausted while receiving a request",
                     )
                 })?;
-                match charge {
+                match growth.node {
                     Charge::Budget(more) => {
                         receive_charged = want;
                         receive_tally.set(want);
-                        receive_charge = Some(match receive_charge.take() {
-                            Some(mut held) => {
-                                held.merge(more);
-                                held
-                            }
-                            None => more,
-                        });
+                        receive_charge = Some(merge_permit(receive_charge.take(), more));
+                        if let Some(more) = growth.share {
+                            receive_share_tally.set(receive_share.charged_for(want));
+                            receive_share_charge =
+                                Some(merge_permit(receive_share_charge.take(), more));
+                        }
                     }
                     Charge::Overdraft(token) => receive_overdraft = Some(token),
                 }
@@ -5024,7 +5245,18 @@ async fn handle_connection(
                     .saturating_sub(REQUEST_BUFFER_SHRINK_THRESHOLD),
             );
             let owed = want.saturating_sub(receive_charged);
-            let charged = if owed == 0 {
+            // What the source IP's share is owed for the same growth: it
+            // must be had now as well, or the buffer would go on pinning
+            // past its share what it no longer pins past the budget.
+            let share_owed = receive_share
+                .charged_for(want)
+                .saturating_sub(receive_share.charged_for(receive_charged));
+            let share_charged = if share_owed == 0 {
+                None
+            } else {
+                receive_share.try_charge_exact(share_owed)
+            };
+            let charged = if owed == 0 || (share_owed != 0 && share_charged.is_none()) {
                 None
             } else {
                 config.in_flight_bytes.try_charge_exact(owed)
@@ -5038,13 +5270,11 @@ async fn handle_connection(
             if let Some(more) = charged {
                 receive_charged = want;
                 receive_tally.set(want);
-                receive_charge = Some(match receive_charge.take() {
-                    Some(mut held) => {
-                        held.merge(more);
-                        held
-                    }
-                    None => more,
-                });
+                receive_charge = Some(merge_permit(receive_charge.take(), more));
+                if let Some(more) = share_charged {
+                    receive_share_tally.set(receive_share.charged_for(want));
+                    receive_share_charge = Some(merge_permit(receive_share_charge.take(), more));
+                }
             }
             // The growth is charged now, as the buffer's whole capacity.
             grew_uncharged = false;
@@ -5089,6 +5319,20 @@ async fn handle_connection(
                 "connection closed before request was complete",
             ));
         }
+    }
+}
+
+/// `held` with `more` merged into it.
+fn merge_permit(
+    held: Option<tokio::sync::OwnedSemaphorePermit>,
+    more: tokio::sync::OwnedSemaphorePermit,
+) -> tokio::sync::OwnedSemaphorePermit {
+    match held {
+        Some(mut held) => {
+            held.merge(more);
+            held
+        }
+        None => more,
     }
 }
 
@@ -12811,6 +13055,14 @@ mod tests {
         "127.0.0.1:9000".parse().unwrap()
     }
 
+    /// The `n`th of several distinct source addresses, for tests whose
+    /// connections are meant to come from different clients: connections
+    /// from one source IP share one `ReceiveShare` of the budget.
+    fn test_client_addr_from(n: usize) -> SocketAddr {
+        let n = u8::try_from(n).expect("a test uses fewer than 256 sources");
+        SocketAddr::from(([127, 0, 1, n], 9000))
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn run_cache_stores_and_retrieves_a_value() {
         let (request_tx, request_rx) = mpsc::channel(1);
@@ -13284,7 +13536,9 @@ mod tests {
         // released once its frame has arrived and been served, so each
         // waited for bytes only the others could free, until the frame
         // deadline (`IDLE_TIMEOUT`) closed some of them. One at a time,
-        // each now grows under the overdraft token and is answered.
+        // each now grows under the overdraft token and is answered. Each
+        // connection comes from its own source: from one source they would
+        // stop at its share first (`stores_from_one_source`).
         const SIZE: usize = 300_000;
         const SENT: usize = 200_000;
         let (request_tx, request_rx) = mpsc::channel(8);
@@ -13294,11 +13548,11 @@ mod tests {
 
         let mut clients = Vec::new();
         let mut tasks = Vec::new();
-        for _ in 0..5 {
+        for source in 0..5 {
             let (mut client, server) = tcp_pair().await;
             tasks.push(tokio::spawn(handle_connection(
                 ServerStream::Plain(server),
-                test_client_addr(),
+                test_client_addr_from(source),
                 request_tx.clone(),
                 connection_config_with_budget(&budget, IDLE_TIMEOUT),
                 shutdown_rx.clone(),
@@ -13345,6 +13599,178 @@ mod tests {
         cache_task.await.unwrap();
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_sources_unfinished_uploads_leave_the_budget_to_other_sources_replies() {
+        // Sixteen connections from one source each send the first 65,000
+        // bytes of a ~1 MiB store and stop. Their receive buffers used to
+        // be charged 64 KiB each against the node-wide budget alone, which
+        // at the 1 MiB minimum is all of it: `room` was 0 and a `G` for a
+        // stored value on another client's connection waited for a byte
+        // until WRITE_TIMEOUT closed it. They are now charged against the
+        // source's share first, a quarter of the budget, so the rest is
+        // left to everyone else and the reply goes out at once.
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+
+        let (mut reader, server) = tcp_pair().await;
+        let reader_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr_from(1),
+            request_tx.clone(),
+            connection_config_with_budget(&budget, IDLE_TIMEOUT),
+            shutdown_rx.clone(),
+        ));
+        let mut store = b"S 1 1000\nk".to_vec();
+        store.extend(std::iter::repeat_n(b'v', 1000));
+        reader.write_all(&store).await.unwrap();
+        let mut stored = [0u8; 2];
+        timeout(Duration::from_secs(5), reader.read_exact(&mut stored))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&stored, b"S\n");
+
+        let mut uploaders = Vec::new();
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let (mut client, server) = tcp_pair().await;
+            tasks.push(tokio::spawn(handle_connection(
+                ServerStream::Plain(server),
+                test_client_addr_from(2),
+                request_tx.clone(),
+                connection_config_with_budget(&budget, IDLE_TIMEOUT),
+                shutdown_rx.clone(),
+            )));
+            let mut head = b"S 1 1048500\nk".to_vec();
+            head.extend(std::iter::repeat_n(b'v', 65_000));
+            client.write_all(&head).await.unwrap();
+            uploaders.push(client);
+        }
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            budget.pinned.load(Ordering::Relaxed),
+            ip_in_flight_share(MAX_REQUEST_SIZE),
+            "the uploads pin their source's share, no more"
+        );
+
+        reader.write_all(b"G 1\nk").await.unwrap();
+        let mut reply = vec![0u8; "V 1000\n".len() + 1000];
+        timeout(Duration::from_secs(2), reader.read_exact(&mut reply))
+            .await
+            .expect("the reply is not held up by another source's uploads")
+            .unwrap();
+        assert!(reply.starts_with(b"V 1000\n"));
+
+        drop(uploaders);
+        drop(reader);
+        for task in tasks {
+            let _ = timeout(Duration::from_secs(5), task).await;
+        }
+        let _ = timeout(Duration::from_secs(5), reader_task).await;
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+        assert_eq!(budget.pinned.load(Ordering::Relaxed), 0);
+        assert!(
+            budget.receive_shares.lock().unwrap().is_empty(),
+            "a source's share goes with its last connection"
+        );
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// Stores of `size` bytes on `connections` connections from one source,
+    /// each sending all but the last 1,000 bytes first, then the rest; every
+    /// store must be answered well before the frame deadline. Their
+    /// buffers together need more than the source's share, so each waits
+    /// for bytes only the others can free, the shape of issue #1869 inside
+    /// one source.
+    async fn stores_from_one_source(connections: usize, size: usize) {
+        let (request_tx, request_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+
+        let mut clients = Vec::new();
+        let mut tasks = Vec::new();
+        for _ in 0..connections {
+            let (mut client, server) = tcp_pair().await;
+            tasks.push(tokio::spawn(handle_connection(
+                ServerStream::Plain(server),
+                test_client_addr(),
+                request_tx.clone(),
+                connection_config_with_budget(&budget, IDLE_TIMEOUT),
+                shutdown_rx.clone(),
+            )));
+            let mut head = format!("S 1 {size}\nk").into_bytes();
+            head.extend(std::iter::repeat_n(b'v', size - 1_000));
+            client.write_all(&head).await.unwrap();
+            clients.push(client);
+            sleep(Duration::from_millis(200)).await;
+        }
+
+        let mut readers = Vec::new();
+        for mut client in clients {
+            client.write_all(&[b'v'; 1_000]).await.unwrap();
+            readers.push(tokio::spawn(async move {
+                let mut reply = [0u8; 2];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply, b"S\n");
+                client
+            }));
+        }
+        let mut clients = Vec::new();
+        for reader in readers {
+            clients.push(
+                timeout(Duration::from_secs(10), reader)
+                    .await
+                    .expect("every store is answered, not at the idle timeout")
+                    .unwrap(),
+            );
+        }
+
+        drop(clients);
+        for task in tasks {
+            let _ = timeout(Duration::from_secs(5), task).await;
+        }
+        assert_eq!(budget.available(), MAX_REQUEST_SIZE);
+        assert_eq!(budget.overdraft.available_permits(), 1);
+        assert!(budget.receive_shares.lock().unwrap().is_empty());
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn uploads_from_one_source_that_each_hold_part_of_its_share_do_not_wait_for_each_other() {
+        stores_from_one_source(5, 300_000).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn largest_uploads_from_one_source_complete_at_the_smallest_budget() {
+        // Each needs about twice the 1 MiB budget, eight times the source's
+        // share: the first is charged the share and grows against the
+        // budget, the second under the overdraft token.
+        stores_from_one_source(2, MAX_REQUEST_SIZE - 100).await;
+    }
+
+    #[test]
+    fn a_source_ip_gets_a_quarter_of_the_budget_and_ipv6_counts_per_64() {
+        assert_eq!(
+            ip_in_flight_share(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            DEFAULT_MAX_IN_FLIGHT_BYTES / 4
+        );
+        assert_eq!(ip_in_flight_share(1), 1);
+        let budget = InFlightBudget::new(MAX_REQUEST_SIZE);
+        let first = budget.receive_share("2001:db8::1".parse().unwrap());
+        let same_64 = budget.receive_share("2001:db8::2".parse().unwrap());
+        let other = budget.receive_share("2001:db8:0:1::1".parse().unwrap());
+        assert!(Arc::ptr_eq(&first, &same_64));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(first.bytes, MAX_REQUEST_SIZE / 4);
+        drop((first, same_64, other));
+        assert!(budget.receive_shares.lock().unwrap().is_empty());
+    }
+
     /// Issue #1995: the `receive_buffers_that_each_hold_part_of_the_budget_
     /// do_not_wait_for_each_other` setup, where the first `stallers` of five
     /// connections send all but the last 1,000 bytes of their store and
@@ -13366,11 +13792,11 @@ mod tests {
 
         let mut clients = Vec::new();
         let mut tasks = Vec::new();
-        for _ in 0..5 {
+        for source in 0..5 {
             let (mut client, server) = tcp_pair().await;
             tasks.push(tokio::spawn(handle_connection(
                 ServerStream::Plain(server),
-                test_client_addr(),
+                test_client_addr_from(source),
                 request_tx.clone(),
                 connection_config_with_budget(&budget, IDLE_TIMEOUT),
                 shutdown_rx.clone(),
@@ -14674,11 +15100,14 @@ mod tests {
 
         let mut clients = Vec::new();
         let mut tasks = Vec::new();
-        for (name, size) in [(b'b', 100_000usize), (b'a', 600_000)] {
+        for (source, (name, size)) in [(b'b', 100_000usize), (b'a', 600_000)]
+            .into_iter()
+            .enumerate()
+        {
             let (mut client, server) = tcp_pair().await;
             tasks.push(tokio::spawn(handle_connection(
                 ServerStream::Plain(server),
-                test_client_addr(),
+                test_client_addr_from(source),
                 request_tx.clone(),
                 connection_config_with_budget(&budget, IDLE_TIMEOUT),
                 shutdown_rx.clone(),
@@ -14742,11 +15171,11 @@ mod tests {
 
         let mut clients = Vec::new();
         let mut tasks = Vec::new();
-        for size in [100_000usize, 600_000] {
+        for (source, size) in [100_000usize, 600_000].into_iter().enumerate() {
             let (mut client, server) = tcp_pair().await;
             tasks.push(tokio::spawn(handle_connection(
                 ServerStream::Plain(server),
-                test_client_addr(),
+                test_client_addr_from(source),
                 request_tx.clone(),
                 connection_config_with_budget(&budget, IDLE_TIMEOUT),
                 shutdown_rx.clone(),

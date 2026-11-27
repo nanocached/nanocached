@@ -33,6 +33,25 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: one source address could pin the whole
+  `--max-in-flight-bytes` budget with uploads it never finished, and every
+  value-carrying reply on other clients' connections then waited for it
+  and was closed after 10 s: at the 1 MiB minimum, 16 connections from one
+  address sending 65,000 bytes of a ~1 MiB `S` each left a `G` from
+  another address unanswered (about 130 such connections at the 256 MiB
+  default). Like the proxy, the node now charges a source IP's receive
+  buffers (IPv6 per /64) against that source's share first, a quarter of
+  the budget; the same 16 connections pin 256 KiB and the `G` is answered
+  at once. A buffer that alone needs more than the share still grows
+  against the rest of the budget, and connections of one source that each
+  hold part of the share take the overdraft slot in turn, so no frame is
+  refused and they do not wait on each other. Replies and multi-key frame
+  charges are not charged to the share. Other nodes and the proxy get no
+  exemption (the node cannot tell them from clients, and each of their
+  few connections receives one frame at a time). At the 1 MiB minimum a
+  single partial ~1 MiB request still fills the budget, as one request's
+  buffer is all of it (#2155).
+
 - Docs: the in-flight byte budget's docs (`docs/deployment-operations.html`,
   `docs/getting-started.html`, `--help`) said only that a connection that
   cannot get its share in time is closed. They now say how cheaply

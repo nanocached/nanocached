@@ -391,10 +391,9 @@ Usage: nanocached-node [options]
                                A connection that cannot get its share
                                in time is closed, like a stalled one.
                                Unfinished uploads pin about 2 MiB per
-                               connection, so one source can pin about
-                               2 MiB times --max-connections-per-ip;
-                               where untrusted clients connect, size it
-                               so what is left covers the others
+                               connection; one source IP may pin 1/4 of
+                               the budget with them (plus one request),
+                               so the rest stays free for the others
   --max-connections <n>       accepted client connections at once
                                (default {}); over the cap new
                                connections get a Busy reply
