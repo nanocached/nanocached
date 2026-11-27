@@ -1770,31 +1770,70 @@ class NanocachedClientTest {
         }
     }
 
-    // Issue #2053: a primary that is dead but still listed by discovery fails
-    // the touch even after the refresh. The replica used to keep its copy, so
-    // a read falling back to it returned the value the caller expired.
+    /**
+     * Stops {@code name}'s node and waits, bounded, until the client has seen its connection to it
+     * close, so the next request to it fails before anything is written and its redial is refused:
+     * a primary dead but still listed by discovery, never sent the request. Without the wait the
+     * first attempt could still be written to the closing socket, which is a request sent and lost.
+     */
+    private static void stopAndAwaitClientClose(NanocachedClient client, Cluster cluster, String name)
+            throws Exception {
+        cluster.nodes().get(name).close();
+        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
+        while (true) {
+            Connection connection = memberConnectionOf(client, name);
+            if (connection == null || connection.isClosed()) return;
+            assertTrue(System.nanoTime() < deadline, "the client never saw its connection to " + name + " close");
+            Thread.sleep(10);
+        }
+    }
+
+    /**
+     * Drops {@code name} from the discovery server's list and waits past the minimum interval
+     * between forced refreshes, so the next call's refresh really reads the new list.
+     */
+    private static void dropFromDiscoveryForTheResend(Cluster cluster, String name) throws Exception {
+        cluster.discovery().nodes = cluster.discovery().nodes.stream()
+                .filter(discovered -> !discovered.name().equals(name))
+                .toList();
+        Thread.sleep(NanocachedClient.FORCED_REFRESH_MIN_INTERVAL.toMillis() + 100);
+    }
+
+    // A primary that is dead but still listed by discovery fails the touch
+    // even after the refresh, before anything was written to it. The replica
+    // must keep its copy and the error must say nothing was sent: the resend
+    // it invites, once discovery has dropped the primary, reaches the replica
+    // as the new primary and must still find the value. Expiring the replica
+    // first made that resend answer a miss, and a getAndTouch lost the value.
     @Test
-    void anExpiringTouchOfAPrimaryThatStaysUnreachableExpiresTheReplicaBeforeFailing() throws Exception {
+    void anExpiringTouchOfAPrimaryThatStaysUnreachableLeavesTheReplicaForTheResend() throws Exception {
         for (boolean get : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
                 try (NanocachedClient client =
                         connect("127.0.0.1", cluster.discovery().port())) {
                     String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                    String storeKey = MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8));
                     client.set(key, "v", 100);
                     MockNode replica = cluster.nodes().get(NAMES.get(1));
-                    cluster.nodes().get(NAMES.get(0)).close();
-                    Thread.sleep(100);
+                    stopAndAwaitClientClose(client, cluster, NAMES.get(0));
 
-                    assertThrows(NanocachedException.ConnectionLost.class, () -> {
-                        if (get) client.getAndTouch(key, 0);
-                        else client.touch(key, 0);
-                    });
-                    assertEquals(List.of(touchFrame(key, "0")), replica.touchFrames, "the replica got the touch");
-                    assertEquals(null, replica.store.get(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
-                    assertEquals(
-                            Optional.empty(),
-                            client.get(key),
-                            "a read falling back to the replica must not return the expired value");
+                    NanocachedException.ConnectionLost failure =
+                            assertThrows(NanocachedException.ConnectionLost.class, () -> {
+                                if (get) client.getAndTouch(key, 0);
+                                else client.touch(key, 0);
+                            });
+                    assertTrue(failure.notSent(), "nothing reached the primary: " + failure);
+                    assertEquals(List.of(), replica.touchFrames, "the replica was not touched");
+                    assertEquals("v", new String(replica.store.get(storeKey), StandardCharsets.UTF_8));
+
+                    dropFromDiscoveryForTheResend(cluster, NAMES.get(0));
+                    if (get) {
+                        assertEquals(Optional.of("v"), client.getAndTouch(key, 0));
+                    } else {
+                        assertTrue(client.touch(key, 0));
+                    }
+                    assertEquals(1, replica.touchFrames.size(), "the resend, to the new primary");
+                    assertEquals(null, replica.store.get(storeKey));
                 }
             }
         }
@@ -2128,11 +2167,12 @@ class NanocachedClientTest {
         }
     }
 
-    // Issue #2053: the positions whose primary leg failed for good used to get
-    // no replica leg, so a read falling back to a replica returned the values
-    // the caller expired.
+    // The batch form of the dead-but-listed primary above: no key's primary
+    // was ever sent the touch, so no replica is touched, the error says
+    // nothing was sent, and the resend once discovery has dropped the
+    // primary still finds every value on the replica, now the primary.
     @Test
-    void anExpiringBatchTouchOfPrimariesThatStayUnreachableExpiresTheReplicaBeforeFailing() throws Exception {
+    void anExpiringBatchTouchOfPrimariesThatStayUnreachableLeavesTheReplicaForTheResend() throws Exception {
         for (boolean get : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
                 try (NanocachedClient client =
@@ -2142,20 +2182,69 @@ class NanocachedClientTest {
                     Map<String, String> values = new java.util.LinkedHashMap<>();
                     for (String key : keysA) values.put(key, "value of " + key);
                     client.setMany(values);
-                    cluster.nodes().get(NAMES.get(0)).close();
-                    Thread.sleep(100);
+                    stopAndAwaitClientClose(client, cluster, NAMES.get(0));
 
-                    assertThrows(NanocachedException.ConnectionLost.class, () -> {
-                        if (get) client.getManyAndTouch(keysA, 0);
-                        else client.touchMany(keysA, 0);
-                    });
-                    assertEquals(1, replica.multiTouchFrames.size(), "one plain frame for the failed keys");
+                    NanocachedException.ConnectionLost failure =
+                            assertThrows(NanocachedException.ConnectionLost.class, () -> {
+                                if (get) client.getManyAndTouch(keysA, 0);
+                                else client.touchMany(keysA, 0);
+                            });
+                    assertTrue(failure.notSent(), "nothing reached the primary: " + failure);
+                    assertEquals(List.of(), replica.multiTouchFrames, "the replica was not touched");
+                    assertEquals(keysA.size(), replica.store.size());
+
+                    dropFromDiscoveryForTheResend(cluster, NAMES.get(0));
+                    if (get) {
+                        assertEquals(values, client.getManyAndTouch(keysA, 0));
+                    } else {
+                        Map<String, Boolean> touched = new java.util.LinkedHashMap<>();
+                        for (String key : keysA) touched.put(key, true);
+                        assertEquals(touched, client.touchMany(keysA, 0));
+                    }
+                    assertEquals(1, replica.multiTouchFrames.size(), "the resend, to the new primary");
+                    assertEquals(0, replica.store.size());
+                }
+            }
+        }
+    }
+
+    // Per key, not per batch: A's keys were sent to A and their reply lost,
+    // so their other owner is sent the touch; B's keys never left (B is dead
+    // but listed), so their other owner, A, is sent nothing for them. The
+    // error must not say "nothing was sent", since A's keys may be expired.
+    @Test
+    void anExpiringBatchTouchExpiresTheOtherOwnersOnlyOfTheKeysWhosePrimaryFrameWasSent() throws Exception {
+        for (boolean get : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
+                    MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                    List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 2);
+                    List<String> keysB = keysWhosePrimaryIs(NAMES.get(1), 2);
+                    List<String> keys = new ArrayList<>(keysA);
+                    keys.addAll(keysB);
+                    Map<String, String> values = new java.util.LinkedHashMap<>();
+                    for (String key : keys) values.put(key, "value of " + key);
+                    client.setMany(values);
+                    stopAndAwaitClientClose(client, cluster, NAMES.get(1));
+                    nodeA.dropReplyAfterNextTouch();
+
+                    NanocachedException.ConnectionLost failure =
+                            assertThrows(NanocachedException.ConnectionLost.class, () -> {
+                                if (get) client.getManyAndTouch(keys, 0);
+                                else client.touchMany(keys, 0);
+                            });
+                    assertFalse(failure.notSent(), "A's keys were sent: " + failure);
+                    assertEquals(1, nodeA.multiTouchFrames.size(), "A's own keys, once: " + nodeA.multiTouchFrames);
                     assertEquals(
                             new java.util.HashSet<>(keysA),
                             new java.util.HashSet<>(
-                                    replica.multiTouchFrames.get(0).keys()));
-                    assertEquals(0, replica.store.size());
-                    assertEquals(Map.of(), client.getMany(keysA));
+                                    nodeA.multiTouchFrames.get(0).keys()));
+                    for (String key : keysB) {
+                        assertTrue(
+                                nodeA.store.containsKey(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))),
+                                "B's key keeps its copy on A");
+                    }
                 }
             }
         }
