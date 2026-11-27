@@ -1373,8 +1373,9 @@ func (c *Client) deleteNS(namespace []byte, key string) (existed bool, err error
 // sendToOtherOwnersAfterLostPrimary runs op (a delete, or the plain touch
 // of an expiring touch, issue #2057) against the other owners of a
 // primary-first write whose primary leg still failed with a lost connection
-// after the refresh and retry (a dead primary discovery still lists, or,
-// for an expiring touch, a reply lost after the send) before the caller
+// after the refresh and retry (for a delete, also a dead primary discovery
+// still lists; for an expiring touch, only a reply lost after the send, see
+// expireOtherOwnersAfterLostPrimary) before the caller
 // gets the error. Without it no owner would receive the delete: a read falls back
 // to a replica on the dead primary and finds the value, and once discovery
 // drops the primary that replica is promoted with it. A delete is safe to
