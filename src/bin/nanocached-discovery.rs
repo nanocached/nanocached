@@ -2889,16 +2889,15 @@ async fn try_begin_next_join(
     while let Some(outcome) = sends.join_next().await {
         match outcome {
             Ok((ready_name, Err(error))) => {
-                // Every individual attempt (see `send_migrate_with_retry`)
-                // was already logged; this is the final, permanent
-                // failure. Staged node join still doesn't define recovery beyond
-                // this point (issue #20's second gap) — the join stalls
-                // until discovery's own size-derived migration timeout
-                // (size-derived migration timeout) reaps it.
-                eprintln!(
-                    "WARN permanently failed to send M to {ready_name} after \
-                     {MIGRATE_SEND_ATTEMPTS} attempts: {error}"
-                );
+                // Every failed attempt (see `send_migrate_with_retry`) was
+                // already logged; this is why the send stopped: its
+                // attempts ran out, the node kept refusing it, or the join
+                // was abandoned or superseded by a newer generation of the
+                // same name (`error` says which). Staged node join still
+                // doesn't define recovery beyond the first two (issue #20's
+                // second gap) — the join stalls until discovery's own
+                // size-derived migration timeout reaps it.
+                eprintln!("WARN stopped sending M to {ready_name}: {error}");
             }
             Ok((_, Ok(Some(entries)))) => {
                 let mut join_guard = lock_current_join(current_join);
@@ -3124,7 +3123,12 @@ async fn send_migrate_with_retry(
                 may_have_landed = true;
                 failures += 1;
                 if failures >= MIGRATE_SEND_ATTEMPTS {
-                    return Err(error);
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "all {MIGRATE_SEND_ATTEMPTS} attempts failed, the last with: {error}"
+                        ),
+                    ));
                 }
             }
         }
@@ -3956,10 +3960,9 @@ fn hand_off_from_late_member(
             }
             // Issue #1870: the join completed before a retry went out.
             Ok(None) => {}
-            Err(error) => eprintln!(
-                "WARN permanently failed to send M to {name} (admitted by P mid-join) after \
-                 {MIGRATE_SEND_ATTEMPTS} attempts: {error}"
-            ),
+            Err(error) => {
+                eprintln!("WARN stopped sending M to {name} (admitted by P mid-join): {error}")
+            }
         }
         // Keep the registry alive for the duration like the other fan-outs.
         drop(registry);
@@ -15640,7 +15643,15 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
+        // Issue #2051: the error, which the caller's WARN prints, says the
+        // attempts ran out (the WARN itself no longer claims it).
+        let error = result.expect_err("every attempt failed");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("all {MIGRATE_SEND_ATTEMPTS} attempts failed")),
+            "{error}"
+        );
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             MIGRATE_SEND_ATTEMPTS

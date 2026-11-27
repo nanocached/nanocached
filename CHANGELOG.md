@@ -14,6 +14,12 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Discovery: an `M` send that stopped was always logged as "permanently
+  failed to send M … after 3 attempts", including when it stopped because a
+  newer generation of the same name had superseded the join, or because the
+  join was abandoned. It is now logged as "stopped sending M to …" with the
+  reason, and a send whose attempts ran out says so in that reason (#2051).
+
 - Discovery: a join started for a name right after that name's previous
   join was abandoned (the joiner re-registered while the abandon's `X` was
   still waiting, or after discovery gave up on it) sent its `M` to a member
