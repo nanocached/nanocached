@@ -1620,6 +1620,12 @@ impl DrainState {
     fn evicted(&self) -> bool {
         self.0.load(Ordering::SeqCst) == Self::EVICTED
     }
+
+    /// Issue #2088: the drain has begun (evicted or not), so the node
+    /// takes on no new join handoff.
+    fn begun(&self) -> bool {
+        self.0.load(Ordering::SeqCst) != 0
+    }
 }
 
 /// Issue #124: a decommission in progress. The mirror of
@@ -3455,11 +3461,20 @@ async fn handle_connection(
                 // new join handoff — its own drain-out is moving the
                 // very entries a join would want it to send. Rejecting
                 // lets discovery's retry land once this node has left.
-                if node_context
-                    .leaving
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .is_some()
+                //
+                // Issue #2088: from the moment the drain begins, not only
+                // once `leaving` is set. `run_decommission` aborts the
+                // active migration first and fetches the roster next, and
+                // sets `leaving` only after both, which can take seconds
+                // (longer for an evicted node, whose fetch keeps retrying).
+                // An `M` accepted in between started a transfer that
+                // nothing aborted, running alongside the drain.
+                if node_context.drain.begun()
+                    || node_context
+                        .leaving
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .is_some()
                 {
                     write_response(&mut stream, &Response::MigrationRejected.encode()).await?;
                     continue;
@@ -3515,6 +3530,21 @@ async fn handle_connection(
                         // the lot: one per key kept discovery waiting
                         // past its ack timeout on a large restore.
                         unmark_migrated_many(&node_context.request_tx, restore).await;
+                        // Issue #2088: the drain may have begun since the
+                        // check above, after its first step looked for a
+                        // migration to abort and found none. Looked at
+                        // again with the slot held: either this sees the
+                        // drain, or the drain's look at the slot comes
+                        // after it and finds this migration. Dropping the
+                        // guard clears the slot. The restored copies stay
+                        // restored: their join was abandoned either way,
+                        // and the drain hands them on.
+                        if node_context.drain.begun() {
+                            drop(guard);
+                            write_response(&mut stream, &Response::MigrationRejected.encode())
+                                .await?;
+                            continue;
+                        }
                         guard
                     }
                     // A discovery retry of `M` for the handoff already
@@ -8362,8 +8392,8 @@ async fn run_decommission(
     // (then aborts) it on override rather than discarding it.
     let mut shutdown_rx = node_context.shutdown_rx.clone();
 
-    // 1. No new joins (the flag isn't set yet, so flip abort first) and
-    // wind down the active one.
+    // 1. No new joins (the `M` arm refuses them from `DrainState::begin`
+    // on, before this task was spawned) and wind down the active one.
     if let Some(active) = node_context
         .active_migration
         .lock()
@@ -30451,6 +30481,89 @@ mod tests {
                 .load(Ordering::SeqCst),
             "a benign retry must not abort the handoff"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn migrate_command_is_refused_once_the_drain_has_begun_before_leaving_is_set() {
+        // Issue #2088: the drain begins on the shutdown signal, and
+        // `leaving` is set only after the migration wait and the roster
+        // fetch. An `M` in between was accepted and its transfer ran
+        // alongside the drain, never aborted.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        send_command(
+            &request_tx,
+            Command::Set {
+                key: key(b"name"),
+                value: Bytes::from_static(b"Alice"),
+                ttl: None,
+            },
+        )
+        .await;
+
+        let mut node_context = two_node_context("ready-node", request_tx.clone());
+        node_context.token = "tk-ready-node".to_string();
+        node_context.drain.begin();
+        assert!(node_context.leaving.lock().unwrap().is_none());
+        let active_migration = Arc::clone(&node_context.active_migration);
+
+        let (migration_tx, mut migration_rx) = mpsc::channel::<MigrationTask>(1);
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx,
+                forward_tx: mpsc::channel(1).0,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        let joining_name = "joiner-107";
+        let joining_addr = "127.0.0.1:1";
+        let joining_token = "tok-joiner-107";
+        let token = "tk-ready-node";
+        let mut migrate_message = format!(
+            "M {} {} {} 0 1 {}\n",
+            joining_name.len(),
+            joining_addr.len(),
+            joining_token.len(),
+            token.len()
+        )
+        .into_bytes();
+        migrate_message.extend_from_slice(token.as_bytes());
+        migrate_message.extend_from_slice(joining_name.as_bytes());
+        migrate_message.extend_from_slice(joining_addr.as_bytes());
+        migrate_message.extend_from_slice(joining_token.as_bytes());
+        client.write_all(&migrate_message).await.unwrap();
+
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .expect("a reply within 5 s")
+            .unwrap();
+        assert_eq!(&reply, b"R\n", "a draining node refuses a new join handoff");
+        assert!(
+            migration_rx.try_recv().is_err(),
+            "no transfer may be started"
+        );
+        assert!(
+            active_migration.lock().unwrap().is_none(),
+            "the migration slot stays free"
+        );
+
+        drop(client);
+        connection_task.await.unwrap().unwrap();
+        drop(request_tx);
+        cache_task.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
