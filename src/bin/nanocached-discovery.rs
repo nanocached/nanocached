@@ -946,6 +946,15 @@ static NEXT_JOIN_GENERATION: std::sync::OnceLock<AtomicU64> = std::sync::OnceLoc
 /// talk to each other) each seed independently, and the wall clock makes
 /// two replicas' ranges overlap only if they start within the same
 /// microsecond and run the same number of joins.
+///
+/// Issue #2125: nor is it monotonic across a restart whose clock was set
+/// back to before the previous process's first join. A member still
+/// holding a completed but unconfirmed handoff for the same joiner then
+/// refuses the new join's `M` as older (`MigrationGuard::new`'s check in
+/// `src/server.rs`, which a stale resend from a superseded join
+/// needs), and the join waits out its migration timeout until the
+/// abandon's `X` clears that slot. Accepted (docs/architecture.html,
+/// "Accepted behaviour"): this process keeps no state to seed from.
 fn next_join_generation() -> u64 {
     NEXT_JOIN_GENERATION
         .get_or_init(|| {
