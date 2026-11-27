@@ -743,12 +743,64 @@ pub(crate) fn split_host_port(address: &str) -> Result<(String, u16)> {
             "nanocached: invalid node address from discovery server: {address}"
         ))
     })?;
+    // Discovery writes an IPv6 host in brackets (`[::1]:8356`); an older
+    // one wrote it bare (`::1:8356`), which the last ':' above still
+    // splits. The dial and the TLS server name take the host without
+    // brackets: `("[::1]", port)` is looked up as a name and fails.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     Ok((host.to_string(), port))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_host_port_takes_a_bracketed_or_a_bare_ipv6_host() {
+        // Discovery writes an IPv6 host in brackets; an older one wrote it
+        // bare. Both must split to the host a dial and a TLS name take.
+        for (address, host) in [
+            ("[::1]:8356", "::1"),
+            ("::1:8356", "::1"),
+            ("[2001:db8::1]:8356", "2001:db8::1"),
+            ("2001:db8::1:8356", "2001:db8::1"),
+            ("[::ffff:10.0.0.5]:8356", "::ffff:10.0.0.5"),
+            ("::ffff:10.0.0.5:8356", "::ffff:10.0.0.5"),
+            ("127.0.0.1:8356", "127.0.0.1"),
+            ("node-a.example.com:8356", "node-a.example.com"),
+        ] {
+            assert_eq!(
+                split_host_port(address).unwrap(),
+                (host.to_string(), 8356),
+                "{address}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_roster_address_with_an_ipv6_host_dials_either_way() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            eprintln!("skipped: no IPv6 loopback");
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let accepter = tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        for address in [format!("[::1]:{port}"), format!("::1:{port}")] {
+            let (host, port) = split_host_port(&address).unwrap();
+            let dialed = tokio::time::timeout(CONNECT_DEADLINE, open(&host, port, None))
+                .await
+                .expect("dial timed out");
+            assert!(dialed.is_ok(), "{address}: {:?}", dialed.err());
+        }
+        accepter.abort();
+    }
 
     #[tokio::test]
     async fn connecting_to_a_silent_server_fails_within_the_deadline() {
