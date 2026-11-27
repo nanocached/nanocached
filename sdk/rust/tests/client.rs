@@ -6103,13 +6103,12 @@ fn frames_carrying(node: &MockNode, keys: &[String]) -> usize {
 }
 
 #[tokio::test]
-async fn an_expiring_touch_whose_primary_stays_unreachable_expires_the_other_owners_before_failing()
-{
-    // Issue #2054: the primary goes away and the roster still lists it, so
-    // the retry after the forced refresh routes to it again and the call
-    // fails. The replica used to be left holding the value, and a read
-    // falling back to it returned it. It now gets the plain touch before
-    // the error is raised.
+async fn an_expiring_touch_whose_primary_stays_unreachable_leaves_the_other_owners_alone() {
+    // The primary goes away and the roster still lists it, so the dial is
+    // refused on the first attempt and again on the retry after the forced
+    // refresh: the touch never left the client. No other owner is touched,
+    // so the resend the `ConnectionLost` invites, once discovery has
+    // dropped the primary, still finds the value on the replica.
     let key = "shared-key";
     for get in [false, true] {
         let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
@@ -6120,6 +6119,9 @@ async fn an_expiring_touch_whose_primary_stays_unreachable_expires_the_other_own
         let primary = node_named(&nodes, &owners[0]);
         let replica = node_named(&nodes, &owners[1]);
 
+        // Long enough for the client to see the primary's connection close,
+        // so the first attempt redials (refused) instead of writing to a
+        // closing socket, which would be a send whose reply was lost.
         primary.stop();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let result = if get {
@@ -6129,16 +6131,28 @@ async fn an_expiring_touch_whose_primary_stays_unreachable_expires_the_other_own
         };
         assert!(
             matches!(result, Err(Error::ConnectionLost(_))),
-            "get={get}: the caller still gets the primary's failure: {result:?}"
+            "get={get}: the caller gets the primary's failure: {result:?}"
         );
-        assert_eq!(touch_frames(replica), ["t 0 10 0"], "get={get}");
-        assert!(
-            !stored(replica, key),
-            "get={get}: the replica's copy is gone"
-        );
-        // A plain read falls back to the replica on the connection failure
-        // and no longer finds the expired value.
-        assert_eq!(client.get(key).await.unwrap(), None, "get={get}");
+        assert!(touch_frames(replica).is_empty(), "get={get}");
+        assert!(stored(replica, key), "get={get}: the copy is still there");
+
+        // Once the roster drops the primary the resend reaches the replica
+        // as the new primary, and finds the value. The call above refreshed
+        // just now, so the next forced refresh waits out the minimum
+        // interval (issue #1580) before it can see the change.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        shrink_roster_to(&discovery, &nodes, &owners[1]);
+        if get {
+            assert_eq!(
+                client.get_and_touch(key, Some(0)).await.unwrap(),
+                Some("v".to_string())
+            );
+            assert_eq!(touch_frames(replica), ["t 0 10 0 G"]);
+        } else {
+            assert!(client.touch(key, Some(0)).await.unwrap());
+            assert_eq!(touch_frames(replica), ["t 0 10 0"]);
+        }
+        assert!(!stored(replica, key), "get={get}: the resend expired it");
 
         client.close().await;
         discovery.stop();
@@ -6324,11 +6338,11 @@ async fn an_expiring_touch_still_reaches_the_replica_when_the_primary_misses() {
 }
 
 #[tokio::test]
-async fn an_expiring_batch_touch_whose_primary_stays_unreachable_expires_the_other_owners_before_failing(
-) {
-    // Issue #2054: as for a single key, the keys of a primary that is dead
-    // but still listed fail both passes; their other owners are now sent
-    // the plain touch before the error is raised.
+async fn an_expiring_batch_touch_whose_primary_stays_unreachable_leaves_the_other_owners_alone() {
+    // As for a single key: the keys of a primary that is dead but still
+    // listed fail both passes without a frame ever leaving, so their other
+    // owners are sent nothing, and the resend once discovery has dropped
+    // the primary still finds every value.
     for get in [false, true] {
         let (nodes, discovery) = start_cluster(2).await;
         let client = NanocachedClient::connect(options(discovery.port))
@@ -6356,13 +6370,26 @@ async fn an_expiring_batch_touch_whose_primary_stays_unreachable_expires_the_oth
             ),
             "get={get}: {result:?}"
         );
-        let frames = multi_touch_frames(replica);
-        assert_eq!(frames.len(), 1, "get={get}");
-        assert!(!frames[0].get, "get={get}: the plain form");
-        assert!(keys.iter().all(|key| !stored(replica, key)), "get={get}");
-        for key in &keys {
-            assert_eq!(client.get(key).await.unwrap(), None, "get={get}: {key}");
+        assert!(multi_touch_frames(replica).is_empty(), "get={get}");
+        assert!(keys.iter().all(|key| stored(replica, key)), "get={get}");
+
+        // The call above refreshed just now: wait out the minimum interval
+        // between forced refreshes (issue #1580).
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        shrink_roster_to(&discovery, &nodes, NAMES[1]);
+        if get {
+            assert_eq!(
+                client.get_many_and_touch(&keys, Some(0)).await.unwrap(),
+                values_for(&keys)
+            );
+        } else {
+            let touched = client.touch_many(&keys, Some(0)).await.unwrap();
+            assert_eq!(touched.len(), keys.len());
+            assert!(touched.values().all(|touched| *touched));
         }
+        assert_eq!(multi_touch_frames(replica).len(), 1, "get={get}");
+        assert_eq!(multi_touch_frames(replica)[0].get, get);
+        assert!(keys.iter().all(|key| !stored(replica, key)), "get={get}");
 
         client.close().await;
         discovery.stop();
@@ -6370,6 +6397,42 @@ async fn an_expiring_batch_touch_whose_primary_stays_unreachable_expires_the_oth
             node.stop();
         }
     }
+}
+
+#[tokio::test]
+async fn an_expiring_batch_touch_expires_the_other_owners_only_of_keys_whose_primary_was_sent() {
+    // Per key: node A applies its keys' touch and drops the connection
+    // before the reply (sent, outcome unknown), while node B is dead but
+    // still listed (never sent). A's keys get their replica leg (to B,
+    // which fails); B's keys get none, so A, their replica, keeps them.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+    let node_a = node_named(&nodes, NAMES[0]);
+    let keys_a = keys_whose_primary_is(NAMES[0], 2);
+    let keys_b = keys_whose_primary_is(NAMES[1], 2);
+    let keys: Vec<String> = keys_a.iter().chain(&keys_b).cloned().collect();
+    client.set_many(&values_for(&keys), 0).await.unwrap();
+    assert!(keys_b.iter().all(|key| stored(node_a, key)));
+
+    node_named(&nodes, NAMES[1]).stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    node_a.state.hang_after_touch.store(1, Ordering::SeqCst);
+    let before = client.stats().replica_write_failures;
+    let result = client.touch_many(&keys, Some(0)).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "{result:?}"
+    );
+    assert_eq!(frames_carrying(node_a, &keys_b), 0, "no leg for B's keys");
+    assert_eq!(multi_touch_frames(node_a).len(), 1, "A's keys, not resent");
+    assert!(keys_b.iter().all(|key| stored(node_a, key)));
+    assert!(keys_a.iter().all(|key| !stored(node_a, key)));
+    // A's keys' leg to B was tried, and failed.
+    assert!(client.stats().replica_write_failures > before);
+
+    stop_cluster(client, nodes, discovery).await;
 }
 
 #[tokio::test]
