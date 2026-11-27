@@ -207,8 +207,10 @@ final class NanocachedCache<K, V> implements Cache<K, V> {
 
     /**
      * Resolves cached values' classes — the loader the manager was created with (a {@code
-     * CachingProvider.getCacheManager(uri, classLoader, props)} argument), as JSR-107 asks, or,
-     * when none was given, the reading thread's context class loader.
+     * CachingProvider.getCacheManager(uri, classLoader, props)} argument), as JSR-107 asks. Never
+     * {@code null}: when that argument is {@code null} the provider substitutes its {@code
+     * getDefaultClassLoader()} (this adapter's own loader), so the thread-context fallback in
+     * {@link ValueCodec#deserialize(byte[], ClassLoader)} is never reached from a cache.
      */
     private final ClassLoader classLoader;
 

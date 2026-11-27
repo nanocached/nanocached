@@ -44,7 +44,8 @@ final class ValueCodec {
 
     /**
      * Resolves classes with the calling thread's context class loader — see {@link
-     * #deserialize(byte[], ClassLoader)}.
+     * #deserialize(byte[], ClassLoader)}. Only tests call this; a cache always passes its manager's
+     * loader.
      */
     static <V> V deserialize(byte[] bytes) {
         return deserialize(bytes, null);
@@ -52,9 +53,11 @@ final class ValueCodec {
 
     /**
      * Resolves the value's classes with {@code classLoader} — the loader the {@code CacheManager}
-     * was created with, which JSR-107 says is the one for loading the cache's underlying classes —
-     * or, when it is {@code null}, the calling thread's context class loader, falling back to this
-     * class's own. A plain {@code ObjectInputStream} uses the loader that defined this adapter,
+     * was created with, which JSR-107 says is the one for loading the cache's underlying classes.
+     * A cache always passes a non-{@code null} loader: for a manager created with a {@code null}
+     * one, the provider substitutes its {@code getDefaultClassLoader()}, this adapter's own. Only a
+     * {@code null} argument (the one-argument overload, used by tests) falls back to the calling
+     * thread's context class loader, then to this class's own. A plain {@code ObjectInputStream} uses the loader that defined this adapter,
      * which cannot see application classes in a child loader (a web application, a devtools
      * restart): every cache hit then failed with {@code ClassNotFoundException}. A failure to read
      * the value back is a {@link CacheException}, as the {@code Cache} contract asks.
