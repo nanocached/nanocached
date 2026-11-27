@@ -5887,19 +5887,20 @@ struct MultiTouchBatch<'a> {
 /// (`request_not_sent`) or that the node refused is retried as before.
 ///
 /// Issue #2046: an expiring group whose primary leg failed in transport
-/// (sent or not) also records its `addr` in `settled_by` for its keys, as an
-/// answer would. If that failure is the last word on them (the outcome is
-/// unknown, or this is the retry pass), `expire_batch_on_other_owners`
-/// expires their other owners before the client is answered: left holding
-/// the value, a replica would serve a later `G` that falls back to it, and
-/// be promoted with it once the primary is dropped. A key the retry pass
-/// sends again starts unsettled (see `retry_multi_touch`); a `W` or `E`
-/// refusal settles nothing, since nothing was expired.
+/// also records its `addr` in `settled_by` for its keys: as `Reached` when
+/// the frame may have reached the node (the outcome is unknown), as
+/// `NotSent` when it provably never left. `finish_multi_touch` expires the
+/// other owners of a `Reached` key before the client is answered — left
+/// holding the value, a replica would serve a later `G` that falls back to
+/// it, and be promoted with it once the primary is dropped — but those of
+/// a `NotSent` key only when the frame is answered `E` (issue #2074). A key
+/// the retry pass sends again starts unsettled (see `retry_multi_touch`);
+/// a `W` or `E` refusal settles nothing, since nothing was expired.
 fn settle_multi_touch_group(
     group: &TouchGroup,
     reply: io::Result<NodeReply>,
     entries: &mut [Option<ProxyMultiEntry>],
-    settled_by: &mut [Option<String>],
+    settled_by: &mut [Option<SettledOn>],
     retry_positions: &mut Vec<usize>,
     replica_legs: &mut ReplicaLegTally,
     expiring: bool,
@@ -5916,7 +5917,7 @@ fn settle_multi_touch_group(
     if may_have_applied && legs.iter().any(|&(_, is_primary)| is_primary) {
         for &(position, is_primary) in legs {
             if is_primary {
-                settled_by[position] = Some(group.addr.clone());
+                settled_by[position] = Some(SettledOn::Reached(group.addr.clone()));
             }
         }
         return true;
@@ -5934,18 +5935,20 @@ fn settle_multi_touch_group(
                     retry_positions.push(position);
                 } else {
                     entries[position] = Some(result);
-                    settled_by[position] = Some(group.addr.clone());
+                    settled_by[position] = Some(SettledOn::Reached(group.addr.clone()));
                 }
             }
         }
         reply => {
-            let failed = expiring && reply.is_err();
+            // An `Err` here never left: one that may have reached a primary
+            // returned above.
+            let not_sent = expiring && reply.is_err();
             let mut replicas = 0;
             for &(position, is_primary) in legs {
                 if is_primary {
                     retry_positions.push(position);
-                    if failed {
-                        settled_by[position] = Some(group.addr.clone());
+                    if not_sent {
+                        settled_by[position] = Some(SettledOn::NotSent(group.addr.clone()));
                     }
                 } else {
                     replicas += 1;
@@ -5955,6 +5958,17 @@ fn settle_multi_touch_group(
         }
     }
     false
+}
+
+/// How an expiring batch's primary leg settled a key, and on which node
+/// (see `settle_multi_touch_group`).
+#[derive(Clone)]
+enum SettledOn {
+    /// The node answered the key, or the frame may have reached it and
+    /// expired the key there.
+    Reached(String),
+    /// The frame provably never left for the node: nothing was expired.
+    NotSent(String),
 }
 
 /// Issue #871: awaits every sub-reply of a `y` batch and splices the
@@ -5978,7 +5992,7 @@ async fn finish_multi_touch(
     for position in missing {
         entries[position] = Some(ProxyMultiEntry::WrongNode);
     }
-    let mut settled_by: Vec<Option<String>> = vec![None; batch.keys.len()];
+    let mut settled_by: Vec<Option<SettledOn>> = vec![None; batch.keys.len()];
     let expiring = batch.ttl == Some(0);
     let mut unknown = false;
     let mut replica_legs = ReplicaLegTally::default();
@@ -6012,7 +6026,20 @@ async fn finish_multi_touch(
         // #966): the keys a primary answered have expired their copies
         // there, so their other owners get theirs even when another leg's
         // outcome is unknown and the client is told `E` — as the SDKs do.
-        // So do the keys whose primary leg failed for good (issue #2046).
+        // So do the keys whose primary leg's outcome is unknown (issue
+        // #2046). A key whose frame never left expired nothing, and is
+        // answered `W` on its own: its other owners get nothing then
+        // (issue #2074), so the client's resend still finds their copies.
+        // Only once the whole frame is `E`, which promises no safe resend,
+        // do they get theirs too.
+        let settled_by: Vec<Option<String>> = settled_by
+            .into_iter()
+            .map(|settled| match settled {
+                Some(SettledOn::Reached(addr)) => Some(addr),
+                Some(SettledOn::NotSent(addr)) if unknown => Some(addr),
+                _ => None,
+            })
+            .collect();
         expire_batch_on_other_owners(context, &batch, &settled_by, signal).await;
     }
     if unknown {
@@ -6035,7 +6062,8 @@ async fn finish_multi_touch(
 /// roster names on one IP:port, as right after a same-address restart), and
 /// the node needs the key once, not once per rank. A key is listed when
 /// `settled_by` names the node its primary leg settled on (see
-/// `settle_multi_touch_group`); a key still `W`, or never sent, gets none.
+/// `settle_multi_touch_group`) and `finish_multi_touch` kept it; a key
+/// still `W` gets none.
 fn plan_expire_on_other_owners(
     ring: &RingView,
     batch: &MultiTouchBatch<'_>,
@@ -6082,8 +6110,9 @@ fn plan_expire_on_other_owners(
 /// `y ... 0` per other owner on the current ring, covering every key whose
 /// primary answered (a value or a miss: a miss on the primary can still
 /// have a replica copy a fire-and-forget write left, and the client asked
-/// for the key to expire everywhere) or whose primary leg failed for good
-/// (issue #2046). Keys still `W` get none. Sent after
+/// for the key to expire everywhere) or whose primary leg's outcome is
+/// unknown (issue #2046). Keys still `W` get none, nor does a key whose
+/// frame never left unless the whole frame is `E` (issue #2074). Sent after
 /// the primaries answered, these run outside the pipelined-order guarantee
 /// like every retry path; a failure is logged and swallowed as for any
 /// replica leg.
@@ -6172,8 +6201,7 @@ async fn expire_batch_on_other_owners(
 /// fresh ring, not just the primary, which is harmless because a touch is
 /// idempotent — except for an expiring batch, whose other owners wait for
 /// `expire_batch_on_other_owners` (issue #934). A key whose primary is still
-/// `W` or unreachable is answered `W`; for an expiring batch, one still
-/// unreachable has its other owners expired all the same (issue #2046). Returns `true` when an expiring
+/// `W` or unreachable is answered `W`. Returns `true` when an expiring
 /// (`ttl=0`) batch's primary leg may have been applied and its reply is lost
 /// (see `settle_multi_touch_group`).
 async fn retry_multi_touch(
@@ -6181,7 +6209,7 @@ async fn retry_multi_touch(
     batch: MultiTouchBatch<'_>,
     retry_positions: &[usize],
     entries: &mut [Option<ProxyMultiEntry>],
-    settled_by: &mut [Option<String>],
+    settled_by: &mut [Option<SettledOn>],
 ) -> bool {
     force_refresh(context).await;
 
@@ -6534,7 +6562,7 @@ fn expires_at_once(ttl: Option<u64>) -> bool {
 /// Issue #934: the deferred replica legs of an expiring touch — the plain
 /// `t ... 0` to every owner of `key` on the current ring other than
 /// `answered`, the node whose definitive reply the client is about to get
-/// (or whose leg failed for good, issue #2046).
+/// (or whose leg's outcome is unknown, issue #2046).
 /// Sent only now, after that reply, these run outside the pipelined-order
 /// guarantee the initial dispatch gives, like every retry path; a replica
 /// failure is logged and swallowed as for any replica leg.
@@ -6583,9 +6611,10 @@ fn touch_answer(reply: &NodeReply, tag: Option<u32>) -> Option<Vec<u8>> {
 /// is `Fatal::Transient` like a refusal of `i`, `k` or `x`. For the same
 /// reason its replica legs were not enqueued with the primary's (see
 /// `enqueue_touch`): they are sent here, once the primary has answered, by
-/// `expire_on_other_owners` — or once its leg has failed for good (an
-/// unknown outcome here, or any failure of the re-fan), before the client
-/// gets the error.
+/// `expire_on_other_owners` — or once its leg's outcome is unknown (here or
+/// in the re-fan), before the client gets the `E`. A re-fan whose frame
+/// never left sends them nothing: the client is answered `R`, and its
+/// resend must still find the replicas' copies.
 async fn finish_touch(
     context: &ProxyContext,
     namespace: &[u8],
@@ -6709,17 +6738,19 @@ async fn refan_touch(
                 expire_on_other_owners(context, namespace, key, primary, signal).await;
                 Ok(answer)
             }
-            Err(error) => {
-                // The primary leg failed for good: the client gets an
-                // error, but the other owners still get theirs first
-                // (issue #2046, as `refan_write` does for a delete). A
-                // `W`/`E` refusal above expired nothing and sends none.
+            // The frame never left: nothing was expired, and a
+            // retry-capable client is answered `R`, which promises a resend
+            // is safe. So no other owner is touched either (issue #2074): a
+            // replica expired here would answer the resent `t ... 0 G` `N`
+            // once the reroute reached it, and the value would be lost.
+            Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
+            Err(_) => {
+                // The frame may have expired the key on the primary and is
+                // not sent again, so the client is told `E`; the other
+                // owners still get theirs first (issue #2046), or a replica
+                // would keep the value and serve it to a later read.
                 expire_on_other_owners(context, namespace, key, primary, signal).await;
-                Err(if request_not_sent(&error) {
-                    Fatal::Transient
-                } else {
-                    Fatal::OutcomeUnknown
-                })
+                Err(Fatal::OutcomeUnknown)
             }
         };
     }
@@ -18341,64 +18372,107 @@ mod tests {
     /// key whose primary is the dead one (so the live node is its replica).
     /// Returns (live node, proxy addr, that key).
     async fn live_replica_dead_primary_cluster() -> (MockNode, String, String) {
-        let live = MockNode::start().await;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_addr = listener.local_addr().unwrap().to_string();
-        let roster = vec![
-            ("node-live".to_string(), live.addr.clone()),
-            ("node-dead".to_string(), dead_addr.clone()),
-        ];
-        let discovery = start_mock_discovery(roster.clone(), 2).await;
-        let proxy = start_proxy(&discovery, None, 64).await;
-        // Freed only once the discovery and proxy listeners have their own
-        // ports (see `dead_node_cluster`).
-        drop(listener);
-        let ring = RingView::new(roster, 2);
+        let (live, proxy, key, _discovery) = live_replica_dead_primary_cluster_handle().await;
+        (live, proxy, key)
+    }
+
+    /// `live_replica_dead_primary_cluster`, with the discovery handle, so a
+    /// test can drop the dead node from the roster.
+    async fn live_replica_dead_primary_cluster_handle()
+    -> (MockNode, String, String, MockDiscoveryHandle) {
+        let (mut live, proxy, dead_addr, discovery) = cluster_with_a_dead_node(1).await;
+        let live = live.remove(0);
+        let ring = RingView::new(discovery.roster.lock().unwrap().clone(), 2);
         let key = (0..64u8)
             .map(|index| format!("k{index}"))
             .find(|key| ring.owners(b"", key.as_bytes())[0] == dead_addr)
             .expect("some key routes to the dead node first");
-        (live, proxy, key)
+        (live, proxy, key, discovery)
+    }
+
+    /// `live` mock nodes and one dead address at replication 2. Returns
+    /// (live nodes, proxy addr, dead addr, discovery handle).
+    async fn cluster_with_a_dead_node(
+        live: usize,
+    ) -> (Vec<MockNode>, String, String, MockDiscoveryHandle) {
+        let mut nodes = Vec::new();
+        for _ in 0..live {
+            nodes.push(MockNode::start().await);
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = listener.local_addr().unwrap().to_string();
+        let mut roster: Vec<(String, String)> = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (format!("node-live-{index}"), node.addr.clone()))
+            .collect();
+        roster.push(("node-dead".to_string(), dead_addr.clone()));
+        let discovery = start_mock_discovery_handle(roster, 2).await;
+        let proxy = start_proxy(&discovery.addr, None, 64).await;
+        // Freed only once the discovery and proxy listeners have their own
+        // ports (see `dead_node_cluster`).
+        drop(listener);
+        (nodes, proxy, dead_addr, discovery)
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_zero_ttl_touch_whose_primary_stays_unreachable_still_expires_the_replica() {
+    async fn a_zero_ttl_touch_answered_r_leaves_the_replica_for_the_resend() {
         // Issue #934: the plain `t ... 0` used to go to the replica together
         // with the primary leg, so a primary that could not be reached
         // left the replica's copy expired before the re-fan asked it for
-        // the key. The replica gets nothing while the primary leg can still
-        // be re-fanned. Issue #2046: but once the re-fan has failed too,
-        // the replica gets its plain touch before the client gets the
-        // error. Left holding the value, it answered a later `G` that fell
-        // back to it, and kept it once promoted.
+        // the key. Issue #2074: the re-fan's frame never left either, so
+        // the client is answered `R` (nothing happened, resend), and the
+        // replica must still not be touched — it was expired there, and
+        // the resent `t ... 0 G` answered `N` once it reached the replica.
         for get in [false, true] {
-            let (live, proxy, key) = live_replica_dead_primary_cluster().await;
+            let (live, proxy, key, discovery) = live_replica_dead_primary_cluster_handle().await;
             store_on(&live, b"", key.as_bytes());
             let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
-            let request = if get {
-                format!("t 0 {} 0 G 1\n{key}", key.len())
-            } else {
-                format!("t 0 {} 0 1\n{key}", key.len())
+            let touch = |tag: u32| {
+                if get {
+                    format!("t 0 {} 0 G {tag}\n{key}", key.len())
+                } else {
+                    format!("t 0 {} 0 {tag}\n{key}", key.len())
+                }
             };
-            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.write_all(touch(1).as_bytes()).await.unwrap();
             assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 1");
-            // Once, after the re-fan failed: sent with the first attempt
-            // as well, it would show twice.
             assert_eq!(
                 live.touches(),
-                vec![(Some(0), false)],
-                "get={get}: the replica is sent its plain touch once, after the primary leg failed"
+                Vec::<(Option<u64>, bool)>::new(),
+                "get={get}: an `R` must leave the replica untouched"
             );
-            assert!(live.entry(b"", key.as_bytes()).is_none(), "get={get}");
-
-            // A read that falls back to the replica no longer finds it.
-            let read = format!("G {} 2\n{key}", key.len());
-            stream.write_all(read.as_bytes()).await.unwrap();
             assert_eq!(
-                read_line(&mut stream, &mut buf).await.unwrap(),
-                "N 2",
+                live.entry(b"", key.as_bytes()),
+                Some(b"v".to_vec()),
                 "get={get}"
             );
+
+            // The dead primary leaves the roster; the resend `R` invited
+            // reaches the replica, now the primary, which still has the
+            // value and expires it. A single-key re-fan does not refresh
+            // the ring (the background refresh would, within
+            // `REFRESH_INTERVAL`), so a plain batch touch, whose retry pass
+            // does, gets the proxy onto the new ring first.
+            discovery
+                .roster
+                .lock()
+                .unwrap()
+                .retain(|(_, addr)| *addr == live.addr);
+            let refresh = format!("y 0 1 {} 30 3\n{key}", key.len());
+            stream.write_all(refresh.as_bytes()).await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "Y 1 S 3");
+            live.touches.lock().unwrap().clear();
+            stream.write_all(touch(2).as_bytes()).await.unwrap();
+            if get {
+                assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "V 1 0 2");
+                read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+                assert_eq!(&buf.split_to(1)[..], b"v");
+            } else {
+                assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 2");
+            }
+            assert_eq!(live.touches(), vec![(Some(0), get)], "get={get}");
+            assert!(live.entry(b"", key.as_bytes()).is_none(), "get={get}");
         }
     }
 
@@ -18611,39 +18685,100 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_zero_ttl_batch_touch_whose_primary_stays_unreachable_still_expires_the_replica() {
+    async fn a_zero_ttl_batch_touch_answered_w_leaves_the_replica_for_the_resend() {
         // Issue #934: the batch counterpart — the key's primary is dead, so
         // the key degrades to `W`; its replica must not have been sent the
-        // plain `y ... 0` while the retry pass could still reach a primary.
-        // Issue #2046: once the retry pass failed too, it is sent once,
-        // before the frame is answered.
+        // plain `y ... 0` in the meantime. Issue #2074: nor once the retry
+        // pass failed too, since its frame never left either: the `W`
+        // invites a resend, which must still find the replica's copy.
         for get in [false, true] {
-            let (live, proxy, key) = live_replica_dead_primary_cluster().await;
+            let (live, proxy, key, discovery) = live_replica_dead_primary_cluster_handle().await;
             store_on(&live, b"", key.as_bytes());
             let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
-            let request = if get {
-                format!("y 0 1 {} 0 G 1\n{key}", key.len())
-            } else {
-                format!("y 0 1 {} 0 1\n{key}", key.len())
+            let touch = |tag: u32| {
+                if get {
+                    format!("y 0 1 {} 0 G {tag}\n{key}", key.len())
+                } else {
+                    format!("y 0 1 {} 0 {tag}\n{key}", key.len())
+                }
             };
-            stream.write_all(request.as_bytes()).await.unwrap();
+            stream.write_all(touch(1).as_bytes()).await.unwrap();
             let expected = if get { "M 1 W 1" } else { "Y 1 W 1" };
             assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), expected);
             assert_eq!(
                 live.touches(),
-                vec![(Some(0), false)],
-                "get={get}: the replica is sent its plain touch once, after the primary leg failed"
+                Vec::<(Option<u64>, bool)>::new(),
+                "get={get}: a `W` must leave the replica untouched"
             );
-            assert!(live.entry(b"", key.as_bytes()).is_none(), "get={get}");
-
-            let read = format!("G {} 2\n{key}", key.len());
-            stream.write_all(read.as_bytes()).await.unwrap();
             assert_eq!(
-                read_line(&mut stream, &mut buf).await.unwrap(),
-                "N 2",
+                live.entry(b"", key.as_bytes()),
+                Some(b"v".to_vec()),
                 "get={get}"
             );
+
+            discovery
+                .roster
+                .lock()
+                .unwrap()
+                .retain(|(_, addr)| *addr == live.addr);
+            stream.write_all(touch(2).as_bytes()).await.unwrap();
+            if get {
+                assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "M 1 1 2");
+                read_exact_into(&mut stream, &mut buf, 1).await.unwrap();
+                assert_eq!(&buf.split_to(1)[..], b"v");
+            } else {
+                assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "Y 1 S 2");
+            }
+            assert_eq!(live.touches(), vec![(Some(0), get)], "get={get}");
+            assert!(live.entry(b"", key.as_bytes()).is_none(), "get={get}");
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_batch_touch_answered_e_expires_the_replica_of_a_key_that_never_left() {
+        // Issue #2074: one group's outcome is unknown, so the retry pass is
+        // skipped and the whole frame is `E`. Another key's primary is
+        // dead, so its frame never left; `E` promises no safe resend, so
+        // that key's replica is expired as well (issue #2046), as the
+        // client asked.
+        let (nodes, proxy, dead_addr, discovery) = cluster_with_a_dead_node(2).await;
+        let ring = RingView::new(discovery.roster.lock().unwrap().clone(), 2);
+        let keys: Vec<String> = (0..255u8).map(|index| format!("k{index}")).collect();
+        let lost_key = keys
+            .iter()
+            .find(|key| ring.owners(b"", key.as_bytes())[0] == nodes[0].addr)
+            .expect("some key routes to node 0 first")
+            .clone();
+        let unsent_key = keys
+            .iter()
+            .find(|key| ring.owners(b"", key.as_bytes())[0] == dead_addr)
+            .expect("some key routes to the dead node first")
+            .clone();
+        let unsent_replica = ring.owners(b"", unsent_key.as_bytes())[1].clone();
+        let unsent_replica = nodes
+            .iter()
+            .find(|node| node.addr == unsent_replica)
+            .unwrap();
+        for node in &nodes {
+            store_on(node, b"", lost_key.as_bytes());
+            store_on(node, b"", unsent_key.as_bytes());
+        }
+
+        nodes[0]
+            .close_after_touch_apply_once
+            .store(true, Ordering::SeqCst);
+        let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+        let request = format!(
+            "y 0 2 {} {} 0 G 1\n{lost_key}{unsent_key}",
+            lost_key.len(),
+            unsent_key.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+        assert!(
+            unsent_replica.entry(b"", unsent_key.as_bytes()).is_none(),
+            "the never-sent key's replica is expired before the E"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
