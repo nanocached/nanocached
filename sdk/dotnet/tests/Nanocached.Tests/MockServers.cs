@@ -243,6 +243,13 @@ public sealed class MockNode : IDisposable
     }
     private volatile string _malformedValueBody = "x";
 
+    /// <summary>Answer the next G/g request with <paramref name="reply"/>
+    /// written verbatim instead of the real response — for a header the
+    /// node never emits, such as <c>V1\nx</c> with no space after the
+    /// marker.</summary>
+    public void AnswerRawToGetOnce(string reply) => _rawGetReply = reply;
+    private volatile string? _rawGetReply;
+
     /// <summary>Answer the next incr with this exact body instead of the
     /// real new value — for the strict-parse tests (a `+` sign or
     /// whitespace the node never emits).</summary>
@@ -371,7 +378,9 @@ public sealed class MockNode : IDisposable
     /// <summary>issue #934: hold every <c>t</c>/<c>y</c> frame for
     /// <paramref name="millis"/> after it was logged and before it is
     /// applied and answered, so a test can look at what the other nodes
-    /// have seen while this one has not answered yet.</summary>
+    /// have seen while this one has not answered yet. A <c>t</c> that
+    /// <see cref="RejectTouchLikeAnOldServer"/> rejects is held the same
+    /// way before its rejection.</summary>
     public void DelayTouches(int millis) => _touchDelayMillis = millis;
     private volatile string _rejectTouchReply = "En\n";
 
@@ -607,6 +616,11 @@ public sealed class MockNode : IDisposable
                             await Wire.WriteAsync(stream, $"N {int.Parse(parts[^1]) + 1}\n");
                             break;
                         }
+                        if (Interlocked.Exchange(ref _rawGetReply, null) is string rawGetReply)
+                        {
+                            await Wire.WriteAsync(stream, rawGetReply);
+                            break;
+                        }
                         if (TakeMalformedValue())
                         {
                             await Wire.WriteAsync(stream, $"V {_malformedValueBody}\n");
@@ -742,6 +756,11 @@ public sealed class MockNode : IDisposable
                         if (tagged && TakeOne(ref _wrongTagReplies))
                         {
                             await Wire.WriteAsync(stream, $"N {int.Parse(parts[^1]) + 1}\n");
+                            break;
+                        }
+                        if (Interlocked.Exchange(ref _rawGetReply, null) is string rawGetReply)
+                        {
+                            await Wire.WriteAsync(stream, rawGetReply);
                             break;
                         }
                         if (TakeMalformedValue())
@@ -1208,6 +1227,9 @@ public sealed class MockNode : IDisposable
                         _touchFrames.Enqueue(string.Join(' ', parts));
                         if (_rejectTouch)
                         {
+                            // A delay holds the rejection too, so a test
+                            // can pipeline a request behind it first.
+                            if (_touchDelayMillis > 0) await Task.Delay(_touchDelayMillis);
                             await Wire.WriteAsync(stream, _rejectTouchReply.Replace("{tag}", tag));
                             return;
                         }

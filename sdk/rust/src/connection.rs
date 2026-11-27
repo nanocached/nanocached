@@ -1874,7 +1874,8 @@ async fn read_one_response(
         // and only the oldest pending request receives it (issue #1873,
         // see the read loop).
         // Any other `E` is not a node's `En`: the proxy answers a bare `E`
-        // (tagged: `E <tag>`) when it could not tell whether a request was
+        // (untagged even on a tagged connection; an `E` with a tag is read
+        // the same way) when it could not tell whether a request was
         // applied (issue #939). That is a connection lost after the frame
         // was written (mirrors Go): idempotent requests replay it as any
         // lost reply, an incr/CAS or expiring touch does not, and every

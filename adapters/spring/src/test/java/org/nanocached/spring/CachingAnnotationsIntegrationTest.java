@@ -47,6 +47,9 @@ class CachingAnnotationsIntegrationTest {
 
     record User(String name, int age) implements Serializable {}
 
+    /** A composite key object: equal routes may hold the same String twice or two copies of it. */
+    record Route(String from, String to) implements Serializable {}
+
     /**
      * The "expensive" backend the annotations are supposed to shield: every real invocation is
      * counted, so the tests can distinguish a cache hit (count unchanged) from a recomputation.
@@ -165,6 +168,15 @@ class CachingAnnotationsIntegrationTest {
         @CacheEvict("users")
         public void deleteUser(String name) {}
 
+        @Cacheable(cacheNames = "users", key = "#route")
+        public User findByRoute(Route route) {
+            dbCalls.incrementAndGet();
+            return new User(route.from() + "-" + route.to(), 0);
+        }
+
+        @CacheEvict(cacheNames = "users", key = "#route")
+        public void deleteRoute(Route route) {}
+
         @CacheEvict(cacheNames = "users", allEntries = true)
         public void deleteEveryUser() {}
     }
@@ -264,6 +276,21 @@ class CachingAnnotationsIntegrationTest {
                 node.store("users").keySet().stream()
                         .filter(key -> new String(key.array(), StandardCharsets.UTF_8).equals("String:alice"))
                         .count());
+    }
+
+    @Test
+    void cacheEvictWithAnEqualKeyObjectHoldingOtherInstancesRemovesTheEntry() {
+        String city = "Tokyo";
+        service.findByRoute(new Route(city, city)); // a round trip: one String twice
+
+        // The evict's key comes from a separately parsed request.
+        Route parsed = new Route("Tokyo", new String("Tokyo"));
+        service.findByRoute(parsed);
+        assertEquals(1, service.dbCalls(), "an equal key object must hit");
+        service.deleteRoute(parsed);
+        service.findByRoute(new Route(city, city));
+
+        assertEquals(2, service.dbCalls(), "@CacheEvict with an equal key object must remove the entry");
     }
 
     @Test
