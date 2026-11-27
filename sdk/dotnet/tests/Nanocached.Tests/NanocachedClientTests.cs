@@ -429,6 +429,21 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task AHeaderWithNoSpaceAfterTheMarkerPoisonsTheConnection()
+    {
+        // The space after the marker is mandatory: `V1\nx` is not the
+        // one-byte hit `V 1\nx`. It poisons the connection like any other
+        // malformed header, and the idempotent get is retried on a new one.
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", node.Port));
+
+        await client.SetAsync("k", "v");
+        node.AnswerRawToGetOnce("V1\nx");
+        Assert.Equal("v", await client.GetAsync("k"));
+        Assert.Equal(2, node.ConnectionCount);
+    }
+
+    [Fact]
     public async Task AMismatchedResponseKindPoisonsTheConnection()
     {
         // A well-formed response of the wrong kind (`S` answering a G)
