@@ -967,23 +967,27 @@ here.</p>
   (allocator share included), so resident memory tracks the bound for
   tiny entries and namespaces; transient allocations (snapshots, in-flight
   requests, forward queues) are outside it. Leave headroom for those.</li>
-  <li>Unfinished uploads can pin the whole in-flight byte budget. A
+  <li>Unfinished uploads can pin part of the in-flight byte budget. A
   receive buffer stays charged until its frame has arrived (up to the
   60&nbsp;s frame deadline), and a connection part-way through a request
-  close to 1&nbsp;MiB pins about 2&nbsp;MiB. While the budget is pinned, a
-  value-carrying reply on any other connection waits and is closed after
-  10&nbsp;s. At the 1&nbsp;MiB minimum one partial request is enough, and
-  at the 256&nbsp;MiB default about 130 connections from one source
-  address; one source can pin about 2&nbsp;MiB &times;
-  <code>--max-connections-per-ip</code>, several together up to about
-  2&nbsp;MiB &times; <code>--max-connections</code>. Keeping part of the budget back for replies would change how
-  receive buffers, multi-key frames and the overdraft slot wait for each
-  other, an arrangement that earlier fixes tuned to avoid connections
-  waiting on each other for good. So the budget stays shared, and sizing
-  is the remedy: a budget whose remainder beyond what one source can pin
-  covers the other clients, or a lower per-IP cap, for a node untrusted
-  clients can reach, with an auth secret limiting it to clients that hold
-  the secret
+  close to 1&nbsp;MiB pins about 2&nbsp;MiB. One source address's buffers
+  are charged against its share first, a quarter of the budget, so one
+  source pins at most that plus one request's buffer, and replies to
+  everyone have the rest. Four or more sources together can still pin
+  all of it, and so can a single partial request of about 1&nbsp;MiB at
+  the 1&nbsp;MiB minimum, where one request's buffer is the whole budget;
+  while the budget is pinned, a value-carrying reply on any other
+  connection waits and is closed after 10&nbsp;s. Keeping part of the
+  budget back for replies would change how receive buffers, multi-key
+  frames and the overdraft slot wait for each other, an arrangement that
+  earlier fixes tuned to avoid connections waiting on each other for good,
+  so the budget stays shared beyond the per-source share. Other nodes and
+  the proxy get the same share as any client: the node cannot tell them
+  apart (they authenticate with the same secret), and their few
+  connections each receive one frame at a time. Clients behind one NAT
+  address share one quarter. Sizing remains the remedy for a node
+  untrusted clients can reach, with an auth secret limiting this to
+  clients that hold the secret
   (see <a href="deployment-operations.html#memory-budget">Sizing a node
   process</a>).</li>
   <li>Replica-leg writes, read-repair writes and node-list refreshes fail
