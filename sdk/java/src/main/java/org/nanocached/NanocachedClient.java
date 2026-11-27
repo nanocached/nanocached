@@ -2984,7 +2984,9 @@ public final class NanocachedClient implements AutoCloseable {
      * INCR's is, and the entry may or may not have expired. In a cluster it goes to every owner,
      * like a set, and the primary's answer is returned; with {@code ttlSeconds == 0} the other
      * owners are sent it only after the primary has answered (issue #934), so a primary that has to
-     * be rerouted never finds its replicas have already expired the entry.
+     * be rerouted never finds its replicas have already expired the entry. When the primary's
+     * connection fails for good (after the retry, or after the request was sent), the other owners
+     * are sent it before that {@link NanocachedException.ConnectionLost} is thrown.
      *
      * @throws NanocachedException.ServerTooOld against a node that predates the command
      */
@@ -3008,21 +3010,15 @@ public final class NanocachedClient implements AutoCloseable {
         // Issue #1255: the op below also runs as a background replica leg.
         byte[] ownedNamespace = ownedForBackground(namespace);
         byte[] ownedKey = ownedForBackground(key);
+        boolean expiring = expiresAtOnce(wireTtl);
+        ConnectionOp<Boolean> op = connection -> connection.touch(ownedNamespace, ownedKey, wireTtl);
         try {
-            boolean expiring = expiresAtOnce(wireTtl);
-            return withTouchRetry(
-                    expiring,
-                    () -> write(
-                            namespace,
-                            key,
-                            connection -> connection.touch(ownedNamespace, ownedKey, wireTtl),
-                            null,
-                            null,
-                            !expiring,
-                            true,
-                            expiring));
+            return withTouchRetry(expiring, () -> write(namespace, key, op, null, null, !expiring, true, expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
+        } catch (NanocachedException.ConnectionLost primaryFailure) {
+            if (expiring) applyOnOtherOwners(namespace, key, op, primaryFailure);
+            throw primaryFailure;
         }
     }
 
@@ -3077,8 +3073,8 @@ public final class NanocachedClient implements AutoCloseable {
         byte[] ownedNamespace = ownedForBackground(namespace);
         byte[] ownedKey = ownedForBackground(key);
         byte[] raw;
+        boolean expiring = expiresAtOnce(wireTtl);
         try {
-            boolean expiring = expiresAtOnce(wireTtl);
             raw = withTouchRetry(
                     expiring,
                     () -> write(
@@ -3095,6 +3091,16 @@ public final class NanocachedClient implements AutoCloseable {
                             expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
+        } catch (NanocachedException.ConnectionLost primaryFailure) {
+            // The other owners are sent the plain touch, as after an answer.
+            if (expiring) {
+                applyOnOtherOwners(
+                        namespace,
+                        key,
+                        connection -> connection.touch(ownedNamespace, ownedKey, wireTtl),
+                        primaryFailure);
+            }
+            throw primaryFailure;
         }
         if (raw == null) return Optional.empty();
         return Optional.of(compress ? Compression.decompressValue(raw, inflateBudget) : raw);
@@ -3504,6 +3510,13 @@ public final class NanocachedClient implements AutoCloseable {
          */
         final Set<Integer> lost = ConcurrentHashMap.newKeySet();
 
+        /**
+         * Issue #2053: the node whose primary leg last failed each position with a connection error
+         * (lost after the send, or never sent), cleared once it is answered or {@code W}. A ttl 0
+         * call that ends with the position still failed sends its other owners the touch anyway.
+         */
+        final Map<Integer, String> failedOn = new ConcurrentHashMap<>();
+
         volatile boolean rejected;
     }
 
@@ -3599,7 +3612,23 @@ public final class NanocachedClient implements AutoCloseable {
             maybeRefresh(true);
             retry = multiTouchPass(namespace, keys, wireTtl, get, retry, state, expiring);
         }
-        if (expiring) multiTouchReplicas(namespace, keys, wireTtl, state);
+        if (expiring) {
+            multiTouchReplicas(namespace, keys, wireTtl, state.answeredBy, true, state);
+            // Issue #2053: a position whose primary leg failed for good with
+            // a connection error (its reply lost, or still unreachable after
+            // the second pass: a dead primary that discovery still lists)
+            // got no replica leg, so a read falling back to a replica would
+            // return the value the caller expired, and the replica would be
+            // promoted with it. Its other owners are sent the touch now,
+            // awaited even with fireAndForgetReplicas, before the caller
+            // raises the connection error. A `W` or `En` position is not in
+            // `failedOn` and keeps its own path.
+            Set<Integer> stillFailed = new java.util.HashSet<>(retry);
+            stillFailed.addAll(state.lost);
+            Map<Integer, String> failed = new java.util.HashMap<>(state.failedOn);
+            failed.keySet().retainAll(stillFailed);
+            if (!failed.isEmpty()) multiTouchReplicas(namespace, keys, wireTtl, failed, false, state);
+        }
         for (Map.Entry<Integer, Connection.MultiEntry> result : state.results.entrySet()) {
             answers[result.getKey()] = result.getValue();
         }
@@ -3720,22 +3749,31 @@ public final class NanocachedClient implements AutoCloseable {
             }
         }
 
-        dispatchTouchLegs(namespace, legs, keyBytes, wireTtl, retry, state);
+        dispatchTouchLegs(namespace, legs, keyBytes, wireTtl, retry, state, true);
         return retry;
     }
 
     /**
      * The fan-out of a ttl 0 batch touch that follows its primary-only passes (issue #934): every
-     * position whose primary answered (a hit, a touch or a miss: a miss may still have a replica
-     * copy, and the caller's intent is to expire it everywhere) is sent as the plain touch to its
-     * other owners on the ring in force now, grouped by owner into one leg each. A position whose
-     * primary answered {@code W}, failed or was lost is not among them, so no replica is touched
-     * for it. A replica's failure is counted in {@link #replicaWriteFailures} and never fails the
-     * batch, exactly as for the concurrent fan-out.
+     * position of {@code primaries} (position to the node its primary leg went to) is sent as the
+     * plain touch to its other owners on the ring in force now, grouped by owner into one leg each.
+     * Those are the positions whose primary answered (a hit, a touch or a miss: a miss may still
+     * have a replica copy, and the caller's intent is to expire it everywhere), and, issue #2053,
+     * the ones whose primary leg failed for good with a connection error. A position whose primary
+     * answered {@code W} or {@code En} is in neither, so no replica is touched for it. A replica's
+     * failure is counted in {@link #replicaWriteFailures} and never fails the batch, exactly as for
+     * the concurrent fan-out. With {@code detachable} a leg may run as a fire-and-forget write;
+     * without it every leg is awaited.
      */
-    private void multiTouchReplicas(byte[] namespace, byte[][] keyBytes, Long wireTtl, MultiTouchState state) {
+    private void multiTouchReplicas(
+            byte[] namespace,
+            byte[][] keyBytes,
+            Long wireTtl,
+            Map<Integer, String> primaries,
+            boolean detachable,
+            MultiTouchState state) {
         Map<String, TouchLeg> legs = new LinkedHashMap<>();
-        for (Map.Entry<Integer, String> answered : new java.util.TreeMap<>(state.answeredBy).entrySet()) {
+        for (Map.Entry<Integer, String> answered : new java.util.TreeMap<>(primaries).entrySet()) {
             int idx = answered.getKey();
             for (String owner : ownerNames(namespace, keyBytes[idx])) {
                 if (owner.equals(answered.getValue())) continue;
@@ -3746,12 +3784,14 @@ public final class NanocachedClient implements AutoCloseable {
         }
         if (legs.isEmpty()) return;
         // Nothing can end up in `retry`: no leg holds a primary position.
-        dispatchTouchLegs(namespace, legs, keyBytes, wireTtl, Collections.synchronizedList(new ArrayList<>()), state);
+        dispatchTouchLegs(
+                namespace, legs, keyBytes, wireTtl, Collections.synchronizedList(new ArrayList<>()), state, detachable);
     }
 
     /**
      * Runs the legs of one {@link #multiTouchPass} (or of {@link #multiTouchReplicas}) concurrently
-     * and waits for all of them.
+     * and waits for all of them, except a pure-replica leg sent fire-and-forget, which only a
+     * {@code detachable} call allows.
      */
     private void dispatchTouchLegs(
             byte[] namespace,
@@ -3759,7 +3799,8 @@ public final class NanocachedClient implements AutoCloseable {
             byte[][] keyBytes,
             Long wireTtl,
             List<Integer> retry,
-            MultiTouchState state) {
+            MultiTouchState state,
+            boolean detachable) {
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         for (TouchLeg leg : legs.values()) {
             boolean pureReplica = !leg.isPrimary.contains(Boolean.TRUE);
@@ -3767,7 +3808,7 @@ public final class NanocachedClient implements AutoCloseable {
             // branch, including its close()-race fallbacks. A pure-replica
             // leg holds no primary key, so it has nothing to put in
             // `retry`.
-            if (fireAndForgetReplicas && pureReplica && backgroundReplicaWritePermits.tryAcquire()) {
+            if (detachable && fireAndForgetReplicas && pureReplica && backgroundReplicaWritePermits.tryAcquire()) {
                 // Issue #1255: the leg frames its keys and namespace after the
                 // call returned; copy the keys it touches (the caller's own
                 // arrays for a positional byte[][] call) and the namespace.
@@ -3844,9 +3885,16 @@ public final class NanocachedClient implements AutoCloseable {
             } else if (answered) {
                 state.results.put(idx, entry);
                 state.answeredBy.put(idx, leg.owner);
+                state.failedOn.remove(idx);
             } else {
                 if (entry == null) {
                     state.wrongNode.remove(idx);
+                    if (failure instanceof NanocachedException.ConnectionLost
+                            && !(failure instanceof NanocachedException.ServerRejected)) {
+                        state.failedOn.put(idx, leg.owner);
+                    } else {
+                        state.failedOn.remove(idx);
+                    }
                     if (i < sentEnd) {
                         // Issue #901: sent, then the connection was lost.
                         state.lost.add(idx);
@@ -3854,6 +3902,7 @@ public final class NanocachedClient implements AutoCloseable {
                     }
                 } else {
                     state.wrongNode.add(idx);
+                    state.failedOn.remove(idx);
                 }
                 retry.add(idx);
             }
@@ -3878,15 +3927,16 @@ public final class NanocachedClient implements AutoCloseable {
         try {
             return withWrongNodeRetry(() -> write(namespace, key, op, null, null, true, false, true));
         } catch (NanocachedException.ConnectionLost primaryFailure) {
-            deleteOnOtherOwners(namespace, key, op, primaryFailure);
+            applyOnOtherOwners(namespace, key, op, primaryFailure);
             throw primaryFailure;
         }
     }
 
     /**
-     * After a delete's primary leg has failed for good with a connection error (the refresh and
-     * retry included: a dead primary that discovery still lists), sends the delete to the other
-     * owners before the caller sees {@code primaryFailure}. Otherwise every replica would keep the
+     * After a delete's (or, issue #2053, an expiring touch's) primary leg has failed for good with a
+     * connection error (the refresh and retry included: a dead primary that discovery still lists;
+     * for the touch also a reply lost after the request was sent, which is not resent), sends
+     * {@code op} to the other owners before the caller sees {@code primaryFailure}. Otherwise every replica would keep the
      * value, a plain read falling back to a replica on the dead primary would return it, and once
      * discovery dropped the primary the replica would be promoted holding it. A delete can be
      * applied at any time, so this cannot undo anything; the caller still gets the error, so what
@@ -3895,8 +3945,8 @@ public final class NanocachedClient implements AutoCloseable {
      * {@code fireAndForgetReplicas}; their failures are counted in {@code replicaWriteFailures} and
      * never replace {@code primaryFailure}.
      */
-    private void deleteOnOtherOwners(
-            byte[] namespace, byte[] key, ConnectionOp<Boolean> op, NanocachedException.ConnectionLost primaryFailure) {
+    private <T> void applyOnOtherOwners(
+            byte[] namespace, byte[] key, ConnectionOp<T> op, NanocachedException.ConnectionLost primaryFailure) {
         if (ring == null || primaryFailure instanceof NanocachedException.ServerRejected) {
             return;
         }
@@ -5842,7 +5892,8 @@ public final class NanocachedClient implements AutoCloseable {
      * INCR/CAS is. Sent together with the primary's, a replica would expire its copy at once; if
      * the primary then turned out to be unreachable or answered {@code W}, the retry over the
      * refreshed ring would reach that replica as the new primary, find the key gone and report a
-     * miss, and the value would be lost. A primary that fails sends no replica leg at all. The
+     * miss, and the value would be lost. A primary that fails sends no replica leg here (the
+     * caller sends them once the retry has failed too, issue #2053). The
      * replica legs therefore run after the primary's answer, outside the pipelined-order guarantee,
      * the same class as the existing retry paths.
      */

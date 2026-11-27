@@ -1770,8 +1770,11 @@ class NanocachedClientTest {
         }
     }
 
+    // Issue #2053: a primary that is dead but still listed by discovery fails
+    // the touch even after the refresh. The replica used to keep its copy, so
+    // a read falling back to it returned the value the caller expired.
     @Test
-    void anExpiringTouchOfAPrimaryThatStaysUnreachableTouchesNoReplica() throws Exception {
+    void anExpiringTouchOfAPrimaryThatStaysUnreachableExpiresTheReplicaBeforeFailing() throws Exception {
         for (boolean get : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
                 try (NanocachedClient client =
@@ -1786,12 +1789,12 @@ class NanocachedClientTest {
                         if (get) client.getAndTouch(key, 0);
                         else client.touch(key, 0);
                     });
-                    assertEquals(List.of(), replica.touchFrames, "the replica was not touched");
+                    assertEquals(List.of(touchFrame(key, "0")), replica.touchFrames, "the replica got the touch");
+                    assertEquals(null, replica.store.get(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
                     assertEquals(
-                            "v",
-                            new String(
-                                    replica.store.get(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))),
-                                    StandardCharsets.UTF_8));
+                            Optional.empty(),
+                            client.get(key),
+                            "a read falling back to the replica must not return the expired value");
                 }
             }
         }
@@ -1825,7 +1828,58 @@ class NanocachedClientTest {
     }
 
     @Test
-    void anExpiringTouchWhoseReplyWasLostTouchedNoReplica() throws Exception {
+    void anExpiringTouchWhoseReplyWasLostExpiresTheReplicaBeforeFailing() throws Exception {
+        for (boolean get : new boolean[] {false, true}) {
+            try (Cluster cluster = startCluster(2)) {
+                try (NanocachedClient client =
+                        connect("127.0.0.1", cluster.discovery().port())) {
+                    String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                    client.set(key, "v", 100);
+                    MockNode primary = cluster.nodes().get(NAMES.get(0));
+                    MockNode replica = cluster.nodes().get(NAMES.get(1));
+                    primary.dropReplyAfterNextTouch();
+
+                    assertThrows(NanocachedException.ConnectionLost.class, () -> {
+                        if (get) client.getAndTouch(key, 0);
+                        else client.touch(key, 0);
+                    });
+                    assertEquals(1, primary.touchFrames.size(), "the applied touch was not resent");
+                    assertEquals(List.of(touchFrame(key, "0")), replica.touchFrames, "the replica got the touch");
+                    assertEquals(null, replica.store.get(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
+                }
+            }
+        }
+    }
+
+    // Issue #2053: with fire-and-forget replicas the fallback touch is still
+    // awaited. The background thread is held, so a detached leg could not run.
+    @Test
+    void anExpiringTouchWhoseReplyWasLostAwaitsTheReplicaTouchEvenWithFireAndForget() throws Exception {
+        NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                    .addresses(
+                            List.of(new Address("127.0.0.1", cluster.discovery().port())))
+                    .fireAndForgetReplicas(true))) {
+                String key = keysWhosePrimaryIs(NAMES.get(0), 1).get(0);
+                client.set(key, "v", 100);
+                MockNode primary = cluster.nodes().get(NAMES.get(0));
+                MockNode replica = cluster.nodes().get(NAMES.get(1));
+                primary.dropReplyAfterNextTouch();
+
+                java.util.concurrent.CountDownLatch release = blockBackgroundLegs(client);
+                try {
+                    assertThrows(NanocachedException.ConnectionLost.class, () -> client.touch(key, 0));
+                    assertEquals(List.of(touchFrame(key, "0")), replica.touchFrames, "touched before the error");
+                } finally {
+                    release.countDown();
+                }
+            }
+        }
+    }
+
+    @Test
+    void anExpiringTouchAnsweredWrongNodeTwiceLeavesTheReplicaAlone() throws Exception {
         try (Cluster cluster = startCluster(2)) {
             try (NanocachedClient client =
                     connect("127.0.0.1", cluster.discovery().port())) {
@@ -1833,11 +1887,12 @@ class NanocachedClientTest {
                 client.set(key, "v", 100);
                 MockNode primary = cluster.nodes().get(NAMES.get(0));
                 MockNode replica = cluster.nodes().get(NAMES.get(1));
-                primary.dropReplyAfterNextTouch();
+                primary.answerWrongNodeOnce();
+                primary.answerWrongNodeOnce();
 
-                assertThrows(NanocachedException.ConnectionLost.class, () -> client.touch(key, 0));
-                assertEquals(1, primary.touchFrames.size());
-                assertEquals(List.of(), replica.touchFrames, "the primary never answered");
+                assertThrows(NanocachedException.WrongNode.class, () -> client.touch(key, 0));
+                assertEquals(List.of(), replica.touchFrames);
+                assertTrue(replica.store.containsKey(MockNode.keyOf(key.getBytes(StandardCharsets.UTF_8))));
             }
         }
     }
@@ -2073,8 +2128,11 @@ class NanocachedClientTest {
         }
     }
 
+    // Issue #2053: the positions whose primary leg failed for good used to get
+    // no replica leg, so a read falling back to a replica returned the values
+    // the caller expired.
     @Test
-    void anExpiringBatchTouchOfPrimariesThatStayUnreachableTouchesNoReplica() throws Exception {
+    void anExpiringBatchTouchOfPrimariesThatStayUnreachableExpiresTheReplicaBeforeFailing() throws Exception {
         for (boolean get : new boolean[] {false, true}) {
             try (Cluster cluster = startCluster(2)) {
                 try (NanocachedClient client =
@@ -2091,34 +2149,79 @@ class NanocachedClientTest {
                         if (get) client.getManyAndTouch(keysA, 0);
                         else client.touchMany(keysA, 0);
                     });
-                    assertEquals(List.of(), replica.multiTouchFrames, "no primary answered, so no replica leg");
-                    assertEquals(keysA.size(), replica.store.size());
+                    assertEquals(1, replica.multiTouchFrames.size(), "one plain frame for the failed keys");
+                    assertEquals(
+                            new java.util.HashSet<>(keysA),
+                            new java.util.HashSet<>(
+                                    replica.multiTouchFrames.get(0).keys()));
+                    assertEquals(0, replica.store.size());
+                    assertEquals(Map.of(), client.getMany(keysA));
                 }
             }
         }
     }
 
     @Test
-    void anExpiringBatchTouchWhosePrimaryReplyWasLostTouchedNoReplica() throws Exception {
-        for (boolean get : new boolean[] {false, true}) {
-            try (Cluster cluster = startCluster(2)) {
-                try (NanocachedClient client =
-                        connect("127.0.0.1", cluster.discovery().port())) {
-                    MockNode nodeA = cluster.nodes().get(NAMES.get(0));
-                    MockNode replica = cluster.nodes().get(NAMES.get(1));
-                    List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
-                    Map<String, String> values = new java.util.LinkedHashMap<>();
-                    for (String key : keysA) values.put(key, "value of " + key);
-                    client.setMany(values);
-                    nodeA.dropReplyAfterNextTouch();
+    void anExpiringBatchTouchWhosePrimaryReplyWasLostExpiresTheReplicaBeforeFailing() throws Exception {
+        for (boolean fireAndForget : new boolean[] {false, true}) {
+            for (boolean get : new boolean[] {false, true}) {
+                NanocachedClient.maxInFlightBackgroundReplicaWrites = 1;
+                try (Cluster cluster = startCluster(2)) {
+                    try (NanocachedClient client = NanocachedClient.connect(NanocachedClient.builder()
+                            .addresses(List.of(
+                                    new Address("127.0.0.1", cluster.discovery().port())))
+                            .fireAndForgetReplicas(fireAndForget))) {
+                        MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                        MockNode replica = cluster.nodes().get(NAMES.get(1));
+                        List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
+                        Map<String, String> values = new java.util.LinkedHashMap<>();
+                        for (String key : keysA) values.put(key, "value of " + key);
+                        client.setMany(values);
+                        nodeA.dropReplyAfterNextTouch();
 
-                    assertThrows(NanocachedException.ConnectionLost.class, () -> {
-                        if (get) client.getManyAndTouch(keysA, 0);
-                        else client.touchMany(keysA, 0);
-                    });
-                    assertEquals(1, nodeA.multiTouchFrames.size(), "the applied frame was not sent again");
-                    assertEquals(List.of(), replica.multiTouchFrames, "the primary never answered");
+                        // With fire-and-forget the background thread is held, so
+                        // a detached leg could not have run before the error.
+                        java.util.concurrent.CountDownLatch release = fireAndForget
+                                ? blockBackgroundLegs(client)
+                                : new java.util.concurrent.CountDownLatch(0);
+                        try {
+                            assertThrows(NanocachedException.ConnectionLost.class, () -> {
+                                if (get) client.getManyAndTouch(keysA, 0);
+                                else client.touchMany(keysA, 0);
+                            });
+                            assertEquals(1, nodeA.multiTouchFrames.size(), "the applied frame was not sent again");
+                            assertEquals(1, replica.multiTouchFrames.size(), "the replica got its frame first");
+                            assertEquals(
+                                    new java.util.HashSet<>(keysA),
+                                    new java.util.HashSet<>(
+                                            replica.multiTouchFrames.get(0).keys()));
+                            assertEquals(0, replica.store.size());
+                        } finally {
+                            release.countDown();
+                        }
+                    }
                 }
+            }
+        }
+    }
+
+    @Test
+    void anExpiringBatchTouchAnsweredWrongNodeOnBothPassesLeavesTheReplicaAlone() throws Exception {
+        try (Cluster cluster = startCluster(2)) {
+            try (NanocachedClient client =
+                    connect("127.0.0.1", cluster.discovery().port())) {
+                MockNode nodeA = cluster.nodes().get(NAMES.get(0));
+                MockNode replica = cluster.nodes().get(NAMES.get(1));
+                List<String> keysA = keysWhosePrimaryIs(NAMES.get(0), 3);
+                Map<String, String> values = new java.util.LinkedHashMap<>();
+                for (String key : keysA) values.put(key, "value of " + key);
+                client.setMany(values);
+                nodeA.answerWrongNodeOnce();
+                nodeA.answerWrongNodeOnce();
+
+                assertThrows(NanocachedException.WrongNode.class, () -> client.touchMany(keysA, 0));
+                assertEquals(List.of(), replica.multiTouchFrames);
+                assertEquals(keysA.size(), replica.store.size());
             }
         }
     }
