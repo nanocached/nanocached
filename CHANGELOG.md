@@ -73,7 +73,12 @@ framework adapters at one version, whether or not a component changed.
   a non-numeric port, or an unbracketed IPv6 host) was accepted at startup,
   and every connect then failed with "invalid socket address", so the node
   never joined and the proxy never had a roster. Each address is now checked
-  at startup and a bad one is a usage error naming it (#2050).
+  at startup and a bad one is a usage error naming it (#2050). A link-local
+  IPv6 host with a numeric scope id (`[fe80::1%2]:8357`), which connects,
+  is accepted by that check; a named zone (`%eth0`), which never connected,
+  is refused with a message saying the scope id must be a number. With
+  `--tls-ca`, the scope id is no longer part of the TLS server name, which
+  made every TLS dial to such an address fail (#2090).
 
 - Node: handoff tombstones were bounded by count only (65,536) and eviction
   removes entries only, so a burst of relayed deletes of distinct large keys
