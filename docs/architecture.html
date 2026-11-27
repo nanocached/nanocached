@@ -474,7 +474,8 @@ below).</p>
 
 <p>An expiring touch (<code>t</code> or <code>y</code> with a TTL of 0) is
 inside the order too. The proxy sends the key&rsquo;s replicas their touch only
-after the primary has answered, since a replica that expired its copy ahead of
+after the primary has answered (or its leg has failed for good, retry
+included), since a replica that expired its copy ahead of
 a failing primary would lose the value. A later request on the same key would
 otherwise reach a replica first and have its write expired by the late touch,
 so it waits until those replica frames are enqueued, as for an <code>i</code>
