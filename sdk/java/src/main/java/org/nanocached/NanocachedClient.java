@@ -3171,9 +3171,7 @@ public final class NanocachedClient implements AutoCloseable {
      * keys that were never sent and keys whose frame was sent and whose outcome is unknown (the
      * node may have expired them already), and the exception cannot tell the two apart. Do not send
      * the batch again, or the keys that failed, with {@code 0}: a resend reports a key the first
-     * attempt expired as missing. The one exception is a {@link
-     * NanocachedException.ConnectionLost#notSent() notSent} error: no failed key's frame left, so
-     * none of them was expired and they may be sent again.
+     * attempt expired as missing.
      *
      * @throws NanocachedException.ServerTooOld against a node that predates the command
      */
@@ -3949,11 +3947,11 @@ public final class NanocachedClient implements AutoCloseable {
      * After a delete's primary leg has failed for good with a connection error (the refresh and
      * retry included: a dead primary that discovery still lists), or an expiring touch's (issue
      * #2053) reply was lost after the request was sent (which is not resent), sends {@code op} to
-     * the other owners before the caller sees {@code primaryFailure}. An expiring touch whose
-     * request never reached the primary does not call this: nothing was expired, and the resend
-     * its {@code notSent} error invites must still find the value. Otherwise every replica would keep the
-     * value, a plain read falling back to a replica on the dead primary would return it, and once
-     * discovery dropped the primary the replica would be promoted holding it. A delete can be
+     * the other owners before the caller sees {@code primaryFailure}. Otherwise every replica would
+     * keep the value, a plain read falling back to a replica on the dead primary would return it,
+     * and once discovery dropped the primary the replica would be promoted holding it. An expiring
+     * touch whose request never reached the primary does not call this: nothing was expired, and
+     * the resend its {@code notSent} error invites must still find the value. A delete can be
      * applied at any time, so this cannot undo anything; the caller still gets the error, so what
      * {@code delete} reports is unchanged. A {@code W} is not a connection error and does not get
      * here. The legs run concurrently on the replica-writer pool and are always awaited, even with
