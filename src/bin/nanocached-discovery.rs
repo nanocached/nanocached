@@ -4617,7 +4617,11 @@ pub(crate) async fn run_on_listener(
     // the startup grace, exactly the window where `L`/`Q` answer `B`.
     if let Some(metrics_address) = &metrics_address {
         let metrics_listener = TcpListener::bind(metrics_address.as_str()).await?;
-        println!("INFO metrics endpoint listening on {metrics_address}");
+        // The bound address, so `--metrics-port 0` logs the port taken.
+        println!(
+            "INFO metrics endpoint listening on {}",
+            metrics_listener.local_addr()?
+        );
         tokio::spawn(run_metrics_server(
             metrics_listener,
             Arc::clone(&cluster_state.registry),

@@ -33,6 +33,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- Proxy: started with `--port 0`, the proxy announced port `0` to discovery,
+  which refused every announce (`Ed`), so the proxy never appeared in `Q`. It
+  now announces the port its listener bound. The announcing refresher also
+  starts only once the client and metrics listeners are bound: started
+  before, a `Y` could reach discovery from a proxy whose bind then failed,
+  and that exit sends no `Z`. The node, proxy and discovery log the bound
+  metrics address, so `--metrics-port 0` shows the port taken (#2098).
 - Node: a put-if-absent handoff (`U … A`, a re-replication's copy) that a
   node refused, because it held a newer value or a tombstone of a later
   delete, was still relayed to its joiner whose join discovery had not
