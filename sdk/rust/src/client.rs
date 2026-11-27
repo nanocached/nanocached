@@ -933,6 +933,12 @@ struct MultiTouchStateInner {
     /// (issue #934): the one node the deferred replica fan-out of a
     /// `Some(0)` batch must not touch a second time.
     answered_by: HashMap<usize, String>,
+    /// The owner whose primary-held leg failed with a connection error
+    /// for each position still unresolved by it (issue #2054), sent or
+    /// not: a `Some(0)` batch sends such a position's other owners the
+    /// plain touch anyway, once the passes are over. An answer or a `W`
+    /// on a later pass removes the position.
+    unreachable: HashMap<usize, String>,
 }
 
 /// What one batched touch ended with, over its distinct keys: `answers[i]`
@@ -2525,32 +2531,50 @@ impl NanocachedClient {
         // it. A delete is safe to apply at any time, so they get it now,
         // before the error is raised; the caller still gets the error, so
         // the `bool` keeps meaning what the primary answered. A `W` or any
-        // other error leaves them alone, as before. The legs run at once
-        // and are awaited even with `fire_and_forget_replicas`, so they
-        // have been answered when the error reaches the caller; a failed
-        // leg counts in `replica_write_failures`.
+        // other error leaves them alone, as before.
         if let Err(Error::ConnectionLost(_)) = &result {
-            let others: Vec<String> = {
-                let state = self.inner.state.lock().await;
-                Self::owner_names(&state, namespace, key)
-                    .into_iter()
-                    .skip(1)
-                    .collect()
-            };
-            let legs = others.iter().map(|name| async move {
-                let op = |connection: Arc<Connection>| async move {
-                    connection.delete(namespace, key).await
-                };
-                if self.apply_reconnecting(Some(name), &op).await.is_err() {
-                    self.inner
-                        .stats
-                        .replica_write_failures
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            });
-            futures_util::future::join_all(legs).await;
+            self.write_other_owners_after_lost_primary(namespace, key, |connection| async move {
+                connection.delete(namespace, key).await
+            })
+            .await;
         }
         result
+    }
+
+    /// The other owners' legs of a delete or an expiring touch whose
+    /// primary leg finally failed with a connection error (issues #2005,
+    /// #2054): every owner but the primary in the ring in force now, each
+    /// sent `op` through a plain reconnecting call, all at once. The legs
+    /// are awaited even with `fire_and_forget_replicas`, so they have been
+    /// answered when the caller gets the primary's error; a failed leg
+    /// counts in `replica_write_failures`. A single node or proxy has no
+    /// other owners, so nothing is sent there.
+    async fn write_other_owners_after_lost_primary<T, F, Fut>(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+        op: F,
+    ) where
+        F: Fn(Arc<Connection>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let others: Vec<String> = {
+            let state = self.inner.state.lock().await;
+            Self::owner_names(&state, namespace, key)
+                .into_iter()
+                .skip(1)
+                .collect()
+        };
+        let op = &op;
+        let legs = others.iter().map(|name| async move {
+            if self.apply_reconnecting(Some(name), op).await.is_err() {
+                self.inner
+                    .stats
+                    .replica_write_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        futures_util::future::join_all(legs).await;
     }
 
     // ── touch (issue #825) ───────────────────────────────────────────
@@ -2576,8 +2600,10 @@ impl NanocachedClient {
     /// the primary's answer is returned; with `Some(0)` the other owners
     /// are sent theirs only after the primary has answered (issue #934),
     /// outside the order a pipelined connection otherwise gives a key's
-    /// operations. Returns [`Error::ServerTooOld`] against a node that
-    /// predates the command.
+    /// operations; when the primary leg still ends in a connection error
+    /// (sent or not), they are sent theirs anyway before
+    /// [`Error::ConnectionLost`] is returned. Returns
+    /// [`Error::ServerTooOld`] against a node that predates the command.
     pub async fn touch(&self, key: impl AsRef<[u8]>, ttl_seconds: Option<u64>) -> Result<bool> {
         self.touch_in(DEFAULT_NAMESPACE, key, ttl_seconds).await
     }
@@ -2593,15 +2619,40 @@ impl NanocachedClient {
         let key = key.as_ref();
         validate_key(namespace, key)?;
         self.before_operation().await?;
-        self.with_cluster_retry(|| {
-            self.write(
-                namespace,
-                key,
-                WriteBody::Touch { ttl_seconds },
-                |connection| async move { connection.touch(namespace, key, ttl_seconds).await },
-            )
+        let result = self
+            .with_cluster_retry(|| {
+                self.write(
+                    namespace,
+                    key,
+                    WriteBody::Touch { ttl_seconds },
+                    |connection| async move { connection.touch(namespace, key, ttl_seconds).await },
+                )
+            })
+            .await;
+        if ttl_seconds == Some(0) {
+            if let Err(Error::ConnectionLost(_)) = &result {
+                self.expire_on_other_owners(namespace, key).await;
+            }
+        }
+        result
+    }
+
+    /// Issue #2054: an expiring touch (`Some(0)`) sends the other owners
+    /// theirs only after the primary has answered (issue #934). When the
+    /// primary leg finally fails with a connection error (its reply lost
+    /// after the frame was written, which is not resent, or a primary that
+    /// is dead but still listed and fails the retry after the forced
+    /// refresh too) they were never sent it: a read falling back to them
+    /// returned the value the caller expired, and one of them was promoted
+    /// with it once discovery dropped the primary. They are sent the plain
+    /// `t … 0` now, as a failed delete's other owners are (issue #2005),
+    /// before the caller gets the error. A `W` or any other error leaves
+    /// them alone.
+    async fn expire_on_other_owners(&self, namespace: &[u8], key: &[u8]) {
+        self.write_other_owners_after_lost_primary(namespace, key, |connection| async move {
+            connection.touch(namespace, key, Some(0)).await
         })
-        .await
+        .await;
     }
 
     /// Reads a value and replaces its TTL in one step (issue #825);
@@ -2621,7 +2672,10 @@ impl NanocachedClient {
     /// resend would report a miss. The other owners are sent the plain
     /// touch only after the primary has answered (issue #934), so a
     /// primary that could not be reached or answered `W` is rerouted with
-    /// no replica touched yet.
+    /// no replica touched yet. If the primary leg still ends in a
+    /// connection error after that retry, or its reply was lost, the other
+    /// owners are sent the plain touch before [`Error::ConnectionLost`] is
+    /// returned.
     pub async fn get_and_touch(
         &self,
         key: impl AsRef<[u8]>,
@@ -2658,7 +2712,7 @@ impl NanocachedClient {
         // `WriteBody::Touch`: only the primary's op asks for the value; a
         // replica is sent the plain touch (it has no value to return, and
         // `G` there would only move the value over the wire for nothing).
-        let raw = self
+        let result = self
             .with_cluster_retry(|| {
                 self.write(
                     namespace,
@@ -2669,7 +2723,13 @@ impl NanocachedClient {
                     },
                 )
             })
-            .await?;
+            .await;
+        if ttl_seconds == Some(0) {
+            if let Err(Error::ConnectionLost(_)) = &result {
+                self.expire_on_other_owners(namespace, key).await;
+            }
+        }
+        let raw = result?;
         match raw {
             Some(bytes) if self.inner.compress => {
                 Ok(Some(crate::compression::decompress_value(&bytes)?))
@@ -2698,7 +2758,9 @@ impl NanocachedClient {
     /// asked first, on both passes, and the other owners are sent one
     /// plain fan-out afterwards for the keys a primary answered (issue
     /// #934), outside the order a pipelined connection otherwise gives a
-    /// key's operations. A replica's failure or `W` is
+    /// key's operations, and for the keys whose primary leg ended in a
+    /// connection error (sent or not), before that error is returned. A
+    /// replica's failure or `W` is
     /// counted in `stats().replica_write_failures` and never fails the
     /// batch. Larger batches are transparently split into more than one
     /// `y` sub-frame per node (400 keys each at most). If some keys'
@@ -3251,51 +3313,81 @@ impl NanocachedClient {
     /// answered (`S`, `V` or `N` — a missed primary may still have a copy
     /// on a replica, written by its fire-and-forget replication, and the
     /// caller meant expire-everywhere). The owners are those of the ring in
-    /// force now, minus the node that answered for the key. Keys left `W`,
-    /// lost or rejected get no replica leg. A replica's failure or `W` is
+    /// force now, minus the node that answered for the key. Keys left `W`
+    /// or rejected get no replica leg. A replica's failure or `W` is
     /// counted in `stats().replica_write_failures` and never fails the
     /// batch; the legs run after the primaries answered, outside the order
     /// the pipelined connections give a key's operations, the same class as
     /// the retry paths.
+    ///
+    /// Issue #2054: a key whose primary leg finally failed with a
+    /// connection error (its reply lost after the frame was written, which
+    /// is not resent, or a primary unreachable on both passes) gets its
+    /// other owners' leg too, minus the node that failed, as a failed
+    /// delete's other owners do (issue #2005): otherwise a read falling
+    /// back to them returned the value the caller expired, and one of them
+    /// was promoted with it once discovery dropped the primary. Those legs
+    /// are awaited even with `fire_and_forget_replicas`, so they have been
+    /// answered when the caller gets the connection error.
     async fn multi_touch_replica_fanout(
         &self,
         namespace: &[u8],
         key_bytes: &[Vec<u8>],
         state: &MultiTouchState,
     ) {
-        let answered: Vec<(usize, String)> = {
+        // Each position with the node its leg must skip.
+        type Positions = Vec<(usize, String)>;
+        let (answered, unreachable): (Positions, Positions) = {
             let inner = state.inner.lock().unwrap();
-            inner
-                .results
-                .keys()
-                .filter_map(|&idx| Some((idx, inner.answered_by.get(&idx)?.clone())))
-                .collect()
+            (
+                inner
+                    .results
+                    .keys()
+                    .filter_map(|&idx| Some((idx, inner.answered_by.get(&idx)?.clone())))
+                    .collect(),
+                inner
+                    .unreachable
+                    .iter()
+                    .filter(|(idx, _)| !inner.results.contains_key(idx))
+                    .map(|(&idx, owner)| (idx, owner.clone()))
+                    .collect(),
+            )
         };
-        if answered.is_empty() {
+        if answered.is_empty() && unreachable.is_empty() {
             return;
         }
-        let mut legs: HashMap<String, MultiTouchLeg> = HashMap::new();
-        {
+        let (answered_legs, unreachable_legs) = {
             let ring_state = self.inner.state.lock().await;
-            for (idx, answered_by) in answered {
-                for name in Self::owner_names(&ring_state, namespace, &key_bytes[idx]) {
-                    if name == answered_by {
-                        continue;
+            let group = |positions: Vec<(usize, String)>| {
+                let mut legs: HashMap<String, MultiTouchLeg> = HashMap::new();
+                for (idx, skip) in positions {
+                    for name in Self::owner_names(&ring_state, namespace, &key_bytes[idx]) {
+                        if name == skip {
+                            continue;
+                        }
+                        let leg = legs.entry(name.clone()).or_insert_with(|| MultiTouchLeg {
+                            owner: name,
+                            ..Default::default()
+                        });
+                        leg.indices.push(idx);
+                        leg.is_primary.push(false);
+                        leg.keys.push(key_bytes[idx].clone());
                     }
-                    let leg = legs.entry(name.clone()).or_insert_with(|| MultiTouchLeg {
-                        owner: name,
-                        ..Default::default()
-                    });
-                    leg.indices.push(idx);
-                    leg.is_primary.push(false);
-                    leg.keys.push(key_bytes[idx].clone());
                 }
-            }
-        }
+                legs
+            };
+            (group(answered), group(unreachable))
+        };
         // Pure-replica legs record nothing in a state of their own, and a
         // replica leg never reports a position to retry.
-        self.run_multi_touch_legs(namespace, legs, Some(0), &MultiTouchState::default())
-            .await;
+        let unused = MultiTouchState::default();
+        let awaited = unreachable_legs
+            .values()
+            .map(|leg| self.run_multi_touch_leg(namespace, leg, Some(0), &unused));
+        tokio::join!(
+            self.run_multi_touch_legs(namespace, answered_legs, Some(0), &unused),
+            futures_util::future::join_all(awaited),
+        );
     }
 
     /// Dispatches one [`MultiTouchLeg`] (via [`Self::multi_touch_chunked`])
@@ -3338,6 +3430,7 @@ impl NanocachedClient {
         // `sent_end` are lost. The chunks after it were never sent and go
         // to the next pass like any other unresolved position.
         let failure = failure.map(Self::downgrade_sent_error);
+        let connection_failed = matches!(failure, Some(Error::ConnectionLost(_)));
         if let Some(failure) = failure {
             if holds_primary {
                 let mut inner = state.inner.lock().unwrap();
@@ -3365,17 +3458,24 @@ impl NanocachedClient {
                     .results
                     .insert(idx, entry.cloned().expect("answered implies an entry"));
                 inner.answered_by.insert(idx, leg.owner.clone());
+                inner.unreachable.remove(&idx);
             } else {
                 {
                     let mut inner = state.inner.lock().unwrap();
                     if entry.is_none() {
                         inner.wrong_node.remove(&idx);
+                        if connection_failed {
+                            inner.unreachable.insert(idx, leg.owner.clone());
+                        } else {
+                            inner.unreachable.remove(&idx);
+                        }
                         if !replay_safe && i < sent_end {
                             inner.lost.insert(idx);
                             continue;
                         }
                     } else {
                         inner.wrong_node.insert(idx);
+                        inner.unreachable.remove(&idx);
                     }
                 }
                 retry.push(idx);
