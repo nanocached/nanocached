@@ -8,6 +8,10 @@ import javax.cache.management.CacheStatisticsMXBean;
  * Timings ({@code getAverageGetTime} and friends) and evictions aren't tracked — the wire protocol
  * doesn't report server-side LRU evictions to the client, and per-call timing isn't otherwise part
  * of this adapter's scope.
+ *
+ * <p>Counts only while statistics are enabled for the cache, as JSR-107's reference implementation
+ * does: an operation run while they are off leaves every counter unchanged, and the counts gathered
+ * before a disable are kept (not cleared) and continue on the next enable.
  */
 final class NanocachedCacheStatistics implements CacheStatisticsMXBean {
 
@@ -15,21 +19,34 @@ final class NanocachedCacheStatistics implements CacheStatisticsMXBean {
     private final AtomicLong misses = new AtomicLong();
     private final AtomicLong puts = new AtomicLong();
     private final AtomicLong removals = new AtomicLong();
+    private volatile boolean enabled;
+
+    void setEnabled(boolean enabled) {
+        this.enabled = enabled;
+    }
 
     void recordHit() {
-        hits.incrementAndGet();
+        if (enabled) {
+            hits.incrementAndGet();
+        }
     }
 
     void recordMiss() {
-        misses.incrementAndGet();
+        if (enabled) {
+            misses.incrementAndGet();
+        }
     }
 
     void recordPut() {
-        puts.incrementAndGet();
+        if (enabled) {
+            puts.incrementAndGet();
+        }
     }
 
     void recordRemove() {
-        removals.incrementAndGet();
+        if (enabled) {
+            removals.incrementAndGet();
+        }
     }
 
     @Override

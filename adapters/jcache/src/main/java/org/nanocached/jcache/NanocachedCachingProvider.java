@@ -60,8 +60,10 @@ public final class NanocachedCachingProvider implements CachingProvider {
         // hung dial used to stall every other getCacheManager/close call
         // that happened to land on the same bucket, not just this key.
         // Dial first, then atomically install-or-discard.
-        NanocachedClient client = connect(properties != null ? properties : new Properties());
-        NanocachedCacheManager created = new NanocachedCacheManager(this, resolvedUri, resolvedClassLoader, client);
+        Properties resolvedProperties = properties != null ? properties : new Properties();
+        NanocachedClient client = connect(resolvedProperties);
+        NanocachedCacheManager created =
+                new NanocachedCacheManager(this, resolvedUri, resolvedClassLoader, resolvedProperties, client);
 
         NanocachedCacheManager[] winner = new NanocachedCacheManager[1];
         managers.compute(key, (unused, current) -> {

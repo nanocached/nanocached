@@ -121,7 +121,9 @@ run's logs instead of a count alone; fewer applications than acknowledged is
 printed only. A node hands its `TRACE` lines to a writer thread through a
 bounded queue and drops what does not fit when stderr falls behind, so a
 stuck log pipe cannot stall the node; it writes `TRACE dropped lines=<n>`
-into the stream. With such a line in the logs the check cannot tell a
+into the stream. A name longer than 256 bytes is shown cut, followed by
+`...(+<n> bytes)`, and a line longer than 4 KiB is cut and ends in
+`...(cut)`, so the queue stays bounded in bytes too. With such a line in the logs the check cannot tell a
 missing line from a phantom, so it reports `trace_lines_dropped` and leaves
 `value_from_nowhere` at 0. The lines still queued when a node is SIGKILLed
 are lost with no such line, and the replica that takes over then serves an
