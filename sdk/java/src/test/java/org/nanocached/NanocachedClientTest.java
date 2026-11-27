@@ -6188,6 +6188,50 @@ class NanocachedClientTest {
     }
 
     @Test
+    void aFailedHedgeLegStartsTheNextOwnerAtOnce() throws Exception {
+        // Issue #2118: with three owners and a silent primary, the hedge to
+        // the second owner fails at once (its node is gone): the third
+        // owner is asked right away, not after another full interval while
+        // the primary is still in flight. It used to start only once no leg
+        // was in flight, so the read took two intervals.
+        List<String> names = new ArrayList<>(NAMES);
+        names.add("9c1e4b7a-2d3f-4a5b-8c6d-7e8f9a0b1c2d");
+        Map<String, MockNode> nodes = new java.util.HashMap<>();
+        List<DiscoveredNode> listed = new ArrayList<>();
+        for (String name : names) {
+            MockNode node = new MockNode();
+            nodes.put(name, node);
+            listed.add(new DiscoveredNode(name, node.address()));
+        }
+        try (Cluster cluster = new Cluster(nodes, new MockDiscovery(listed, 3))) {
+            List<String> owners = new HashRing(names).owners("k".getBytes(StandardCharsets.UTF_8), 3);
+            long hedgeAfterMillis = 300;
+            try (NanocachedClient client =
+                    connectWithReadHedgeAfter(cluster.discovery().port(), hedgeAfterMillis)) {
+                client.set("k", "v");
+                nodes.get(owners.get(0)).delayGets(2000);
+                nodes.get(owners.get(1)).close();
+                Thread.sleep(50); // give the FIN a moment to be observable
+
+                long start = System.nanoTime();
+                Optional<String> value = client.get("k");
+                long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+                assertEquals(Optional.of("v"), value);
+                assertEquals(1, nodes.get(owners.get(2)).getCount.get());
+                assertTrue(
+                        elapsedMillis >= hedgeAfterMillis - HEDGE_TIMING_TOLERANCE_MILLIS,
+                        "the second owner is asked after one interval, took " + elapsedMillis + "ms");
+                assertTrue(
+                        elapsedMillis < hedgeAfterMillis * 3 / 2,
+                        "expected the third owner to be asked as soon as the second failed, took "
+                                + elapsedMillis
+                                + "ms");
+            }
+        }
+    }
+
+    @Test
     void aDeadPrimaryFailsOverImmediately() throws Exception {
         try (Cluster cluster = startCluster(2)) {
             List<String> owners = new HashRing(NAMES).owners("k".getBytes(StandardCharsets.UTF_8), 2);

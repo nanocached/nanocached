@@ -5521,9 +5521,9 @@ public final class NanocachedClient implements AutoCloseable {
      *       lack the copy) and the primary is still waited for, so hedging never turns a hit into a
      *       miss; it is accepted only once every owner has answered or failed;
      *   <li>a failure ({@link NanocachedException} other than {@link
-     *       NanocachedException.WrongNode}, or a connection-level one) hedges onward immediately —
-     *       the moment nothing else is still in flight, not after waiting out another full
-     *       interval;
+     *       NanocachedException.WrongNode}, or a connection-level one) hedges onward immediately:
+     *       the next owner, if any, starts right away, even while other legs are still in flight,
+     *       not after waiting out another full interval;
      *   <li>{@link NanocachedException.WrongNode} propagates exactly as the sequential path's does;
      *   <li>an {@link Error} thrown by a leg is rethrown as itself on the calling thread (issue
      *       #1150).
@@ -5644,6 +5644,14 @@ public final class NanocachedClient implements AutoCloseable {
                     throw outcome.fatal;
                 } else if (outcome.failure != null) {
                     lastError = outcome.failure;
+                    if (nextIndex < names.size()) {
+                        // Issue #2118: a failed leg is replaced by the next
+                        // owner right away, even while other legs (a silent
+                        // primary) are still in flight.
+                        legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
+                        pendingCount++;
+                        nextIndex++;
+                    }
                 } else if (outcome.value != null || names.get(index).equals(primary)) {
                     resolved = true;
                     resolveLosers(legFutures.values());
@@ -5653,9 +5661,9 @@ public final class NanocachedClient implements AutoCloseable {
                 }
 
                 if (pendingCount == 0 && nextIndex < names.size()) {
-                    // Everything started so far has failed or missed
-                    // provisionally: the next owner gets its turn right away,
-                    // rather than waiting out another full interval.
+                    // Everything started so far has missed provisionally: the
+                    // next owner gets its turn right away, rather than waiting
+                    // out another full interval.
                     legFutures.put(nextIndex, startHedgeLeg(nextIndex, names.get(nextIndex), op, settlement));
                     pendingCount++;
                     nextIndex++;
