@@ -272,7 +272,10 @@ existed, err := client.Delete("greeting")</code></pre>
   forwarded back to the primary lands after a later increment). The same
   holds for one caller whose increments follow each other within a few
   milliseconds, since a forward can lag that long; with spacing well above
-  that, increments are practically exact. The proxy does not change this.
+  that, increments are practically exact. A sustained stream loses far
+  more: with 64 in flight at a time on one counter, a burst of 30,000
+  sent shortly after a join lost 44 to 79&nbsp;% of them, all
+  acknowledged. The proxy does not change this.
   Two clients incrementing the same key at the same time can also leave a
   replica one or two increments behind the primary, because each writes its
   result to the replica on its own and the writes are not ordered

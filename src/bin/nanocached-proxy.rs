@@ -5825,7 +5825,7 @@ struct MultiTouchBatch<'a> {
 /// `retry_positions`, and so does a group that failed or came back
 /// malformed. A replica leg's `W` or failure is logged and swallowed, like
 /// `finish_touch`'s stance on a replica. The group's `addr`, the node this
-/// sub-reply came from, is recorded in `answered_by` for every entry it decides
+/// sub-reply came from, is recorded in `settled_by` for every entry it decides
 /// (issue #966): the one node an expiring batch's deferred replica legs
 /// must not send the touch to again.
 ///
@@ -5835,11 +5835,21 @@ struct MultiTouchBatch<'a> {
 /// node is then not retried but reported to the caller (`true`), who fails
 /// the whole frame as an outcome unknown. A frame that provably never left
 /// (`request_not_sent`) or that the node refused is retried as before.
+///
+/// Issue #2046: an expiring group whose primary leg failed in transport
+/// (sent or not) also records its `addr` in `settled_by` for its keys, as an
+/// answer would. If that failure is the last word on them (the outcome is
+/// unknown, or this is the retry pass), `expire_batch_on_other_owners`
+/// expires their other owners before the client is answered: left holding
+/// the value, a replica would serve a later `G` that falls back to it, and
+/// be promoted with it once the primary is dropped. A key the retry pass
+/// sends again starts unsettled (see `retry_multi_touch`); a `W` or `E`
+/// refusal settles nothing, since nothing was expired.
 fn settle_multi_touch_group(
     group: &TouchGroup,
     reply: io::Result<NodeReply>,
     entries: &mut [Option<ProxyMultiEntry>],
-    answered_by: &mut [Option<String>],
+    settled_by: &mut [Option<String>],
     retry_positions: &mut Vec<usize>,
     replica_legs: &mut ReplicaLegTally,
     expiring: bool,
@@ -5854,6 +5864,11 @@ fn settle_multi_touch_group(
             Ok(_) => false,
         };
     if may_have_applied && legs.iter().any(|&(_, is_primary)| is_primary) {
+        for &(position, is_primary) in legs {
+            if is_primary {
+                settled_by[position] = Some(group.addr.clone());
+            }
+        }
         return true;
     }
     match reply {
@@ -5869,15 +5884,19 @@ fn settle_multi_touch_group(
                     retry_positions.push(position);
                 } else {
                     entries[position] = Some(result);
-                    answered_by[position] = Some(group.addr.clone());
+                    settled_by[position] = Some(group.addr.clone());
                 }
             }
         }
         reply => {
+            let failed = expiring && reply.is_err();
             let mut replicas = 0;
             for &(position, is_primary) in legs {
                 if is_primary {
                     retry_positions.push(position);
+                    if failed {
+                        settled_by[position] = Some(group.addr.clone());
+                    }
                 } else {
                     replicas += 1;
                 }
@@ -5909,7 +5928,7 @@ async fn finish_multi_touch(
     for position in missing {
         entries[position] = Some(ProxyMultiEntry::WrongNode);
     }
-    let mut answered_by: Vec<Option<String>> = vec![None; batch.keys.len()];
+    let mut settled_by: Vec<Option<String>> = vec![None; batch.keys.len()];
     let expiring = batch.ttl == Some(0);
     let mut unknown = false;
     let mut replica_legs = ReplicaLegTally::default();
@@ -5918,7 +5937,7 @@ async fn finish_multi_touch(
             &group,
             reply.await,
             &mut entries,
-            &mut answered_by,
+            &mut settled_by,
             &mut retry_positions,
             &mut replica_legs,
             expiring,
@@ -5934,7 +5953,7 @@ async fn finish_multi_touch(
             batch,
             &retry_positions,
             &mut entries,
-            &mut answered_by,
+            &mut settled_by,
         )
         .await;
     }
@@ -5943,7 +5962,8 @@ async fn finish_multi_touch(
         // #966): the keys a primary answered have expired their copies
         // there, so their other owners get theirs even when another leg's
         // outcome is unknown and the client is told `E` — as the SDKs do.
-        expire_batch_on_other_owners(context, &batch, &entries, &answered_by, signal).await;
+        // So do the keys whose primary leg failed for good (issue #2046).
+        expire_batch_on_other_owners(context, &batch, &settled_by, signal).await;
     }
     if unknown {
         return Err(Fatal::OutcomeUnknown);
@@ -5963,24 +5983,19 @@ async fn finish_multi_touch(
 /// The keys `expire_batch_on_other_owners` sends, per owner address. A key
 /// is listed once per address: two of its owner ranks can share one (two
 /// roster names on one IP:port, as right after a same-address restart), and
-/// the node needs the key once, not once per rank.
+/// the node needs the key once, not once per rank. A key is listed when
+/// `settled_by` names the node its primary leg settled on (see
+/// `settle_multi_touch_group`); a key still `W`, or never sent, gets none.
 fn plan_expire_on_other_owners(
     ring: &RingView,
     batch: &MultiTouchBatch<'_>,
-    entries: &[Option<ProxyMultiEntry>],
-    answered_by: &[Option<String>],
+    settled_by: &[Option<String>],
 ) -> Vec<(String, Vec<Bytes>)> {
     let mut others: AddrGroups<Vec<usize>> = AddrGroups::new(ring);
     let namespace_hash = NamespaceHash::of(batch.namespace);
     let mut top = Vec::new();
-    for (position, entry) in entries.iter().enumerate() {
-        if !matches!(
-            entry,
-            Some(ProxyMultiEntry::Value(_) | ProxyMultiEntry::Miss)
-        ) {
-            continue;
-        }
-        let Some(answered) = answered_by[position].as_deref() else {
+    for (position, settled) in settled_by.iter().enumerate() {
+        let Some(answered) = settled.as_deref() else {
             continue;
         };
         ring.rank_owners(
@@ -6017,13 +6032,14 @@ fn plan_expire_on_other_owners(
 /// `y ... 0` per other owner on the current ring, covering every key whose
 /// primary answered (a value or a miss: a miss on the primary can still
 /// have a replica copy a fire-and-forget write left, and the client asked
-/// for the key to expire everywhere). Keys still `W` get none. Sent after
+/// for the key to expire everywhere) or whose primary leg failed for good
+/// (issue #2046). Keys still `W` get none. Sent after
 /// the primaries answered, these run outside the pipelined-order guarantee
 /// like every retry path; a failure is logged and swallowed as for any
 /// replica leg.
 ///
 /// A key's other owners are every owner on the ring in force now except
-/// the node that answered for it (`answered_by`), as `expire_on_other_owners`
+/// the node that answered for it (`settled_by`), as `expire_on_other_owners`
 /// and the SDKs pick them (issue #966) — not the ring's rank 1 and below:
 /// the retry pass refreshes the ring, so a key answered in the first pass
 /// can have a new first owner, which must be expired too, while the node
@@ -6031,14 +6047,13 @@ fn plan_expire_on_other_owners(
 async fn expire_batch_on_other_owners(
     context: &ProxyContext,
     batch: &MultiTouchBatch<'_>,
-    entries: &[Option<ProxyMultiEntry>],
-    answered_by: &[Option<String>],
+    settled_by: &[Option<String>],
     signal: Option<OrderSignal>,
 ) {
     let Some(ring) = current_ring(context) else {
         return;
     };
-    let others = plan_expire_on_other_owners(&ring, batch, entries, answered_by);
+    let others = plan_expire_on_other_owners(&ring, batch, settled_by);
     if others.is_empty() {
         return;
     }
@@ -6107,7 +6122,8 @@ async fn expire_batch_on_other_owners(
 /// fresh ring, not just the primary, which is harmless because a touch is
 /// idempotent — except for an expiring batch, whose other owners wait for
 /// `expire_batch_on_other_owners` (issue #934). A key whose primary is still
-/// `W` or unreachable is answered `W`. Returns `true` when an expiring
+/// `W` or unreachable is answered `W`; for an expiring batch, one still
+/// unreachable has its other owners expired all the same (issue #2046). Returns `true` when an expiring
 /// (`ttl=0`) batch's primary leg may have been applied and its reply is lost
 /// (see `settle_multi_touch_group`).
 async fn retry_multi_touch(
@@ -6115,10 +6131,15 @@ async fn retry_multi_touch(
     batch: MultiTouchBatch<'_>,
     retry_positions: &[usize],
     entries: &mut [Option<ProxyMultiEntry>],
-    answered_by: &mut [Option<String>],
+    settled_by: &mut [Option<String>],
 ) -> bool {
     force_refresh(context).await;
 
+    // Sent again, a key is settled by this pass alone: a first-pass primary
+    // whose frame never left expired nothing (issue #2046).
+    for &position in retry_positions {
+        settled_by[position] = None;
+    }
     let Some(ring) = current_ring(context) else {
         for &position in retry_positions {
             entries[position] = Some(ProxyMultiEntry::WrongNode);
@@ -6155,7 +6176,7 @@ async fn retry_multi_touch(
             group,
             reply,
             entries,
-            answered_by,
+            settled_by,
             &mut unresolved,
             &mut replica_legs,
             expiring,
@@ -6462,7 +6483,8 @@ fn expires_at_once(ttl: Option<u64>) -> bool {
 
 /// Issue #934: the deferred replica legs of an expiring touch — the plain
 /// `t ... 0` to every owner of `key` on the current ring other than
-/// `answered`, the node whose definitive reply the client is about to get.
+/// `answered`, the node whose definitive reply the client is about to get
+/// (or whose leg failed for good, issue #2046).
 /// Sent only now, after that reply, these run outside the pipelined-order
 /// guarantee the initial dispatch gives, like every retry path; a replica
 /// failure is logged and swallowed as for any replica leg.
@@ -6511,7 +6533,9 @@ fn touch_answer(reply: &NodeReply, tag: Option<u32>) -> Option<Vec<u8>> {
 /// is `Fatal::Transient` like a refusal of `i`, `k` or `x`. For the same
 /// reason its replica legs were not enqueued with the primary's (see
 /// `enqueue_touch`): they are sent here, once the primary has answered, by
-/// `expire_on_other_owners`.
+/// `expire_on_other_owners` — or once its leg has failed for good (an
+/// unknown outcome here, or any failure of the re-fan), before the client
+/// gets the error.
 async fn finish_touch(
     context: &ProxyContext,
     namespace: &[u8],
@@ -6556,6 +6580,15 @@ async fn finish_touch(
             .await
         }
         Err(error) if expires_at_once(ttl) && !request_not_sent(error) => {
+            // Not sent again, so this is the last word on the primary leg,
+            // and it may have expired the key there. Issue #2046: the other
+            // owners still get theirs before the client gets the error;
+            // left holding the value, a replica would answer a later `G`
+            // that falls back to it, and be promoted with it once the
+            // primary is dropped.
+            if let Some(primary) = owners.first() {
+                expire_on_other_owners(context, namespace, key, primary, signal).await;
+            }
             Err(Fatal::OutcomeUnknown)
         }
         Err(_) => {
@@ -6626,8 +6659,18 @@ async fn refan_touch(
                 expire_on_other_owners(context, namespace, key, primary, signal).await;
                 Ok(answer)
             }
-            Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
-            Err(_) => Err(Fatal::OutcomeUnknown),
+            Err(error) => {
+                // The primary leg failed for good: the client gets an
+                // error, but the other owners still get theirs first
+                // (issue #2046, as `refan_write` does for a delete). A
+                // `W`/`E` refusal above expired nothing and sends none.
+                expire_on_other_owners(context, namespace, key, primary, signal).await;
+                Err(if request_not_sent(&error) {
+                    Fatal::Transient
+                } else {
+                    Fatal::OutcomeUnknown
+                })
+            }
         };
     }
     let plain = frame_touch(namespace, key, ttl, false);
@@ -8765,7 +8808,10 @@ where
 // ─── main ────────────────────────────────────────────────────────────
 
 fn main() -> ExitCode {
-    let args = match parse_args_from(std::env::args().skip(1)) {
+    let args = match infra::command_line_args()
+        .map_err(ArgsError::Invalid)
+        .and_then(|raw| parse_args_from(raw.into_iter()))
+    {
         Ok(args) => args,
         Err(ArgsError::Help(message)) => {
             println!("{message}");
@@ -14667,10 +14713,9 @@ mod tests {
             ttl: Some(0),
             get: false,
         };
-        let entries = vec![Some(ProxyMultiEntry::Miss); keys.len()];
-        let answered_by = vec![Some("addr-1".to_string()); keys.len()];
+        let settled_by = vec![Some("addr-1".to_string()); keys.len()];
 
-        let plan = plan_expire_on_other_owners(&ring, &batch, &entries, &answered_by);
+        let plan = plan_expire_on_other_owners(&ring, &batch, &settled_by);
         assert_eq!(plan.len(), 1, "only the address that did not answer");
         let (addr, listed) = &plan[0];
         assert_eq!(addr, "addr-2");
@@ -18267,13 +18312,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_zero_ttl_touch_does_not_expire_a_replica_while_its_primary_is_unreachable() {
+    async fn a_zero_ttl_touch_whose_primary_stays_unreachable_still_expires_the_replica() {
         // Issue #934: the plain `t ... 0` used to go to the replica together
         // with the primary leg, so a primary that could not be reached
         // left the replica's copy expired before the re-fan asked it for
-        // the key. The replica gets nothing until a primary has answered.
+        // the key. The replica gets nothing while the primary leg can still
+        // be re-fanned. Issue #2046: but once the re-fan has failed too,
+        // the replica gets its plain touch before the client gets the
+        // error. Left holding the value, it answered a later `G` that fell
+        // back to it, and kept it once promoted.
         for get in [false, true] {
             let (live, proxy, key) = live_replica_dead_primary_cluster().await;
+            store_on(&live, b"", key.as_bytes());
             let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
             let request = if get {
                 format!("t 0 {} 0 G 1\n{key}", key.len())
@@ -18282,10 +18332,22 @@ mod tests {
             };
             stream.write_all(request.as_bytes()).await.unwrap();
             assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 1");
+            // Once, after the re-fan failed: sent with the first attempt
+            // as well, it would show twice.
             assert_eq!(
                 live.touches(),
-                Vec::<(Option<u64>, bool)>::new(),
-                "get={get}: the replica must not be touched while the primary leg fails"
+                vec![(Some(0), false)],
+                "get={get}: the replica is sent its plain touch once, after the primary leg failed"
+            );
+            assert!(live.entry(b"", key.as_bytes()).is_none(), "get={get}");
+
+            // A read that falls back to the replica no longer finds it.
+            let read = format!("G {} 2\n{key}", key.len());
+            stream.write_all(read.as_bytes()).await.unwrap();
+            assert_eq!(
+                read_line(&mut stream, &mut buf).await.unwrap(),
+                "N 2",
+                "get={get}"
             );
         }
     }
@@ -18330,6 +18392,54 @@ mod tests {
         // Both copies are gone: the touch expired the key everywhere.
         stream.write_all(b"G 3\nkey").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_touch_with_an_unknown_outcome_still_expires_the_replica() {
+        // Issue #2046: the primary applies the `t ... 0` and drops the
+        // connection before answering. The frame is not sent again and the
+        // client is told the outcome is unknown (issue #919), but the
+        // replica used to keep its copy: a later `G` that fell back to it
+        // returned the value, and it kept it once promoted. With
+        // `refan`, the primary's first answer is a stale `W`, so the lost
+        // reply is the re-fan's.
+        for (get, refan) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (nodes, proxy, replica) = two_nodes_with_replica_of("key").await;
+            let primary = &nodes[1 - replica];
+            let replica = &nodes[replica];
+            let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+            stream.write_all(b"S 3 1 1\nkeyv").await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 1");
+            assert!(replica_settles_on(replica, b"key", Some(b"v")).await);
+
+            if refan {
+                primary.wrong_node_once.store(true, Ordering::SeqCst);
+            }
+            primary
+                .close_after_touch_apply_once
+                .store(true, Ordering::SeqCst);
+            let request: &[u8] = if get {
+                b"t 0 3 0 G 2\nkey"
+            } else {
+                b"t 0 3 0 2\nkey"
+            };
+            stream.write_all(request).await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+            assert_eq!(
+                primary.touches(),
+                vec![(Some(0), get)],
+                "get={get} refan={refan}: the lost-reply attempt is not re-sent"
+            );
+            assert_eq!(
+                replica.touches(),
+                vec![(Some(0), false)],
+                "get={get} refan={refan}: the replica is expired once, before the E"
+            );
+            assert!(
+                replica.entry(b"", b"key").is_none(),
+                "get={get} refan={refan}"
+            );
+        }
     }
 
     /// The replica of `key` in a two-node cluster, and the cluster's proxy.
@@ -18451,12 +18561,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_zero_ttl_batch_touch_does_not_expire_a_replica_while_its_primary_is_unreachable() {
+    async fn a_zero_ttl_batch_touch_whose_primary_stays_unreachable_still_expires_the_replica() {
         // Issue #934: the batch counterpart — the key's primary is dead, so
         // the key degrades to `W`; its replica must not have been sent the
-        // plain `y ... 0` in the meantime.
+        // plain `y ... 0` while the retry pass could still reach a primary.
+        // Issue #2046: once the retry pass failed too, it is sent once,
+        // before the frame is answered.
         for get in [false, true] {
             let (live, proxy, key) = live_replica_dead_primary_cluster().await;
+            store_on(&live, b"", key.as_bytes());
             let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
             let request = if get {
                 format!("y 0 1 {} 0 G 1\n{key}", key.len())
@@ -18468,8 +18581,17 @@ mod tests {
             assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), expected);
             assert_eq!(
                 live.touches(),
-                Vec::<(Option<u64>, bool)>::new(),
-                "get={get}: the replica must not be touched while the primary leg fails"
+                vec![(Some(0), false)],
+                "get={get}: the replica is sent its plain touch once, after the primary leg failed"
+            );
+            assert!(live.entry(b"", key.as_bytes()).is_none(), "get={get}");
+
+            let read = format!("G {} 2\n{key}", key.len());
+            stream.write_all(read.as_bytes()).await.unwrap();
+            assert_eq!(
+                read_line(&mut stream, &mut buf).await.unwrap(),
+                "N 2",
+                "get={get}"
             );
         }
     }
@@ -18580,9 +18702,15 @@ mod tests {
             vec![(Some(0), true), (Some(0), false)],
             "the answered key's replica is expired although the frame is E"
         );
-        // node-b answered its primary leg; the lost key's outcome is
-        // unknown, so its replica is not touched.
-        assert_eq!(nodes[1].touches(), vec![(Some(0), true)]);
+        // node-b answered its primary leg. Issue #2046: the lost key's
+        // outcome is unknown, but its primary leg is not sent again, so
+        // its replica is expired too before the frame is answered.
+        assert_eq!(
+            nodes[1].touches(),
+            vec![(Some(0), true), (Some(0), false)],
+            "the lost key's replica is expired too"
+        );
+        assert!(nodes[1].entry(b"", lost_key.as_bytes()).is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -449,6 +449,14 @@ the delete anyway before the call throws `ConnectionLostException`: a
 read that falls back to them then misses instead of returning the deleted
 value.
 
+A touch with a TTL of 0 (`TouchAsync`, `GetAndTouchAsync`,
+`TouchManyAsync`, `GetManyAndTouchAsync`) follows the same order and the
+same rule: when the primary's leg ends in a connection failure (still
+unreachable after the retry, or the connection was lost after the request
+was sent, which is not resent), the other owners are sent the touch, and
+it is waited for even with `FireAndForgetReplicas`, before the call
+throws `ConnectionLostException`.
+
 ## Fire-and-forget replica writes
 
 Off by default. `SetAsync`/`DeleteAsync` normally wait for every replica
