@@ -6102,7 +6102,13 @@ fn frames_carrying(node: &MockNode, keys: &[String]) -> usize {
 }
 
 #[tokio::test]
-async fn an_expiring_touch_reroutes_a_dead_primary_with_no_replica_touched() {
+async fn an_expiring_touch_whose_primary_stays_unreachable_expires_the_other_owners_before_failing()
+{
+    // Issue #2054: the primary goes away and the roster still lists it, so
+    // the retry after the forced refresh routes to it again and the call
+    // fails. The replica used to be left holding the value, and a read
+    // falling back to it returned it. It now gets the plain touch before
+    // the error is raised.
     let key = "shared-key";
     for get in [false, true] {
         let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
@@ -6113,8 +6119,6 @@ async fn an_expiring_touch_reroutes_a_dead_primary_with_no_replica_touched() {
         let primary = node_named(&nodes, &owners[0]);
         let replica = node_named(&nodes, &owners[1]);
 
-        // The primary goes away and the roster still lists it: the call
-        // fails, and the replica was never touched.
         primary.stop();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let result = if get {
@@ -6124,16 +6128,80 @@ async fn an_expiring_touch_reroutes_a_dead_primary_with_no_replica_touched() {
         };
         assert!(
             matches!(result, Err(Error::ConnectionLost(_))),
+            "get={get}: the caller still gets the primary's failure: {result:?}"
+        );
+        assert_eq!(touch_frames(replica), ["t 0 10 0"], "get={get}");
+        assert!(
+            !stored(replica, key),
+            "get={get}: the replica's copy is gone"
+        );
+        // A plain read falls back to the replica on the connection failure
+        // and no longer finds the expired value.
+        assert_eq!(client.get(key).await.unwrap(), None, "get={get}");
+
+        client.close().await;
+        discovery.stop();
+        for (_, node) in nodes {
+            node.stop();
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_expiring_touch_whose_reply_was_lost_expires_the_other_owners_before_failing() {
+    // Issue #2054: the primary applies the touch and the connection closes
+    // before its reply (outcome unknown, not resent). The replica is sent
+    // the plain touch, awaited even with fire-and-forget replicas, before
+    // the error is raised.
+    let key = "shared-key";
+    for get in [false, true] {
+        let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
+        let client =
+            NanocachedClient::connect(options(discovery.port).fire_and_forget_replicas(true))
+                .await
+                .unwrap();
+        let owners = owners_of(key);
+        let primary = node_named(&nodes, &owners[0]);
+        let replica = node_named(&nodes, &owners[1]);
+
+        primary.state.hang_after_touch.store(1, Ordering::SeqCst);
+        let result = if get {
+            client.get_and_touch(key, Some(0)).await.map(|_| ())
+        } else {
+            client.touch(key, Some(0)).await.map(|_| ())
+        };
+        assert!(
+            matches!(result, Err(Error::ConnectionLost(_))),
             "get={get}: {result:?}"
         );
-        assert!(touch_frames(replica).is_empty(), "get={get}");
-        assert!(stored(replica, key), "get={get}: the copy is still there");
+        assert_eq!(touch_frames(primary).len(), 1, "get={get}: not resent");
+        assert_eq!(touch_frames(replica), ["t 0 10 0"], "get={get}");
+        assert!(!stored(replica, key), "get={get}");
+        assert!(!stored(primary, key), "get={get}");
 
-        // Once the roster drops the primary the reroute reaches the replica
-        // as the new primary, and finds the value. The call above refreshed
-        // just now, so the next forced refresh waits out the minimum
-        // interval (issue #1580) before it can see the change.
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        client.close().await;
+        discovery.stop();
+        for (_, node) in nodes {
+            node.stop();
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_expiring_touch_reroutes_a_primary_dropped_from_the_roster_to_the_value() {
+    // Once the roster drops the dead primary, the forced refresh's retry
+    // reaches the replica as the new primary, which still has the value.
+    let key = "shared-key";
+    for get in [false, true] {
+        let (nodes, discovery) = start_cluster_with_seed(key, [true, true]).await;
+        let client = NanocachedClient::connect(options(discovery.port))
+            .await
+            .unwrap();
+        let owners = owners_of(key);
+        let replica = node_named(&nodes, &owners[1]);
+
+        node_named(&nodes, &owners[0]).stop();
+        tokio::time::sleep(Duration::from_millis(100)).await;
         shrink_roster_to(&discovery, &nodes, &owners[1]);
         if get {
             assert_eq!(
@@ -6145,6 +6213,7 @@ async fn an_expiring_touch_reroutes_a_dead_primary_with_no_replica_touched() {
             assert!(client.touch(key, Some(0)).await.unwrap());
             assert_eq!(touch_frames(replica), ["t 0 10 0"]);
         }
+        assert!(!stored(replica, key), "get={get}");
 
         client.close().await;
         discovery.stop();
@@ -6254,7 +6323,11 @@ async fn an_expiring_touch_still_reaches_the_replica_when_the_primary_misses() {
 }
 
 #[tokio::test]
-async fn an_expiring_batch_touch_reroutes_a_dead_primary_with_no_replica_touched() {
+async fn an_expiring_batch_touch_whose_primary_stays_unreachable_expires_the_other_owners_before_failing(
+) {
+    // Issue #2054: as for a single key, the keys of a primary that is dead
+    // but still listed fail both passes; their other owners are now sent
+    // the plain touch before the error is raised.
     for get in [false, true] {
         let (nodes, discovery) = start_cluster(2).await;
         let client = NanocachedClient::connect(options(discovery.port))
@@ -6282,12 +6355,64 @@ async fn an_expiring_batch_touch_reroutes_a_dead_primary_with_no_replica_touched
             ),
             "get={get}: {result:?}"
         );
-        assert!(multi_touch_frames(replica).is_empty(), "get={get}");
-        assert!(keys.iter().all(|key| stored(replica, key)), "get={get}");
+        let frames = multi_touch_frames(replica);
+        assert_eq!(frames.len(), 1, "get={get}");
+        assert!(!frames[0].get, "get={get}: the plain form");
+        assert!(keys.iter().all(|key| !stored(replica, key)), "get={get}");
+        for key in &keys {
+            assert_eq!(client.get(key).await.unwrap(), None, "get={get}: {key}");
+        }
 
-        // The call above refreshed just now: wait out the minimum interval
-        // between forced refreshes (issue #1580).
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        client.close().await;
+        discovery.stop();
+        for (_, node) in nodes {
+            node.stop();
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_expiring_batch_touch_whose_reply_was_lost_expires_the_other_owners_before_failing() {
+    // Issue #2054: the primary applies the batch and the connection closes
+    // before its reply (not resent, issue #901). The replica gets the plain
+    // touch, awaited even with fire-and-forget replicas.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = NanocachedClient::connect(options(discovery.port).fire_and_forget_replicas(true))
+        .await
+        .unwrap();
+    let node_a = node_named(&nodes, NAMES[0]);
+    let replica = node_named(&nodes, NAMES[1]);
+    let keys = keys_whose_primary_is(NAMES[0], 3);
+    client.set_many(&values_for(&keys), 0).await.unwrap();
+
+    node_a.state.hang_after_touch.store(1, Ordering::SeqCst);
+    let result = client.touch_many(&keys, Some(0)).await;
+    assert!(
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "{result:?}"
+    );
+    assert_eq!(multi_touch_frames(node_a).len(), 1, "not resent");
+    assert_eq!(frames_carrying(replica, &keys), 1);
+    assert!(keys.iter().all(|key| !stored(replica, key)));
+
+    stop_cluster(client, nodes, discovery).await;
+}
+
+#[tokio::test]
+async fn an_expiring_batch_touch_reroutes_a_primary_dropped_from_the_roster_to_the_values() {
+    // Once the roster drops the dead primary, the second pass reaches the
+    // replica as the new primary, which still has the values.
+    for get in [false, true] {
+        let (nodes, discovery) = start_cluster(2).await;
+        let client = NanocachedClient::connect(options(discovery.port))
+            .await
+            .unwrap();
+        let keys = keys_whose_primary_is(NAMES[0], 3);
+        let replica = node_named(&nodes, NAMES[1]);
+        client.set_many(&values_for(&keys), 0).await.unwrap();
+
+        node_named(&nodes, NAMES[0]).stop();
+        tokio::time::sleep(Duration::from_millis(100)).await;
         shrink_roster_to(&discovery, &nodes, NAMES[1]);
         if get {
             assert_eq!(

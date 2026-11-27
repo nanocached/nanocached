@@ -53,7 +53,9 @@ import (
 // could not be reached on both passes returns the last connection error
 // (ErrConnectionLost) — never ErrWrongNode, since no `W` was ever received.
 // Every key that did resolve was touched, and since a touch is idempotent
-// the whole batch may simply be sent again. Returns ErrServerTooOldBatch
+// the whole batch may simply be sent again. With ttlSeconds == 0 the keys
+// whose primary was lost or unreachable that way are still sent to their
+// other owners before the error is returned. Returns ErrServerTooOldBatch
 // against a node that predates the command.
 func (c *Client) TouchMany(keys []string, ttlSeconds int64) (map[string]bool, error) {
 	return c.touchManyNS(nil, keys, ttlSeconds)
@@ -259,7 +261,7 @@ func (c *Client) multiTouchNS(namespace []byte, keys []string, ttlSeconds int64,
 
 	state := &multiTouchState{
 		results: make(map[int]multiEntry, len(keys)), wrongNode: map[int]bool{}, lost: map[int]bool{},
-		answeredBy: map[int]string{},
+		answeredBy: map[int]string{}, unreachable: map[int]bool{},
 	}
 	retry := c.multiTouchPass(namespace, keyBytes, ttlSeconds, get, nil, state)
 	if len(retry) > 0 {
@@ -396,6 +398,11 @@ type multiTouchState struct {
 	// the deferred replica fan-out of a ttlSeconds == 0 call (issue #934)
 	// does not touch it a second time.
 	answeredBy map[int]string
+	// unreachable holds the indices whose primary leg's latest outcome was a
+	// connection-level failure (sent or not; not `W`, not `En`), which the
+	// deferred replica fan-out of a ttlSeconds == 0 call still sends to the
+	// other owners (issue #2057).
+	unreachable map[int]bool
 }
 
 // multiTouchPass runs one pass of the cluster routing of TouchMany and
@@ -505,16 +512,20 @@ func (c *Client) multiTouchPass(
 					c.stats.replicaWriteFailures.Add(1)
 				}
 			case answered:
+				delete(state.unreachable, idx)
 				state.results[idx] = entries[i]
 				state.answeredBy[idx] = leg.name
 			case i >= resolved && errors.Is(err, errServerRejected):
 				// A node that predates `y` refuses it every time: another
 				// pass would only dial it again.
+				delete(state.unreachable, idx)
 				delete(state.wrongNode, idx)
 			default:
 				if i < resolved {
+					delete(state.unreachable, idx)
 					state.wrongNode[idx] = true
 				} else {
+					state.unreachable[idx] = true
 					delete(state.wrongNode, idx)
 					// Only the chunk whose frame was written may have been
 					// applied (issue #1602): the chunks after it never left,
@@ -596,30 +607,55 @@ func (c *Client) detachReplicaLeg(fn func()) bool {
 // in force, the other owners are sent the touch for every key whose primary
 // answered — `S`/`V` and also `N`, since a primary that missed may still
 // have a replica copy, and the caller's intent is to expire it everywhere.
-// A key whose primary answered `W`, was lost or was rejected gets no replica
-// leg. A replica's failure or `W` is counted in
-// Stats().ReplicaWriteFailures and never fails the batch, and a leg is
-// eligible for Config.FireAndForgetReplicas as an ordinary replica leg is.
-// These legs run after the primary answered, outside the pipelined-order
-// guarantee, the same class as the retry paths.
+// A key whose primary answered `W` or was rejected gets no replica leg. A
+// replica's failure or `W` is counted in Stats().ReplicaWriteFailures and
+// never fails the batch, and a leg is eligible for
+// Config.FireAndForgetReplicas as an ordinary replica leg is. These legs run
+// after the primary answered, outside the pipelined-order guarantee, the
+// same class as the retry paths.
+//
+// A key whose primary leg finally failed at the connection level (lost
+// after the send, or unreachable on both passes) is sent to every owner but
+// the current primary too (issue #2057): otherwise no other owner would be,
+// and a read falling back to a replica would return the value the caller
+// expired. Those legs are awaited even with FireAndForgetReplicas, so the
+// caller gets the error only once they have been answered, as for Delete.
 func (c *Client) touchReplicasAfterPrimary(namespace []byte, keyBytes [][]byte, state *multiTouchState) {
-	groups := make(map[string][][]byte)
+	type group struct {
+		name    string
+		awaited bool
+	}
+	groups := make(map[group][][]byte)
 	for idx := range state.results {
 		for _, name := range c.ownersExcept(namespace, keyBytes[idx], state.answeredBy[idx]) {
-			groups[name] = append(groups[name], keyBytes[idx])
+			id := group{name, false}
+			groups[id] = append(groups[id], keyBytes[idx])
+		}
+	}
+	for idx := range state.unreachable {
+		if _, answered := state.results[idx]; answered {
+			continue
+		}
+		names := c.ownerNames(namespace, keyBytes[idx])
+		if len(names) < 2 {
+			continue
+		}
+		for _, name := range names[1:] {
+			id := group{name, true}
+			groups[id] = append(groups[id], keyBytes[idx])
 		}
 	}
 	var wg sync.WaitGroup
-	for name, groupKeys := range groups {
+	for id, groupKeys := range groups {
 		run := func() {
-			entries, resolved, _, _ := c.multiTouchChunked(name, namespace, groupKeys, 0, false, true)
+			entries, resolved, _, _ := c.multiTouchChunked(id.name, namespace, groupKeys, 0, false, true)
 			for i := range groupKeys {
 				if i >= resolved || entries[i].wrongNode {
 					c.stats.replicaWriteFailures.Add(1)
 				}
 			}
 		}
-		if c.detachReplicaLeg(run) {
+		if !id.awaited && c.detachReplicaLeg(run) {
 			continue
 		}
 		wg.Add(1)

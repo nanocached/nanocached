@@ -25,6 +25,14 @@ framework adapters at one version, whether or not a component changed.
   runs of at most 1 MiB of keys and values, each waiting for room in the
   target's queue like any other write (#2042).
 
+- All binaries (`nanocached-node`, `nanocached-proxy`,
+  `nanocached-discovery`, `ncd`, `verify-staged-join`): a command-line
+  argument that is not valid UTF-8, such as a `--tls-cert` path with a stray
+  byte, made the process panic with exit code 101 and a backtrace. It is now
+  a usage error ("command-line argument is not valid UTF-8: ...") with exit
+  code 1, like any other invalid option; `ncd` passes the arguments through
+  untouched and lets the binary it runs report it (#2049).
+
 - Node: a receive buffer that grew under the in-flight overdraft token kept
   it until its frame arrived, which only the client decided, so a client
   that stalled or trickled mid-frame made every other large upload that
@@ -105,6 +113,16 @@ framework adapters at one version, whether or not a component changed.
   client gets the error; a later request on the key from the same connection
   still waits until those legs are enqueued. A `W` is retried as before
   (#2016).
+
+- Proxy: a `ttl=0` touch (`t`, `t … G`, `y`) whose primary leg failed for
+  good — its re-fan found the primary still unreachable, or the primary
+  dropped the connection after the frame may have reached it — was answered
+  `R`, `W` or `E` and no other owner was sent the touch, so a later `G` that
+  fell back to a replica returned the value the client had expired, and the
+  replica kept it once promoted. The other owners now get their plain
+  touch before the client gets the error, as for a delete. A first attempt
+  that is re-fanned still sends them nothing until the primary has answered
+  (#2046).
 
 - Node: a decommission that retried a key's transfer after a refused or
   failed attempt resent the value and TTL it had read before the first try.
@@ -287,6 +305,17 @@ framework adapters at one version, whether or not a component changed.
   non-blocking busy reply and is closed at once, with no drain (#1720).
 
 ### Changed
+
+- Docs: the accepted-behaviour item on increments rewound by a lagging
+  forward described one to three lost increments for concurrent callers
+  and, for one caller sending four increments about 1 ms apart, one lost
+  increment on about a fifth of the counters. A counter incremented in a
+  sustained stream loses far more: with 64 increments in flight on one
+  counter, a 30,000-increment burst sent 6 s after a join ended at 8,542 to
+  16,662 through the proxy and 6,209 to 8,520 through the Rust SDK, every
+  increment acknowledged, because each result the old owner forwards back
+  rewinds the counter by the increments sent since. The accepted-behaviour list, the proxy ordering section, the
+  SDKs page and the protocol page now give that scale (#2047).
 
 - Docs: the proxy ordering section now says that a delete (`D`/`d`) is in
   the connection's order like an expiring touch: a later request on the key
