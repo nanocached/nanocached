@@ -3632,8 +3632,8 @@ export class NanocachedClient {
    *   waited for, so hedging never turns a hit into a miss; a miss is
    *   accepted only once every owner has answered or failed;
    * - a failure (anything but `WrongNodeError`) hedges onward
-   *   immediately — the same fall-through condition `readFromOwners`
-   *   uses;
+   *   immediately, even while other legs are still in flight — the same
+   *   fall-through condition `readFromOwners` uses;
    * - `WrongNodeError` propagates exactly as in `readFromOwners`.
    *
    * The losing legs are never cancelled — there is nothing to cancel a
@@ -3768,6 +3768,12 @@ export class NanocachedClient {
           throw winner.error;
         }
         lastError = winner.error;
+        if (nextIndex < names.length) {
+          // A failed leg is replaced by the next owner right away, even
+          // while other legs (a silent primary) are still in flight.
+          pending.push({ promise: start(nextIndex), index: nextIndex });
+          nextIndex++;
+        }
       } else if (winner.value !== null || names[winner.index] === primaryName) {
         await resolveLosers(pending);
         return winner.value;
@@ -3777,8 +3783,8 @@ export class NanocachedClient {
       }
 
       if (pending.length === 0 && nextIndex < names.length) {
-        // Everything so far failed or missed provisionally: the next
-        // owner gets its turn right away, no waiting for the interval.
+        // Everything so far missed provisionally: the next owner gets
+        // its turn right away, no waiting for the interval.
         pending.push({ promise: start(nextIndex), index: nextIndex });
         nextIndex++;
       }
