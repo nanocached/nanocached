@@ -338,8 +338,9 @@ existed, err := client.Delete("greeting")</code></pre>
   have expired the entry, so the other owners are sent the touch before the
   connection-lost error is raised. When the primary stays unreachable
   through the retry (dead, but still listed by discovery), the touch never
-  left: no other owner is touched and the error is the not-sent kind, so a
-  retry once discovery has dropped the primary still finds the value. Against
+  left: no other owner is touched (an SDK whose errors say whether the
+  request was sent reports it as not sent), so a retry once discovery has
+  dropped the primary still finds the value. Against
   a node that predates the command the SDK
   raises a "server too old" error (a node before 0.4.8 closes the
   connection without a reply instead); upgrade every node before using it.

@@ -521,7 +521,8 @@ raises its connection-lost error and <code>nanocached-proxy</code> answers
 <code>E</code>. Both still send the other owners their plain <code>t</code>
 first, so a replica does not keep a value the client asked to expire and
 serve it to a later read. When the retry never reached the primary either,
-nothing was expired: an SDK raises its not-sent error, and
+nothing was expired: an SDK raises its connection error (marked not sent
+where the SDK's errors carry that), and
 <code>nanocached-proxy</code> answers <code>R</code> (to a client that
 asked for it) or a <code>W</code> entry. No other owner is touched, so the
 resend it invites still finds the value. The exception is a
