@@ -8463,6 +8463,75 @@ async fn off_by_default_a_slow_primary_bounds_the_read() {
 }
 
 #[tokio::test]
+async fn a_failed_hedge_leg_starts_the_next_owner_at_once() {
+    // Issue #2116: with three owners and a silent primary, the hedge to
+    // the second owner fails at once (its node is gone): the third owner
+    // is asked right away, not after another full interval while the
+    // primary is still in flight. It used to start only once no leg was
+    // in flight, so the read took two intervals.
+    let names: Vec<String> = NAMES
+        .iter()
+        .map(|name| name.to_string())
+        .chain(std::iter::once(
+            "9c1e4b7a-2d3f-4a5b-8c6d-7e8f9a0b1c2d".to_string(),
+        ))
+        .collect();
+    let mut nodes = Vec::new();
+    for name in &names {
+        nodes.push((name.clone(), MockNode::start().await));
+    }
+    let listed = nodes
+        .iter()
+        .map(|(name, node)| (name.clone(), node.address()))
+        .collect();
+    let discovery = MockDiscovery::start(listed, 3).await;
+    let hedge_after = Duration::from_millis(300);
+    let client = NanocachedClient::connect(options(discovery.port).read_hedge_after(hedge_after))
+        .await
+        .unwrap();
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners: Vec<String> = HashRing::new(names.clone())
+        .owners(b"", b"k", 3)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    node_by_name(&nodes, &owners[0])
+        .state
+        .gets_delay_ms
+        .store(2000, Ordering::SeqCst);
+    node_by_name(&nodes, &owners[1]).stop();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let start = tokio::time::Instant::now();
+    let value = client.get("k").await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(value, Some("v".to_string()));
+    assert_eq!(
+        node_by_name(&nodes, &owners[2])
+            .state
+            .gets
+            .load(Ordering::SeqCst),
+        1
+    );
+    assert!(
+        elapsed >= hedge_after - HEDGE_TIMING_TOLERANCE,
+        "the second owner is asked after one interval: elapsed = {elapsed:?}"
+    );
+    assert!(
+        elapsed < hedge_after * 3 / 2,
+        "the third owner should be asked as soon as the second fails: elapsed = {elapsed:?}"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
 async fn a_dead_primary_fails_over_immediately() {
     let (nodes, discovery) = start_cluster(2).await;
     let client = NanocachedClient::connect(

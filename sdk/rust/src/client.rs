@@ -5080,7 +5080,8 @@ impl NanocachedClient {
     ///   sequential path's does;
     /// - any other error hedges onward immediately (the next owner, if
     ///   any, starts right away rather than waiting out the rest of the
-    ///   interval) and is remembered as `last_error`.
+    ///   interval, even while other legs are still in flight) and is
+    ///   remembered as `last_error`.
     ///
     /// An owner with `HEDGE_SUSPECT_LATE_LEGS` late legs outstanding is
     /// tried last (`LateHedgeLegs::demote`), while the primary stays
@@ -5183,7 +5184,7 @@ impl NanocachedClient {
             };
             in_flight -= 1;
 
-            match outcome.result {
+            let failed = match outcome.result {
                 // Issue #1164: a leg that panicked is surfaced to the
                 // caller, not hedged around.
                 Err(error) if outcome.panicked => {
@@ -5198,19 +5199,27 @@ impl NanocachedClient {
                     self.resolve_hedge_losers(&mut rx, in_flight).await;
                     return Ok(None);
                 }
-                Ok(None) => replica_missed = true,
+                Ok(None) => {
+                    replica_missed = true;
+                    false
+                }
                 Err(Error::WrongNode) => {
                     self.resolve_hedge_losers(&mut rx, in_flight).await;
                     return Err(Error::WrongNode);
                 }
-                Err(error) => last_error = Some(error),
-            }
+                Err(error) => {
+                    last_error = Some(error);
+                    true
+                }
+            };
 
-            // Everything currently in flight has now answered or failed
-            // (a provisional replica miss or a swallowed failure): the
-            // next owner, if any is left, gets its turn immediately
-            // instead of waiting out the rest of the interval.
-            if in_flight == 0 {
+            // A failed leg is replaced by the next owner, if any is left,
+            // immediately, even while other legs (a silent primary) are
+            // still in flight. Once everything in flight has answered or
+            // failed (a provisional replica miss included), the next
+            // owner gets its turn immediately too, instead of waiting out
+            // the rest of the interval.
+            if failed || in_flight == 0 {
                 if next_index < owners.len() {
                     legs.legs.push(
                         self.spawn_hedge_leg(
@@ -5224,7 +5233,7 @@ impl NanocachedClient {
                     );
                     next_index += 1;
                     in_flight += 1;
-                } else {
+                } else if in_flight == 0 {
                     break;
                 }
             }
