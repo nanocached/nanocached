@@ -911,7 +911,16 @@ number of nodes that hold each key. <code>&lt;name&gt;</code> is the
 node&rsquo;s identity: an opaque string, chosen by the node, that the
 client hashes to place the node on the ring; it is not an address and
 carries no meaning of its own. <code>&lt;address&gt;</code> is
-<code>host:port</code> and is only for opening a connection. Both lengths
+<code>host:port</code> and is only for opening a connection. Discovery
+builds it from the source address of the connection the node or proxy
+registered on, plus the port it declared. An IPv6 host is in brackets
+(<code>[2001:db8::1]:8356</code>), so the port&rsquo;s <code>:</code> is
+unambiguous, and an IPv4 address that reached a dual-stack discovery as
+<code>::ffff:10.0.0.5</code> is written as plain IPv4
+(<code>10.0.0.5:8356</code>). Older discovery servers wrote an IPv6
+host without brackets (<code>2001:db8::1:8356</code>). A client
+should accept that form too, splitting on the last <code>:</code>, which
+is always the port separator. Both lengths
 are in bytes. Every entry ends with a <code>\n</code> that neither length
 counts, so the next entry&rsquo;s header starts right after it. An empty list
 is <code>N 0\n</code> for <code>Q</code>. For example, one node and no

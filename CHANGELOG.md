@@ -14,6 +14,18 @@ framework adapters at one version, whether or not a component changed.
 
 ### Changed
 
+- `nanocached-discovery`: a node or proxy registered from an IPv6
+  address is listed (in `L`, `Q`, `T`, the heartbeat ack and `M`) with
+  its host in brackets, `[2001:db8::1]:8356`. It used to be written bare,
+  `2001:db8::1:8356`, which is not a `host:port` most parsers take. An IPv4
+  peer on a dual-stack listener (`::ffff:10.0.0.5`) is now listed as plain
+  IPv4, `10.0.0.5:8356`. Nodes and proxies accept both forms, so the
+  documented roll-out order still holds. **Clients:** a Python, TypeScript
+  or Rust SDK client from an earlier release cannot dial a bracketed
+  address (#2150, #2151, #2152). If clients reach nodes or proxies over
+  IPv6, upgrade them before discovery. The Go, Java and .NET SDKs take
+  either form (#2153).
+
 - `ci`: the four Maven modules (the Java SDK and the `spring`, `jcache` and
   `spring-boot-starter` adapters) are published as one Central Portal
   deployment, from the `sdk/java` tag, instead of one deployment per module.
