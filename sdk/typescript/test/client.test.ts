@@ -4969,23 +4969,32 @@ describe("NanocachedClient touch/getAndTouch in a cluster (issue #825)", () => {
     }
   }
 
-  // Issue #2052: a primary leg that fails for good (dead but still listed
-  // by discovery, or its reply lost after the send) used to leave the
-  // replica's copy, so a read falling back to it returned the value the
-  // caller expired. The replica is now sent the touch before the error.
+  // Issue #2052: a primary whose reply was lost after the send may have
+  // expired the key, so the replica is sent the touch before the error.
+  // Issue #2140: a primary that stays unreachable (dead but still listed by
+  // discovery, so the retry's dial is refused too) was never sent it, so
+  // the replica is left alone and the error is the not-sent kind: the
+  // resend it invites, once discovery has dropped the primary, still finds
+  // the value.
   for (const withValue of [false, true]) {
     const method = withValue ? "getAndTouch" : "touch";
-    it(`a ttl=0 ${method} whose primary stays unreachable expires the replica before it throws (issue #2052)`, async () => {
+    it(`a ttl=0 ${method} whose primary stays unreachable leaves the replica for the resend (issue #2140)`, async () => {
       await withCluster(async (client, cluster) => {
         const { primary, replica } = cluster.ownerOf("k");
         await client.set("k", "payload");
         await primary.mock.close();
         await waitFor(() => memberConnectionClosed(client, primary.name), "the client to see the FIN");
-        await assert.rejects(() => (withValue ? client.getAndTouch("k", 0) : client.touch("k", 0)), ConnectionLostError);
-        assert.deepEqual(replica.mock.touches(), [{ namespace: "", key: "k", ttl: 0, get: false }]);
+        const call = () => (withValue ? client.getAndTouch("k", 0) : client.touch("k", 0));
+        await assert.rejects(call, (error: unknown) => error instanceof ConnectionLostError && error.requestWasSent === false);
+        assert.deepEqual(replica.mock.touches(), []);
+        assert.equal(replica.mock.store.get("k")?.toString(), "payload");
+        cluster.discovery.setNodes([{ name: replica.name, address: replica.mock.address }]);
+        // Past the forced-refresh spacing, so the resend's refresh learns
+        // the new roster.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        assert.equal(await call(), withValue ? "payload" : true);
+        assert.deepEqual(replica.mock.touches(), [{ namespace: "", key: "k", ttl: 0, get: withValue }]);
         assert.equal(replica.mock.store.has("k"), false);
-        // A plain read falls back to the replica on the dead primary.
-        assert.equal(await client.get("k"), null);
       });
     });
 
@@ -5757,29 +5766,61 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
     });
   }
 
-  // Issue #2052: keys whose primary leg failed for good used to get no
+  // Issue #2052: keys whose primary's reply was lost after the send got no
   // replica leg, so a read falling back to a replica returned the values
-  // the caller expired. Their other owners are now sent the touch before
-  // the error is thrown.
+  // the primary may have expired. Their other owners are now sent the
+  // touch before the error is thrown. Issue #2140: keys whose primary
+  // stayed unreachable were never sent, so they get no replica leg and the
+  // resend after discovery dropped the primary still finds every value.
   for (const withValue of [false, true]) {
     const method = withValue ? "getManyAndTouch" : "touchMany";
-    it(`an expiring ${method} whose primary stays unreachable expires the replicas before it throws (issue #2052)`, async () => {
+    it(`an expiring ${method} whose primary stays unreachable leaves the replica for the resend (issue #2140)`, async () => {
       await withCluster(async (client, cluster) => {
         const deadKeys = keysWithPrimary(cluster, names[0], 3, "dead");
-        await client.setMany(Object.fromEntries(deadKeys.map((key) => [key, "v"])));
+        await client.setMany(Object.fromEntries(deadKeys.map((key) => [key, `v-${key}`])));
         await cluster.nodes[0].mock.close();
         await waitFor(() => memberConnectionClosed(client, names[0]), "the client to see the FIN");
+        const call = () => (withValue ? client.getManyAndTouch(deadKeys, 0) : client.touchMany(deadKeys, 0));
+        await assert.rejects(call, (error: unknown) => error instanceof ConnectionLostError && error.requestWasSent === false);
+        assert.deepEqual(cluster.nodes[1].mock.multiTouchFrames(), []);
+        for (const key of deadKeys) assert.equal(cluster.nodes[1].mock.store.has(key), true);
+        cluster.discovery.setNodes([{ name: names[1], address: cluster.nodes[1].mock.address }]);
+        // Past the forced-refresh spacing, so the resend's refresh learns
+        // the new roster.
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        const expected = withValue
+          ? new Map(deadKeys.map((key) => [key, `v-${key}`]))
+          : new Map(deadKeys.map((key) => [key, true]));
+        assert.deepEqual(await call(), expected);
+        for (const key of deadKeys) assert.equal(cluster.nodes[1].mock.store.has(key), false);
+      });
+    });
+
+    it(`an expiring ${method} expires the other owners only of the keys whose primary reply was lost (issue #2140)`, async () => {
+      await withCluster(async (client, cluster) => {
+        // names[0] is dead but listed (its keys never leave); names[1]
+        // applies its keys' touch and drops the connection (sent and lost).
+        const deadKeys = keysWithPrimary(cluster, names[0], 3, "dead");
+        const lostKeys = keysWithPrimary(cluster, names[1], 3, "lost");
+        const keys = [...deadKeys, ...lostKeys];
+        await client.setMany(Object.fromEntries(keys.map((key) => [key, "v"])));
+        await cluster.nodes[0].mock.close();
+        await waitFor(() => memberConnectionClosed(client, names[0]), "the client to see the FIN");
+        cluster.nodes[1].mock.dropAfterTouchOnce();
         await assert.rejects(
-          () => (withValue ? client.getManyAndTouch(deadKeys, 0) : client.touchMany(deadKeys, 0)),
-          ConnectionLostError,
+          () => (withValue ? client.getManyAndTouch(keys, 0) : client.touchMany(keys, 0)),
+          // A lost key may have been applied, so the error says so.
+          (error: unknown) => error instanceof ConnectionLostError && error.requestWasSent === true,
         );
+        // names[1] saw only its own primary frame: no replica leg for the
+        // dead keys, which it still holds.
         const frames = cluster.nodes[1].mock.multiTouchFrames();
         assert.equal(frames.length, 1);
-        assert.equal(frames[0].get, false);
-        assert.equal(frames[0].ttl, 0);
-        assert.deepEqual(sorted(frames[0].keys), sorted(deadKeys));
-        for (const key of deadKeys) assert.equal(cluster.nodes[1].mock.store.has(key), false);
-        assert.deepEqual(await client.getMany(deadKeys), new Map());
+        assert.deepEqual(sorted(frames[0].keys), sorted(lostKeys));
+        for (const key of deadKeys) assert.equal(cluster.nodes[1].mock.store.has(key), true);
+        // The lost keys' other owner is the dead node: that leg was tried,
+        // failed and counted.
+        assert.ok(client.stats().replicaWriteFailures >= 1);
       });
     });
 
