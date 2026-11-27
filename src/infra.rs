@@ -35,6 +35,29 @@ use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+/// The process's command-line arguments after the program name, each
+/// required to be valid UTF-8. `std::env::args()` panics on the first one
+/// that is not, so a mistyped path (say, `--tls-cert` given a file name
+/// with a stray byte) took the process down with a backtrace and exit code
+/// 101 instead of the usage error every other bad option gets.
+pub fn command_line_args() -> Result<Vec<String>, String> {
+    utf8_args(std::env::args_os().skip(1))
+}
+
+/// `command_line_args` on already-read arguments, so the not-UTF-8 case
+/// can be tested without touching the process argv.
+pub fn utf8_args(raw: impl Iterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    raw.map(|argument| {
+        argument.into_string().map_err(|argument| {
+            format!(
+                "command-line argument is not valid UTF-8: {}",
+                argument.to_string_lossy()
+            )
+        })
+    })
+    .collect()
+}
+
 // ─── TCP keepalive ─────────────────────────────────────────────────────
 
 /// Reads the shared auth secret `name` from the environment: unset or empty
@@ -231,6 +254,41 @@ fn load_private_key(path: &str) -> io::Result<PrivateKeyDer<'static>> {
             format!("no private key found in {path}"),
         )
     })
+}
+
+/// Checks that `addr` is a `host:port` address a connect can use: a
+/// non-empty host (a bracketed one if it is an IPv6 address, so the
+/// port's `:` is unambiguous) and a port from 1 to 65535. Used on the
+/// `--discovery` lists at startup, where an address without a port was
+/// otherwise accepted and only failed every connect attempt later
+/// ("invalid socket address"), leaving a node that never joined or a proxy
+/// that never had a roster, with nothing but a retrying log line to say
+/// why. A host name is not resolved here: DNS may not be up yet at start.
+pub fn check_host_port(addr: &str) -> Result<(), String> {
+    let invalid = |why: &str| format!("{addr:?} is not a host:port address: {why}");
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return Err(invalid("no port"));
+    };
+    match port.parse::<u16>() {
+        Ok(0) => return Err(invalid("port 0")),
+        Ok(_) => {}
+        Err(_) => return Err(invalid("the port is not a number from 1 to 65535")),
+    }
+    if host.is_empty() {
+        return Err(invalid("no host"));
+    }
+    if host.contains(':') {
+        let bracketed = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .is_some_and(|inner| inner.parse::<Ipv6Addr>().is_ok());
+        if !bracketed {
+            return Err(invalid(
+                "an IPv6 host must be in brackets, as in [::1]:8357",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Parses the host portion of a `host:port` address into a TLS server name
@@ -1435,6 +1493,63 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("rather than treated as unset"), "{error}");
+    }
+
+    #[test]
+    fn check_host_port_accepts_host_port_and_rejects_what_a_connect_cannot_use() {
+        for good in [
+            "127.0.0.1:8357",
+            "discovery.internal:8357",
+            "[::1]:8357",
+            "[fe80::1]:1",
+            "localhost:65535",
+        ] {
+            assert_eq!(check_host_port(good), Ok(()), "{good}");
+        }
+        for (bad, why) in [
+            ("127.0.0.1", "no port"),
+            ("discovery.internal", "no port"),
+            ("127.0.0.1:", "the port is not a number from 1 to 65535"),
+            ("127.0.0.1:x", "the port is not a number from 1 to 65535"),
+            (
+                "127.0.0.1:65536",
+                "the port is not a number from 1 to 65535",
+            ),
+            ("127.0.0.1:0", "port 0"),
+            (":8357", "no host"),
+            (
+                "::1:8357",
+                "an IPv6 host must be in brackets, as in [::1]:8357",
+            ),
+            (
+                "[::1:8357",
+                "an IPv6 host must be in brackets, as in [::1]:8357",
+            ),
+        ] {
+            assert_eq!(
+                check_host_port(bad),
+                Err(format!("{bad:?} is not a host:port address: {why}")),
+                "{bad}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_line_argument_that_is_not_utf8_is_a_usage_error_not_a_panic() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = vec![
+            std::ffi::OsString::from("--tls-cert"),
+            std::ffi::OsString::from_vec(b"/tmp/\xff".to_vec()),
+        ];
+        assert_eq!(
+            utf8_args(raw.into_iter()),
+            Err("command-line argument is not valid UTF-8: /tmp/\u{fffd}".to_string())
+        );
+        assert_eq!(
+            utf8_args(["--port", "1"].map(std::ffi::OsString::from).into_iter()),
+            Ok(vec!["--port".to_string(), "1".to_string()])
+        );
     }
 
     #[tokio::test]

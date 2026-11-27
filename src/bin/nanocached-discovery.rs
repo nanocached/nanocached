@@ -1769,7 +1769,7 @@ impl From<String> for ArgsError {
 }
 
 fn parse_args() -> Result<Args, ArgsError> {
-    parse_args_from(std::env::args().skip(1))
+    parse_args_from(infra::command_line_args()?.into_iter())
 }
 
 fn parse_args_from(raw: impl Iterator<Item = String>) -> Result<Args, ArgsError> {

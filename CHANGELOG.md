@@ -20,6 +20,25 @@ framework adapters at one version, whether or not a component changed.
   join was abandoned. It is now logged as "stopped sending M to …" with the
   reason, and a send whose attempts ran out says so in that reason (#2051).
 
+- Proxy: the roster was taken from whichever discovery replica answered
+  first, not from the first one configured, so a healthy but slower first
+  replica lost to a later one, and replicas that briefly disagreed could
+  flip the proxy's ring from one refresh to the next. Every replica is
+  still asked at once, but a later one's roster is used only once every
+  replica listed before it has failed or gone 1 s without answering, as
+  the SDKs and nodes keep to the configured order (#2048).
+
+- Node: during a forwarding window (a join, a decommission or a
+  re-replication), a plain `y` (batch touch) queued a forward for every
+  occurrence of a key, and each one copied the cached value in full before
+  the target's queue coalesced them, so a 3 KB frame naming a 200 KB key
+  1,000 times grew the node by about 210 MB, and a larger value or frame
+  could run it out of memory. A frame of distinct keys likewise copied
+  every value it forwarded in one go before the queue's bound applied. A
+  repeated key is now forwarded once, and a `y`'s forwards are queued in
+  runs of at most 1 MiB of keys and values, each waiting for room in the
+  target's queue like any other write (#2042).
+
 - Discovery: a join started for a name right after that name's previous
   join was abandoned (the joiner re-registered while the abandon's `X` was
   still waiting, or after discovery gave up on it) sent its `M` to a member
@@ -30,6 +49,38 @@ framework adapters at one version, whether or not a component changed.
   started again. An `M` refused with `R` is now resent every second for up
   to 45 s, without using up the three attempts kept for connection and ack
   failures, and with no `X` after it if the join ends meanwhile (#2045).
+
+- Node and proxy: a `--discovery` address without a port (or with port 0,
+  a non-numeric port, or an unbracketed IPv6 host) was accepted at startup,
+  and every connect then failed with "invalid socket address", so the node
+  never joined and the proxy never had a roster. Each address is now checked
+  at startup and a bad one is a usage error naming it (#2050).
+
+- Node: handoff tombstones were bounded by count only (65,536) and eviction
+  removes entries only, so a burst of relayed deletes of distinct large keys
+  during a join or decommission window pushed `used_bytes` far past
+  `--max-memory`, and the next stores evicted the live set until the
+  tombstones expired two minutes later: on a 4 MiB node, 64 deletes of
+  512 KiB keys charged 33.9 MB and the next set evicted all but one of 1,000
+  entries. Tombstones are now also held to an eighth of `--max-memory`,
+  forgetting the oldest first and always keeping the newest; at the default
+  256 MiB the count stays the bound for keys up to about 260 bytes (#2044).
+
+- Node: a repeated handoff delete of the same key (a forwarded `d`/`D`
+  relayed as `u` during a join or decommission window) queued a fresh copy
+  of the key on every repeat while the tombstone kept the first one, so
+  each repeat held an uncharged copy until it expired two minutes later; a
+  joiner sent 1,000 deletes of one 512 KiB key grew from 3 MB to 504 MB of
+  RSS. A repeat now queues the key the tombstone already holds and only
+  refreshes its stamp (#2043).
+
+- All binaries (`nanocached-node`, `nanocached-proxy`,
+  `nanocached-discovery`, `ncd`, `verify-staged-join`): a command-line
+  argument that is not valid UTF-8, such as a `--tls-cert` path with a stray
+  byte, made the process panic with exit code 101 and a backtrace. It is now
+  a usage error ("command-line argument is not valid UTF-8: ...") with exit
+  code 1, like any other invalid option; `ncd` passes the arguments through
+  untouched and lets the binary it runs report it (#2049).
 
 - Node: a receive buffer that grew under the in-flight overdraft token kept
   it until its frame arrived, which only the client decided, so a client
@@ -111,6 +162,16 @@ framework adapters at one version, whether or not a component changed.
   client gets the error; a later request on the key from the same connection
   still waits until those legs are enqueued. A `W` is retried as before
   (#2016).
+
+- Proxy: a `ttl=0` touch (`t`, `t … G`, `y`) whose primary leg failed for
+  good — its re-fan found the primary still unreachable, or the primary
+  dropped the connection after the frame may have reached it — was answered
+  `R`, `W` or `E` and no other owner was sent the touch, so a later `G` that
+  fell back to a replica returned the value the client had expired, and the
+  replica kept it once promoted. The other owners now get their plain
+  touch before the client gets the error, as for a delete. A first attempt
+  that is re-fanned still sends them nothing until the primary has answered
+  (#2046).
 
 - Node: a decommission that retried a key's transfer after a refused or
   failed attempt resent the value and TTL it had read before the first try.
@@ -293,6 +354,17 @@ framework adapters at one version, whether or not a component changed.
   non-blocking busy reply and is closed at once, with no drain (#1720).
 
 ### Changed
+
+- Docs: the accepted-behaviour item on increments rewound by a lagging
+  forward described one to three lost increments for concurrent callers
+  and, for one caller sending four increments about 1 ms apart, one lost
+  increment on about a fifth of the counters. A counter incremented in a
+  sustained stream loses far more: with 64 increments in flight on one
+  counter, a 30,000-increment burst sent 6 s after a join ended at 8,542 to
+  16,662 through the proxy and 6,209 to 8,520 through the Rust SDK, every
+  increment acknowledged, because each result the old owner forwards back
+  rewinds the counter by the increments sent since. The accepted-behaviour list, the proxy ordering section, the
+  SDKs page and the protocol page now give that scale (#2047).
 
 - Docs: the proxy ordering section now says that a delete (`D`/`d`) is in
   the connection's order like an expiring touch: a later request on the key

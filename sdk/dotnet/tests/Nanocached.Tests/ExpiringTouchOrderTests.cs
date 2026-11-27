@@ -34,8 +34,12 @@ public class ExpiringTouchOrderTests
             Discovery = new MockDiscovery(Nodes.Select(p => (p.Key, p.Value.Address)).ToList(), 2);
         }
 
-        public async Task ConnectAsync() =>
-            Client = await NanocachedClient.ConnectAsync(new() { Addresses = { ("127.0.0.1", Discovery.Port) } });
+        public async Task ConnectAsync(bool fireAndForgetReplicas = false) =>
+            Client = await NanocachedClient.ConnectAsync(new()
+            {
+                Addresses = { ("127.0.0.1", Discovery.Port) },
+                FireAndForgetReplicas = fireAndForgetReplicas,
+            });
 
         public (string Name, MockNode Node) Primary(string key) => Owner(key, 0);
 
@@ -78,34 +82,61 @@ public class ExpiringTouchOrderTests
 
     // ── single key ───────────────────────────────────────────────────
 
-    [Fact]
-    public async Task ADeadPrimaryIsReroutedWithoutTheReplicaHavingBeenTouched()
+    // Issue #2056: the primary goes away and the roster still lists it, so
+    // the retry after the forced refresh routes to it again and the call
+    // fails. The replica used to be left holding the value, and a read
+    // falling back to it returned what the caller expired. It now gets the
+    // plain touch before the error is raised, awaited even with
+    // FireAndForgetReplicas.
+    [Theory]
+    [InlineData("touch", false)]
+    [InlineData("getAndTouch", false)]
+    [InlineData("touch", true)]
+    [InlineData("getAndTouch", true)]
+    public async Task AnExpiringTouchWhosePrimaryStaysUnreachableExpiresTheOtherOwnersBeforeFailing(
+        string op, bool fireAndForget)
+    {
+        using var cluster = new Cluster();
+        await cluster.ConnectAsync(fireAndForget);
+        const string key = "shared-key";
+        await cluster.Client.SetAsync(key, "v", 100);
+        var (_, primary) = cluster.Primary(key);
+        var (_, replica) = cluster.Replica(key);
+        await WaitForAsync(() => !replica.Store.IsEmpty, "the replica's copy");
+        primary.Dispose();
+        await Task.Delay(100);
+
+        await Assert.ThrowsAsync<ConnectionLostException>(
+            () => op == "touch" ? cluster.Client.TouchAsync(key, 0) : cluster.Client.GetAndTouchAsync(key, 0));
+        Assert.Single(replica.TouchFrames);
+        Assert.DoesNotContain("G", replica.TouchFrames[0].Split(' ')); // the plain form
+        Assert.True(replica.Store.IsEmpty, "the replica's copy is expired");
+        // A plain read falls back to the replica on the connection failure
+        // and no longer finds the expired value.
+        Assert.Null(await cluster.Client.GetAsync(key));
+    }
+
+    // Issue #2056: the primary applied the touch and the reply was lost.
+    // The touch is not resent (issue #901), and the replica is expired
+    // before the error is raised.
+    [Theory]
+    [InlineData("touch")]
+    [InlineData("getAndTouch")]
+    public async Task AnExpiringTouchWhosePrimaryReplyWasLostExpiresTheOtherOwnersBeforeFailing(string op)
     {
         using var cluster = new Cluster();
         await cluster.ConnectAsync();
         const string key = "shared-key";
         await cluster.Client.SetAsync(key, "v", 100);
-        var (primaryName, primary) = cluster.Primary(key);
+        var (_, primary) = cluster.Primary(key);
         var (_, replica) = cluster.Replica(key);
-        primary.Dispose();
-        await Task.Delay(100);
+        primary.FailTouchAfterApplyOnce();
 
-        // The roster still lists the dead primary: the call ends in its
-        // connection failure, and the replica was never sent a touch.
-        await Assert.ThrowsAsync<ConnectionLostException>(() => cluster.Client.GetAndTouchAsync(key, 0));
-        await Assert.ThrowsAsync<ConnectionLostException>(() => cluster.Client.TouchAsync(key, 0));
-        Assert.Empty(replica.TouchFrames);
-
-        // Once discovery drops the primary the reroute finds the value on
-        // the surviving replica, which is the primary now. The calls above
-        // refreshed just now, so the next forced refresh waits out the
-        // minimum interval (issue #1583) before it can see the change.
-        await Task.Delay(NanocachedClient.ForcedRefreshMinInterval + TimeSpan.FromMilliseconds(100));
-        cluster.Discovery.SetNodes(
-            cluster.Nodes.Where(p => p.Key != primaryName).Select(p => (p.Key, p.Value.Address)).ToList());
-        Assert.Equal("v", await cluster.Client.GetAndTouchAsync(key, 0));
+        await Assert.ThrowsAsync<ConnectionLostException>(
+            () => op == "touch" ? cluster.Client.TouchAsync(key, 0) : cluster.Client.GetAndTouchAsync(key, 0));
+        Assert.Single(primary.TouchFrames); // not resent
         Assert.Single(replica.TouchFrames);
-        Assert.Contains("G", replica.TouchFrames[0].Split(' ')); // the reroute asks the new primary for the value
+        Assert.True(replica.Store.IsEmpty, "the replica's copy is expired");
     }
 
     [Fact]
@@ -124,6 +155,25 @@ public class ExpiringTouchOrderTests
 
         Assert.True(await cluster.Client.TouchAsync(key, 0));
         Assert.Single(replica.TouchFrames);
+    }
+
+    [Fact]
+    public async Task ADeadPrimaryDroppedFromTheRosterReroutesAGetAndTouchToTheValue()
+    {
+        using var cluster = new Cluster();
+        await cluster.ConnectAsync();
+        const string key = "shared-key";
+        await cluster.Client.SetAsync(key, "v", 100);
+        var (primaryName, primary) = cluster.Primary(key);
+        var (_, replica) = cluster.Replica(key);
+        primary.Dispose();
+        await Task.Delay(100);
+        cluster.Discovery.SetNodes(
+            cluster.Nodes.Where(p => p.Key != primaryName).Select(p => (p.Key, p.Value.Address)).ToList());
+
+        Assert.Equal("v", await cluster.Client.GetAndTouchAsync(key, 0));
+        Assert.Single(replica.TouchFrames);
+        Assert.Contains("G", replica.TouchFrames[0].Split(' ')); // the reroute asks the new primary for the value
     }
 
     [Theory]
@@ -294,8 +344,60 @@ public class ExpiringTouchOrderTests
 
     // ── batch ────────────────────────────────────────────────────────
 
+    // Issue #2056: the batch form of the dead-primary case above.
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task AnExpiringBatchWhosePrimaryStaysUnreachableExpiresTheOtherOwnersBeforeFailing(
+        bool get, bool fireAndForget)
+    {
+        using var cluster = new Cluster();
+        await cluster.ConnectAsync(fireAndForget);
+        var deadPrimaryName = Names[0];
+        var keys = KeysWhosePrimaryIs(deadPrimaryName, 3);
+        await cluster.Client.SetManyAsync(keys.ToDictionary(k => k, k => "v"), 100);
+        MockNode primary = cluster.Nodes[deadPrimaryName];
+        MockNode replica = cluster.Nodes[Names[1]];
+        await WaitForAsync(() => replica.Store.Count == keys.Count, "the replica's copies");
+        primary.Dispose();
+        await Task.Delay(100);
+
+        await Assert.ThrowsAnyAsync<ConnectionLostException>(
+            () => get ? cluster.Client.GetManyAndTouchAsync(keys, 0) : cluster.Client.TouchManyAsync(keys, 0));
+        Assert.Single(replica.MultiTouchFrames);
+        Assert.False(replica.MultiTouchFrames[0].Get);
+        Assert.Equal(0, replica.MultiTouchFrames[0].Ttl);
+        Assert.Equal(keys.OrderBy(k => k), replica.MultiTouchFrames[0].Keys.OrderBy(k => k));
+        Assert.True(replica.Store.IsEmpty, "the replica's copies are expired");
+        foreach (string key in keys) Assert.Null(await cluster.Client.GetAsync(key));
+    }
+
+    // Issue #2056: the primary applied the batch and the reply was lost;
+    // the frame is not resent (issue #901) and the replica is expired.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AnExpiringBatchWhosePrimaryReplyWasLostExpiresTheOtherOwnersBeforeFailing(bool get)
+    {
+        using var cluster = new Cluster();
+        await cluster.ConnectAsync();
+        var keys = KeysWhosePrimaryIs(Names[0], 3);
+        await cluster.Client.SetManyAsync(keys.ToDictionary(k => k, k => "v"), 100);
+        MockNode primary = cluster.Nodes[Names[0]];
+        MockNode replica = cluster.Nodes[Names[1]];
+        primary.FailTouchAfterApplyOnce();
+
+        await Assert.ThrowsAnyAsync<ConnectionLostException>(
+            () => get ? cluster.Client.GetManyAndTouchAsync(keys, 0) : cluster.Client.TouchManyAsync(keys, 0));
+        Assert.Single(primary.MultiTouchFrames); // not resent
+        Assert.Single(replica.MultiTouchFrames);
+        Assert.True(replica.Store.IsEmpty, "the replica's copies are expired");
+    }
+
     [Fact]
-    public async Task ABatchWithADeadPrimaryIsReroutedWithoutTheReplicaHavingBeenTouched()
+    public async Task ABatchWhosePrimaryIsDroppedFromTheRosterIsReroutedToTheValues()
     {
         using var cluster = new Cluster();
         await cluster.ConnectAsync();
@@ -306,18 +408,11 @@ public class ExpiringTouchOrderTests
         MockNode replica = cluster.Nodes[Names[1]];
         primary.Dispose();
         await Task.Delay(100);
-
-        await Assert.ThrowsAnyAsync<ConnectionLostException>(() => cluster.Client.GetManyAndTouchAsync(keys, 0));
-        await Assert.ThrowsAnyAsync<ConnectionLostException>(() => cluster.Client.TouchManyAsync(keys, 0));
-        Assert.Empty(replica.MultiTouchFrames);
-
-        // The calls above refreshed just now: wait out the minimum
-        // interval between forced refreshes (issue #1583).
-        await Task.Delay(NanocachedClient.ForcedRefreshMinInterval + TimeSpan.FromMilliseconds(100));
         cluster.Discovery.SetNodes(new List<(string, string)> { (Names[1], replica.Address) });
+
         var hits = await cluster.Client.GetManyAndTouchAsync(keys, 0);
         Assert.Equal(keys.OrderBy(k => k), hits.Keys.OrderBy(k => k));
-        // One frame per pass: the rerouted batch, the survivor being the primary.
+        // One frame: the batch rerouted to the survivor as the primary.
         Assert.Single(replica.MultiTouchFrames);
         Assert.True(replica.MultiTouchFrames[0].Get);
     }

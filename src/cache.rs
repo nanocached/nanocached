@@ -257,6 +257,18 @@ pub const HANDOFF_TOMBSTONE_TTL: Duration = Duration::from_secs(120);
 /// goes first. Each is charged to `used_bytes` like a `migrated` mark.
 const MAX_HANDOFF_TOMBSTONES: usize = 65_536;
 
+/// The tombstones' charges together are kept to at most
+/// `max_memory_bytes / TOMBSTONE_MEMORY_SHARE`; past it the oldest goes
+/// first, as for the count. Eviction removes entries only, so without it
+/// a burst of handoff deletes of large keys (up to the 1 MiB frame each)
+/// pushed `used_bytes` far past `--max-memory` and the next stores evicted
+/// the live set for the tombstones' two minutes (issue #2044). An eighth
+/// leaves the live set at least seven eighths of the budget and, at the
+/// default 256 MiB, keeps all 65,536 tombstones for keys up to about
+/// 260 B, so the count, not the bytes, stays the bound for ordinary keys
+/// there; a smaller `--max-memory` keeps proportionally fewer.
+const TOMBSTONE_MEMORY_SHARE: usize = 8;
+
 /// What a `migrated` mark for the key `name` is charged — see
 /// `MARK_OVERHEAD_BYTES`.
 fn mark_charge(name: &[u8]) -> usize {
@@ -401,6 +413,10 @@ pub struct Cache {
     /// again is queued again with its newer stamp; the older item is then
     /// stale and skipped when it surfaces.
     tombstone_order: VecDeque<(Instant, Key)>,
+    /// The part of `used_bytes` that `handoff_tombstones` is charged: the
+    /// sum of `tombstone_bytes` over its keys, held against
+    /// `TOMBSTONE_MEMORY_SHARE`.
+    tombstone_bytes: usize,
     /// Issue #594: how many handoff writes that arrived ahead of their
     /// ring (`handoff_set` / `handoff_set_if_absent` with `ahead_of_ring`)
     /// have landed since this cache was created. Reported by
@@ -574,6 +590,7 @@ impl Cache {
             last_handoff_at: None,
             handoff_tombstones: HashMap::with_hasher(RandomState::new()),
             tombstone_order: VecDeque::new(),
+            tombstone_bytes: 0,
             handoff_writes: 0,
             #[cfg(test)]
             name_lookups: std::cell::Cell::new(0),
@@ -1197,21 +1214,38 @@ impl Cache {
     /// Records `key` as handoff-deleted at `now` — see `handoff_delete`.
     fn tombstone(&mut self, key: &Key, now: Instant) {
         self.prune_tombstones(now);
-        if self.handoff_tombstones.len() >= MAX_HANDOFF_TOMBSTONES {
-            self.forget_oldest_tombstone();
-        }
-        // The key is sliced out of the connection's receive buffer; kept
-        // as is, a tombstone would pin that whole (pipelined) chunk for
-        // its two-minute life — the same reason `insert_into` and
-        // `ensure_namespace` copy theirs. One copy, shared by both
-        // containers.
-        let key = Key::new(
-            Bytes::copy_from_slice(&key.namespace),
-            Bytes::copy_from_slice(&key.name),
-        );
-        if self.handoff_tombstones.insert(key.clone(), now).is_none() {
-            self.used_bytes += tombstone_bytes(&key);
-        }
+        let key = if let Some((stored, _)) = self.handoff_tombstones.get_key_value(key) {
+            // A re-delete refreshes the stamp and queues the key the map
+            // already holds: a copy of its own would sit in the order queue
+            // uncharged until it surfaced, one per repeat (issue #2043).
+            let stored = stored.clone();
+            self.handoff_tombstones.insert(stored.clone(), now);
+            stored
+        } else {
+            if self.handoff_tombstones.len() >= MAX_HANDOFF_TOMBSTONES {
+                self.forget_oldest_tombstone();
+            }
+            // Room for this one under the byte share, oldest first. The
+            // newest is kept even if it alone is over the share (a large
+            // key on a small node): it is the one a stale copy can still
+            // be racing, and it overshoots by at most one key.
+            let charge = tombstone_bytes(key);
+            let share = self.max_memory_bytes / TOMBSTONE_MEMORY_SHARE;
+            while self.tombstone_bytes + charge > share && self.forget_oldest_tombstone() {}
+            // The key is sliced out of the connection's receive buffer;
+            // kept as is, a tombstone would pin that whole (pipelined)
+            // chunk for its two-minute life — the same reason
+            // `insert_into` and `ensure_namespace` copy theirs. One copy,
+            // shared by both containers.
+            let key = Key::new(
+                Bytes::copy_from_slice(&key.namespace),
+                Bytes::copy_from_slice(&key.name),
+            );
+            self.used_bytes += charge;
+            self.tombstone_bytes += charge;
+            self.handoff_tombstones.insert(key.clone(), now);
+            key
+        };
         self.tombstone_order.push_back((now, key));
         // Re-deletes leave stale items behind the live ones; compact once
         // they are the majority so the order queue stays bounded too.
@@ -1245,13 +1279,20 @@ impl Cache {
         }
     }
 
-    /// Drops the oldest live tombstone (the cap).
-    fn forget_oldest_tombstone(&mut self) {
+    /// Drops the oldest live tombstone (the caps); false if there was none.
+    fn forget_oldest_tombstone(&mut self) -> bool {
         while let Some((stamped, key)) = self.tombstone_order.pop_front() {
             if self.forget_tombstone_if_stamped(&key, stamped) {
-                return;
+                return true;
             }
         }
+        false
+    }
+
+    /// Gives back what `released` bytes of tombstones were charged.
+    fn credit_tombstones(&mut self, released: usize) {
+        self.used_bytes -= released;
+        self.tombstone_bytes -= released;
     }
 
     /// Removes `key`'s tombstone if it still carries `stamped` (a re-delete
@@ -1261,7 +1302,7 @@ impl Cache {
             return false;
         }
         self.handoff_tombstones.remove(key);
-        self.used_bytes -= tombstone_bytes(key);
+        self.credit_tombstones(tombstone_bytes(key));
         true
     }
 
@@ -1283,7 +1324,7 @@ impl Cache {
             return;
         }
         if self.handoff_tombstones.remove(key).is_some() {
-            self.used_bytes -= tombstone_bytes(key);
+            self.credit_tombstones(tombstone_bytes(key));
         }
     }
 
@@ -1309,7 +1350,7 @@ impl Cache {
                 true
             }
         });
-        self.used_bytes -= released;
+        self.credit_tombstones(released);
         self.tombstone_order
             .retain(|(_, key)| key.namespace[..] != *namespace);
     }
@@ -2134,6 +2175,7 @@ impl Cache {
         // have covered on the sender.
         self.handoff_tombstones.clear();
         self.tombstone_order.clear();
+        self.tombstone_bytes = 0;
         // `used_bytes` is already 0; the marks' duplicate bytes and the
         // namespace name charges went with everything else.
         removed
@@ -5138,6 +5180,130 @@ mod tests {
     }
 
     #[test]
+    fn a_re_delete_queues_the_tombstones_own_key_rather_than_a_fresh_copy() {
+        // Issue #2043: every handoff delete copied the key, and on a repeat
+        // the map kept its first copy, so the new one lived only in the
+        // order queue, uncharged: 1,000 re-deletes of a 512 KiB key held
+        // 1,000 such copies (500 MiB) against a 512 KiB charge.
+        let mut cache = Cache::new(UNBOUNDED);
+        let k = key(&vec![b'k'; 512 * 1024]);
+        let t0 = Instant::now();
+        for i in 0..1_000_u64 {
+            cache.handoff_delete_at(&k, t0 + Duration::from_millis(i));
+        }
+        assert_eq!(cache.handoff_tombstones.len(), 1);
+        assert_eq!(cache.used_bytes, tombstone_bytes(&k));
+        let (stored, stamp) = cache
+            .handoff_tombstones
+            .get_key_value(&k)
+            .expect("one tombstone");
+        assert_eq!(*stamp, t0 + Duration::from_millis(999), "the latest stamp");
+        assert_eq!(cache.tombstone_order.len(), 1_000);
+        let copies = cache
+            .tombstone_order
+            .iter()
+            .filter(|(_, queued)| queued.name.as_ptr() != stored.name.as_ptr())
+            .count();
+        assert_eq!(copies, 0, "order items holding a key copy of their own");
+        // The stale items are skipped as they surface; the live one expires
+        // with its own stamp and gives the charge back.
+        cache.sweep_at(t0 + HANDOFF_TOMBSTONE_TTL, true, None);
+        assert_eq!(cache.handoff_tombstones.len(), 1);
+        cache.sweep_at(
+            t0 + Duration::from_millis(999) + HANDOFF_TOMBSTONE_TTL,
+            true,
+            None,
+        );
+        assert!(cache.handoff_tombstones.is_empty());
+        assert!(cache.tombstone_order.is_empty());
+        assert_eq!(cache.used_bytes, 0);
+    }
+
+    /// `tombstone_bytes` is the sum of what the live tombstones are charged.
+    fn assert_tombstone_bytes(cache: &Cache) {
+        let charged: usize = cache.handoff_tombstones.keys().map(tombstone_bytes).sum();
+        assert_eq!(cache.tombstone_bytes, charged, "tombstone_bytes drifted");
+    }
+
+    #[test]
+    fn tombstones_of_large_keys_are_capped_by_bytes_and_do_not_evict_the_live_set() {
+        // Issue #2044: tombstones were bounded by count only, and eviction
+        // removes entries only, so 64 handoff deletes of distinct 512 KiB
+        // keys on a 4 MiB node charged 33.9 MB and the next set evicted
+        // all but one of 1,000 live entries.
+        let max_memory = 4 * 1024 * 1024;
+        let mut cache = Cache::new(max_memory);
+        for i in 0..1_000_u32 {
+            cache.set(
+                key(format!("live-{i}").as_bytes()),
+                Bytes::from(vec![b'v'; 1_000]),
+            );
+        }
+        assert_eq!(cache.len(), 1_000);
+        let t0 = Instant::now();
+        let big = |i: u32| {
+            let mut name = vec![b'k'; 512 * 1024];
+            name[..4].copy_from_slice(&i.to_be_bytes());
+            key(&name)
+        };
+        for i in 0..64_u32 {
+            cache.handoff_delete_at(&big(i), t0 + Duration::from_millis(u64::from(i)));
+            assert_tombstone_bytes(&cache);
+        }
+        // A 512 KiB key alone is just over the 512 KiB share, so only the
+        // newest is left: the overshoot is at most that one key.
+        let share = max_memory / TOMBSTONE_MEMORY_SHARE;
+        assert!(
+            cache.tombstone_bytes <= share.max(tombstone_bytes(&big(63))),
+            "{} bytes of tombstones against a share of {share}",
+            cache.tombstone_bytes
+        );
+        cache.set(key(b"after"), Bytes::from(vec![b'v'; 1_000]));
+        assert_eq!(cache.len(), 1_001, "the live set survives the tombstones");
+        assert!(cache.used_bytes <= max_memory);
+        // The newest are kept and still refuse a stale put-if-absent copy;
+        // the oldest went first.
+        let now = t0 + Duration::from_millis(64);
+        assert!(cache.tombstoned_at(&big(63), now));
+        assert!(!cache.tombstoned_at(&big(62), now));
+        assert!(!cache.tombstoned_at(&big(0), now));
+        assert!(matches!(
+            cache.handoff_set_if_absent_at(&big(63), Bytes::from_static(b"old"), None, false, now),
+            CasResult::Mismatch
+        ));
+        cache.clear_all();
+        assert_eq!(cache.tombstone_bytes, 0);
+    }
+
+    #[test]
+    fn a_tombstone_larger_than_the_byte_share_alone_is_kept() {
+        // A key over the whole share (a near-1 MiB key on a 1 MiB node)
+        // still gets its tombstone, replacing the older ones: the overshoot
+        // is that one key.
+        let max_memory = 1024 * 1024;
+        let mut cache = Cache::new(max_memory);
+        let t0 = Instant::now();
+        cache.handoff_delete_at(&key(b"small"), t0);
+        let big = key(&vec![b'k'; 512 * 1024]);
+        cache.handoff_delete_at(&big, t0);
+        assert_eq!(cache.handoff_tombstones.len(), 1);
+        assert!(cache.tombstoned_at(&big, t0));
+        assert_eq!(cache.tombstone_bytes, tombstone_bytes(&big));
+        assert_eq!(cache.used_bytes, tombstone_bytes(&big));
+        // A re-delete neither copies nor charges it again.
+        cache.handoff_delete_at(&big, t0 + Duration::from_millis(1));
+        assert_eq!(cache.tombstone_bytes, tombstone_bytes(&big));
+        assert_tombstone_bytes(&cache);
+        cache.sweep_at(
+            t0 + Duration::from_millis(1) + HANDOFF_TOMBSTONE_TTL,
+            true,
+            None,
+        );
+        assert_eq!(cache.tombstone_bytes, 0);
+        assert_eq!(cache.used_bytes, 0);
+    }
+
+    #[test]
     fn handoff_tombstones_are_capped_oldest_first_and_a_re_delete_refreshes() {
         let mut cache = Cache::new(UNBOUNDED);
         let t0 = Instant::now();
@@ -5162,6 +5328,7 @@ mod tests {
         assert!(cache.tombstoned_at(&key(b"k2"), t0 + Duration::from_millis(3)));
         let charged: usize = cache.handoff_tombstones.keys().map(tombstone_bytes).sum();
         assert_eq!(cache.used_bytes, charged);
+        assert_tombstone_bytes(&cache);
         // `clear_all` drops them with the memory they were charged to.
         cache.clear_all();
         assert!(cache.handoff_tombstones.is_empty());

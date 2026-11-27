@@ -416,6 +416,16 @@ const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const UPSTREAM_IO_TIMEOUT: Duration = Duration::from_millis(600);
 
+/// Issue #2048: how long `fetch_roster` holds a later discovery replica's
+/// roster while an earlier-listed one has neither answered nor failed. A
+/// healthy replica answers `L` well within it; one that does not is passed
+/// over after this rather than after its whole `UPSTREAM_IO_TIMEOUT`.
+#[cfg(not(test))]
+const ROSTER_PREFERENCE_WINDOW: Duration = Duration::from_secs(1);
+/// Shrunk under test like `UPSTREAM_IO_TIMEOUT`, and well below half of it.
+#[cfg(test)]
+const ROSTER_PREFERENCE_WINDOW: Duration = Duration::from_millis(150);
+
 /// How often the roster is re-fetched in the background. `W` answers
 /// force an immediate refresh regardless, so this only bounds how stale
 /// the view can get while nothing is being rerouted.
@@ -1028,6 +1038,10 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                 .into(),
         );
     }
+    for address in &args.discovery {
+        infra::check_host_port(address)
+            .map_err(|why| format!("invalid --discovery address {why}"))?;
+    }
     if args.tls_cert.is_some() != args.tls_key.is_some() {
         return Err("--tls-cert and --tls-key must be set together"
             .to_string()
@@ -1193,17 +1207,23 @@ async fn read_exact_into<S: AsyncRead + Unpin>(
 
 // ─── discovery client ────────────────────────────────────────────────
 
-/// Fetches `L` from the fastest answering discovery replica. A `B` (the
-/// replica's startup grace) or connect failure falls back to another
-/// replica; `Err` only once every replica has failed.
+/// Fetches `L` from the discovery replicas in their configured order, as
+/// the SDKs and nodes do: a replica's roster is adopted only once every
+/// replica listed before it has failed (a `B` for its startup grace, an
+/// empty roster, a connect or read failure), or has gone unanswered for
+/// `ROSTER_PREFERENCE_WINDOW`. `Err` only once every replica has failed.
 ///
-/// Issue #409: every replica is raced concurrently (`race_ok`) rather
-/// than tried one at a time — this was the one multi-address fan-out
-/// left sequential by the #177 pass. A `for` loop here meant a
-/// black-holed first replica cost a full `UPSTREAM_IO_TIMEOUT` on every
-/// refresh cycle (`run_refresher`'s `REFRESH_INTERVAL` tick and every
-/// `force_refresh`) before the next replica was even dialed, directly
-/// delaying `/readyz` and `force_refresh` convergence behind it.
+/// Issue #409: every replica is still dialed at once (`first_ok_in_order`)
+/// rather than tried one at a time. A `for` loop here meant a black-holed
+/// first replica cost a full `UPSTREAM_IO_TIMEOUT` on every refresh cycle
+/// (`run_refresher`'s `REFRESH_INTERVAL` tick and every `force_refresh`)
+/// before the next replica was even dialed, delaying `/readyz` and
+/// `force_refresh` convergence behind it; now it costs the window.
+///
+/// Issue #2048: the fastest roster used to win outright. Replicas that
+/// briefly disagree (one has dropped a node the other still lists) then
+/// gave the proxy whichever ring answered first on each refresh, so it
+/// could flip between them, where every SDK keeps to its first replica.
 async fn fetch_roster(
     context_discovery: &[String],
     secret: &Option<Bytes>,
@@ -1234,7 +1254,7 @@ async fn fetch_roster(
         })
         .collect();
 
-    race_ok(futs).await
+    first_ok_in_order(futs, ROSTER_PREFERENCE_WINDOW).await
 }
 
 async fn fetch_roster_from(
@@ -1292,8 +1312,8 @@ async fn fetch_roster_from(
     }
     // A replica with no node registered (a fresh process, or one the
     // nodes stopped heartbeating to) answers `N 0 R`. Like `B` it has no
-    // roster to give yet, so it is a failed fetch: `race_ok` then moves on
-    // to the replicas that do, instead of the first-listed empty one
+    // roster to give yet, so it is a failed fetch: `fetch_roster` then moves
+    // on to the replicas that do, instead of the first-listed empty one
     // winning every refresh and emptying the ring.
     if count == 0 {
         return Err(io::Error::new(
@@ -4501,39 +4521,73 @@ async fn join_all<'a, T>(futs: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>
     .await
 }
 
-/// One future in a `race_ok` fan-out.
+/// One future in a `first_ok_in_order` fan-out.
 type RaceFuture<'a, T> = Pin<Box<dyn Future<Output = io::Result<T>> + Send + 'a>>;
 
-/// Issue #409: like `join_all`, but returns the moment any future
-/// resolves `Ok`, leaving the rest unpolled from then on — a race rather
-/// than a join. Used for a fan-out where only the fastest success
-/// matters (`fetch_roster`'s discovery replicas), as opposed to
-/// `join_all`'s fan-outs where every reply is needed. If every future
-/// resolves `Err` (or `futs` is empty), returns the last error seen in
-/// polling order.
-async fn race_ok<'a, T>(futs: Vec<RaceFuture<'a, T>>) -> io::Result<T> {
-    let mut slots: Vec<Option<RaceFuture<'a, T>>> = futs.into_iter().map(Some).collect();
+/// Where one future of a `first_ok_in_order` fan-out stands.
+enum InOrderSlot<'a, T> {
+    Pending(RaceFuture<'a, T>),
+    Done(T),
+    Failed,
+}
+
+/// Issue #2048: runs every future at once and returns the success of the
+/// earliest-listed one, the configured order deciding rather than speed.
+/// A later future's success is held while an earlier one is still pending,
+/// until `window` has elapsed: from then on the earliest success at hand
+/// wins, so a black-holed first entry delays the answer by `window`, not by
+/// its own timeout (issue #409). The rest are dropped once one is returned.
+/// If every future resolves `Err` (or `futs` is empty), returns the last
+/// error seen.
+async fn first_ok_in_order<'a, T>(futs: Vec<RaceFuture<'a, T>>, window: Duration) -> io::Result<T> {
+    let mut slots: Vec<InOrderSlot<'a, T>> = futs.into_iter().map(InOrderSlot::Pending).collect();
     let mut last_error: Option<io::Error> = None;
-    let mut remaining = slots.len();
+    let mut window_timer = Box::pin(sleep(window));
+    let mut window_over = false;
     std::future::poll_fn(move |cx| {
+        if !window_over && window_timer.as_mut().poll(cx).is_ready() {
+            window_over = true;
+        }
         for slot in slots.iter_mut() {
-            if let Some(fut) = slot.as_mut()
+            if let InOrderSlot::Pending(fut) = slot
                 && let Poll::Ready(value) = fut.as_mut().poll(cx)
             {
-                *slot = None;
-                remaining -= 1;
-                match value {
-                    Ok(value) => return Poll::Ready(Ok(value)),
-                    Err(error) => last_error = Some(error),
+                *slot = match value {
+                    Ok(value) => InOrderSlot::Done(value),
+                    Err(error) => {
+                        last_error = Some(error);
+                        InOrderSlot::Failed
+                    }
+                };
+            }
+        }
+        let mut pending = false;
+        for slot in slots.iter_mut() {
+            match slot {
+                InOrderSlot::Failed => {}
+                InOrderSlot::Pending(_) => {
+                    if !window_over {
+                        // An earlier entry may still answer: nothing listed
+                        // after it is adopted yet.
+                        return Poll::Pending;
+                    }
+                    pending = true;
+                }
+                InOrderSlot::Done(_) => {
+                    let InOrderSlot::Done(value) = std::mem::replace(slot, InOrderSlot::Failed)
+                    else {
+                        unreachable!("matched Done above");
+                    };
+                    return Poll::Ready(Ok(value));
                 }
             }
         }
-        if remaining == 0 {
+        if pending {
+            Poll::Pending
+        } else {
             Poll::Ready(Err(last_error
                 .take()
                 .unwrap_or_else(|| io::Error::other("no futures to race"))))
-        } else {
-            Poll::Pending
         }
     })
     .await
@@ -5821,7 +5875,7 @@ struct MultiTouchBatch<'a> {
 /// `retry_positions`, and so does a group that failed or came back
 /// malformed. A replica leg's `W` or failure is logged and swallowed, like
 /// `finish_touch`'s stance on a replica. The group's `addr`, the node this
-/// sub-reply came from, is recorded in `answered_by` for every entry it decides
+/// sub-reply came from, is recorded in `settled_by` for every entry it decides
 /// (issue #966): the one node an expiring batch's deferred replica legs
 /// must not send the touch to again.
 ///
@@ -5831,11 +5885,21 @@ struct MultiTouchBatch<'a> {
 /// node is then not retried but reported to the caller (`true`), who fails
 /// the whole frame as an outcome unknown. A frame that provably never left
 /// (`request_not_sent`) or that the node refused is retried as before.
+///
+/// Issue #2046: an expiring group whose primary leg failed in transport
+/// (sent or not) also records its `addr` in `settled_by` for its keys, as an
+/// answer would. If that failure is the last word on them (the outcome is
+/// unknown, or this is the retry pass), `expire_batch_on_other_owners`
+/// expires their other owners before the client is answered: left holding
+/// the value, a replica would serve a later `G` that falls back to it, and
+/// be promoted with it once the primary is dropped. A key the retry pass
+/// sends again starts unsettled (see `retry_multi_touch`); a `W` or `E`
+/// refusal settles nothing, since nothing was expired.
 fn settle_multi_touch_group(
     group: &TouchGroup,
     reply: io::Result<NodeReply>,
     entries: &mut [Option<ProxyMultiEntry>],
-    answered_by: &mut [Option<String>],
+    settled_by: &mut [Option<String>],
     retry_positions: &mut Vec<usize>,
     replica_legs: &mut ReplicaLegTally,
     expiring: bool,
@@ -5850,6 +5914,11 @@ fn settle_multi_touch_group(
             Ok(_) => false,
         };
     if may_have_applied && legs.iter().any(|&(_, is_primary)| is_primary) {
+        for &(position, is_primary) in legs {
+            if is_primary {
+                settled_by[position] = Some(group.addr.clone());
+            }
+        }
         return true;
     }
     match reply {
@@ -5865,15 +5934,19 @@ fn settle_multi_touch_group(
                     retry_positions.push(position);
                 } else {
                     entries[position] = Some(result);
-                    answered_by[position] = Some(group.addr.clone());
+                    settled_by[position] = Some(group.addr.clone());
                 }
             }
         }
         reply => {
+            let failed = expiring && reply.is_err();
             let mut replicas = 0;
             for &(position, is_primary) in legs {
                 if is_primary {
                     retry_positions.push(position);
+                    if failed {
+                        settled_by[position] = Some(group.addr.clone());
+                    }
                 } else {
                     replicas += 1;
                 }
@@ -5905,7 +5978,7 @@ async fn finish_multi_touch(
     for position in missing {
         entries[position] = Some(ProxyMultiEntry::WrongNode);
     }
-    let mut answered_by: Vec<Option<String>> = vec![None; batch.keys.len()];
+    let mut settled_by: Vec<Option<String>> = vec![None; batch.keys.len()];
     let expiring = batch.ttl == Some(0);
     let mut unknown = false;
     let mut replica_legs = ReplicaLegTally::default();
@@ -5914,7 +5987,7 @@ async fn finish_multi_touch(
             &group,
             reply.await,
             &mut entries,
-            &mut answered_by,
+            &mut settled_by,
             &mut retry_positions,
             &mut replica_legs,
             expiring,
@@ -5930,7 +6003,7 @@ async fn finish_multi_touch(
             batch,
             &retry_positions,
             &mut entries,
-            &mut answered_by,
+            &mut settled_by,
         )
         .await;
     }
@@ -5939,7 +6012,8 @@ async fn finish_multi_touch(
         // #966): the keys a primary answered have expired their copies
         // there, so their other owners get theirs even when another leg's
         // outcome is unknown and the client is told `E` — as the SDKs do.
-        expire_batch_on_other_owners(context, &batch, &entries, &answered_by, signal).await;
+        // So do the keys whose primary leg failed for good (issue #2046).
+        expire_batch_on_other_owners(context, &batch, &settled_by, signal).await;
     }
     if unknown {
         return Err(Fatal::OutcomeUnknown);
@@ -5959,24 +6033,19 @@ async fn finish_multi_touch(
 /// The keys `expire_batch_on_other_owners` sends, per owner address. A key
 /// is listed once per address: two of its owner ranks can share one (two
 /// roster names on one IP:port, as right after a same-address restart), and
-/// the node needs the key once, not once per rank.
+/// the node needs the key once, not once per rank. A key is listed when
+/// `settled_by` names the node its primary leg settled on (see
+/// `settle_multi_touch_group`); a key still `W`, or never sent, gets none.
 fn plan_expire_on_other_owners(
     ring: &RingView,
     batch: &MultiTouchBatch<'_>,
-    entries: &[Option<ProxyMultiEntry>],
-    answered_by: &[Option<String>],
+    settled_by: &[Option<String>],
 ) -> Vec<(String, Vec<Bytes>)> {
     let mut others: AddrGroups<Vec<usize>> = AddrGroups::new(ring);
     let namespace_hash = NamespaceHash::of(batch.namespace);
     let mut top = Vec::new();
-    for (position, entry) in entries.iter().enumerate() {
-        if !matches!(
-            entry,
-            Some(ProxyMultiEntry::Value(_) | ProxyMultiEntry::Miss)
-        ) {
-            continue;
-        }
-        let Some(answered) = answered_by[position].as_deref() else {
+    for (position, settled) in settled_by.iter().enumerate() {
+        let Some(answered) = settled.as_deref() else {
             continue;
         };
         ring.rank_owners(
@@ -6013,13 +6082,14 @@ fn plan_expire_on_other_owners(
 /// `y ... 0` per other owner on the current ring, covering every key whose
 /// primary answered (a value or a miss: a miss on the primary can still
 /// have a replica copy a fire-and-forget write left, and the client asked
-/// for the key to expire everywhere). Keys still `W` get none. Sent after
+/// for the key to expire everywhere) or whose primary leg failed for good
+/// (issue #2046). Keys still `W` get none. Sent after
 /// the primaries answered, these run outside the pipelined-order guarantee
 /// like every retry path; a failure is logged and swallowed as for any
 /// replica leg.
 ///
 /// A key's other owners are every owner on the ring in force now except
-/// the node that answered for it (`answered_by`), as `expire_on_other_owners`
+/// the node that answered for it (`settled_by`), as `expire_on_other_owners`
 /// and the SDKs pick them (issue #966) — not the ring's rank 1 and below:
 /// the retry pass refreshes the ring, so a key answered in the first pass
 /// can have a new first owner, which must be expired too, while the node
@@ -6027,14 +6097,13 @@ fn plan_expire_on_other_owners(
 async fn expire_batch_on_other_owners(
     context: &ProxyContext,
     batch: &MultiTouchBatch<'_>,
-    entries: &[Option<ProxyMultiEntry>],
-    answered_by: &[Option<String>],
+    settled_by: &[Option<String>],
     signal: Option<OrderSignal>,
 ) {
     let Some(ring) = current_ring(context) else {
         return;
     };
-    let others = plan_expire_on_other_owners(&ring, batch, entries, answered_by);
+    let others = plan_expire_on_other_owners(&ring, batch, settled_by);
     if others.is_empty() {
         return;
     }
@@ -6103,7 +6172,8 @@ async fn expire_batch_on_other_owners(
 /// fresh ring, not just the primary, which is harmless because a touch is
 /// idempotent — except for an expiring batch, whose other owners wait for
 /// `expire_batch_on_other_owners` (issue #934). A key whose primary is still
-/// `W` or unreachable is answered `W`. Returns `true` when an expiring
+/// `W` or unreachable is answered `W`; for an expiring batch, one still
+/// unreachable has its other owners expired all the same (issue #2046). Returns `true` when an expiring
 /// (`ttl=0`) batch's primary leg may have been applied and its reply is lost
 /// (see `settle_multi_touch_group`).
 async fn retry_multi_touch(
@@ -6111,10 +6181,15 @@ async fn retry_multi_touch(
     batch: MultiTouchBatch<'_>,
     retry_positions: &[usize],
     entries: &mut [Option<ProxyMultiEntry>],
-    answered_by: &mut [Option<String>],
+    settled_by: &mut [Option<String>],
 ) -> bool {
     force_refresh(context).await;
 
+    // Sent again, a key is settled by this pass alone: a first-pass primary
+    // whose frame never left expired nothing (issue #2046).
+    for &position in retry_positions {
+        settled_by[position] = None;
+    }
     let Some(ring) = current_ring(context) else {
         for &position in retry_positions {
             entries[position] = Some(ProxyMultiEntry::WrongNode);
@@ -6151,7 +6226,7 @@ async fn retry_multi_touch(
             group,
             reply,
             entries,
-            answered_by,
+            settled_by,
             &mut unresolved,
             &mut replica_legs,
             expiring,
@@ -6458,7 +6533,8 @@ fn expires_at_once(ttl: Option<u64>) -> bool {
 
 /// Issue #934: the deferred replica legs of an expiring touch — the plain
 /// `t ... 0` to every owner of `key` on the current ring other than
-/// `answered`, the node whose definitive reply the client is about to get.
+/// `answered`, the node whose definitive reply the client is about to get
+/// (or whose leg failed for good, issue #2046).
 /// Sent only now, after that reply, these run outside the pipelined-order
 /// guarantee the initial dispatch gives, like every retry path; a replica
 /// failure is logged and swallowed as for any replica leg.
@@ -6507,7 +6583,9 @@ fn touch_answer(reply: &NodeReply, tag: Option<u32>) -> Option<Vec<u8>> {
 /// is `Fatal::Transient` like a refusal of `i`, `k` or `x`. For the same
 /// reason its replica legs were not enqueued with the primary's (see
 /// `enqueue_touch`): they are sent here, once the primary has answered, by
-/// `expire_on_other_owners`.
+/// `expire_on_other_owners` — or once its leg has failed for good (an
+/// unknown outcome here, or any failure of the re-fan), before the client
+/// gets the error.
 async fn finish_touch(
     context: &ProxyContext,
     namespace: &[u8],
@@ -6552,6 +6630,15 @@ async fn finish_touch(
             .await
         }
         Err(error) if expires_at_once(ttl) && !request_not_sent(error) => {
+            // Not sent again, so this is the last word on the primary leg,
+            // and it may have expired the key there. Issue #2046: the other
+            // owners still get theirs before the client gets the error;
+            // left holding the value, a replica would answer a later `G`
+            // that falls back to it, and be promoted with it once the
+            // primary is dropped.
+            if let Some(primary) = owners.first() {
+                expire_on_other_owners(context, namespace, key, primary, signal).await;
+            }
             Err(Fatal::OutcomeUnknown)
         }
         Err(_) => {
@@ -6622,8 +6709,18 @@ async fn refan_touch(
                 expire_on_other_owners(context, namespace, key, primary, signal).await;
                 Ok(answer)
             }
-            Err(error) if request_not_sent(&error) => Err(Fatal::Transient),
-            Err(_) => Err(Fatal::OutcomeUnknown),
+            Err(error) => {
+                // The primary leg failed for good: the client gets an
+                // error, but the other owners still get theirs first
+                // (issue #2046, as `refan_write` does for a delete). A
+                // `W`/`E` refusal above expired nothing and sends none.
+                expire_on_other_owners(context, namespace, key, primary, signal).await;
+                Err(if request_not_sent(&error) {
+                    Fatal::Transient
+                } else {
+                    Fatal::OutcomeUnknown
+                })
+            }
         };
     }
     let plain = frame_touch(namespace, key, ttl, false);
@@ -8761,7 +8858,10 @@ where
 // ─── main ────────────────────────────────────────────────────────────
 
 fn main() -> ExitCode {
-    let args = match parse_args_from(std::env::args().skip(1)) {
+    let args = match infra::command_line_args()
+        .map_err(ArgsError::Invalid)
+        .and_then(|raw| parse_args_from(raw.into_iter()))
+    {
         Ok(args) => args,
         Err(ArgsError::Help(message)) => {
             println!("{message}");
@@ -9705,6 +9805,18 @@ mod tests {
 
     fn args(list: &[&str]) -> Result<Args, ArgsError> {
         parse_args_from(list.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn a_discovery_address_without_a_port_is_refused_at_startup() {
+        let Err(ArgsError::Invalid(message)) = args(&["--discovery", "10.0.0.1:8357,10.0.0.2"])
+        else {
+            panic!("an address without a port must be rejected");
+        };
+        assert_eq!(
+            message,
+            "invalid --discovery address \"10.0.0.2\" is not a host:port address: no port"
+        );
     }
 
     #[test]
@@ -14651,10 +14763,9 @@ mod tests {
             ttl: Some(0),
             get: false,
         };
-        let entries = vec![Some(ProxyMultiEntry::Miss); keys.len()];
-        let answered_by = vec![Some("addr-1".to_string()); keys.len()];
+        let settled_by = vec![Some("addr-1".to_string()); keys.len()];
 
-        let plan = plan_expire_on_other_owners(&ring, &batch, &entries, &answered_by);
+        let plan = plan_expire_on_other_owners(&ring, &batch, &settled_by);
         assert_eq!(plan.len(), 1, "only the address that did not answer");
         let (addr, listed) = &plan[0];
         assert_eq!(addr, "addr-2");
@@ -18251,13 +18362,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_zero_ttl_touch_does_not_expire_a_replica_while_its_primary_is_unreachable() {
+    async fn a_zero_ttl_touch_whose_primary_stays_unreachable_still_expires_the_replica() {
         // Issue #934: the plain `t ... 0` used to go to the replica together
         // with the primary leg, so a primary that could not be reached
         // left the replica's copy expired before the re-fan asked it for
-        // the key. The replica gets nothing until a primary has answered.
+        // the key. The replica gets nothing while the primary leg can still
+        // be re-fanned. Issue #2046: but once the re-fan has failed too,
+        // the replica gets its plain touch before the client gets the
+        // error. Left holding the value, it answered a later `G` that fell
+        // back to it, and kept it once promoted.
         for get in [false, true] {
             let (live, proxy, key) = live_replica_dead_primary_cluster().await;
+            store_on(&live, b"", key.as_bytes());
             let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
             let request = if get {
                 format!("t 0 {} 0 G 1\n{key}", key.len())
@@ -18266,10 +18382,22 @@ mod tests {
             };
             stream.write_all(request.as_bytes()).await.unwrap();
             assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "R 1");
+            // Once, after the re-fan failed: sent with the first attempt
+            // as well, it would show twice.
             assert_eq!(
                 live.touches(),
-                Vec::<(Option<u64>, bool)>::new(),
-                "get={get}: the replica must not be touched while the primary leg fails"
+                vec![(Some(0), false)],
+                "get={get}: the replica is sent its plain touch once, after the primary leg failed"
+            );
+            assert!(live.entry(b"", key.as_bytes()).is_none(), "get={get}");
+
+            // A read that falls back to the replica no longer finds it.
+            let read = format!("G {} 2\n{key}", key.len());
+            stream.write_all(read.as_bytes()).await.unwrap();
+            assert_eq!(
+                read_line(&mut stream, &mut buf).await.unwrap(),
+                "N 2",
+                "get={get}"
             );
         }
     }
@@ -18314,6 +18442,54 @@ mod tests {
         // Both copies are gone: the touch expired the key everywhere.
         stream.write_all(b"G 3\nkey").await.unwrap();
         assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "N");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_zero_ttl_touch_with_an_unknown_outcome_still_expires_the_replica() {
+        // Issue #2046: the primary applies the `t ... 0` and drops the
+        // connection before answering. The frame is not sent again and the
+        // client is told the outcome is unknown (issue #919), but the
+        // replica used to keep its copy: a later `G` that fell back to it
+        // returned the value, and it kept it once promoted. With
+        // `refan`, the primary's first answer is a stale `W`, so the lost
+        // reply is the re-fan's.
+        for (get, refan) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (nodes, proxy, replica) = two_nodes_with_replica_of("key").await;
+            let primary = &nodes[1 - replica];
+            let replica = &nodes[replica];
+            let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
+            stream.write_all(b"S 3 1 1\nkeyv").await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "S 1");
+            assert!(replica_settles_on(replica, b"key", Some(b"v")).await);
+
+            if refan {
+                primary.wrong_node_once.store(true, Ordering::SeqCst);
+            }
+            primary
+                .close_after_touch_apply_once
+                .store(true, Ordering::SeqCst);
+            let request: &[u8] = if get {
+                b"t 0 3 0 G 2\nkey"
+            } else {
+                b"t 0 3 0 2\nkey"
+            };
+            stream.write_all(request).await.unwrap();
+            assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), "E");
+            assert_eq!(
+                primary.touches(),
+                vec![(Some(0), get)],
+                "get={get} refan={refan}: the lost-reply attempt is not re-sent"
+            );
+            assert_eq!(
+                replica.touches(),
+                vec![(Some(0), false)],
+                "get={get} refan={refan}: the replica is expired once, before the E"
+            );
+            assert!(
+                replica.entry(b"", b"key").is_none(),
+                "get={get} refan={refan}"
+            );
+        }
     }
 
     /// The replica of `key` in a two-node cluster, and the cluster's proxy.
@@ -18435,12 +18611,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_zero_ttl_batch_touch_does_not_expire_a_replica_while_its_primary_is_unreachable() {
+    async fn a_zero_ttl_batch_touch_whose_primary_stays_unreachable_still_expires_the_replica() {
         // Issue #934: the batch counterpart — the key's primary is dead, so
         // the key degrades to `W`; its replica must not have been sent the
-        // plain `y ... 0` in the meantime.
+        // plain `y ... 0` while the retry pass could still reach a primary.
+        // Issue #2046: once the retry pass failed too, it is sent once,
+        // before the frame is answered.
         for get in [false, true] {
             let (live, proxy, key) = live_replica_dead_primary_cluster().await;
+            store_on(&live, b"", key.as_bytes());
             let (mut stream, mut buf) = connect_and_auth_tagged(&proxy).await;
             let request = if get {
                 format!("y 0 1 {} 0 G 1\n{key}", key.len())
@@ -18452,8 +18631,17 @@ mod tests {
             assert_eq!(read_line(&mut stream, &mut buf).await.unwrap(), expected);
             assert_eq!(
                 live.touches(),
-                Vec::<(Option<u64>, bool)>::new(),
-                "get={get}: the replica must not be touched while the primary leg fails"
+                vec![(Some(0), false)],
+                "get={get}: the replica is sent its plain touch once, after the primary leg failed"
+            );
+            assert!(live.entry(b"", key.as_bytes()).is_none(), "get={get}");
+
+            let read = format!("G {} 2\n{key}", key.len());
+            stream.write_all(read.as_bytes()).await.unwrap();
+            assert_eq!(
+                read_line(&mut stream, &mut buf).await.unwrap(),
+                "N 2",
+                "get={get}"
             );
         }
     }
@@ -18564,9 +18752,15 @@ mod tests {
             vec![(Some(0), true), (Some(0), false)],
             "the answered key's replica is expired although the frame is E"
         );
-        // node-b answered its primary leg; the lost key's outcome is
-        // unknown, so its replica is not touched.
-        assert_eq!(nodes[1].touches(), vec![(Some(0), true)]);
+        // node-b answered its primary leg. Issue #2046: the lost key's
+        // outcome is unknown, but its primary leg is not sent again, so
+        // its replica is expired too before the frame is answered.
+        assert_eq!(
+            nodes[1].touches(),
+            vec![(Some(0), true), (Some(0), false)],
+            "the lost key's replica is expired too"
+        );
+        assert!(nodes[1].entry(b"", lost_key.as_bytes()).is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -20538,17 +20732,19 @@ mod tests {
         );
     }
 
-    // ── issue #409(b): `fetch_roster` races its replicas ────────────────
+    // ── issue #409(b): `fetch_roster` dials its replicas at once ────────
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fetch_roster_races_replicas_instead_of_trying_them_in_order() {
+    async fn fetch_roster_does_not_wait_out_a_black_holed_first_replica() {
         // Before the fix, `fetch_roster` tried discovery replicas one at
         // a time in a `for` loop — the one multi-address fan-out left
         // sequential by the earlier #177 pass (every other fan-out in
         // this module already runs concurrently). A black-holed first
         // replica cost a full `UPSTREAM_IO_TIMEOUT` on every refresh
         // cycle, and delayed `/readyz`/`force_refresh` convergence,
-        // before the next (live) replica was even dialed.
+        // before the next (live) replica was even dialed. Issue #2048:
+        // the live replica's roster is held for the preference window
+        // while the first one may still answer, and no longer.
         let black_hole = start_black_hole_node().await;
         let live =
             start_mock_discovery(vec![("node".to_string(), "127.0.0.1:1".to_string())], 1).await;
@@ -20559,23 +20755,89 @@ mod tests {
 
         let ring = result.expect("the live replica's roster should still answer");
         assert_eq!(ring.all_addresses(), vec!["127.0.0.1:1".to_string()]);
-        // Raced concurrently, the live replica answers almost
-        // immediately regardless of where the black hole sits in the
-        // list; sequential trial would have cost a full
+        // Dialed concurrently, the live replica is adopted once the
+        // window is over; sequential trial would have cost a full
         // `UPSTREAM_IO_TIMEOUT` first since the black hole is listed
         // *before* the live replica.
         assert!(
             elapsed < UPSTREAM_IO_TIMEOUT / 2,
-            "elapsed {elapsed:?} suggests the black-holed replica was tried before the live one, not raced"
+            "elapsed {elapsed:?} suggests the black-holed replica was waited out"
         );
+        assert!(
+            elapsed >= ROSTER_PREFERENCE_WINDOW,
+            "elapsed {elapsed:?}: the live replica was adopted while the first could still answer"
+        );
+    }
+
+    /// A listener that forwards each connection to `target` after `delay`:
+    /// a healthy discovery replica that answers slowly.
+    async fn start_delayed_relay(target: String, delay: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                let target = target.clone();
+                tokio::spawn(async move {
+                    sleep(delay).await;
+                    if let Ok(mut outbound) = TcpStream::connect(&target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Issue #2048: the first replica is healthy but slower than the second,
+    /// and the two disagree. The proxy adopted the faster one's roster on
+    /// every refresh, where the SDKs and nodes keep to the configured order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_roster_prefers_the_first_replica_over_a_faster_later_one() {
+        let first = start_mock_discovery(
+            vec![
+                ("node-a".to_string(), "127.0.0.1:1".to_string()),
+                ("node-b".to_string(), "127.0.0.1:2".to_string()),
+            ],
+            2,
+        )
+        .await;
+        let slow_first = start_delayed_relay(first, ROSTER_PREFERENCE_WINDOW / 3).await;
+        let fast_second =
+            start_mock_discovery(vec![("node-c".to_string(), "127.0.0.1:3".to_string())], 1).await;
+
+        let ring = fetch_roster(&[slow_first, fast_second], &None, &None)
+            .await
+            .expect("the first replica answers");
+        assert_eq!(
+            ring.all_addresses(),
+            vec!["127.0.0.1:1".to_string(), "127.0.0.1:2".to_string()],
+            "the first replica's roster, not the faster second one's"
+        );
+        assert_eq!(ring.replication, 2);
+    }
+
+    /// Issue #2048: past the window, a later replica's roster is adopted
+    /// while the first is still slow, as for a black hole.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_roster_adopts_a_later_replica_once_the_first_outlasts_the_window() {
+        let first =
+            start_mock_discovery(vec![("node-a".to_string(), "127.0.0.1:1".to_string())], 1).await;
+        let slower_than_window = start_delayed_relay(first, ROSTER_PREFERENCE_WINDOW * 2).await;
+        let second =
+            start_mock_discovery(vec![("node-c".to_string(), "127.0.0.1:3".to_string())], 1).await;
+
+        let ring = fetch_roster(&[slower_than_window, second], &None, &None)
+            .await
+            .expect("the second replica answers");
+        assert_eq!(ring.all_addresses(), vec!["127.0.0.1:3".to_string()]);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_roster_falls_back_when_every_replica_but_one_fails() {
-        // The race still needs a correct fallback story: if the fastest
+        // The fan-out still needs a correct fallback story: if the earlier
         // replicas all fail (refuse, or answer `B` for their startup
         // grace), the one that eventually succeeds must still be
-        // returned rather than the race giving up early.
+        // returned rather than the fetch giving up early.
         let refused = "127.0.0.1:1".to_string(); // connection refused: fails fast
         let live =
             start_mock_discovery(vec![("node".to_string(), "127.0.0.1:2".to_string())], 1).await;
@@ -20587,11 +20849,11 @@ mod tests {
     }
 
     /// Issue #1591: a replica with no node registered answers `N 0 R`. It
-    /// used to count as a success, and listed first it won the race on every
+    /// used to count as a success, and listed first it was adopted on every
     /// refresh, so the proxy adopted an empty ring and answered every
     /// request `B` while the next replica held the full roster.
     #[tokio::test(flavor = "current_thread")]
-    async fn an_empty_roster_from_the_first_replica_loses_the_race() {
+    async fn an_empty_roster_from_the_first_replica_is_passed_over() {
         let empty = start_mock_discovery(Vec::new(), 2).await;
         let live =
             start_mock_discovery(vec![("node".to_string(), "127.0.0.1:2".to_string())], 2).await;

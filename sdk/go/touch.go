@@ -31,7 +31,10 @@ const RemoveTTL int64 = -1
 // expired its copy before the primary failed or answered `W` would leave the
 // reroute, which makes it the primary, nothing to find. Those replica legs
 // therefore run after the primary answered, outside the pipelined-order
-// guarantee, the same class as the retry paths.
+// guarantee, the same class as the retry paths. A 0 TTL whose primary leg
+// still fails with ErrConnectionLost (a lost reply, or a primary still
+// unreachable after the refresh and retry) returns that error only after the
+// other owners have been sent the touch.
 // Returns ErrServerTooOld against a node that predates the command.
 func (c *Client) Touch(key string, ttlSeconds int64) (existed bool, err error) {
 	return c.touchNS(nil, key, ttlSeconds)
@@ -129,7 +132,37 @@ func (c *Client) touchNS(namespace []byte, key string, ttlSeconds int64) (existe
 			return opErr
 		}, applyPrimary, ttlSeconds == 0)
 	})
+	c.expireOtherOwnersAfterLostPrimary(namespace, keyBytes, ttlSeconds, err)
 	return existed, touchRejected(err)
+}
+
+// expiringTouchPrimaryFailed reports whether err is the final failure of an
+// expiring touch's primary leg at the connection level: a lost connection,
+// sent or not, or a reply that could not be read (ErrProtocol), after which
+// the node may have applied the touch. A `W` and the node's `En` are not.
+func expiringTouchPrimaryFailed(err error) bool {
+	return err != nil && (errors.Is(err, ErrConnectionLost) || errors.Is(err, ErrProtocol)) &&
+		!errors.Is(err, ErrWrongNode) && !errors.Is(err, errServerRejected)
+}
+
+// expireOtherOwnersAfterLostPrimary is the second half of an expiring touch
+// (ttlSeconds == 0) whose primary leg finally failed (issue #2057). The
+// other owners are sent their plain `t ... 0` only after the primary
+// answered (issue #934), so when the primary instead lost the reply (not
+// resent, issue #901) or stayed unreachable through the retry, no other
+// owner would ever be sent it: a read falling back to a replica would return
+// the value the caller expired, and that replica would be promoted with it.
+// They are sent it now, before the caller gets the error, as a Delete does —
+// concurrently and awaited even with FireAndForgetReplicas. Any other TTL,
+// or any other error, leaves them alone.
+func (c *Client) expireOtherOwnersAfterLostPrimary(namespace, key []byte, ttlSeconds int64, err error) {
+	if ttlSeconds != 0 || !expiringTouchPrimaryFailed(err) {
+		return
+	}
+	c.sendToOtherOwnersAfterLostPrimary(namespace, key, func(conn *connection) error {
+		_, err := conn.touchNS(namespace, key, 0)
+		return err
+	})
 }
 
 // getAndTouchBytesNS is GetAndTouchBytes scoped to namespace.
@@ -161,6 +194,7 @@ func (c *Client) getAndTouchBytesNS(namespace []byte, key string, ttlSeconds int
 		}, applyPrimary, ttlSeconds == 0)
 	})
 	if err != nil {
+		c.expireOtherOwnersAfterLostPrimary(namespace, keyBytes, ttlSeconds, err)
 		return nil, false, touchRejected(err)
 	}
 	if !ok || !c.compress {

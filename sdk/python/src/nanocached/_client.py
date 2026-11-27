@@ -144,6 +144,8 @@ class _MultiTouchState:
     frame was written, so the node may have expired them already;
     ``lost_cause`` is that failure, kept apart from ``last_cause`` so a
     later not-sent failure in the retry pass cannot replace it.
+    ``unreachable`` holds the indices whose primary leg's latest outcome
+    was a connection failure (sent or not; not ``W``, not ``En``).
     Single-threaded (asyncio), so no locking."""
 
     __slots__ = (
@@ -153,6 +155,7 @@ class _MultiTouchState:
         "lost_cause",
         "rejected",
         "results",
+        "unreachable",
         "wrong_node",
     )
 
@@ -166,6 +169,7 @@ class _MultiTouchState:
         self.lost_cause: BaseException | None = None
         self.rejected = False
         self.lost: set[int] = set()
+        self.unreachable: set[int] = set()
 
 
 @dataclass(frozen=True)
@@ -1518,17 +1522,30 @@ class NanocachedClient:
             # concurrently and are awaited even with
             # fire_and_forget_replicas, so a read after the error sees them.
             # A `W` answer is not caught here and keeps its own path.
-            if self._ring is not None and not self._closed:
-                others = self._owner_names(namespace, key_bytes)[1:]
-                tasks = self._dispatch_replica_writes(others, op, synchronous=True)
-                if tasks:
-                    for outcome in await asyncio.gather(*tasks, return_exceptions=True):
-                        if isinstance(outcome, BaseException):
-                            _warn(
-                                "nanocached: a replica write raised an unexpected error: "
-                                f"{outcome!r}"
-                            )
+            await self._send_to_other_owners_after_lost_primary(namespace, key_bytes, op)
             raise
+
+    async def _send_to_other_owners_after_lost_primary(
+        self,
+        namespace: bytes,
+        key: bytes,
+        op: Callable[[Connection], Awaitable[object]],
+    ) -> None:
+        """The other owners' legs of a primary-first write (a delete, or a
+        ``0``-TTL touch) whose primary leg finally failed with a connection
+        error: sent to every owner but the primary on the ring in force
+        now, concurrently, and awaited even with fire_and_forget_replicas,
+        so a read after the caller's error sees them. A failed leg counts
+        in stats().replica_write_failures. Nothing to do against a single
+        node or a proxy."""
+        if self._ring is None or self._closed:
+            return
+        others = self._owner_names(namespace, key)[1:]
+        tasks = self._dispatch_replica_writes(others, op, synchronous=True)
+        if tasks:
+            for outcome in await asyncio.gather(*tasks, return_exceptions=True):
+                if isinstance(outcome, BaseException):
+                    _warn(f"nanocached: a replica write raised an unexpected error: {outcome!r}")
 
     # ── Touch (issue #825) ─────────────────────────────────────────────
 
@@ -1555,7 +1572,10 @@ class NanocachedClient:
         primary that is unreachable or answers wrong-node has touched no
         replica when the call is rerouted. Those replica touches run after
         the primary's answer, outside the pipelined-order guarantee, like
-        the retry paths. Raises ServerTooOldError against a node that
+        the retry paths. A ``0`` TTL whose primary still fails with a
+        connection error (a lost reply, or a primary still unreachable
+        after the retry) raises, but only once the other owners have been
+        sent the touch. Raises ServerTooOldError against a node that
         predates the command."""
         return await self._touch(b"", key, ttl_seconds)
 
@@ -1566,20 +1586,22 @@ class NanocachedClient:
         _check_key(key_bytes, namespace)
         _check_touch_ttl(ttl_seconds)
         await self._before_operation()
+
+        def op(connection: Connection) -> Awaitable[bool]:
+            return connection.touch(key_bytes, ttl_seconds, namespace)
+
         try:
             return await self._with_wrong_node_retry(
-                lambda: self._write(
-                    namespace,
-                    key_bytes,
-                    lambda connection: connection.touch(key_bytes, ttl_seconds, namespace),
-                    primary_first=ttl_seconds == 0,
-                ),
+                lambda: self._write(namespace, key_bytes, op, primary_first=ttl_seconds == 0),
                 replay_safe=ttl_seconds != 0,
                 rejection_is_final=True,
             )
         except (NanocachedError, ConnectionError, OSError) as error:
             if _rejected_by_server(error):
                 raise ServerTooOldError() from error
+            await self._expire_other_owners_after_lost_primary(
+                namespace, key_bytes, ttl_seconds, error
+            )
             raise
 
     async def get_and_touch_bytes(self, key: str | bytes, ttl_seconds: int | None) -> bytes | None:
@@ -1639,10 +1661,34 @@ class NanocachedClient:
         except (NanocachedError, ConnectionError, OSError) as error:
             if _rejected_by_server(error):
                 raise ServerTooOldError() from error
+            await self._expire_other_owners_after_lost_primary(
+                namespace, key_bytes, ttl_seconds, error
+            )
             raise
         if value is None or not self._compress:
             return value
         return decompress_value(value)
+
+    async def _expire_other_owners_after_lost_primary(
+        self, namespace: bytes, key: bytes, ttl_seconds: int | None, error: BaseException
+    ) -> None:
+        """A ``0``-TTL touch sends the other owners theirs only once the
+        primary has answered (issue #934). When the primary leg finally
+        fails with a connection error instead (its reply was lost after
+        the send, which is not resent, or the primary is dead but still
+        listed, so the retry failed too), no other owner would ever be
+        sent the touch: a read falling back to a replica would return the
+        value the caller expired, and the replica would be promoted with
+        it. They are sent the plain ``t ... 0`` before the error is
+        raised (issue #2055), as a delete does. A ``W`` (WrongNodeError)
+        or an ``En`` leaves them alone."""
+        if ttl_seconds != 0 or not isinstance(error, (ConnectionError, OSError)):
+            return
+
+        def op(connection: Connection) -> Awaitable[bool]:
+            return connection.touch(key, 0, namespace)
+
+        await self._send_to_other_owners_after_lost_primary(namespace, key, op)
 
     # ── Batched get and set (issues #128/#150/#151) ────────────────────
     #
@@ -2393,8 +2439,10 @@ class NanocachedClient:
         be reached on both passes raises that connection error — every
         other key was still touched, and since a touch is idempotent the
         whole batch may simply be sent again, so nothing partial is
-        attached. Raises ServerTooOldError against a node that predates
-        the command."""
+        attached. With ``ttl_seconds == 0`` the keys whose primary failed
+        that way (lost or unreachable) are still sent to their other
+        owners before the error is raised. Raises ServerTooOldError
+        against a node that predates the command."""
         return await self._touch_many(b"", keys, ttl_seconds)
 
     async def _touch_many(
@@ -2752,7 +2800,9 @@ class NanocachedClient:
                 if not primary:
                     if not answered:
                         self._replica_write_failures += 1
-                elif answered:
+                    continue
+                state.unreachable.discard(idx)
+                if answered:
                     state.results[idx] = entries[pos]
                     state.answered_by[idx] = name
                 else:
@@ -2760,6 +2810,11 @@ class NanocachedClient:
                         state.wrong_node.add(idx)
                     else:
                         state.wrong_node.discard(idx)
+                        if error is not None and not _rejected_by_server(error):
+                            # A connection failure, before or after the
+                            # frame left (issue #2055): see
+                            # _multi_touch_replica_fan_out().
+                            state.unreachable.add(idx)
                         # Only the chunk whose frame was written may have
                         # been applied (issue #1600): the chunks after it
                         # never left, so they are retried like any other
@@ -2795,18 +2850,30 @@ class NanocachedClient:
         #934): one plain ``y ... 0`` per other owner, on the ring in force
         now, for every key a primary answered (``S``/``V`` or a miss: a
         missing primary may still have a replica copy, and the caller's
-        intent is to expire it everywhere). A key still ``W``, lost or
-        rejected gets no replica leg. Failures are swallowed into
+        intent is to expire it everywhere). A key still ``W`` or rejected
+        gets no replica leg. Failures are swallowed into
         stats().replica_write_failures, and a leg is eligible for
         fire_and_forget_replicas, as in _multi_touch_pass(). These legs run
         after the primary's answer, outside the pipelined-order guarantee,
-        the same class as the retry paths."""
-        legs: dict[str, list[int]] = {}
+        the same class as the retry paths.
+
+        A key whose primary leg finally failed with a connection error
+        (lost after the send, or unreachable on both passes) is sent to
+        every owner but the current primary too (issue #2055): otherwise
+        no other owner would be, and a read falling back to a replica
+        would return the value the caller expired. Those legs are awaited
+        even with fire_and_forget_replicas, so the caller's error comes
+        only once they have been answered, as for a delete."""
+        # (owner, awaited) -> key indices.
+        legs: dict[tuple[str, bool], list[int]] = {}
         for idx in sorted(state.answered_by):
             answered_by = state.answered_by[idx]
             for name in self._owner_names(namespace, key_bytes_list[idx]):
                 if name != answered_by:
-                    legs.setdefault(name, []).append(idx)
+                    legs.setdefault((name, False), []).append(idx)
+        for idx in sorted(state.unreachable - state.answered_by.keys()):
+            for name in self._owner_names(namespace, key_bytes_list[idx])[1:]:
+                legs.setdefault((name, True), []).append(idx)
         if not legs:
             return
 
@@ -2824,9 +2891,10 @@ class NanocachedClient:
                     self._replica_write_failures += 1
 
         synchronous_legs = []
-        for name, leg_indices in legs.items():
+        for (name, awaited), leg_indices in legs.items():
             if (
-                self._fire_and_forget_replicas
+                not awaited
+                and self._fire_and_forget_replicas
                 and not self._closed
                 and len(self._background_replica_writes) < _MAX_INFLIGHT_BACKGROUND_REPLICA_WRITES
             ):
