@@ -7,9 +7,10 @@ import (
 	"testing"
 )
 
-// Only a node's `En` is "server too old" (issue #939). The bare `E` (or the
-// tagged `E <tag>`) nanocached-proxy answers when a request's outcome is
-// unknown is a connection lost after the frame was written: a ttl=0 touch is
+// Only a node's `En` is "server too old" (issue #939). The bare `E`
+// nanocached-proxy answers when a request's outcome is unknown (untagged even
+// on a tagged connection; an `E` with a tag is read the same way) is a
+// connection lost after the frame was written: a ttl=0 touch is
 // not resent, and it is not a protocol error a redial would replay.
 func TestABareEToATTLZeroTouchIsAConnectionLossAndTheFrameIsNotResent(t *testing.T) {
 	for _, reply := range []string{"E 7\n", "E\n"} {

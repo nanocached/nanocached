@@ -424,12 +424,25 @@ export class NanocachedStore implements Store {
    * single `Promise.all` here would fan out one concurrent `d` request
    * per key with no bound at all for an arbitrarily large batch; this
    * instead runs at most `MAX_BATCH_KEYS` deletes concurrently at a
-   * time, chunk by chunk. */
+   * time, chunk by chunk.
+   *
+   * A failed delete does not stop the batch: every delete of every chunk
+   * is sent and settled first, and only then does this reject, with the
+   * first failure in key order — the same "wait for all, then raise"
+   * convention as nanocached-django's `delete_many` and nanocached-jcache's
+   * `removeAll`. Failing fast would return while the chunk's other deletes
+   * are still in flight and never send the later chunks, leaving the
+   * caller unable to tell which keys are gone. */
   async mdel(...keys: string[]): Promise<void> {
+    let failure: { error: unknown } | undefined;
     for (let start = 0; start < keys.length; start += MAX_BATCH_KEYS) {
       const chunk = keys.slice(start, start + MAX_BATCH_KEYS);
-      await Promise.all(chunk.map((key) => this.del(key)));
+      const results = await Promise.allSettled(chunk.map((key) => this.del(key)));
+      if (failure !== undefined) continue;
+      const rejected = results.find((result) => result.status === "rejected");
+      if (rejected !== undefined) failure = { error: rejected.reason };
     }
+    if (failure !== undefined) throw failure.error;
   }
 
   /** The wire has no way to enumerate a namespace's keys — a node only

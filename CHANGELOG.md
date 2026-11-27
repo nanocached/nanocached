@@ -24,6 +24,13 @@ framework adapters at one version, whether or not a component changed.
   operations), seven a month, and one version cost four of them. The adapter
   tags no longer publish to Maven (#2077).
 
+- Docs: the accepted-behaviour list in `docs/architecture.html` now
+  covers discovery restarted with its clock set back. A member holding a
+  finished but unconfirmed handoff for the same joiner refuses the first
+  join after the restart, which then waits out one migration timeout. No
+  code change: the member cannot tell that join from a stale resend it
+  must refuse (#2125).
+
 ### Fixed
 
 - Node: a join handoff `M` that reached a node after its drain had begun
@@ -34,6 +41,32 @@ framework adapters at one version, whether or not a component changed.
   the entrants. A draining node now refuses `M` from the shutdown signal
   on, as it already did once the roster was fetched (#2088).
 
+- Docs: the protocol page said the proxy answers `E <tag>` on a tagged
+  connection. It always sends the bare `E\n`, untagged, like the node's `En`,
+  as the answer to the oldest request still waiting, and then closes the
+  connection. Every SDK already reads it that way (#2112).
+- Proxy: started with `--port 0`, the proxy announced port `0` to discovery,
+  which refused every announce (`Ed`), so the proxy never appeared in `Q`. It
+  now announces the port its listener bound. The announcing refresher also
+  starts only once the client and metrics listeners are bound: started
+  before, a `Y` could reach discovery from a proxy whose bind then failed,
+  and that exit sends no `Z`. The node, proxy and discovery log the bound
+  metrics address, so `--metrics-port 0` shows the port taken (#2098).
+- Node: a put-if-absent handoff (`U … A`, a re-replication's copy) that a
+  node refused, because it held a newer value or a tombstone of a later
+  delete, was still relayed to its joiner whose join discovery had not
+  confirmed yet. A joiner that held nothing stored that older value and
+  then refused the node's own transfer of the newer one, so it kept the
+  older value (or got back a deleted key). Only a handoff the node stored
+  is relayed now, as for a decommission's entrant (#2087).
+
+- Proxy: when a primary's `m` sub-batch failed in transport (a node that
+  stopped answering on an established connection), the retry asked that same
+  primary first for every key and waited out a second `UPSTREAM_IO_TIMEOUT`
+  before trying the replica; a single `G` of the same key asks the other
+  owners first. The retry now asks a failed primary last, so an `m` costs one
+  timeout, like a `G`. A per-key `W` still retries the fresh primary first
+  (#2083).
 - Discovery: an `M` send that stopped was always logged as "permanently
   failed to send M … after 3 attempts", including when it stopped because a
   newer generation of the same name had superseded the join, or because the
@@ -69,12 +102,25 @@ framework adapters at one version, whether or not a component changed.
   started again. An `M` refused with `R` is now resent every second for up
   to 45 s, without using up the three attempts kept for connection and ack
   failures, and with no `X` after it if the join ends meanwhile (#2045).
+  The 45 s count from the start of the send, not from the first `R`, so
+  connection and ack failures before the first refusal (10 s each) no longer
+  push the send past the 60 s migration timeout. Waiting for a dial permit
+  counts against the same 45 s, and an attempt still in flight when they
+  run out is cut off. While the `M` fan-out runs, the sweep cannot reap
+  the join. A paused send no longer holds its dial permit, so with more
+  than 64 members, or with members admitted mid-join, the sends queued
+  behind refusing members dial during the pauses (#2102).
 
 - Node and proxy: a `--discovery` address without a port (or with port 0,
   a non-numeric port, or an unbracketed IPv6 host) was accepted at startup,
   and every connect then failed with "invalid socket address", so the node
   never joined and the proxy never had a roster. Each address is now checked
-  at startup and a bad one is a usage error naming it (#2050).
+  at startup and a bad one is a usage error naming it (#2050). A link-local
+  IPv6 host with a numeric scope id (`[fe80::1%2]:8357`), which connects,
+  is accepted by that check; a named zone (`%eth0`), which never connected,
+  is refused with a message saying the scope id must be a number. With
+  `--tls-ca`, the scope id is no longer part of the TLS server name, which
+  made every TLS dial to such an address fail (#2090).
 
 - Node: handoff tombstones were bounded by count only (65,536) and eviction
   removes entries only, so a burst of relayed deletes of distinct large keys

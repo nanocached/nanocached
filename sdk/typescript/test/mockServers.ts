@@ -244,6 +244,10 @@ export interface MockDiscovery extends MockServerBase {
   /** Total bytes written so far by the unterminated-list stream queued
    * with answerUnterminatedListOnce. */
   unterminatedListBytesSent(): number;
+  /** Replace the header line (`N <count> <r>\n` for `L`, `N <count>\n`
+   * for `Q`) of the next list reply with `header`, verbatim; the entries
+   * still follow. */
+  answerListHeaderOnce(header: string): void;
   /** SDK proxy mode (issue #122): sets the roster `Q` serves — entirely
    * separate from `setNodes`' node list, mirroring the real server's
    * separate `proxies`/`nodes` registries. Callable mid-test to simulate
@@ -1478,6 +1482,7 @@ export async function startMockDiscovery(
   let unterminatedListBytesSent = 0;
   let listCalls = 0;
   let listProxiesCalls = 0;
+  let listHeaderOnce: string | undefined;
   // Default 1 (no replication) so single-placement assertions in tests
   // stay exact; replication tests opt in explicitly. The real server
   // defaults to 2.
@@ -1535,7 +1540,9 @@ export async function startMockDiscovery(
               return;
             }
 
-            socket.write(Buffer.concat([Buffer.from(`N ${nodes.length} ${replication}\n`), ...encodeEntries(nodes)]));
+            const nodeHeader = listHeaderOnce ?? `N ${nodes.length} ${replication}\n`;
+            listHeaderOnce = undefined;
+            socket.write(Buffer.concat([Buffer.from(nodeHeader), ...encodeEntries(nodes)]));
             break;
           }
 
@@ -1552,7 +1559,9 @@ export async function startMockDiscovery(
               return;
             }
 
-            socket.write(Buffer.concat([Buffer.from(`N ${proxies.length}\n`), ...encodeEntries(proxies)]));
+            const proxyHeader = listHeaderOnce ?? `N ${proxies.length}\n`;
+            listHeaderOnce = undefined;
+            socket.write(Buffer.concat([Buffer.from(proxyHeader), ...encodeEntries(proxies)]));
             break;
           }
 
@@ -1575,6 +1584,9 @@ export async function startMockDiscovery(
     },
     setWarmingUp: (warming) => {
       warmingUp = warming;
+    },
+    answerListHeaderOnce: (header) => {
+      listHeaderOnce = header;
     },
     answerUnterminatedListOnce: () => {
       unterminatedListReplies++;
