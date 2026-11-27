@@ -4663,7 +4663,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// <item>a failure (connection-level, or any
     /// <see cref="NanocachedException"/> other than
     /// <see cref="WrongNodeException"/>) hedges onward immediately, with
-    /// no wait;</item>
+    /// no wait, even while other legs are still in flight;</item>
     /// <item><see cref="WrongNodeException"/> propagates as in
     /// <see cref="ReadAsync{T}"/>.</item>
     /// </list>
@@ -4789,11 +4789,12 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             catch (Exception error) when (error is NanocachedException)
             {
                 lastError = error;
-                if (pending.Count == 0 && nextIndex < names.Count)
+                if (nextIndex < names.Count)
                 {
-                    // Everything in flight so far failed: the next owner
-                    // gets its turn right away, not after waiting out the
-                    // rest of the interval.
+                    // A failed leg is replaced by the next owner right
+                    // away, even while other legs (a silent primary) are
+                    // still in flight, not after waiting out the rest of
+                    // the interval.
                     pending.Add(StartLeg(nextIndex));
                     nextIndex++;
                 }
