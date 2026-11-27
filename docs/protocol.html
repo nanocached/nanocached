@@ -960,7 +960,8 @@ plain overwrite, so a re-replication racing a newer client write on the
 receiver can never regress it — the receiver stores the entry only if it was absent
 and no <code>u</code> removed it within the last two minutes (a relayed
 delete leaves a tombstone, since a sender may have read the key before
-that delete), and acks <code>S\n</code> either way, since a key already
+that delete; a node bounds how many it keeps and the memory they take,
+forgetting the oldest first), and acks <code>S\n</code> either way, since a key already
 present there is a success for the sender, not a conflict. An ordinary
 decommission handoff never sets it. <code>H</code> takes an optional trailing
 <code>&lt;joiner-len&gt;</code> header field, with the joiner's name

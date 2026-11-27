@@ -934,7 +934,9 @@ const KEY_TRANSFER_ATTEMPTS: u32 = 3;
 /// `run_migration` is between keys and sees `abort_requested` within one
 /// key's send; a send stuck on an unresponsive joiner can hold the slot
 /// for up to `KEY_TRANSFER_ATTEMPTS` × `OUTBOUND_IO_TIMEOUT` (30s), and
-/// that case is left to `MigrationGuard::new`'s generation check.
+/// that case is left to `MigrationGuard::new`'s generation check (which
+/// refuses the next generation's `M` until the slot clears) and to
+/// discovery resending that refused `M`.
 const MIGRATION_ABANDON_DRAIN_WAIT: Duration = Duration::from_secs(8);
 /// Issue #7: `handle_connection`'s read buffer grows (via `reserve`) to fit
 /// whatever request it's mid-receiving, up to `MAX_REQUEST_SIZE`, but never
@@ -7242,11 +7244,15 @@ impl MigrationGuard {
                 // superseding the one running here. Either way the slot
                 // can't be handed over synchronously (only
                 // `run_migration`'s own unwind can safely drop it
-                // mid-transfer): ask it to stop and reject this `M`,
-                // trusting the caller (discovery, on `X`'s `abandon_
-                // migration` path) to wait for the slot to actually
-                // clear before it lets a same-name retry land — see
-                // `wait_for_migration_slot_to_clear`.
+                // mid-transfer): ask it to stop and reject this `M`.
+                // Discovery resends a refused `M` after a pause until the
+                // slot clears (`MIGRATE_REJECTED_RETRY_WINDOW` in
+                // `src/bin/nanocached-discovery.rs`); its `X` path also
+                // waits here for the unwind before acking — see
+                // `wait_for_migration_slot_to_clear`. Neither is ordered
+                // before the next same-name `M`: discovery can start the
+                // next generation while the abandon's `X` is still
+                // waiting, or after giving up on it.
                 if same_name {
                     existing.abort_requested.store(true, Ordering::SeqCst);
                     existing.forward_revoked.store(true, Ordering::SeqCst);
@@ -10154,14 +10160,13 @@ fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> AbandonO
 /// arrive here before `run_migration`'s unwind has actually cleared the
 /// slot. `MigrationGuard::new`'s generation check (see its own doc
 /// comment) correctly tells this apart from a same-generation retry and
-/// rejects it — but that rejection can bounce for longer than discovery's
-/// `send_migrate_with_retry` covers: `MIGRATE_SEND_ATTEMPTS` (3, in
-/// `src/bin/nanocached-discovery.rs`) retries back-to-back with no delay
-/// between them, nowhere close to the worst-case time `run_migration` can
-/// still be blocked inside one stuck send — up to `KEY_TRANSFER_ATTEMPTS`
-/// (3) × `OUTBOUND_IO_TIMEOUT` (10s) — before it even re-checks `abort_requested`.
-/// So instead of hoping the retries outlast that window, this wait closes
-/// the *common* case at the source: `run_migration` checks
+/// rejects it. Discovery resends a refused `M` every second for up to
+/// `MIGRATE_REJECTED_RETRY_WINDOW` (45 s, in
+/// `src/bin/nanocached-discovery.rs`), which outlasts the worst-case time
+/// `run_migration` can still be blocked inside one stuck send — up to
+/// `KEY_TRANSFER_ATTEMPTS` (3) × `OUTBOUND_IO_TIMEOUT` (10s) — before it
+/// even re-checks `abort_requested`; this wait still closes the *common*
+/// case at the source, so the next join's `M` usually needs no resend: `run_migration` checks
 /// `abort_requested` between keys, so unless it is mid-send to a joiner
 /// that has stopped answering, the slot is free within one key's send
 /// and the ack goes out with it already empty. The stuck-send case is
@@ -10170,7 +10175,8 @@ fn abandon_migration(node_context: &NodeContext, joining_name: &str) -> AbandonO
 /// regardless, so `MIGRATION_ABANDON_DRAIN_WAIT` stays under that and a
 /// slot still held by a 30s stuck send is left to `MigrationGuard::new`'s
 /// generation check, which rejects the new-generation `M` with
-/// `Conflict` rather than mistaking it for a retry.
+/// `Conflict` rather than mistaking it for a retry, and to discovery's
+/// resends of that refused `M`.
 ///
 /// Bounded, never indefinite (this codebase's rule for every wait on
 /// another task), and it also stops at shutdown: this runs inside the

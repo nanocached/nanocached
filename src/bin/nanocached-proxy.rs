@@ -1028,6 +1028,10 @@ fn parse_args_from(mut raw: impl Iterator<Item = String>) -> Result<Args, ArgsEr
                 .into(),
         );
     }
+    for address in &args.discovery {
+        infra::check_host_port(address)
+            .map_err(|why| format!("invalid --discovery address {why}"))?;
+    }
     if args.tls_cert.is_some() != args.tls_key.is_some() {
         return Err("--tls-cert and --tls-key must be set together"
             .to_string()
@@ -9751,6 +9755,18 @@ mod tests {
 
     fn args(list: &[&str]) -> Result<Args, ArgsError> {
         parse_args_from(list.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn a_discovery_address_without_a_port_is_refused_at_startup() {
+        let Err(ArgsError::Invalid(message)) = args(&["--discovery", "10.0.0.1:8357,10.0.0.2"])
+        else {
+            panic!("an address without a port must be rejected");
+        };
+        assert_eq!(
+            message,
+            "invalid --discovery address \"10.0.0.2\" is not a host:port address: no port"
+        );
     }
 
     #[test]

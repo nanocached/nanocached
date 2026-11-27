@@ -290,7 +290,10 @@ are orchestrated by discovery in stages:</p>
   put-if-absent on its own connection (and with replication, from
   several old owners at once), so a copy read before the delete can
   land after it, and the tombstone refuses it; an unconditional forward
-  and a client write are newer than the delete and go in. A forwarded
+  and a client write are newer than the delete and go in. A node keeps at
+  most 65,536 tombstones, charged to <code>--max-memory</code> together
+  with their keys and held to an eighth of it; past either bound the oldest
+  is forgotten early (see the accepted behaviour below). A forwarded
   touch that expires the key (a TTL of zero) is applied as such a
   delete, removal and tombstone alike, rather than stored as an entry
   that has just expired: an expired entry counts as absent to a
@@ -720,6 +723,22 @@ here.</p>
   two copies apart would need each copy to carry when it was last written,
   a wire change; a shorter tombstone would let a copy read before a delete
   come back.</li>
+  <li>A tombstone can be forgotten before its two minutes, and a
+  put-if-absent copy read before that delete can then bring the key back
+  with its old value until the next write or TTL expiry. A node keeps at
+  most 65,536 tombstones, and their charges (each key plus about 250
+  bytes) together at most an eighth of <code>--max-memory</code>; a new
+  one past either bound forgets the oldest, and the newest is always kept,
+  even when its key alone is over the share. At the default 256&nbsp;MiB
+  that is all 65,536 for keys up to about 260 bytes; at 4&nbsp;MiB, about
+  1,670 tombstones of 64-byte keys or a single one of a 512&nbsp;KiB key.
+  Reaching it takes that many relayed deletes of distinct keys inside one
+  membership change&rsquo;s window, each of a key a sender is still
+  copying. Accepted 2026-11-27: without the byte bound, tombstones are not
+  removed by eviction, so a burst of deletes of large keys pushed a node
+  far past <code>--max-memory</code> and the next writes evicted the live
+  set for the tombstones&rsquo; two minutes; that loses every key, against
+  the few a stale copy can bring back.</li>
   <li>A write a client sends to an old owner is relayed to that
   owner&rsquo;s joiner, but not on to the joiner&rsquo;s own joiner: a
   node relays a write that reached it as a handoff only to a joiner
