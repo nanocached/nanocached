@@ -29,8 +29,9 @@ Printed, not asserted:
    whose new values differ by 2 or more: between them a write that was
    not an increment (a handoff or a forward carrying a copy that was
    ahead) moved the key, or an increment went untraced. The loader's
-   `is_phantom` is this seen from the client side, so each one is printed
-   with every trace line of the key around it.
+   `is_restore` (a forward put a rewound counter back) and `is_phantom` are
+   this seen from the client side, so each one is printed with every trace
+   line of the key around it.
 4. Unmatched answers. When the loader saved its answers (`hist_s` in
    incrstate.json), each answer is matched to an application with that new
    value within the match window; an answer no node applied points at the

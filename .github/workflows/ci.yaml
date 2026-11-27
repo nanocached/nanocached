@@ -588,3 +588,11 @@ jobs:
       - name: Python syntax
         working-directory: tests/e2e
         run: python -m py_compile *.py hostile/*.py
+
+      # The oracles' own self-tests run on hand-made input, no cluster: they
+      # pin the classifications the chaos runs assert on.
+      - name: Oracle self-tests
+        working-directory: tests/e2e
+        run: |
+          python incrtrace_selftest.py
+          python incrload_selftest.py

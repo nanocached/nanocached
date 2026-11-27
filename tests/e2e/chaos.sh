@@ -463,7 +463,7 @@ for k in ('counter_miss','not_numeric','is_phantom'):
   if sdk.get('anomalies',{}).get(k): print('sdk', k, sdk['anomalies'][k])
 " "$isdk" "$icheck")
   [ -z "$ibad" ] || { T "FAIL: incr oracle: $(echo $ibad | tr '\n' ' ')"; fail=1; }
-  echo "$isdk $icheck" | grep -oE '"(ia_short|ia_lost_min|ia_dup_returns|is_short|is_lost_min|is_dup_returns|ia_short_on_owner|ia_short_on_primary|ia_short_on_replica|ia_lost_min_on_owner|ia_owners_differ|is_short_on_owner|is_short_on_primary|is_short_on_replica|is_owners_differ|is_rewind|is_skip|acked_a|maybe_a|acked_s|maybe_s)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== incr accepted (printed, not asserted): /'; echo
+  echo "$isdk $icheck" | grep -oE '"(ia_short|ia_lost_min|ia_dup_returns|is_short|is_lost_min|is_dup_returns|ia_short_on_owner|ia_short_on_primary|ia_short_on_replica|ia_lost_min_on_owner|ia_owners_differ|is_short_on_owner|is_short_on_primary|is_short_on_replica|is_owners_differ|is_rewind|is_restore|is_skip|acked_a|maybe_a|acked_s|maybe_s)": [0-9]+' | tr '\n' ' ' | sed 's/^/=== incr accepted (printed, not asserted): /'; echo
 fi
 if [ "${CLEAR_ORACLE:-0}" = 1 ]; then
   lbad=$(python3 -c "
