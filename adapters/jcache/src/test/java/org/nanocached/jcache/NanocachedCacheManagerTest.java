@@ -48,6 +48,28 @@ class NanocachedCacheManagerTest {
     }
 
     @Test
+    void getPropertiesReturnsThePropertiesTheManagerWasCreatedWithExceptTheSecret() {
+        Properties defaults = new Properties();
+        defaults.setProperty("nanocached.read-repair", "false");
+        Properties given = new Properties(defaults);
+        given.setProperty("nanocached.addresses", node.address());
+        given.setProperty("nanocached.secret", "s3cret");
+        given.setProperty("app.region", "eu");
+        CacheManager created = provider.getCacheManager(URI.create("test:properties"), null, given);
+
+        Properties expected = new Properties();
+        expected.setProperty("nanocached.addresses", node.address());
+        expected.setProperty("nanocached.read-repair", "false");
+        expected.setProperty("app.region", "eu");
+        assertEquals(expected, created.getProperties());
+
+        // A snapshot: neither the caller's object nor a returned copy reaches the manager.
+        given.setProperty("app.region", "us");
+        created.getProperties().setProperty("app.extra", "x");
+        assertEquals(expected, created.getProperties());
+    }
+
+    @Test
     void getCacheOnAnUncreatedNameReturnsNull() {
         assertNull(manager.getCache("never-created"));
     }

@@ -800,6 +800,18 @@ interface MultiHeader {
   headerEnd: number;
 }
 
+// The fields of a `V`/`I`/`M`/`O`/`Y` header line, after the marker and
+// the one mandatory space that follows it. The space is checked, not
+// skipped blindly: `VX5\n` is not `V 5\n`, and a peer that leaves it out
+// cannot be trusted to frame the next response either, so it throws (and
+// poisons the connection), as in the Go, Java and Rust SDKs.
+function headerFields(buf: Buffer, headerEnd: number): string[] {
+  if (buf[1] !== 0x20 /* ' ' */) {
+    throw new NanocachedError("nanocached: malformed response header line (connection desynced)");
+  }
+  return buf.subarray(2, headerEnd).toString("ascii").split(" ");
+}
+
 // Shared by tryParseResponse's MARKER_MULTI/MARKER_MULTI_ACK cases and
 // peekMultiFrameLength below, so the two can never disagree about what a
 // legal `M`/`O` header looks like. Returns null while the header line
@@ -826,7 +838,7 @@ function parseMultiHeader(buf: Buffer, tagged: boolean): MultiHeader | null {
     throw new NanocachedError("nanocached: invalid multi-get/multi-set response (header too long)");
   }
 
-  const fields = buf.subarray(2, headerEnd).toString("ascii").split(" ");
+  const fields = headerFields(buf, headerEnd);
   const count = parseStrictInteger(fields[0]);
   if (count === undefined) {
     throw new NanocachedError("nanocached: invalid multi-get/multi-set count in response");
@@ -966,7 +978,7 @@ export function tryParseResponse(
       // tags). A get-and-touch's reply (issue #825) adds `I`'s optional
       // TTL between them — told apart by field count for the connection's
       // mode, never guessed frame by frame.
-      const fields = buf.subarray(2, headerEnd).toString("ascii").split(" ");
+      const fields = headerFields(buf, headerEnd);
       const minFields = tagged ? 2 : 1;
       if (fields.length !== minFields && fields.length !== minFields + 1) {
         throw new NanocachedError("nanocached: invalid value header in response");
@@ -1015,7 +1027,7 @@ export function tryParseResponse(
       // Untagged: `I <len>` (no TTL) or `I <len> <ttl>`. Tagged: `I <len>
       // <tag>` (no TTL) or `I <len> <ttl> <tag>` — disambiguated purely by
       // field count for the connection's mode (see ParsedResponse.ttlSeconds).
-      const fields = buf.subarray(2, headerEnd).toString("ascii").split(" ");
+      const fields = headerFields(buf, headerEnd);
       const minFields = tagged ? 2 : 1;
       const maxFields = tagged ? 3 : 2;
       if (fields.length < minFields || fields.length > maxFields) {
@@ -1159,8 +1171,9 @@ export function tryParseResponse(
     // Told apart from other unexpected bytes so a touch can report "server
     // too old" (issue #825); every other command still fails the same way.
     // Only the node's `En` (the server-type byte `n` right after the `E`)
-    // is that: the proxy's bare `E\n` / `E <tag>\n` means the request failed
-    // or its outcome is unknown (issue #939), which is not a protocol
+    // is that: the proxy's bare `E\n` (untagged even on a tagged
+    // connection; an `E` with a tag is read the same way) means the request
+    // failed or its outcome is unknown (issue #939), which is not a protocol
     // mismatch. It poisons the connection like any other unexpected reply,
     // so the waiters see a `ConnectionLostError` with `requestWasSent` true
     // — never resent where the command is not idempotent.

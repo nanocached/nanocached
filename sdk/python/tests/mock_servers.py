@@ -192,6 +192,7 @@ class MockNode:
         self._swallowed_gets = 0
         self._malformed_value_replies = 0
         self._plus_prefixed_length_replies = 0
+        self._raw_get_reply: bytes | None = None
         self._unterminated_value_replies = 0
         self.unterminated_value_bytes_sent = 0
         self._stored_to_get_replies = 0
@@ -267,6 +268,12 @@ class MockNode:
         rejected. Proves the strict-grammar check runs, not just the
         pre-existing non-numeric/negative guard."""
         self._plus_prefixed_length_replies += 1
+
+    def answer_raw_to_get_once(self, reply: bytes) -> None:
+        """Reply to the next G with `reply`, verbatim — for a header the
+        node never emits, such as `VX1\\nx` with no space after the
+        marker."""
+        self._raw_get_reply = reply
 
     def answer_unterminated_value_once(self) -> None:
         """Reply `V` to the next G, then stream chunks of non-newline
@@ -617,6 +624,11 @@ class MockNode:
                     if self._malformed_value_replies > 0:
                         self._malformed_value_replies -= 1
                         writer.write(b"V x\n")
+                        await writer.drain()
+                        continue
+                    if self._raw_get_reply is not None:
+                        writer.write(self._raw_get_reply)
+                        self._raw_get_reply = None
                         await writer.drain()
                         continue
                     if self._plus_prefixed_length_replies > 0:
