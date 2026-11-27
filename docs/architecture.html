@@ -458,7 +458,10 @@ An <code>i</code>, <code>k</code> or <code>x</code> behind another one is
 not held: its frame is sent to the primary at once, so a burst of
 increments of one key on one connection stays pipelined at the primary, and
 only the write of its result to the replicas waits for the earlier
-result&rsquo;s.
+result&rsquo;s. That order does not cover a join&rsquo;s or a
+decommission&rsquo;s forwarding window: an old owner forwards each result
+it is sent back to the primary, where it lands behind later increments of
+the burst and rewinds the counter (see the accepted behaviour below).
 The wait ends when the primary has answered or the proxy has given up on
 it, so a dead primary does not hold the connection longer than the
 proxy&rsquo;s backend timeouts. What stays outside the order is a retry: a
@@ -471,7 +474,8 @@ below).</p>
 
 <p>An expiring touch (<code>t</code> or <code>y</code> with a TTL of 0) is
 inside the order too. The proxy sends the key&rsquo;s replicas their touch only
-after the primary has answered, since a replica that expired its copy ahead of
+after the primary has answered (or its leg has failed for good, retry
+included), since a replica that expired its copy ahead of
 a failing primary would lose the value. A later request on the same key would
 otherwise reach a replica first and have its write expired by the late touch,
 so it waits until those replica frames are enqueued, as for an <code>i</code>
@@ -567,7 +571,20 @@ here.</p>
   each other within a few milliseconds, as a forward lags that long:
   with four back-to-back increments about 1&nbsp;ms apart on each counter,
   357 to 395 of 2,000 counters lost an acknowledged increment in
-  six-round join, decommission and kill runs. With increments spaced well
+  six-round join, decommission and kill runs. A counter incremented in a
+  sustained stream loses far more, since every forward that lands
+  rewinds the counter by the increments sent since: with 64 increments of
+  one counter in flight at a time from one caller (one proxy connection
+  pipelining them, or 64 tasks sharing one Rust SDK client), a burst of
+  30,000 increments sent 6&nbsp;s after a join, three nodes on loopback
+  and two owners per key, ended at 8,542 to 16,662 through the proxy (five
+  runs, 0.7 to 2&nbsp;s each) and at 6,209 to 8,520 through the SDK (two
+  runs), every increment acknowledged. The old owner sent the 30,000
+  results back as 2,000 to 4,600 coalesced forwards, which reached the
+  primary a median of 12 to 21 increments behind. Sent one at a time
+  through the proxy (about 0.5&nbsp;ms apart), the same burst lost 1,066
+  increments; 70&nbsp;s after the join both bursts were exact (measured
+  2026-11-27). With increments spaced well
   above the lag they are practically exact (about one in 12,000 in a
   join window, measured). A compare-and-set loop is exposed the same way: the
   result of an acknowledged <code>replace</code> that a lagging forward

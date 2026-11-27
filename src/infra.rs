@@ -35,6 +35,29 @@ use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
+/// The process's command-line arguments after the program name, each
+/// required to be valid UTF-8. `std::env::args()` panics on the first one
+/// that is not, so a mistyped path (say, `--tls-cert` given a file name
+/// with a stray byte) took the process down with a backtrace and exit code
+/// 101 instead of the usage error every other bad option gets.
+pub fn command_line_args() -> Result<Vec<String>, String> {
+    utf8_args(std::env::args_os().skip(1))
+}
+
+/// `command_line_args` on already-read arguments, so the not-UTF-8 case
+/// can be tested without touching the process argv.
+pub fn utf8_args(raw: impl Iterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    raw.map(|argument| {
+        argument.into_string().map_err(|argument| {
+            format!(
+                "command-line argument is not valid UTF-8: {}",
+                argument.to_string_lossy()
+            )
+        })
+    })
+    .collect()
+}
+
 // ─── TCP keepalive ─────────────────────────────────────────────────────
 
 /// Reads the shared auth secret `name` from the environment: unset or empty
@@ -1435,6 +1458,24 @@ mod tests {
             "{error}"
         );
         assert!(error.contains("rather than treated as unset"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_command_line_argument_that_is_not_utf8_is_a_usage_error_not_a_panic() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = vec![
+            std::ffi::OsString::from("--tls-cert"),
+            std::ffi::OsString::from_vec(b"/tmp/\xff".to_vec()),
+        ];
+        assert_eq!(
+            utf8_args(raw.into_iter()),
+            Err("command-line argument is not valid UTF-8: /tmp/\u{fffd}".to_string())
+        );
+        assert_eq!(
+            utf8_args(["--port", "1"].map(std::ffi::OsString::from).into_iter()),
+            Ok(vec!["--port".to_string(), "1".to_string()])
+        );
     }
 
     #[tokio::test]

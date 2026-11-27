@@ -163,7 +163,19 @@ impl Default for Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args::default();
-    let mut raw = env::args().skip(1);
+    // Not `env::args()`, which panics on an argument that is not UTF-8.
+    let mut raw = env::args_os()
+        .skip(1)
+        .map(|argument| {
+            argument.into_string().map_err(|argument| {
+                format!(
+                    "command-line argument is not valid UTF-8: {}",
+                    argument.to_string_lossy()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter();
 
     while let Some(flag) = raw.next() {
         let mut value = || raw.next().ok_or_else(|| format!("{flag} requires a value"));
