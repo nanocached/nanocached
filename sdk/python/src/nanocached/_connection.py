@@ -1350,10 +1350,11 @@ class Connection:
             # connection (a command it does not know, one too large or
             # malformed). Told apart from other unexpected bytes so a
             # touch can report "server too old" (issue #825). Only that
-            # exact form is: any other `E` (a bare `E\n` or `E <tag>\n`,
-            # which nanocached-proxy answers when a request's outcome is
-            # unknown) is an unexpected response like any other, which a
-            # sent request fails with as ConnectionLostError (issue #939).
+            # exact form is: any other `E` (the bare `E\n` nanocached-proxy
+            # answers when a request's outcome is unknown, untagged even on
+            # a tagged connection, or an `E` that carries a tag) is an
+            # unexpected response like any other, which a sent request fails
+            # with as ConnectionLostError (issue #939).
             try:
                 rest = await self._reader.readuntil(b"\n")
             except asyncio.IncompleteReadError as error:
