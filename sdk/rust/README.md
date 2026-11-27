@@ -575,8 +575,9 @@ state the order is unchanged. Separately, a read whose answer came from
 one owner normally leaves its other legs running; past 256 legs left
 running that way a read waits for its own remaining legs instead, which
 bounds what a client can accumulate against a cluster that is slow
-throughout. Legs of reads still in flight do not count towards that
-limit.
+throughout. A read the caller cancels (a `tokio::time::timeout` around
+`get`, say) also leaves its legs running, and they count the same way.
+Legs of reads still in flight do not count towards that limit.
 
 ## Transient retries and `Error::Retryable`
 

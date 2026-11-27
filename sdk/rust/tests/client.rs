@@ -8812,6 +8812,100 @@ async fn legs_of_reads_still_in_flight_do_not_count_against_the_hedge_cap() {
 }
 
 #[tokio::test]
+async fn the_legs_of_a_cancelled_hedged_read_count_against_the_hedge_cap() {
+    // Issue #2079: a read whose future is dropped (here by a timeout
+    // around `get`) leaves its legs running, never cancelled, exactly like
+    // a decided read's losers, so they must count against the cap. They
+    // were counted only once a read decided: ten timed-out reads left 20
+    // legs running with the counter at 0, and reads that then decided kept
+    // detaching their losers.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = connect_with_hedge_loser_cap(discovery.port, Duration::from_millis(30), 2).await;
+
+    client.set("k", "v", 0).await.unwrap();
+    for (_, node) in &nodes {
+        node.state.gets_delay_ms.store(400, Ordering::SeqCst);
+    }
+    let reads: Vec<_> = (0..10)
+        .map(|_| tokio::time::timeout(Duration::from_millis(100), client.get("k")))
+        .collect();
+    for read in futures_util::future::join_all(reads).await {
+        assert!(read.is_err(), "both owners are slower than the timeout");
+    }
+    assert_eq!(client.hedged_reads_len().await, 20);
+    assert_eq!(
+        client.detached_hedge_legs(),
+        20,
+        "every leg of the cancelled reads is still running and counted"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while client.detached_hedge_legs() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        client.detached_hedge_legs(),
+        0,
+        "the detached legs release their counts"
+    );
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
+async fn a_read_cancelled_while_it_waits_for_its_losers_counts_them() {
+    // Issue #2079: past the cap a read that has decided waits for its
+    // losers; cancelled during that wait, it leaves them running, and they
+    // must be counted as detached like any other leg left running.
+    let (nodes, discovery) = start_cluster(2).await;
+    let client = connect_with_hedge_loser_cap(discovery.port, Duration::from_millis(30), 0).await;
+
+    client.set("k", "v", 0).await.unwrap();
+    let owners = owners_of("k");
+    node_by_name(&nodes, &owners[0])
+        .state
+        .gets_delay_ms
+        .store(1500, Ordering::SeqCst);
+
+    // The replica answers at about 30 ms; with the cap at 0 the read then
+    // waits for the primary's leg until the timeout drops it.
+    let read = tokio::time::timeout(Duration::from_millis(300), client.get("k")).await;
+    assert!(
+        read.is_err(),
+        "the read should still be waiting for its loser"
+    );
+    assert_eq!(
+        node_by_name(&nodes, &owners[1])
+            .state
+            .gets
+            .load(Ordering::SeqCst),
+        1,
+        "the replica was asked before the timeout"
+    );
+    assert_eq!(
+        client.detached_hedge_legs(),
+        1,
+        "the primary's leg is still running and counted"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while client.detached_hedge_legs() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(client.detached_hedge_legs(), 0);
+
+    client.close().await;
+    discovery.stop();
+    for (_, node) in nodes {
+        node.stop();
+    }
+}
+
+#[tokio::test]
 async fn the_last_owner_started_is_counted_late_too() {
     // Once the final owner's leg has started there is no owner left to
     // hedge to, but its silence counts like any other's: the hedge timer is
