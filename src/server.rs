@@ -771,9 +771,10 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const OVERDRAFT_RECEIVE_GRACE: Duration = Duration::from_secs(2);
 /// See `OVERDRAFT_RECEIVE_GRACE`: the slowest a client may send, on
 /// average over one growth, while its buffer holds the overdraft token.
-/// 1 MiB/s fills the largest doubling a frame can need (128 MiB, for a
-/// multi-key frame near its 85 MiB limit) in about two minutes, beyond
-/// the frame deadline anyway.
+/// Frames are capped at `request_limit` (`MAX_REQUEST_SIZE`, 1 MiB, plus
+/// `INTERNAL_FRAME_ALLOWANCE` for an internal `U`/`u`/`f` frame), so the
+/// largest doubling a frame can need is about 1 MiB (1 MiB to 2 MiB), which
+/// 1 MiB/s fills in about a second on top of the grace.
 const OVERDRAFT_MIN_RECEIVE_RATE: usize = 1024 * 1024;
 
 /// How long a buffer that just grew by `growth` bytes under the overdraft
@@ -7084,9 +7085,16 @@ enum MigrationOutcome {
     /// resend `MigrationAccepted` with this same count rather than start
     /// a second migration.
     DuplicateAcked(usize),
-    /// The slot is occupied by a handoff for a different `joining_name`,
-    /// or by the same `joining_name` whose `acked_entries` hasn't been
-    /// stamped yet. The caller should reject with `MigrationRejected`.
+    /// The slot is occupied and this `M` can't take it or be re-acked
+    /// from it; the caller should reject with `MigrationRejected`. Any of:
+    /// - a still-transferring handoff for a different `joining_name`;
+    /// - the same `joining_name` and generation, whose `acked_entries`
+    ///   hasn't been stamped yet (the next retry finds it stamped);
+    /// - the same `joining_name` at a newer generation than this `M`'s (a
+    ///   stale send of a superseded join), left untouched;
+    /// - the same `joining_name` at an older generation, still
+    ///   transferring: its `abort_requested` is set first, and the `M` is
+    ///   refused until its unwind has cleared the slot.
     Conflict,
 }
 
