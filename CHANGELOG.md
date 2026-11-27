@@ -33,6 +33,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a draining node no longer acts on a heartbeat ack that
+  was in flight when the drain fixed its rings. The heartbeat read
+  `leaving` once per tick, before the heartbeat went out, and used it after
+  the ack came back, so a roster in that ack could still replace
+  `known_ring` (and queue a re-replication), and a `G` verdict could abandon
+  the pending joiner's slot and revert `known_ring` under the drain's rings.
+  Both now read `leaving` right before acting. The window between the
+  shutdown signal and `leaving` is unchanged: the drain has fetched no rings
+  there yet and the node is still serving (#2149).
+
 - Docs: the in-flight byte budget's docs (`docs/deployment-operations.html`,
   `docs/getting-started.html`, `--help`) said only that a connection that
   cannot get its share in time is closed. They now say how cheaply
