@@ -116,10 +116,15 @@ value.
 
 An expiring touch (`touch`, `get_and_touch`, `touch_many` or
 `get_many_and_touch` with `Some(0)`) follows the same order and the same
-rule: when the primary leg ends in a connection error, including a reply
-lost after the request was sent (which is not resent), the other owners
-are sent the plain touch before the error is returned, so a read that
-falls back to them misses instead of returning the expired value.
+rule, with one difference: the other owners are sent the plain touch
+before the error is returned only when the primary's reply was lost after
+the request was sent (which is not resent, and the primary may have
+expired the key), so a read that falls back to them misses instead of
+returning the expired value. A primary still unreachable after the retry
+was never sent the touch, so no other owner is touched either: the
+`Error::ConnectionLost` invites a resend, and once discovery has dropped
+the primary that resend still finds the value. A batch applies this per
+key.
 
 ## Counters (`incr`/`decr`)
 
