@@ -3319,7 +3319,20 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             {
                 // An owner that already stored this position on the
                 // previous pass is not sent it again (see MultiSetTracker).
-                if (tracker.IsAcknowledged(idx, names[rank])) continue;
+                if (tracker.IsAcknowledged(idx, names[rank]))
+                {
+                    // If the refresh between the passes promoted this
+                    // owner to the key's primary (the old primary left the
+                    // roster), the key is stored on its primary now and is
+                    // reported so: the earlier pass recorded the
+                    // acknowledgement as a replica's (issue #2174, as in
+                    // the Python, Go and TypeScript SDKs).
+                    if (rank == 0)
+                    {
+                        lock (tracker) tracker.PrimaryAcknowledged.Add(idx);
+                    }
+                    continue;
+                }
                 if (!owners.TryGetValue(names[rank], out OwnerBatch? batch))
                 {
                     batch = new OwnerBatch();
