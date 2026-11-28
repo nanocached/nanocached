@@ -6135,6 +6135,30 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
     }
   });
 
+  it("a get the node rejects with En is final: one frame, no redial", async () => {
+    // Issue #2184: the same frame on a new connection is refused the same
+    // way, so the refresh-and-retry does not resend it (as in Go and Rust).
+    await withCluster(
+      async (client, cluster) => {
+        const key = keysWithPrimary(cluster, names[0], 1)[0];
+        const node = cluster.nodes[0].mock;
+        const connectionsBefore = node.connectionCount();
+        await assert.rejects(
+          () => client.get(key),
+          (error: unknown) => {
+            assert.ok(error instanceof ConnectionLostError);
+            assert.match(error.message, /unexpected response from server: E/);
+            return true;
+          },
+        );
+        assert.equal(node.getCount(), 1);
+        assert.equal(node.connectionCount(), connectionsBefore);
+      },
+      [{ rejectGets: true }, {}],
+      1,
+    );
+  });
+
   it("a primary that predates t is asked once by a single-key call", async () => {
     // Issue #902: `En` is final, so no redial and resend.
     for (const get of [false, true]) {
