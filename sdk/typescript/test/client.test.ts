@@ -1113,6 +1113,22 @@ describe("NanocachedClient reconnect-on-use", () => {
     }
   });
 
+  it("a discovery list header with a high-bit byte is rejected", async () => {
+    // 0xB1 decoded as "ascii" lost its high bit and read as "1", so
+    // `N \xB1 1\n` passed as `N 1 1\n`.
+    const discovery = await startMockDiscovery([{ name: "a", address: "127.0.0.1:1" }]);
+    try {
+      const { connectAndIdentify, connectAndListProxies } = await import("../src/identify.js");
+      discovery.answerListHeaderOnce(Buffer.from([0x4e, 0x20, 0xb1, 0x20, 0x31, 0x0a]));
+      await assert.rejects(connectAndIdentify({ host: "127.0.0.1", port: discovery.port }), /invalid node count/);
+      discovery.setProxies([{ name: "p", address: "127.0.0.1:1" }]);
+      discovery.answerListHeaderOnce(Buffer.from([0x4e, 0x20, 0xb1, 0x0a]));
+      await assert.rejects(connectAndListProxies({ host: "127.0.0.1", port: discovery.port }), /invalid proxy count/);
+    } finally {
+      await discovery.close();
+    }
+  });
+
   it("an oversized node-list response fails instead of buffering unbounded memory", async () => {
     // Regression: bounds a malicious discovery server's memory pressure
     // with an aggregate cap on the whole `N ...` response (16 MiB),
@@ -1288,6 +1304,22 @@ describe("NanocachedClient reconnect-on-use", () => {
         // into this response.
         assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("an incr counter body with a high-bit byte poisons the connection", async () => {
+    // 0xB5 decoded as "ascii" lost its high bit and read as "5".
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        node.answerMalformedIncrValueOnce(Buffer.from([0xb5]));
+        await assert.rejects(client.incr("k", 1), /invalid incr value/);
       } finally {
         await client.close();
       }
