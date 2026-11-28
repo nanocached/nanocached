@@ -1592,7 +1592,6 @@ class NanocachedClient:
             return await self._with_wrong_node_retry(
                 lambda: self._write(namespace, key_bytes, op, primary_first=ttl_seconds == 0),
                 replay_safe=ttl_seconds != 0,
-                rejection_is_final=True,
             )
         except (NanocachedError, ConnectionError, OSError) as error:
             if _rejected_by_server(error):
@@ -1654,7 +1653,6 @@ class NanocachedClient:
                     primary_first=ttl_seconds == 0,
                 ),
                 replay_safe=ttl_seconds != 0,
-                rejection_is_final=True,
             )
         except (NanocachedError, ConnectionError, OSError) as error:
             if _rejected_by_server(error):
@@ -3436,7 +3434,6 @@ class NanocachedClient:
         operation: Callable[[], Awaitable[_T]],
         *,
         replay_safe: bool = True,
-        rejection_is_final: bool = False,
     ) -> _T:
         """Connection-level failures (and `W`) retry once, after a forced
         node-list refresh: the usual cause is a node death that discovery
@@ -3459,17 +3456,21 @@ class NanocachedClient:
         or WrongNodeError means the request never reached the server at
         all either way, so it retries regardless of ``replay_safe``.
 
-        ``rejection_is_final`` (issue #902): an ``En`` answer arrives as a
-        connection loss carrying it as the cause, and a refresh and a
-        second attempt would only ask the same node again. touch and
-        get_and_touch set it, so an old node that predates them fails the
-        call at once with the rejection."""
+        An ``En`` answer (issues #902, #2183) is final for every request
+        kind, as in the Go and Rust SDKs: it arrives as a connection loss
+        carrying the rejection as its cause, and the node refuses the
+        request itself (a command it does not know, one too large or
+        malformed), so a refresh and a second attempt would only get the
+        same ``En`` on a new connection. A touch or get_and_touch against
+        a node that predates them therefore fails at once. The requests
+        pipelined behind the rejected one fail as never sent, not as
+        rejected, and keep this retry."""
         try:
             return await operation()
         except (WrongNodeError, ConnectionError, OSError) as error:
             if not replay_safe and isinstance(error, ConnectionLostError):
                 raise
-            if rejection_is_final and _rejected_by_server(error):
+            if _rejected_by_server(error):
                 raise
             if self._ring is None:
                 raise
