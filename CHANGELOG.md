@@ -61,6 +61,50 @@ framework adapters at one version, whether or not a component changed.
   is leaving or draining keeps its cache. A discovery of an earlier version
   rejects the field, and the node then sends plain `J`s as before (#2252).
 
+- `nanocached-node`: a put-if-absent re-replication copy of a key a join
+  took, arriving while that join's transfer was being rolled back, was
+  marked dead after the rollback had already undone the join's marks. The
+  copy then stayed marked with no join left to settle it: no later
+  handoff, re-replication or drain sent it, and the sweep could delete it
+  on a node that the abandoned join leaves an owner of the key. A mark
+  is no longer added once the rollback has begun, and it is queued to the
+  cache before the rollback's unmark (#2256).
+
+- `nanocached-node`: when the roster fetch a re-replication pass starts
+  with failed or took more than 10 s, the pass was dropped. The WARN said a
+  later ring change would retrigger it, but a later pass heals only the
+  keys its own change re-ranks, so the owners this change promoted never
+  got their copies. The ring change is now kept for the next pass to cover
+  as well, from both the eviction trigger and the join-flip trigger
+  (#2258).
+- `nanocached-node`: a re-replication pass that could not send some keys
+  to a promoted owner still counted as complete. A target refused on all
+  three attempts (three refused dials take milliseconds) was written off
+  for the rest of the pass, and a target with no address or token was
+  skipped, so those keys stayed one replica short until a client wrote
+  them again. The pass now retries the keys of an unreachable target in up
+  to three more rounds (after 2 s, 8 s and 20 s), with a short backoff
+  between attempts. A pass that still leaves keys undelivered keeps its
+  ring change for the next pass to cover (#2257).
+- `nanocached-node`: one heartbeat that discovery neither answered nor
+  refused (a blackholed path, a lost ack) kept the node silent for about
+  20 s: the ack was waited for 10 s and the reconnect then waited out the
+  5 s interval. Past the 15 s liveness timeout, discovery evicted the node
+  and its next announce could send it back through a join with an empty
+  cache. The whole heartbeat exchange is now bounded by the 5 s interval
+  and the node reconnects at once when it runs out, so one lost heartbeat
+  leaves a gap of about 10 s (#2253).
+
+- `nanocached-proxy`: a failed dial to a node (a TLS mismatch, a certificate
+  without the node's IP, a refused secret, a node at its connection cap) is
+  logged as `WARN dial to backend <addr> failed: <error>`. It used to show
+  only as `R`, `B` or `E` at the client, with nothing in the proxy log. On a
+  plaintext proxy whose node hung up on the handshake, the line ends with the
+  hint that `--tls-ca` may be missing. Like the backend connection lines,
+  they are rate-limited per address (three every ten seconds, then one
+  summary line), so a dead node under load does not fill the log. The proxy's
+  announce and deregister warnings carry the same hint (#2260).
+
 - `nanocached-node`: one source address could pin the whole
   `--max-in-flight-bytes` budget with uploads it never finished, and every
   value-carrying reply on other clients' connections then waited for it

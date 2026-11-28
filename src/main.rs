@@ -588,6 +588,18 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_exchange_fits_in_one_heartbeat_interval() {
+        // Issue #2253: a heartbeat left unanswered is given up on at
+        // `HEARTBEAT_EXCHANGE_TIMEOUT` and redialed at once, so the node's
+        // next contact comes interval + exchange timeout after its last
+        // answered heartbeat. That must stay within two intervals, below
+        // the three-interval liveness minimum discovery enforces.
+        let interval = Duration::from_secs(DEFAULT_HEARTBEAT_INTERVAL_SECS);
+        assert!(server::HEARTBEAT_EXCHANGE_TIMEOUT <= interval);
+        assert!(interval + server::HEARTBEAT_EXCHANGE_TIMEOUT < 3 * interval);
+    }
+
+    #[test]
     fn port_0_is_refused_with_discovery_in_either_flag_order() {
         for flags in [
             &["--port", "0", "--discovery", "127.0.0.1:8357"],

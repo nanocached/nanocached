@@ -511,7 +511,9 @@ const NODE_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 /// A `Joined` node heard from again after this long without a heartbeat or
 /// an announce was out of contact: at least one heartbeat did not arrive.
 /// Below two intervals so that a single lost heartbeat (a gap of two
-/// intervals) counts, above one and a half so that one heartbeat that is
+/// intervals: the node gives up on an unanswered heartbeat one interval
+/// after sending it and redials at once) counts, above one and a half so
+/// that one heartbeat that is
 /// late by a few seconds does not. `note_contact` records such a gap in the
 /// node's `NodeInfo::contact_breaks`, which is what `announce_needs_rejoin`
 /// reads.
