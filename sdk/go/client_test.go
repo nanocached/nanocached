@@ -5983,6 +5983,61 @@ func TestAFailedHedgeLegStartsTheNextOwnerAtOnce(t *testing.T) {
 	}
 }
 
+func TestAHedgedReadRacingCloseFailsWithErrClosed(t *testing.T) {
+	// Close() starts while a hedged read waits out the interval before its
+	// second leg: the refused leg fails the read with ErrClosed, as in the
+	// other SDKs, instead of the read waiting for the primary's value.
+	nodes, discovery := startCluster(t, 2)
+	hedgeAfter := 300 * time.Millisecond
+	client, err := Connect(Config{
+		Addresses:      []Address{addr(discovery.address())},
+		ReadHedgeAfter: hedgeAfter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Set("k", "v", 0); err != nil {
+		t.Fatal(err)
+	}
+	owners := ownersOf("k")
+	nodes[owners[0]].delayGets(4 * hedgeAfter)
+
+	type getResult struct {
+		value string
+		ok    bool
+		err   error
+	}
+	done := make(chan getResult, 1)
+	go func() {
+		value, ok, err := client.Get("k")
+		done <- getResult{value, ok, err}
+	}()
+	// Close() once the primary leg is in flight, well before the interval.
+	waitFor(t, func() bool { return nodes[owners[0]].getCount.Load() == 1 }, "the primary leg to start")
+	closed := make(chan struct{})
+	go func() {
+		client.Close()
+		close(closed)
+	}()
+
+	select {
+	case res := <-done:
+		if !errors.Is(res.err, ErrClosed) {
+			t.Fatalf("Get = %q, %v, %v, want ErrClosed", res.value, res.ok, res.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Get did not return")
+	}
+	if got := nodes[owners[1]].getCount.Load(); got != 0 {
+		t.Fatalf("replica getCount = %d, want 0 (no leg starts once Close() has begun)", got)
+	}
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return")
+	}
+}
+
 func TestADeadPrimaryFailsOverImmediatelyWhenHedgingIsOn(t *testing.T) {
 	nodes, discovery := startCluster(t, 2)
 	client, err := Connect(Config{
