@@ -8274,9 +8274,11 @@ async fn run_migration(
     // member as the joiner). So, unlike the old "reuse what `M` already
     // carried" shortcut, this now pays for the same `fetch_roster_once`
     // (issue #295: self-authenticated, tokens included) fetch
-    // `spawn_or_supersede_rereplication` does — a failure here just skips
+    // `spawn_or_supersede_rereplication` does — a failure here skips
     // this trigger (logged), same as that function's own failure
-    // handling: the next ring-changing event retries.
+    // handling, and parks its ring change for the next ring-changing
+    // event's pass to cover too (`park_rereplication_baseline`, issue
+    // #2258).
     if let Some(previous_membership) = pre_completion_ring {
         let previous_ring = Arc::clone(&previous_membership.ring);
         if ring_dropped_a_member(&previous_ring, &after_ring) {
@@ -8294,18 +8296,19 @@ async fn run_migration(
                     Ok(Err(error)) => {
                         eprintln!(
                             "WARN re-replication: fetching the roster with addresses for the \
-                             join-flip trigger failed: {error} — giving up; a later ring \
-                             change will retrigger it if the cluster is still \
-                             under-replicated"
+                             join-flip trigger failed: {error} — giving up on this pass; the \
+                             next ring change's pass covers this change too"
                         );
+                        park_rereplication_baseline(&node_context, previous_ring);
                         return;
                     }
                     Err(_) => {
                         eprintln!(
                             "WARN re-replication: fetching the roster with addresses for the \
-                             join-flip trigger timed out — giving up; a later ring change will \
-                             retrigger it if the cluster is still under-replicated"
+                             join-flip trigger timed out — giving up on this pass; the next \
+                             ring change's pass covers this change too"
                         );
+                        park_rereplication_baseline(&node_context, previous_ring);
                         return;
                     }
                 };
@@ -10039,14 +10042,6 @@ async fn run_superseding_rereplication(
     )
     .await;
 
-    if completed {
-        state
-            .unfinished_baselines
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-    }
-    state.done.store(true, Ordering::SeqCst);
     {
         // Stamp this pass's own window only: a later pass may already
         // have put its own in the slot.
@@ -10064,11 +10059,32 @@ async fn run_superseding_rereplication(
     // pass takes its baselines over (as it would from a run it aborted)
     // instead of healing only from its own ring change. Not at shutdown:
     // there is no next pass.
+    //
+    // Issue #2258: a finished run drops only the baselines it ran from; one
+    // `park_rereplication_baseline` added meanwhile stays. Under the slot
+    // lock, the lock that function takes first, so a baseline is never
+    // added to a run that has just left the slot.
     let mut slot = node_context
         .active_rereplication
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if (completed || *shutdown_rx.borrow())
+    let unfinished = {
+        let mut own = state
+            .unfinished_baselines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if completed {
+            own.retain(|left| {
+                !baselines.iter().any(|ran| {
+                    Arc::ptr_eq(&ran.ring, &left.ring)
+                        && ran.every_other_owner == left.every_other_owner
+                })
+            });
+        }
+        !own.is_empty()
+    };
+    state.done.store(true, Ordering::SeqCst);
+    if (!unfinished || *shutdown_rx.borrow())
         && slot
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, &state))
@@ -10077,12 +10093,48 @@ async fn run_superseding_rereplication(
     }
 }
 
+/// Issue #2258: records the ring change `before_ring` started from for the
+/// next pass to cover, when this change's own pass cannot run (its roster
+/// fetch failed). Added to the run in the slot, running or parked (issue
+/// #2257) — a running one keeps it past its own finish, see
+/// `run_superseding_rereplication` — or, with the slot empty, parked there
+/// in a run of its own that is already done. Bounded by
+/// `fold_unfinished_baselines`; nothing reschedules a pass from here, the
+/// next ring change does.
+fn park_rereplication_baseline(node_context: &NodeContext, before_ring: Arc<HashRing>) {
+    let mut slot = node_context
+        .active_rereplication
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match slot.as_ref() {
+        Some(current) => {
+            let mut own = current
+                .unfinished_baselines
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut baselines = std::mem::take(&mut *own);
+            baselines.push(RereplicationBaseline::plain(before_ring));
+            *own = fold_unfinished_baselines(baselines, &node_context.name);
+        }
+        None => {
+            *slot = Some(Arc::new(ActiveRereplication {
+                abort_requested: AtomicBool::new(false),
+                done: AtomicBool::new(true),
+                unfinished_baselines: Mutex::new(vec![RereplicationBaseline::plain(before_ring)]),
+            }));
+        }
+    }
+}
+
 /// Issue #266: the task `register_with_discovery` hands to
 /// `send_heartbeats`'s `JoinSet` when `adopt_membership` reports a ring
 /// change that dropped a member. Fetches the roster with addresses (the
 /// heartbeat ack carries names only) and waits out any join migration in
 /// progress (`wait_for_migration_to_clear`) before handing off to
-/// `run_superseding_rereplication` for the rest.
+/// `run_superseding_rereplication` for the rest. A failed fetch parks
+/// `before_ring` for the next pass (`park_rereplication_baseline`, issue
+/// #2258) rather than retrying here: a retry that succeeded late could take
+/// over from a newer change's pass with an older ring.
 async fn spawn_or_supersede_rereplication(
     node_context: NodeContext,
     discovery_addr: String,
@@ -10103,17 +10155,19 @@ async fn spawn_or_supersede_rereplication(
         Ok(Err(error)) => {
             eprintln!(
                 "WARN re-replication: fetching the roster with addresses from {discovery_addr} \
-                 failed: {error} — giving up; a later ring change will retrigger it if the \
-                 cluster is still under-replicated"
+                 failed: {error} — giving up on this pass; the next ring change's pass covers \
+                 this change too"
             );
+            park_rereplication_baseline(&node_context, before_ring);
             return;
         }
         Err(_) => {
             eprintln!(
                 "WARN re-replication: fetching the roster with addresses from {discovery_addr} \
-                 timed out — giving up; a later ring change will retrigger it if the cluster is \
-                 still under-replicated"
+                 timed out — giving up on this pass; the next ring change's pass covers this \
+                 change too"
             );
+            park_rereplication_baseline(&node_context, before_ring);
             return;
         }
     };
@@ -33891,6 +33945,229 @@ mod tests {
             node_context.active_rereplication.lock().unwrap().is_none(),
             "a finished pass leaves the slot empty"
         );
+
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// Issue #2258: ten keys `node-a` must hand to `node-b` when
+    /// `[node-a, node-b, node-c]` drops `node-c` at R=2, stored in a fresh
+    /// cache; returns the rings, the keys and the cache's sender.
+    async fn rereplication_fixture() -> (
+        Arc<HashRing>,
+        Arc<HashRing>,
+        Vec<Key>,
+        mpsc::Sender<CacheRequest>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (request_tx, request_rx) = mpsc::channel(64);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let before_ring = Arc::new(HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+        ]));
+        let stored: Vec<Key> = (0..2000)
+            .map(|index| key(format!("key-{index}").as_bytes()))
+            .filter(|candidate| {
+                rereplication_targets(
+                    &before_ring,
+                    &after_ring,
+                    KeyHash::of(candidate),
+                    2,
+                    "node-a",
+                ) == vec!["node-b".to_string()]
+            })
+            .take(10)
+            .collect();
+        assert_eq!(stored.len(), 10);
+        for stored_key in &stored {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: stored_key.clone(),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+        (before_ring, after_ring, stored, request_tx, cache_task)
+    }
+
+    /// A discovery address nothing listens on: the roster fetch fails at
+    /// once.
+    async fn unreachable_discovery_addr() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        addr
+    }
+
+    /// Issue #2258: a ring change whose roster fetch fails is covered by
+    /// the next pass, even though that pass's own change re-ranks none of
+    /// its keys.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ring_change_whose_roster_fetch_failed_is_covered_by_the_next_pass() {
+        let (before_ring, after_ring, stored, request_tx, cache_task) =
+            rereplication_fixture().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut node_context = test_node_context(
+            "node-a",
+            "tok-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        node_context.shutdown_rx = shutdown_rx.clone();
+
+        timeout(
+            Duration::from_secs(30),
+            spawn_or_supersede_rereplication(
+                node_context.clone(),
+                unreachable_discovery_addr().await,
+                Arc::clone(&before_ring),
+                Arc::new(Membership {
+                    ring: Arc::clone(&after_ring),
+                    replication: 2,
+                }),
+                shutdown_rx.clone(),
+            ),
+        )
+        .await
+        .expect("the failed trigger returns");
+        let parked = node_context
+            .active_rereplication
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the ring change is parked in the slot");
+        assert!(parked.done.load(Ordering::SeqCst));
+        timeout(
+            Duration::from_secs(1),
+            wait_for_rereplication_to_clear(&node_context, &AtomicBool::new(false)),
+        )
+        .await
+        .expect("a parked ring change does not hold a join up");
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+        timeout(
+            Duration::from_secs(30),
+            run_superseding_rereplication(
+                node_context.clone(),
+                Arc::clone(&after_ring),
+                Arc::clone(&after_ring),
+                2,
+                HashMap::from([("node-b".to_string(), peer_addr)]),
+                HashMap::from([("node-b".to_string(), "tok-b".to_string())]),
+                shutdown_rx,
+            ),
+        )
+        .await
+        .expect("the next pass finishes");
+
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            stored.len(),
+            "the next pass delivers the keys of the change it could not run"
+        );
+        assert!(node_context.active_rereplication.lock().unwrap().is_none());
+
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// Issue #2258: a ring change parked while another pass is running
+    /// outlives that pass's finish, instead of being cleared with the
+    /// baselines that pass ran from.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ring_change_parked_during_a_pass_outlives_its_finish() {
+        let (before_ring, after_ring, stored, request_tx, cache_task) =
+            rereplication_fixture().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut node_context = test_node_context(
+            "node-a",
+            "tok-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        node_context.shutdown_rx = shutdown_rx.clone();
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        node_context.gates.pass.hold();
+        let running = tokio::spawn(run_superseding_rereplication(
+            node_context.clone(),
+            Arc::clone(&before_ring),
+            Arc::clone(&after_ring),
+            2,
+            HashMap::from([("node-b".to_string(), peer_addr)]),
+            HashMap::from([("node-b".to_string(), "tok-b".to_string())]),
+            shutdown_rx.clone(),
+        ));
+        let running_state = timeout(Duration::from_secs(30), async {
+            loop {
+                let installed = node_context.active_rereplication.lock().unwrap().clone();
+                if let Some(state) = installed {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the pass installs itself");
+
+        // Another change, whose fetch fails, while the pass is running.
+        let other_before = Arc::new(HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-d".to_string(),
+        ]));
+        timeout(
+            Duration::from_secs(30),
+            spawn_or_supersede_rereplication(
+                node_context.clone(),
+                unreachable_discovery_addr().await,
+                Arc::clone(&other_before),
+                Arc::new(Membership {
+                    ring: Arc::clone(&after_ring),
+                    replication: 2,
+                }),
+                shutdown_rx,
+            ),
+        )
+        .await
+        .expect("the failed trigger returns");
+        node_context.gates.pass.release();
+        timeout(Duration::from_secs(30), running)
+            .await
+            .expect("the pass finishes")
+            .unwrap();
+
+        assert_eq!(frames.lock().unwrap().len(), stored.len());
+        let left = node_context
+            .active_rereplication
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the parked change keeps the finished pass in the slot");
+        assert!(Arc::ptr_eq(&left, &running_state));
+        assert!(left.done.load(Ordering::SeqCst));
+        let baselines = left.unfinished_baselines.lock().unwrap().clone();
+        assert_eq!(baselines.len(), 1);
+        assert!(Arc::ptr_eq(&baselines[0].ring, &other_before));
 
         peer_task.abort();
         drop(node_context);
