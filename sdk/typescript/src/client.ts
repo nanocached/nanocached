@@ -4847,7 +4847,14 @@ export class NanocachedClient {
       return;
     }
 
-    for (const proxy of shuffled(proxies)) {
+    // Leave out the proxy that just failed (issue #2203), as Go does: a
+    // black-holed one would cost a whole connect deadline. It stays a
+    // candidate only when the roster lists nothing else.
+    const failedAddress = this.target.address;
+    const others = proxies.filter((proxy) => proxy.address !== failedAddress);
+    const candidates = others.length > 0 ? others : proxies;
+
+    for (const proxy of shuffled(candidates)) {
       if (this.closed) return; // close() ran while we were dialing (issue #10-style race)
 
       let identified;

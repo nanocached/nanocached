@@ -9309,6 +9309,85 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
     }
   });
 
+  it("a failover leaves the proxy that just failed out of the candidates (issue #2203)", async () => {
+    // Regression: refreshProxyTarget dialed the whole fresh roster in
+    // random order, so it could redial the proxy that had just failed
+    // (one extra dial when refused, a whole connect deadline when
+    // black-holed). Math.random is pinned so the shuffle keeps roster
+    // order, which puts the failed proxy first.
+    const port = await revivablePort();
+    const proxyA = await startMockNode({ port });
+    const proxyB = await startMockNode();
+    const discovery = await startMockDiscovery([]);
+    discovery.setProxies([
+      { name: "proxy-a", address: proxyA.address },
+      { name: "proxy-b", address: proxyB.address },
+    ]);
+    const random = mock.method(Math, "random", () => 0.99);
+    // proxy-a's address comes back as something that is not a proxy: it
+    // answers the handshake with garbage, which fails a dial at once and
+    // (unlike a bare reset) is not retried with the legacy handshake, so
+    // each dial is exactly one connection here.
+    let dials = 0;
+    const held: Socket[] = [];
+    const hole = createServer((socket) => {
+      dials++;
+      held.push(socket);
+      socket.on("error", () => {});
+      socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+    });
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: discovery.port }], viaProxy: true });
+      try {
+        assert.equal(proxyAddressOf(client), proxyA.address);
+        await proxyA.close();
+        await waitFor(() => singleConnectionClosed(client), "the client to notice the dead proxy");
+        await new Promise<void>((resolve) => hole.listen(port, "127.0.0.1", () => resolve()));
+
+        assert.equal(await client.get("k"), null);
+        assert.equal(proxyAddressOf(client), proxyB.address);
+        // Only the same-proxy redial, never a failover candidate.
+        assert.equal(dials, 1);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      random.mock.restore();
+      for (const socket of held) socket.destroy();
+      await new Promise<void>((resolve) => hole.close(() => resolve()));
+      await Promise.all([discovery.close(), proxyB.close()]);
+    }
+  });
+
+  it("a failover still redials the failed proxy when the roster lists nothing else (issue #2203)", async () => {
+    const port = await revivablePort();
+    let proxyA = await startMockNode({ port });
+    const discovery = await startMockDiscovery([]);
+    discovery.setProxies([{ name: "proxy-a", address: proxyA.address }]);
+    try {
+      const client = await NanocachedClient.connect({
+        addresses: [{ host: "127.0.0.1", port: discovery.port }],
+        viaProxy: true,
+        disableReconnectCooldown: true,
+      });
+      try {
+        await proxyA.close();
+        await waitFor(() => singleConnectionClosed(client), "the client to notice the dead proxy");
+        // The same-proxy redial fails; the proxy is back by the time the
+        // failover runs, so only the failover can reach it.
+        await assert.rejects(client.get("k"));
+        proxyA = await startMockNode({ port });
+        await (client as any).refreshProxyTarget();
+        assert.equal(singleConnectionClosed(client), false);
+        assert.equal(proxyA.connectionCount(), 1);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await Promise.all([discovery.close(), proxyA.close().catch(() => {})]);
+    }
+  });
+
   it("prunes the departed proxy's reconnect cooldown once refreshProxyTarget swaps to a new one (issue #296)", async () => {
     // Regression: refreshProxyTarget used to swap `target.address` to the
     // new proxy without ever deleting the old address's entry from

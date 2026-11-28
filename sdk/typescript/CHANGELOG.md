@@ -19,6 +19,7 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- With `viaProxy`, a failover to another proxy could pick the proxy that had just failed again, which cost one more dial when it refused connections and up to the connect deadline when it was black-holed. The failed proxy is now left out of the candidates unless the roster lists no other, as in the Go SDK. (#2203)
 - A node or proxy address from discovery with a bracketed IPv6 host (`[::1]:8356`) could not be dialed: the brackets were passed to `net.connect`, which failed with `ENOTFOUND`. They are now stripped; the bare form older discovery servers write (`::1:8356`) still works. (#2151)
 - With `readHedgeAfterMs` and three or more owners, a hedge leg that failed at once (its node gone) while the primary was still silent did not start the next owner: that waited for the next hedge interval, so with replication 3, a 300 ms interval and the second owner's node down, a hit from the third owner took 611 ms. A failed leg now starts the next owner right away, as documented. A replica's provisional miss is unchanged: the next owner starts at once only when no other leg is in flight. (#2120)
 - A `V`, `I`, `M`, `O` or `Y` response header did not check the byte after the marker: on an untagged connection `VX5\nhello` was read as a 5-byte hit. A byte other than the mandatory space there is now a protocol error that poisons the connection, as in the Go, Java and Rust SDKs. The same holds for the `N` header of a discovery server's node or proxy list (`NX1 2\n` was read as `N 1 2\n`). (#2105)
