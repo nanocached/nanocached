@@ -6244,12 +6244,19 @@ impl NanocachedClient {
             Arc::clone(redials.entry(String::new()).or_default())
         };
         let _guard = gate.lock().await;
-        if let Target::Single { connection, .. } = &self.inner.state.lock().await.target {
-            if !connection.is_closed() {
-                return;
+        let failed = match &self.inner.state.lock().await.target {
+            Target::Single {
+                address,
+                connection,
+            } => {
+                if !connection.is_closed() {
+                    return;
+                }
+                address.clone()
             }
-        }
-        let (dialed, got_roster) = self.dial_a_fresh_proxy().await;
+            _ => return,
+        };
+        let (dialed, got_roster) = self.dial_a_fresh_proxy(&failed).await;
         let Some((address, stream, tagged)) = dialed else {
             self.inner
                 .proxy_failovers_failed
@@ -6320,7 +6327,15 @@ impl NanocachedClient {
     /// and none yielded a reachable proxy. The second value is whether any
     /// address returned a non-empty roster, so the caller can tell a failed
     /// refresh from a usable roster whose proxies all failed to dial.
-    async fn dial_a_fresh_proxy(&self) -> (Option<(String, crate::identify::Stream, bool)>, bool) {
+    ///
+    /// `failed` is the pinned proxy whose redial just failed: it is left
+    /// out of the candidates unless it is the roster's only entry, as in
+    /// the Go SDK (issue #2202), so the failover does not spend a dial (up
+    /// to the connect deadline, for a black-holed address) on it again.
+    async fn dial_a_fresh_proxy(
+        &self,
+        failed: &str,
+    ) -> (Option<(String, crate::identify::Stream, bool)>, bool) {
         let mut got_roster = false;
         for (host, port) in &self.inner.addresses {
             if let Ok(Identified::Proxies { proxies }) = connect_and_identify(
@@ -6335,8 +6350,14 @@ impl NanocachedClient {
             {
                 if !proxies.is_empty() {
                     got_roster = true;
+                    let others: Vec<DiscoveredNode> = proxies
+                        .iter()
+                        .filter(|proxy| proxy.address != failed)
+                        .cloned()
+                        .collect();
+                    let candidates = if others.is_empty() { &proxies } else { &others };
                     if let Some(result) = dial_random_proxy(
-                        &proxies,
+                        candidates,
                         self.inner.auth_secret_bytes(),
                         self.inner.tls.as_ref(),
                     )
