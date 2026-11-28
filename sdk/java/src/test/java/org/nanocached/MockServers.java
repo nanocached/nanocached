@@ -29,6 +29,14 @@ final class MockServers {
 
     private MockServers() {}
 
+    /**
+     * Every mock listens on the loopback address the tests dial (127.0.0.1), never on the wildcard
+     * one. On macOS a wildcard listener can be handed a port another process already listens on at
+     * 127.0.0.1, and connections to 127.0.0.1 then reach that process instead of the mock: a dial
+     * to it never gets an answer to {@code A} and fails after the 5 s connect timeout.
+     */
+    static final java.net.InetAddress LOOPBACK = java.net.InetAddress.getLoopbackAddress();
+
     static final class MockNode implements AutoCloseable {
         final Map<String, byte[]> store = new ConcurrentHashMap<>();
 
@@ -399,8 +407,8 @@ final class MockServers {
             this.closeOnExtendedAuth = closeOnExtendedAuth;
             this.closeOnRetryToken = closeOnRetryToken;
             this.server = serverTls == null
-                    ? new ServerSocket(port)
-                    : serverTls.getServerSocketFactory().createServerSocket(port);
+                    ? new ServerSocket(port, 50, LOOPBACK)
+                    : serverTls.getServerSocketFactory().createServerSocket(port, 50, LOOPBACK);
             Thread acceptor = new Thread(this::acceptLoop, "mock-node-accept");
             acceptor.setDaemon(true);
             acceptor.start();
@@ -1661,7 +1669,7 @@ final class MockServers {
         MockDiscovery(List<DiscoveredNode> nodes, int replication) throws IOException {
             this.nodes = nodes;
             this.replication = replication;
-            this.server = new ServerSocket(0);
+            this.server = new ServerSocket(0, 50, LOOPBACK);
             Thread acceptor = new Thread(this::acceptLoop, "mock-discovery-accept");
             acceptor.setDaemon(true);
             acceptor.start();
@@ -1891,7 +1899,7 @@ final class MockServers {
         ScriptedNode(boolean acceptTags, java.util.function.Function<String, String> script) throws IOException {
             this.acceptTags = acceptTags;
             this.script = script;
-            this.server = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());
+            this.server = new ServerSocket(0, 50, LOOPBACK);
             Thread acceptor = new Thread(this::acceptLoop, "scripted-node-accept");
             acceptor.setDaemon(true);
             acceptor.start();
@@ -1959,7 +1967,7 @@ final class MockServers {
     }
 
     static int unusedPort() throws IOException {
-        try (ServerSocket socket = new ServerSocket(0)) {
+        try (ServerSocket socket = new ServerSocket(0, 50, LOOPBACK)) {
             return socket.getLocalPort();
         }
     }
