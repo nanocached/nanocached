@@ -1510,7 +1510,9 @@ final class Connection {
             // either way, so every other command is unaffected.
             //
             // Only the node's `En` (the `n` server-type byte right after
-            // the `E`) is that (issue #939). The proxy answers a bare `E`
+            // the `E`) is that (issue #939); whatever follows the `n` (the
+            // `T` of the `EnT` a tagged connection can get) does not matter,
+            // as in the other five SDKs (issue #2259). The proxy answers a bare `E`
             // (`E\n`, untagged even on a tagged connection; an `E` that
             // carries a tag is read the same way) when it
             // could not tell whether a request was applied -- a ttl=0 touch
@@ -1528,7 +1530,7 @@ final class Connection {
                     throw new NanocachedException.ConnectionLost(
                             "nanocached: unexpected response from server: E", unreadable);
                 }
-                if (rest.equals("n") || rest.startsWith("n ")) {
+                if (rest.startsWith("n")) {
                     throw new NanocachedException.ServerRejected();
                 }
                 throw new NanocachedException.ConnectionLost("nanocached: unexpected response from server: E", null);

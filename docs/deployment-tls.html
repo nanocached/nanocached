@@ -51,7 +51,11 @@ of them set warns at start-up that the other direction is plaintext
 <code>--discovery</code> to register with &mdash; a standalone node with
 only a certificate dials nothing and stays quiet; with only
 <code>--tls-ca</code>, a node, a discovery server or a proxy warns that
-what it accepts is plaintext, whether or not it dials anything). The SDKs take the
+what it accepts is plaintext, whether or not it dials anything). A
+proxy with no <code>--tls-ca</code> whose cluster requires TLS has
+nothing to warn about at start-up; its first dial to a node logs the
+failure with a hint that <code>--tls-ca</code> may be missing, a few
+lines per node every ten seconds at most. The SDKs take the
 same two pieces as options: <code>tls</code> and, for anything that is
 not publicly issued, <code>ca</code>. There are no client certificates:
 a peer is authenticated by the shared secret, and TLS adds
@@ -90,7 +94,10 @@ verifies the node&rsquo;s certificate against that IP, so a
 node&rsquo;s certificate must carry its IP address in
 <code>subjectAltName</code>. A certificate with only a DNS name fails
 with <code>certificate not valid for name "10.0.0.10"</code> on
-discovery and an <code>IP address mismatch</code> on the SDKs. The
+discovery and in a proxy&rsquo;s log (<code>WARN dial to backend
+10.0.0.10:8356 failed: &hellip;</code>, while its clients see only
+<code>R</code> or <code>B</code>), and an <code>IP address
+mismatch</code> on the SDKs. The
 same holds for a proxy that applications reach through the proxy list
 discovery serves: that list is registration IPs too.</p>
 <p>Discovery itself is different: nodes dial the address given as

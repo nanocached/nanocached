@@ -84,7 +84,7 @@ class ResponseHeaderGrammarTest {
      * with {@code reply} (given the request's tag, the header's last field, on a tagged connection).
      */
     private static void withConnection(boolean tagged, Reply reply, Check check) throws Exception {
-        try (ServerSocket server = new ServerSocket(0);
+        try (ServerSocket server = new ServerSocket(0, 50, MockServers.LOOPBACK);
                 Socket clientSocket = new Socket("127.0.0.1", server.getLocalPort());
                 Socket serverSocket = server.accept()) {
             CompletableFuture<Void> peer = CompletableFuture.runAsync(() -> {

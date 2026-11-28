@@ -119,7 +119,7 @@
 //!                             see `src/server.rs`'s `Command::HandoffSet::
 //!                             token`.
 //!
-//!   J <name-length> <port> <token-length>\n<name><token>   Ask to join
+//!   J <name-length> <port> <token-length> [G]\n<name><token>   Ask to join
 //!                             (staged node join), declaring the node's own name
 //!                             (node identity decoupled from address), the port it serves on (the
 //!                             reachable address is composed from this
@@ -142,6 +142,25 @@
 //!                             `R\n` at once, and the connection carries
 //!                             heartbeats the same way. Under another
 //!                             token it is rejected (connection closed).
+//!                             A `G` after the token lengths marks a `J`
+//!                             the node sends again after an earlier
+//!                             attempt's connection ended without `R`: the
+//!                             node still holds what that attempt handed
+//!                             it. If `name` is not registered (the
+//!                             attempt was abandoned, or dropped with its
+//!                             connection), discovery answers `G\n` and
+//!                             closes without registering it, once any
+//!                             abandon of that name has finished
+//!                             cancelling its handoff; the node clears its
+//!                             cache and sends a plain `J`. The next
+//!                             handoff is put-if-absent, so the copies of
+//!                             the abandoned attempt would otherwise
+//!                             outlive the writes and deletes made since.
+//!                             For a name still `Waiting`/`Joining`, the
+//!                             `J` is the same attempt and is handled like
+//!                             one without the `G`. A discovery of an
+//!                             earlier version rejects the field (`Ed\n`),
+//!                             and the node then sends plain `J`s.
 //!
 //!   P <name-length> <port> <token-length> [G]\n<name><token>   Announce
 //!                             (discovery HA): an already-promoted node
@@ -497,7 +516,9 @@ const NODE_HEARTBEAT_INTERVAL_SECS: u64 = 5;
 /// A `Joined` node heard from again after this long without a heartbeat or
 /// an announce was out of contact: at least one heartbeat did not arrive.
 /// Below two intervals so that a single lost heartbeat (a gap of two
-/// intervals) counts, above one and a half so that one heartbeat that is
+/// intervals: the node gives up on an unanswered heartbeat one interval
+/// after sending it and redials at once) counts, above one and a half so
+/// that one heartbeat that is
 /// late by a few seconds does not. `note_contact` records such a gap in the
 /// node's `NodeInfo::contact_breaks`, which is what `announce_needs_rejoin`
 /// reads.
@@ -1066,6 +1087,17 @@ struct RegistryState {
     /// (`DEPARTED_RETENTION`) on every insert and capped
     /// (`MAX_DEPARTED`).
     departed: Mutex<Departed>,
+    /// Joiner names whose abandoned join is still telling its sources to
+    /// roll back (`abandon_current_join`'s `X` fan-out), with how many such
+    /// abandons are running. A source streams that join's copies to the
+    /// joiner until its `X` is acknowledged, so a retried `J` for one of
+    /// these names is answered `G` only once the fan-out has finished: a
+    /// joiner that cleared earlier could take a late copy from the
+    /// abandoned attempt into its empty cache, where the next handoff's
+    /// put-if-absent would not replace it. See `wait_for_abandon_to_finish`.
+    abandoning: Mutex<FxHashMap<String, usize>>,
+    /// Woken whenever an entry of `abandoning` goes away.
+    abandon_finished: Notify,
 }
 
 /// How long a departure stays answerable — comfortably past the longest
@@ -1177,6 +1209,8 @@ impl Default for RegistryState {
             list_cache: Mutex::new(None),
             roster_cache: Mutex::new(None),
             departed: Mutex::new(Departed::default()),
+            abandoning: Mutex::new(FxHashMap::default()),
+            abandon_finished: Notify::new(),
         }
     }
 }
@@ -1966,6 +2000,12 @@ enum DiscoveryCommand {
         name: String,
         port: u16,
         token: String,
+        /// The trailing `G`: the sender sent `J` before and holds the copies
+        /// that attempt handed it. If that attempt is gone (the name is not
+        /// registered), discovery answers `G\n` without registering it, so
+        /// the node clears them before the join that stages the new
+        /// handoff — see the module docs' `J`.
+        retry: bool,
     },
     /// Staged node join: a ready node reporting it has finished handing off its
     /// share of a join, identified by its own name (node identity decoupled from address) and the
@@ -2291,11 +2331,12 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             let port = parts.next().ok_or(ParseError::InvalidLength)?;
             let token_length = parts.next().ok_or(ParseError::InvalidLength)?;
 
-            // `P` alone takes one more field, the `G` of a node that can
-            // start over (`DiscoveryCommand::Announce::rejoin_capable`).
+            // `P` and `J` take one more field, the `G` of a node that can
+            // start over (`DiscoveryCommand::Announce::rejoin_capable`,
+            // `DiscoveryCommand::Join::retry`).
             let rejoin_capable = match parts.next() {
                 None => false,
-                Some(b"G") if command == b"P" => true,
+                Some(b"G") if command == b"P" || command == b"J" => true,
                 Some(_) => return Err(ParseError::InvalidLength),
             };
             if parts.next().is_some() {
@@ -2316,7 +2357,12 @@ fn parse(input: &mut BytesMut) -> Result<DiscoveryCommand, ParseError> {
             // variant while `command` is still alive, so `input` can be
             // reborrowed mutably below.
             let make: fn(String, u16, String, bool) -> DiscoveryCommand = match command {
-                b"J" => |name, port, token, _| DiscoveryCommand::Join { name, port, token },
+                b"J" => |name, port, token, retry| DiscoveryCommand::Join {
+                    name,
+                    port,
+                    token,
+                    retry,
+                },
                 b"Y" => {
                     |name, port, token, _| DiscoveryCommand::ProxyAnnounce { name, port, token }
                 }
@@ -4409,6 +4455,10 @@ async fn abandon_current_join(
         );
         return;
     };
+    // Before the entry goes, so a retried `J` that finds the name
+    // unregistered also finds this abandon running (see
+    // `RegistryState::abandoning`). Dropped once the `X` fan-out is done.
+    let _abandoning = AbandonInFlight::begin(registry, &pending.joining_name);
     // Issue #1100: the `M` sends to this join's late members stop here,
     // before the `X`s below, rather than at some later attempt.
     pending.late.sends.abort_all();
@@ -4498,6 +4548,7 @@ async fn abandon_current_join(
             Err(error) => eprintln!("WARN a task sending X panicked: {error}"),
         }
     }
+    drop(_abandoning);
 
     try_begin_next_join(
         registry,
@@ -4508,6 +4559,83 @@ async fn abandon_current_join(
         joins_ready_at,
     )
     .await;
+}
+
+/// One running `abandon_current_join` for a joiner name, counted in
+/// `RegistryState::abandoning` for as long as it lives.
+struct AbandonInFlight<'a> {
+    registry: &'a Registry,
+    name: String,
+}
+
+impl<'a> AbandonInFlight<'a> {
+    fn begin(registry: &'a Registry, name: &str) -> Self {
+        *lock_abandoning(registry)
+            .entry(name.to_string())
+            .or_insert(0) += 1;
+        AbandonInFlight {
+            registry,
+            name: name.to_string(),
+        }
+    }
+}
+
+impl Drop for AbandonInFlight<'_> {
+    fn drop(&mut self) {
+        let mut abandoning = lock_abandoning(self.registry);
+        if let Some(count) = abandoning.get_mut(&self.name) {
+            *count -= 1;
+            if *count == 0 {
+                abandoning.remove(&self.name);
+            }
+        }
+        drop(abandoning);
+        self.registry.abandon_finished.notify_waiters();
+    }
+}
+
+fn lock_abandoning(registry: &Registry) -> std::sync::MutexGuard<'_, FxHashMap<String, usize>> {
+    registry
+        .abandoning
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Upper bound on how long a retried `J` waits for an abandon of its name
+/// to finish (`wait_for_abandon_to_finish`). The `X` fan-out is bounded per
+/// member already; this only keeps a wedged one from holding the joiner
+/// forever, after which it is answered `G` anyway.
+const ABANDON_WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+/// Waits until no `abandon_current_join` for `name` is running, at most
+/// `ABANDON_WAIT_LIMIT`. Returns `false` on shutdown.
+async fn wait_for_abandon_to_finish(
+    registry: &Registry,
+    name: &str,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> bool {
+    let deadline = Instant::now() + ABANDON_WAIT_LIMIT;
+    loop {
+        let finished = registry.abandon_finished.notified();
+        tokio::pin!(finished);
+        // Registered before the check, so a drop in between still wakes it.
+        finished.as_mut().enable();
+        if !lock_abandoning(registry).contains_key(name) {
+            return true;
+        }
+        tokio::select! {
+            _ = &mut finished => {}
+            _ = shutdown_rx.changed() => return false,
+            _ = tokio::time::sleep_until(deadline) => {
+                eprintln!(
+                    "WARN the abandon of {name}'s earlier join is still cancelling its \
+                     handoff after {}s; telling the node to start over anyway",
+                    ABANDON_WAIT_LIMIT.as_secs()
+                );
+                return true;
+            }
+        }
+    }
 }
 
 /// Holds a Waiting/Joining node's connection open after it sends `J`,
@@ -6533,7 +6661,40 @@ async fn handle_connection(
                 write_response(&mut stream, &response).await?;
                 continue;
             }
-            Ok(DiscoveryCommand::Join { name, port, token }) => {
+            Ok(DiscoveryCommand::Join {
+                name,
+                port,
+                token,
+                retry,
+            }) => {
+                // A node sending `J` again holds what its earlier attempt
+                // handed it. With no entry for the name, that attempt is
+                // gone — abandoned, or its connection's death dropped it —
+                // and the next handoff is put-if-absent: those copies would
+                // win over the owners' newer values, and a key deleted
+                // since is not in the handoff at all. So it is told to
+                // clear them first (`G\n`) and send a plain `J`, after any
+                // abandon of its name has stopped the old sources streaming
+                // to it. A `Waiting`/`Joining` entry is that same attempt
+                // still running (the node lost its connection, discovery
+                // has not noticed yet): the `J` below adopts it, and the
+                // node keeps what it was handed.
+                if retry && !lock(&registry).contains_key(&name) {
+                    let mut abandon_shutdown_rx = shutdown_rx.clone();
+                    if !wait_for_abandon_to_finish(&registry, &name, &mut abandon_shutdown_rx).await
+                    {
+                        return Err(io::Error::other("shutting down"));
+                    }
+                    if !lock(&registry).contains_key(&name) {
+                        log_registration(format_args!(
+                            "INFO {name} asked to join again after an earlier attempt ended: it \
+                             must clear what that attempt handed it first"
+                        ));
+                        write_response(&mut stream, b"G\n").await?;
+                        return Ok(());
+                    }
+                }
+
                 let addr = registered_address(peer_ip, port);
 
                 // The node was promoted but never read its `R` (the write
@@ -7360,6 +7521,7 @@ mod tests {
                 name: "some-name".to_string(),
                 port: 8356,
                 token: "tok-a".to_string(),
+                retry: false,
             }
         );
         assert_eq!(&input[..], b"L\n");
@@ -9049,7 +9211,7 @@ mod tests {
         );
         assert_eq!(&input[..], b"L\n");
         for frame in [
-            &b"J 9 8356 12 G\nsome-nametk-some-name"[..],
+            &b"J 9 8356 12 X\nsome-nametk-some-name"[..],
             b"Y 9 8356 12 G\nsome-nametk-some-name",
             b"P 9 8356 12 X\nsome-nametk-some-name",
             b"P 9 8356 12 G G\nsome-nametk-some-name",
@@ -9139,6 +9301,123 @@ mod tests {
             lock(&registry).get("node-a").map(|info| info.token.clone()),
             Some("tk-node-a".to_string())
         );
+    }
+
+    #[test]
+    fn parse_reads_the_g_of_a_retried_join() {
+        let mut input = BytesMut::from(&b"J 9 8356 12 G\nsome-nametk-some-nameL\n"[..]);
+        assert_eq!(
+            parse(&mut input).unwrap(),
+            DiscoveryCommand::Join {
+                name: "some-name".to_string(),
+                port: 8356,
+                token: "tk-some-name".to_string(),
+                retry: true,
+            }
+        );
+        assert_eq!(&input[..], b"L\n");
+    }
+
+    /// Serves one connection on a fresh registry prepared by `prepare`,
+    /// sends `frame`, and returns the connection and the registry.
+    async fn serve_frame(
+        frame: &[u8],
+        prepare: impl FnOnce(&Registry),
+    ) -> (TcpStream, Registry, watch::Sender<bool>) {
+        let registry: Registry = Arc::new(RegistryState::default());
+        prepare(&registry);
+        let current_join: CurrentJoin = Arc::new(Mutex::new(None));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut client, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            current_join,
+            ConnectionConfig {
+                idle_timeout: Duration::from_secs(5),
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        client.write_all(frame).await.unwrap();
+        (client, registry, shutdown_tx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retried_join_whose_earlier_attempt_is_gone_is_told_to_start_over() {
+        // The name is not registered: the attempt that handed the node its
+        // copies was abandoned or dropped. It is told to clear them, and is
+        // not registered until it sends a plain `J`.
+        let (mut client, registry, _shutdown_tx) =
+            serve_frame(b"J 6 2222 9 G\nnode-atk-node-a", |_| {}).await;
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .expect("answered at once")
+            .unwrap();
+        assert_eq!(&reply, b"G\n");
+        assert!(!lock(&registry).contains_key("node-a"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retried_join_of_an_attempt_still_registered_carries_that_attempt_on() {
+        // Discovery has not seen the earlier connection end: the `J` is the
+        // same attempt, adopted like a duplicate, and the node keeps what it
+        // was handed. With no other member, that attempt is promoted at
+        // once.
+        let (mut client, registry, _shutdown_tx) =
+            serve_frame(b"J 6 2222 9 G\nnode-atk-node-a", |registry| {
+                insert_survivor(registry, "node-a", NodeState::Waiting, None);
+            })
+            .await;
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .expect("answered at once")
+            .unwrap();
+        assert_eq!(&reply, b"R\n");
+        assert_eq!(
+            lock(&registry).get("node-a").map(|info| info.state),
+            Some(NodeState::Joined)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retried_join_is_told_to_start_over_only_once_the_abandon_has_cancelled_its_sources()
+    {
+        // The abandoned attempt's sources stream to the joiner until their
+        // `X` is acknowledged; a joiner that cleared before that could take
+        // a late copy into its empty cache.
+        let (mut client, registry, _shutdown_tx) =
+            serve_frame(b"J 6 2222 9 G\nnode-atk-node-a", |registry| {
+                lock_abandoning(registry).insert("node-a".to_string(), 1);
+            })
+            .await;
+        let mut reply = [0u8; 2];
+        assert!(
+            timeout(Duration::from_millis(300), client.read_exact(&mut reply))
+                .await
+                .is_err(),
+            "answered {reply:?} while the abandon was running"
+        );
+        // What dropping the running abandon's `AbandonInFlight` does.
+        drop(AbandonInFlight {
+            registry: &registry,
+            name: "node-a".to_string(),
+        });
+        assert!(lock_abandoning(&registry).is_empty());
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .expect("answered once the abandon finished")
+            .unwrap();
+        assert_eq!(&reply, b"G\n");
     }
 
     #[tokio::test(flavor = "current_thread")]
