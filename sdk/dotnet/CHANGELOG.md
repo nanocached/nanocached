@@ -14,6 +14,7 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 
 - Every public async method of `NanocachedClient` and `NanocachedNamespace`, and `ConnectAsync`, takes an optional trailing `CancellationToken cancellationToken = default`. Cancelling abandons the wait (`OperationCanceledException`) while the operation may still complete on the cluster; a token that is already cancelled sends nothing; a client that finishes connecting after a cancelled `ConnectAsync` is closed. Added now because a trailing parameter is a binary break once the API is frozen.
 - `NanocachedClient` implements `IAsyncDisposable`; `DisposeAsync()` runs `Close()` on the thread pool.
+- `ClientStats.BackgroundWriteBugs` counts an unexpected exception (a bug in the SDK, never an expected failure) that escaped a background replica write or a read-repair task, as the Java SDK's `backgroundWriteBugs` does. It must never increase. (#2194)
 
 ### Changed
 
@@ -23,6 +24,7 @@ whether or not a component changed. There is no `sdk/dotnet/v0.4.3` tag:
 ### Fixed
 
 - With `ReadHedgeAfter` and three or more owners, a hedge leg that failed at once (its node gone) while the primary was still silent did not start the next owner: that waited for the next hedge interval, so with replication 3, a 300 ms interval and the second owner's node down, a hit from the third owner took 623 ms. A failed leg now starts the next owner right away, as documented. A replica's provisional miss is unchanged: the next owner starts at once only when no other leg is in flight. (#2119)
+- An unexpected exception escaping a read-repair task was counted in `ReadRepairFailures`, which is documented as failed write-backs, and one escaping a background (`FireAndForgetReplicas`) replica write in `ReplicaWriteFailures`. Both are now counted in the new `BackgroundWriteBugs` instead. (#2194)
 - A `V`, `I`, `M`, `O` or `Y` response header with no space after the marker was accepted: on an untagged connection `V5\nhello` was read as a 5-byte hit. It is now a protocol error that poisons the connection, as in the Go, Java and Rust SDKs. (#2095)
 - A node's rejection on an established connection was recognised only when the `E` line was exactly `En`. Any `E` line whose rest starts with `n` (such as the `EnT` a node answers a failed tagged `A`) is now a rejection, the same test as the Python, Go and Rust SDKs. No request the SDK sends after the handshake gets such a reply today, so this aligns the parsing rather than changing a visible outcome. (#2181)
 - When a node answered `En` (it does not know the command, then closes the connection), every request pipelined behind the rejected one failed as possibly sent, so an `IncrAsync`/`DecrAsync`, a CAS (`ReplaceAsync` with a token, `DeleteIfMatchesAsync`) or a ttl=0 touch queued behind it was never replayed although the node never ran it. Those requests now fail as not sent and are replayed after the redial, as in the other SDKs. (#2080)
