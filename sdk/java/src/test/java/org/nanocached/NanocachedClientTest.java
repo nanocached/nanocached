@@ -1706,6 +1706,23 @@ class NanocachedClientTest {
     }
 
     @Test
+    void anyELineStartingWithNIsAServerRejection() throws Exception {
+        // Issue #2259: an `E` line whose rest starts with `n` is the node's
+        // rejection, not only the exact `En` (`EnT` too), as in the other
+        // five SDKs.
+        for (String reply : List.of("En\n", "EnT\n", "Enx\n")) {
+            try (ScriptedNode node = new ScriptedNode(header -> header.startsWith("G ") ? reply : null)) {
+                try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                    NanocachedException.ConnectionLost error =
+                            assertThrows(NanocachedException.ConnectionLost.class, () -> client.get("k"));
+                    assertTrue(error instanceof NanocachedException.ServerRejected, reply + ": " + error);
+                }
+                assertEquals(1, node.frames.get(), reply + ": the refused get must be sent once");
+            }
+        }
+    }
+
+    @Test
     void anEnToAGetInAClusterIsFinalAndNotResentAfterARefresh() throws Exception {
         // Issue #2182: in a cluster the refresh-and-retry must not resend
         // the refused request either.
