@@ -816,7 +816,7 @@ never replayed.
   multi-address config, if that is your shape
 - `client.nodeUrls` — addresses currently connected to (introspection); read-only
 - `client.isClosed()` — `true` once `close()` has run
-- Option mistakes caught by `connect()` before anything is dialed (an empty `addresses`, `readHedgeAfterMs` not in (0, 24 h], `ca` without `tls`, a negative `reconnectCooldownMs`, ...) throw a builtin `RangeError`, like an invalid `ttlSeconds`; they are not a `NanocachedError`
+- Option mistakes caught by `connect()` before anything is dialed (an empty `addresses`, `readHedgeAfterMs` not in (0, 365 days], `ca` without `tls`, a negative `reconnectCooldownMs`, ...) throw a builtin `RangeError`, like an invalid `ttlSeconds`; they are not a `NanocachedError`
 - `client.stats()` — a snapshot `ClientStats` of counters for failures and
   events this client swallows or retries by design instead of raising
   them to a caller: `replicaWriteFailures`, `readRepairFailures`,

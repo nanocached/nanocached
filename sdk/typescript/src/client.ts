@@ -372,8 +372,9 @@ export interface NanocachedClientOptions {
    * an owner that has *failed*, so one slow-but-alive owner bounds every
    * read that touches it at its full round trip. Only applies when the
    * key has at least 2 owners (`replication >= 2`); with a single copy
-   * there is nobody to hedge to. Must be a positive number when set — a
-   * non-positive value is rejected at `connect()`, and so is setting it
+   * there is nobody to hedge to. Must be a positive number of at most 365
+   * days when set — any other value is rejected at `connect()`, and so is
+   * setting it
    * together with `viaProxy` (issue #488): a proxy connection is
    * single-connection mode, so there is never a second owner to hedge to
    * either. */
@@ -416,10 +417,16 @@ export function resolveReconnectCooldownMs(options: NanocachedClientOptions): nu
 
 const DEFAULT_COMPRESSION_THRESHOLD = 256;
 
-/** Longest `readHedgeAfterMs` accepted: 24 hours, as in the Rust SDK. Anything
- * above 2^31-1 would also overflow `setTimeout`, which then fires after about
- * a millisecond and turns hedging into an immediate second request. */
-const MAX_READ_HEDGE_AFTER_MS = 24 * 60 * 60 * 1000;
+/** Longest `readHedgeAfterMs` accepted: 365 days, as in the Java and .NET
+ * SDKs. */
+const MAX_READ_HEDGE_AFTER_MS = 365 * 24 * 60 * 60 * 1000;
+
+/** Longest delay `setTimeout` takes: above 2^31-1 ms it overflows and fires
+ * after about a millisecond, which would turn hedging into an immediate
+ * second request. The hedge timer is capped at this (about 24.8 days); a
+ * read's legs time out long before either delay elapses, so the cap never
+ * changes when a hedge starts. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 // TTL a read-repair write uses (read repair), in whole seconds —
 // the protocol's TTL unit throughout (see encodeSet in protocol.ts). The
@@ -3749,7 +3756,7 @@ export class NanocachedClient {
       if (nextIndex < names.length || uncounted) {
         racers.push(
           new Promise<"timeout">((resolve) => {
-            timer = setTimeout(() => resolve("timeout"), hedgeAfterMs);
+            timer = setTimeout(() => resolve("timeout"), Math.min(hedgeAfterMs, MAX_TIMER_DELAY_MS));
           }),
         );
       }
