@@ -4434,7 +4434,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         {
             return await operation().ConfigureAwait(false);
         }
-        catch (Exception error) when (error is WrongNodeException or ConnectionLostException)
+        // An `En` is final (issue #2230): the node would refuse the same
+        // request again after the refresh.
+        catch (Exception error) when (error is WrongNodeException
+            or ConnectionLostException and not ServerRejectedException)
         {
             if (_ring is null) throw;
             await MaybeRefreshAsync(force: true).ConfigureAwait(false);
@@ -4482,7 +4485,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         // reading made a cluster SetAsync take twice the request timeout)
         // and would re-send a write the peer may still apply. The timeout
         // is surfaced as-is instead.
-        catch (ConnectionLostException error) when (!error.TimedOut)
+        //
+        // An `En` is the node refusing this request itself (a command it
+        // does not know, one too large or malformed; issue #2230, as in
+        // Go and Rust): the same frame on a fresh connection is refused
+        // the same way, so it is surfaced as it is. The requests pipelined
+        // behind it fail as not sent (a plain ConnectionLostException)
+        // and keep this retry.
+        catch (ConnectionLostException error) when (!error.TimedOut && error is not ServerRejectedException)
         {
             return await op(await SlotConnectionAsync(slot).ConfigureAwait(false)).ConfigureAwait(false);
         }
