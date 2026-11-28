@@ -763,7 +763,7 @@ left; this is how to read it.
 
 | `Error` | Retry the call? |
 |---|---|
-| `ConnectionLost` | `get`/`set`/`delete`/`clear`/`touch` and the batched forms: yes, they are idempotent. `incr`/`decr`, `put_if_absent`, `replace_if_present`, `replace`, `delete_if_matches`: **the outcome is unknown** (the request may have been applied before the reply was lost), so read the key first, or accept a possible double apply. A request that timed out is `ConnectionLost` too; the node was reachable and did not answer in time. |
+| `ConnectionLost` | `get`/`set`/`delete`/`clear`/`touch` and the batched forms: yes, they are idempotent. `incr`/`decr`, `put_if_absent`, `replace_if_present`, `replace`, `delete_if_matches`: **the outcome is unknown** (the request may have been applied before the reply was lost), so read the key first, or accept a possible double apply. A request that timed out is `ConnectionLost` too; the node was reachable and did not answer in time. So is a reply the SDK could not parse: the connection is closed and the reply counts as lost. |
 | `Retryable` | Yes, later. The connection is fine and stays open; the SDK has already retried this request a few times. |
 | `DiscoveryBusy` | Yes, shortly, or with another discovery address. |
 | `WrongNode` | The SDK refreshed the node list and retried once already; it escapes when that failed too, or in single-node mode. A retry helps only once membership has settled. |
