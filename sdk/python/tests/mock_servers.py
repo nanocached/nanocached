@@ -190,6 +190,7 @@ class MockNode:
         self._multi_set_reply_count_override: int | None = None
         self._wrong_tag_replies = 0
         self._swallowed_gets = 0
+        self._dropped_gets = 0
         self._malformed_value_replies = 0
         self._plus_prefixed_length_replies = 0
         self._raw_get_reply: bytes | None = None
@@ -256,6 +257,12 @@ class MockNode:
         off-by-one stream desync where every later response answers the
         previous request."""
         self._swallowed_gets += 1
+
+    def drop_next_get(self) -> None:
+        """Close the connection instead of answering the next G — a
+        connection lost in flight under a live node, whose next connection
+        answers normally."""
+        self._dropped_gets += 1
 
     def answer_malformed_value_once(self) -> None:
         self._malformed_value_replies += 1
@@ -596,6 +603,10 @@ class MockNode:
                     self.get_count += 1
                     if self._silent:
                         continue
+                    if self._dropped_gets > 0:
+                        self._dropped_gets -= 1
+                        writer.close()
+                        return
                     if self._retryable_replies > 0:
                         self._retryable_replies -= 1
                         writer.write(b"R" + tag_suffix + b"\n")

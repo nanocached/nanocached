@@ -46,7 +46,14 @@ from ._compression import (
     compress_value,
     decompress_value,
 )
-from ._connection import CAS_ABSENT, CAS_PRESENT, WRONG_NODE, Connection, _ServerRejectedError
+from ._connection import (
+    CAS_ABSENT,
+    CAS_PRESENT,
+    WRONG_NODE,
+    Connection,
+    _RequestTimedOutError,
+    _ServerRejectedError,
+)
 from ._digest import content_digest
 from ._errors import (
     AlreadyClosedError,
@@ -634,17 +641,39 @@ def _check_touch_ttl(ttl_seconds: int | None) -> None:
         _check_ttl_seconds(ttl_seconds)
 
 
+def _caused_by(error: BaseException, kind: type[BaseException]) -> bool:
+    """Whether ``error`` is, or was caused by, a ``kind``: a sent request
+    that fails because the connection was poisoned arrives wrapped, with
+    the original as ``__cause__``."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        if isinstance(current, kind):
+            return True
+        seen.add(id(current))
+        current = current.__cause__
+    return False
+
+
 def _rejected_by_server(error: BaseException) -> bool:
     """Whether ``error`` is, or was caused by, the node's ``En`` (issue
-    #825): a sent request that fails because the connection was poisoned
-    arrives wrapped, with the original as ``__cause__``."""
-    seen: set[int] = set()
-    while error is not None and id(error) not in seen:
-        if isinstance(error, _ServerRejectedError):
-            return True
-        seen.add(id(error))
-        error = error.__cause__  # type: ignore[assignment]
-    return False
+    #825)."""
+    return _caused_by(error, _ServerRejectedError)
+
+
+def _resend_after_redial(error: BaseException) -> bool:
+    """Whether a read that failed with ``error`` is resent once on a new
+    connection to the same owner (issue #2185, as Go's, Rust's, Java's and
+    .NET's redial-and-resend wrappers do): a lost connection (a peer FIN
+    or reset, a desynced stream, a pipelined neighbour's failure) is, but
+    not a node's ``En`` (the same frame is refused the same way) nor a
+    request timeout (the peer accepted the frame and did not answer; a
+    resend would most likely wait out another full timeout)."""
+    return (
+        isinstance(error, (ConnectionError, OSError))
+        and not _rejected_by_server(error)
+        and not _caused_by(error, _RequestTimedOutError)
+    )
 
 
 # Compare-and-set (issue #141): a token must be exactly the 32-character
@@ -1369,10 +1398,13 @@ class NanocachedClient:
         an error — except a genuine programming error (anything outside
         _SWALLOWABLE_ERRORS), which still propagates."""
         names = self._owner_names(namespace, key)
+
+        def probe(connection: Connection) -> Awaitable[bytes | None]:
+            return connection.get(key, namespace)
+
         for name in names[1:]:
             try:
-                connection = await self._member_connection(name)
-                value = await connection.get(key, namespace)
+                value = await self._read_from_owner(name, probe)
             except _SWALLOWABLE_ERRORS:
                 continue
             if value is None:
@@ -1400,11 +1432,9 @@ class NanocachedClient:
                     if self._closed:
                         return
                     try:
-                        primary_connection = await self._member_connection(primary)
-                        if await primary_connection.get(key, namespace) is not None:
+                        if await self._read_from_owner(primary, probe) is not None:
                             return
-                        replica_connection = await self._member_connection(replica)
-                        if await replica_connection.get(key, namespace) != value:
+                        if await self._read_from_owner(replica, probe) != value:
                             return
                     except _SWALLOWABLE_ERRORS:
                         return
@@ -1974,6 +2004,8 @@ class NanocachedClient:
         connection_getter: Callable[[], Awaitable[Connection]],
         namespace: bytes,
         keys: list[bytes],
+        *,
+        resend: bool = False,
     ) -> tuple[list[bytes | object | None], BaseException | None, int]:
         """Issues one or more ``m`` sub-frames for ``keys`` — already
         grouped to one owner (or the single/proxy target) by the caller
@@ -1998,14 +2030,27 @@ class NanocachedClient:
         caller that wants to tell "some earlier chunk already succeeded,
         so entries[:failed_at] is real partial data worth keeping" apart
         from "the first chunk itself failed, so there's nothing to
-        attach" checks ``failed_at > 0``."""
+        attach" checks ``failed_at > 0``.
+
+        With ``resend`` (a cluster owner, issue #2185) a chunk that fails
+        with a lost connection is resent once on a new connection to the
+        same owner first, as _read_from_owner does for one key and Go's
+        multiGetChunked does per chunk."""
         entries: list[bytes | object | None] = [None] * len(keys)
         bounds = _batch_chunk_bounds(namespace, [len(key) for key in keys], None)
         for start, end in bounds:
             chunk = keys[start:end]
+
+            def multi_get(
+                connection: Connection, chunk: list[bytes] = chunk
+            ) -> Awaitable[Sequence[bytes | object | None]]:
+                return connection.multi_get(chunk, namespace)
+
             try:
-                connection = await connection_getter()
-                chunk_entries = await connection.multi_get(chunk, namespace)
+                if resend:
+                    chunk_entries = await self._reconnecting(connection_getter, multi_get)
+                else:
+                    chunk_entries = await multi_get(await connection_getter())
             except _SWALLOWABLE_ERRORS as error:
                 return entries, error, start
             entries[start:end] = chunk_entries
@@ -2032,7 +2077,8 @@ class NanocachedClient:
         owner group failed at the connection level — a dead or
         unreachable node, a certificate the client cannot verify, a
         possibly idle-closed connection; indistinguishable, the stance
-        _read() takes — is sent to its *next* owner in rank order, the
+        _read() takes — is sent to its *next* owner in rank order (once
+        _multi_get_chunked's one resend to the same owner has failed too), the
         same walk _read() does for one key, until an owner answers or
         the key has run out of owners. On a chunked group only the keys
         from the failing chunk onward move on (issue #411 / #485; the
@@ -2054,7 +2100,7 @@ class NanocachedClient:
         ) -> tuple[list[int], list[bytes | object | None], BaseException | None, int]:
             group_keys = [key_bytes_list[idx] for idx in group_indices]
             entries, error, failed_at = await self._multi_get_chunked(
-                lambda: self._member_connection(owner), namespace, group_keys
+                lambda: self._member_connection(owner), namespace, group_keys, resend=True
             )
             return group_indices, entries, error, failed_at
 
@@ -3496,19 +3542,13 @@ class NanocachedClient:
             # every op hedged here also returns for one.
             return cast(_T, await self._read_hedged(key, op, names))
 
-        # Owners in rank order; fall through only on connection-level
-        # failure — a replica hedges against a dead holder, not a miss.
+        # Owners in rank order; fall through only on failure — a replica
+        # hedges against a dead holder, not a miss. Each owner gets one
+        # redial-and-resend first (_read_from_owner).
         last_error: Exception | None = None
         for name in names:
             try:
-                connection = await self._member_connection(name)
-            except (ConnectionError, OSError, NanocachedError) as error:
-                if isinstance(error, WrongNodeError):
-                    raise
-                last_error = error
-                continue
-            try:
-                return await op(connection)
+                return await self._read_from_owner(name, op)
             except WrongNodeError:
                 raise
             except (NanocachedError, ConnectionError, OSError) as error:
@@ -3521,6 +3561,34 @@ class NanocachedClient:
             if last_error is not None
             else ConnectFailedError("nanocached: no owner is reachable for this key")
         )
+
+    async def _read_from_owner(self, name: str, op: Callable[[Connection], Awaitable[_T]]) -> _T:
+        """Runs the read ``op`` on owner ``name``'s connection, resent once
+        on a new connection to the same owner when it fails with a lost
+        connection (see _resend_after_redial), as Go's applyReconnecting
+        and the Rust, Java and .NET wrappers do (issue #2185): a
+        connection the node closed while idle, or one reset under a live
+        node, is only discovered by the read on it, and the owner should
+        still answer before the read moves on to the next one. A failure
+        to get a connection at all (a dead owner, its redial cooldown) is
+        raised at once, not dialed twice. Only for reads: a resent read
+        has no effect beyond its answer."""
+        return await self._reconnecting(lambda: self._member_connection(name), op)
+
+    async def _reconnecting(
+        self,
+        connection_getter: Callable[[], Awaitable[Connection]],
+        op: Callable[[Connection], Awaitable[_T]],
+    ) -> _T:
+        """_read_from_owner's body, for a caller that already holds the
+        connection getter (a get_many chunk)."""
+        connection = await connection_getter()
+        try:
+            return await op(connection)
+        except (ConnectionError, OSError) as error:
+            if not _resend_after_redial(error):
+                raise
+        return await op(await connection_getter())
 
     async def _read_hedged(
         self, key: bytes, op: Callable[[Connection], Awaitable[object]], names: list[str]
@@ -3541,7 +3609,8 @@ class NanocachedClient:
         - a failure (connection-level or a NanocachedError other than
           WrongNodeError) just hedges onward immediately: the next owner,
           if any, starts right away, even while other legs are still in
-          flight;
+          flight. A leg whose connection is lost is first resent once to
+          its own owner (_read_from_owner), so that is one failure;
         - WrongNodeError propagates as in _read().
 
         An owner with _HEDGE_SUSPECT_LATE_LEGS late legs outstanding (see
@@ -3575,8 +3644,7 @@ class NanocachedClient:
                 raise AlreadyClosedError()
 
             async def leg() -> object:
-                connection = await self._member_connection(names[index])
-                return await op(connection)
+                return await self._read_from_owner(names[index], op)
 
             task = asyncio.ensure_future(leg())
             task.add_done_callback(_retrieve_outcome)

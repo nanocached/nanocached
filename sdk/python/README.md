@@ -106,7 +106,9 @@ The cluster's replication factor R rides along with the node list, so the
 SDK needs no configuration: `set`/`delete` fan out to all R owners of a
 key (the primary's result decides; a dead replica never fails a write),
 and `get` asks the primary, falling over to the next owner only when the
-holder is unreachable. `client.replication` exposes the factor in use.
+holder is unreachable (a read whose connection is lost in flight is first
+resent once to the same owner on a new connection). `client.replication`
+exposes the factor in use.
 A `delete` goes to the primary first and to the other owners only once the
 primary has answered, so a reroute after a failed or wrong-node primary still
 finds the key and returns `True`. If the primary is still unreachable after
@@ -345,6 +347,8 @@ and a batched read survives an unreachable owner the way a single `get`
 does: a key whose owner cannot be reached at the connection level (a
 dead node, a certificate this client cannot verify) is read from its
 next owner in rank order, so with replication the batch still resolves.
+A chunk whose connection is lost in flight is first resent once to the
+same owner on a new connection, as for a single `get`.
 If some keys are still routed to the wrong node after one bounded
 refresh-and-retry (the same policy `get`/`set` apply per key, not per
 call), `get_many`/`get_many_bytes` raise `PartialWrongNodeError` — a
@@ -572,8 +576,10 @@ healthy connection never goes much past 45 seconds without traffic and an
 idle timeout never severs a
 healthy client. A request that finds its connection already closed (a node
 restart, a network blip) redials it before sending. In cluster mode a
-request whose connection is lost is also retried once, after a node-list
-refresh (an idempotent request always; `incr`/`decr` and the compare-and-set
+read whose connection is lost in flight is resent once to the same owner on
+a new connection before it moves on to the next owner (a node's `En` and a
+request timeout are not resent), and a request whose connection is lost is
+also retried once, after a node-list refresh (an idempotent request always; `incr`/`decr` and the compare-and-set
 calls only when the SDK can prove nothing was sent — see "What never sent
 means" below). In single-node and `via_proxy` mode there is no node list to
 refresh from, so a request that loses its connection while it is in flight is
