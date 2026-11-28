@@ -6536,11 +6536,22 @@ public final class NanocachedClient implements AutoCloseable {
      * reusing the exact same per-address cooldown bookkeeping {@link #connectToOneProxy}'s initial
      * pick and every ordinary node redial already use, rather than a second reconnect machine built
      * for this mode.
+     *
+     * <p>While the proxy in use is in its cooldown, this fails at once with the stored error and
+     * neither asks discovery nor dials anything: a failover (roster fetch plus dials) happens at
+     * most once per cooldown period, as in the Python and Go SDKs.
      */
     private Connection reconnectProxy() {
         String previousAddress = singleAddress;
+        // Issue #2167: the cooldown error is not a fresh dial failure. Treating
+        // it as one fetched the roster from discovery on every request while
+        // the proxy tier was down (two fetches per get, with its resend).
+        CooldownEntry pinned = reconnectCooldowns.get(previousAddress);
+        if (pinned != null && System.nanoTime() < pinned.untilNanos) {
+            throw pinned.error;
+        }
         try {
-            return dialWithCooldown(singleAddress);
+            return dialWithCooldown(previousAddress);
         } catch (RuntimeException sameProxyFailed) {
             List<DiscoveredNode> proxies = fetchProxyRoster();
             if (proxies == null || proxies.isEmpty()) {
@@ -6561,6 +6572,12 @@ public final class NanocachedClient implements AutoCloseable {
             for (DiscoveredNode proxy : proxies) {
                 rosterAddresses.add(proxy.address());
             }
+            // The proxy in use keeps the cooldown its failed dial just armed,
+            // even if discovery no longer lists it: until a failover succeeds
+            // it is still the address the next request redials, and that
+            // cooldown is what holds the next failover off (issue #2167). A
+            // successful swap below removes it.
+            rosterAddresses.add(previousAddress);
             reconnectCooldowns.keySet().retainAll(rosterAddresses);
 
             List<DiscoveredNode> shuffled = new ArrayList<>(proxies);
