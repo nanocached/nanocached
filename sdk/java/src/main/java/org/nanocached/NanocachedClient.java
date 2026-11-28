@@ -4325,7 +4325,15 @@ public final class NanocachedClient implements AutoCloseable {
             for (int rank = 0; rank < names.size(); rank++) {
                 // An owner that already stored this position on the
                 // previous pass is not sent it again (see MultiSetTracker).
-                if (tracker.isAcknowledged(idx, names.get(rank))) continue;
+                if (tracker.isAcknowledged(idx, names.get(rank))) {
+                    // Issue #2173: if the refresh between the passes made
+                    // this owner the key's primary (the old primary left
+                    // the roster), the key is stored on its primary now
+                    // and is reported so; the earlier pass recorded the
+                    // acknowledgement as a replica's.
+                    if (rank == 0) tracker.primaryAcknowledged.add(idx);
+                    continue;
+                }
                 OwnerBatch batch = owners.computeIfAbsent(names.get(rank), name -> new OwnerBatch());
                 batch.indices.add(idx);
                 batch.isPrimary.add(rank == 0);

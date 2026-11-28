@@ -9749,6 +9749,53 @@ class NanocachedClientTest {
         }
     }
 
+    @Test
+    void batchedSetReportsAKeyStoredWhenItsAcknowledgingReplicaBecomesThePrimary() throws Exception {
+        // Issue #2173: R=2 over {a, b, c}, c unreachable. The first key's
+        // primary a answers `W` and its replica b stores it; a then leaves
+        // the roster, so after the refresh the key's owners are [b, c]: b,
+        // which already stored it, is not sent the key again, and the key
+        // used to go unreported although its primary holds it. The second
+        // key's primary is c on both passes, which is what makes setMany
+        // throw the partial failure at all.
+        List<String> names = List.of(NAMES.get(0), NAMES.get(1), "9c3e2a1b-3c1a-4d7e-9f20-8b6c5d4e3f21");
+        try (MockNode nodeA = new MockNode();
+                MockNode nodeB = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 2)) {
+            // The dead port last, after every listener is bound (see
+            // startClusterWithDeadNodes).
+            List<DiscoveredNode> listed = List.of(
+                    new DiscoveredNode(names.get(0), nodeA.address()),
+                    new DiscoveredNode(names.get(1), nodeB.address()),
+                    new DiscoveredNode(names.get(2), "127.0.0.1:" + MockServers.unusedPort()));
+            discovery.nodes = listed;
+            HashRing before = new HashRing(names);
+            String promotedKey = null;
+            String unreachableKey = null;
+            for (int i = 0; promotedKey == null || unreachableKey == null; i++) {
+                String candidate = "key-" + i;
+                List<String> owners = before.owners(candidate.getBytes(StandardCharsets.UTF_8), 2);
+                if (promotedKey == null && owners.equals(List.of(names.get(0), names.get(1)))) promotedKey = candidate;
+                if (unreachableKey == null && owners.get(0).equals(names.get(2))) unreachableKey = candidate;
+            }
+            try (NanocachedClient client = connect("127.0.0.1", discovery.port())) {
+                nodeA.answerWrongNodeOnce();
+                // The refresh the `W` triggers finds a gone.
+                discovery.nodes = listed.subList(1, 3);
+                Map<String, String> batch = new java.util.LinkedHashMap<>();
+                batch.put(promotedKey, "v");
+                batch.put(unreachableKey, "w");
+                NanocachedException.PartialConnectionLostSet failure =
+                        assertThrows(NanocachedException.PartialConnectionLostSet.class, () -> client.setMany(batch));
+                assertEquals(
+                        Set.of(promotedKey),
+                        failure.succeededKeys,
+                        "the key's acknowledging replica is its primary now");
+                assertTrue(nodeB.store.containsKey(promotedKey));
+            }
+        }
+    }
+
     // ── a closed client does not refresh ─────────────────────────────
 
     @Test
