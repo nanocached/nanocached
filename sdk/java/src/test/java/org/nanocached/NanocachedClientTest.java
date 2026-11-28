@@ -4185,7 +4185,7 @@ class NanocachedClientTest {
         // timeout: that gives this test a wide, deterministic window in
         // which to sample how many "nanocached-bootstrap-dial" threads
         // are alive at once, instead of racing a fast-failing dial.
-        int nodeCount = 20; // > the 16-thread cap (MAX_BOOTSTRAP_DIALER_THREADS)
+        int nodeCount = 70; // > the 64-thread cap (MAX_BOOTSTRAP_DIALER_THREADS)
         List<java.net.ServerSocket> silentServers = new ArrayList<>();
         List<DiscoveredNode> nodes = new ArrayList<>();
         try {
@@ -4236,9 +4236,13 @@ class NanocachedClientTest {
                     sampler.join();
                 }
 
-                assertTrue(maxObserved.get() > 0, "test never observed a dialer thread running");
+                // Issue #2204: the cap is 64, as in the other five SDKs; with 16
+                // a large roster was dialed in four times as many waves.
                 assertTrue(
-                        maxObserved.get() <= 16,
+                        maxObserved.get() > 16,
+                        "bootstrap must dial more than 16 nodes at once, observed " + maxObserved.get());
+                assertTrue(
+                        maxObserved.get() <= 64,
                         "bootstrap dialer pool must never exceed its cap, observed " + maxObserved.get());
             }
         } finally {

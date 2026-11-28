@@ -3909,6 +3909,34 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task AnExceptionEscapingAReadRepairIsABackgroundBugNotAReadRepairFailure()
+    {
+        // Issue #2194: ReadRepairFailures counts failed write-backs only. An
+        // unexpected exception escaping the repair task (here the primary's
+        // connection is swapped, right after the replica's hit, for one whose
+        // stream throws InvalidOperationException, so the repair's recheck of
+        // the primary throws it) is a bug, counted in BackgroundWriteBugs as
+        // the Java SDK does.
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        cluster.Nodes[owners[1]].Store[MockNode.KeyOf(Bytes("k"))] = Bytes("from-replica");
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadRepair = true,
+        });
+        cluster.Nodes[owners[1]].AfterNextGetHit(
+            () => ReplaceMemberConnection(client, owners[0], new Connection(new ThrowingStream())));
+
+        Assert.Equal(Bytes("from-replica"), await client.GetBytesAsync("k"));
+
+        await WaitForAsync(() => client.Stats().BackgroundWriteBugs > 0, "the escaped exception to be counted");
+        Assert.Equal(0, client.Stats().ReadRepairFailures);
+        Assert.False(cluster.Nodes[owners[0]].Store.ContainsKey(MockNode.KeyOf(Bytes("k"))));
+    }
+
+    [Fact]
     public async Task AnUnreachableAddressDuringRefreshIncrementsRefreshFailures()
     {
         using Cluster cluster = StartCluster(replication: 1);
@@ -4076,7 +4104,7 @@ public class NanocachedClientTests
     // TaskScheduler.UnobservedTaskException once the faulted Task is
     // finalized. This proves the fix actually reads `completed.Exception`
     // (nothing is ever raised as unobserved) and still counts the failure
-    // via Stats(), the one diagnostic channel this SDK has for it.
+    // via Stats(), in BackgroundWriteBugs (issue #2194).
     [Fact]
     public async Task AnEscapedExceptionOnAFireAndForgetReplicaLegIsObservedNotLeaked()
     {
@@ -4099,12 +4127,14 @@ public class NanocachedClientTests
             string replica = OwnersOf("k")[1];
             ReplaceMemberConnection(client, replica, new Connection(new ThrowingStream()));
 
-            Assert.Equal(0, client.Stats().ReplicaWriteFailures);
+            Assert.Equal(0, client.Stats().BackgroundWriteBugs);
             // The primary write still succeeds; the replica leg's bug is
             // backgrounded, so this must not throw.
             await client.SetAsync("k", "v");
             await WaitForAsync(
-                () => client.Stats().ReplicaWriteFailures > 0, "the escaped replica exception to be counted");
+                () => client.Stats().BackgroundWriteBugs > 0, "the escaped replica exception to be counted");
+            // Issue #2194: a bug, not a failed replica write.
+            Assert.Equal(0, client.Stats().ReplicaWriteFailures);
 
             // Force finalization: an exception left genuinely unobserved
             // (the pre-fix behavior) only gets reported by the runtime
@@ -6491,6 +6521,97 @@ public class NanocachedClientTests
         Assert.Equal(fetches, client.Stats().RefreshFailures);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ViaProxyFetchesTheRosterAtMostOncePerCooldownWhileEveryProxyIsDown(bool concurrent)
+    {
+        // Issue #2168: with every proxy down but still listed, each request
+        // used to fetch the roster (twice, with its own retry) and dial
+        // every proxy, ignoring the reconnect cooldown.
+        var proxyA = new MockNode();
+        var proxyB = new MockNode();
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.SetProxies(new[] { ("proxy-a", proxyA.Address), ("proxy-b", proxyB.Address) });
+        var options = ViaProxyAddress("127.0.0.1", discovery.Port);
+        // Long enough that the 50 gets cannot straddle two periods.
+        options.ReconnectCooldown = TimeSpan.FromSeconds(30);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(options);
+        await client.SetAsync("k", "v");
+
+        proxyA.Dispose();
+        proxyB.Dispose();
+        await Task.Delay(50); // let the FIN land
+        int before = discovery.ConnectionCount;
+
+        if (concurrent)
+        {
+            await Task.WhenAll(Enumerable.Range(0, 50).Select(_ =>
+                Assert.ThrowsAnyAsync<NanocachedException>(() => client.GetAsync("k"))));
+        }
+        else
+        {
+            for (int i = 0; i < 50; i++)
+            {
+                await Assert.ThrowsAnyAsync<NanocachedException>(() => client.GetAsync("k"));
+            }
+        }
+
+        Assert.Equal(1, discovery.ConnectionCount - before);
+    }
+
+    [Fact]
+    public async Task ViaProxyFailoverWithEveryDiscoveryAddressDownIsANotSentConnectionLoss()
+    {
+        // Issue #2172: the roster fetch's raw SocketException used to reach
+        // the caller.
+        var proxy = new MockNode();
+        var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.SetProxies(new[] { ("proxy-1", proxy.Address) });
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            ViaProxyAddress("127.0.0.1", discovery.Port));
+        await client.SetAsync("k", "v");
+
+        proxy.Dispose();
+        discovery.Dispose();
+        await Task.Delay(50); // let the FIN land
+
+        ConnectionLostException error =
+            await Assert.ThrowsAnyAsync<ConnectionLostException>(() => client.GetAsync("k"));
+        Assert.True(error.RequestNotSent);
+        Assert.NotNull(error.InnerException);
+    }
+
+    [Fact]
+    public async Task ViaProxyFailoverSkipsADiscoveryAddressThatAnswersAsANode()
+    {
+        // Issue #2172: a discovery address that answers as a node (reclaimed
+        // since the connect) is skipped like an unreachable one, as in the
+        // other SDKs, instead of failing the operation.
+        var first = new MockNode();
+        using var second = new MockNode();
+        using var node = new MockNode();
+        var firstDiscovery = new MockDiscovery(Array.Empty<(string, string)>());
+        using var lastDiscovery = new MockDiscovery(Array.Empty<(string, string)>());
+        firstDiscovery.SetProxies(new[] { ("proxy-1", first.Address) });
+        lastDiscovery.SetProxies(new[] { ("proxy-2", second.Address) });
+
+        var options = new NanocachedClient.Options { ViaProxy = true };
+        options.Addresses.Add(("127.0.0.1", firstDiscovery.Port));
+        options.Addresses.Add(("127.0.0.1", node.Port));
+        options.Addresses.Add(("127.0.0.1", lastDiscovery.Port));
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(options);
+        Assert.Equal(first.Address, GetSingleAddress(client));
+
+        first.Dispose();
+        firstDiscovery.Dispose();
+        await Task.Delay(50);
+
+        await client.SetAsync("k", "v");
+        Assert.Equal(second.Address, GetSingleAddress(client));
+        Assert.Equal(0, client.Stats().RefreshFailures);
+    }
+
     [Fact]
     public async Task ViaProxySkipsAWarmingUpDiscoverySeedAndFetchesQFromTheNext()
     {
@@ -6731,6 +6852,54 @@ public class NanocachedClientTests
         Assert.Equal(12, nodeA.Store.Count);
     }
 
+    [Fact]
+    public async Task BatchedSetReportsAKeyStoredWhenItsAcknowledgingReplicaBecomesThePrimary()
+    {
+        // Issue #2174. R=2 over {a, b, c}, c unreachable. The first key's
+        // primary a answers W and its replica b acknowledges; a then
+        // leaves the roster, so after the refresh the key's primary is b:
+        // b, already acknowledged, is not sent the key again, and used to
+        // go unrecorded as its primary. The second key's primary is c on
+        // both passes, which is what makes SetManyAsync report at all: the
+        // first key must be among the keys reported stored.
+        string[] names =
+        {
+            "aaaaaaaa-1b3d-4e6f-8a90-c1d2e3f4a5b6",
+            "bbbbbbbb-7e2c-4f58-9b31-6a8d0c9e2f47",
+            "cccccccc-3c1a-4d7e-9f20-8b6c5d4e3f21",
+        };
+        using var nodeA = new MockNode();
+        using var nodeB = new MockNode();
+        string deadAddress = $"127.0.0.1:{Wire.DeadNodePort()}";
+        var listed = new List<(string, string)>
+        {
+            (names[0], nodeA.Address), (names[1], nodeB.Address), (names[2], deadAddress),
+        };
+        using var discovery = new MockDiscovery(listed, replication: 2);
+
+        var before = new HashRing(names);
+        var after = new HashRing(names.Skip(1).ToList());
+        // a's `o` frame must hold only the first key (the mock's W answers
+        // the whole frame), so the second key's owners are [c, b].
+        string promotedKey = Enumerable.Range(0, 10_000).Select(i => $"key-{i}").First(key =>
+            before.Owners(Bytes(key), 2).SequenceEqual(new[] { names[0], names[1] })
+            && after.Owners(Bytes(key), 2)[0] == names[1]);
+        string unreachableKey = Enumerable.Range(0, 10_000).Select(i => $"key-{i}").First(key =>
+            before.Owners(Bytes(key), 2).SequenceEqual(new[] { names[2], names[1] }));
+
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", discovery.Port));
+        nodeA.AnswerWrongNodeOnce();
+        // The refresh the W triggers finds a gone.
+        discovery.SetNodes(listed.Skip(1).ToList());
+
+        var failure = await Assert.ThrowsAsync<PartialConnectionLostException<HashSet<string>>>(
+            () => client.SetManyAsync(new Dictionary<string, string> { [promotedKey] = "v", [unreachableKey] = "w" }));
+
+        Assert.Equal(new HashSet<string> { promotedKey }, failure.PartialValues);
+        Assert.True(nodeB.Store.ContainsKey(MockNode.KeyOf(Bytes(promotedKey))));
+    }
+
     // ── forced refreshes are single-flight ──────────────────────────
 
     [Fact]
@@ -6765,6 +6934,46 @@ public class NanocachedClientTests
             Assert.True(millis < 1_500, $"a caller waited {millis}ms (serialized refreshes?)");
         }
         Assert.Equal(3, cluster.Discovery.ConnectionCount);
+    }
+
+    [Fact]
+    public async Task ARequestDuringARefreshsSlowDialIsRoutedByTheOldRingAndItsMembers()
+    {
+        // Issue #2197: discovery drops node A (still alive) and adds node C,
+        // whose handshake takes 1.5 s. The refresh used to remove A from the
+        // members before dialing C while the old ring still routed A's keys
+        // to it, so a get in the dial window found no member for its owner.
+        // Members and ring are now published together after the dials.
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        string key = KeyOwnedBy(Names[0]);
+        await client.SetAsync(key, "v");
+        MockNode nodeA = cluster.Nodes[Names[0]];
+        int getsOnA = nodeA.GetCount;
+
+        using var nodeC = new MockNode();
+        nodeC.DelayAuth(1500);
+        cluster.Discovery.SetNodes(new List<(string, string)>
+        {
+            (Names[1], cluster.Nodes[Names[1]].Address),
+            ("8c2d7e41-5a6b-4c3d-9e8f-0a1b2c3d4e5f", nodeC.Address),
+        });
+
+        MethodInfo refreshMethod = typeof(NanocachedClient)
+            .GetMethod("MaybeRefreshAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var refresh = (Task)refreshMethod.Invoke(client, new object[] { true })!;
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (nodeC.ConnectionCount == 0)
+        {
+            Assert.True(DateTime.UtcNow < deadline, "the refresh never dialed the new node");
+            await Task.Delay(5);
+        }
+
+        Assert.Equal("v", await client.GetAsync(key));
+        Assert.False(refresh.IsCompleted, "the get must have run during the dial");
+        Assert.Equal(getsOnA + 1, nodeA.GetCount);
+        await refresh.WaitAsync(TimeSpan.FromSeconds(10));
     }
 
     /// <summary>A key whose primary under <see cref="Names"/> (R=1) is

@@ -164,8 +164,8 @@ single copy there is nobody to hedge to. Writes are unaffected — every
 copy must be written, so a slow owner bounds writes to it regardless
 (`FireAndForgetReplicas` moves only the replica legs off the caller's
 path). The losing leg of a hedge is left to finish and is drained by
-`Close()`. Zero (the default) disables hedging; a negative value is
-rejected by `Connect`.
+`Close()`. Zero (the default) disables hedging; a negative value, or one
+over 365 days, is rejected by `Connect`.
 
 An owner that stops answering is tried last. Once an owner has 32 hedge
 legs that were still unanswered when the hedge interval elapsed, reads
