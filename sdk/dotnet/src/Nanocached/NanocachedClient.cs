@@ -215,6 +215,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
 
         /// <summary>Every <c>R</c> (transient-failure) response received.</summary>
         public long TransientRetries { get; init; }
+
+        /// <summary>Programming bugs (an unexpected exception, never an
+        /// expected failure, which the counters above already count) that
+        /// escaped a background replica write or a read-repair task, as in
+        /// the Java SDK's <c>backgroundWriteBugs</c>. Must never increase:
+        /// it exists so a bug in this SDK's background handling cannot
+        /// vanish silently.</summary>
+        public long BackgroundWriteBugs { get; init; }
     }
 
     // The server rejects (and drops the connection for) any request frame
@@ -448,6 +456,9 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     private long _replicaWriteFailures;
     private long _readRepairFailures;
     private long _refreshFailures;
+    // An unexpected exception that escaped a background replica write or
+    // read-repair task (issue #2194) — see ClientStats.BackgroundWriteBugs.
+    private long _backgroundWriteBugs;
     // issue #125 — retryable-error status R: every R any connection this
     // client owns has received, whether transparently retried away or
     // ultimately surfaced as RetryableException — see NewConnection's
@@ -1033,14 +1044,19 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// cluster node dial uses, since a proxy identifies exactly like one.
     /// Throws the last dial error when none connect.</summary>
     private async Task<(Connection Connection, string Address)> ConnectToAnyProxyAsync(
-        IReadOnlyList<DiscoveredNode> proxies)
+        IReadOnlyList<DiscoveredNode> proxies, bool throughCooldown = false)
     {
         Exception? lastError = null;
         foreach (DiscoveredNode proxy in ShuffleProxies(proxies))
         {
             try
             {
-                Connection connection = await OpenNodeConnectionAsync(proxy.Address).ConfigureAwait(false);
+                // A failover dials through the per-address cooldown (issue
+                // #2168): a proxy that just failed is skipped with its
+                // stored error, and one that fails now is put in cooldown.
+                Connection connection = throughCooldown
+                    ? await DialWithCooldownAsync(proxy.Address).ConfigureAwait(false)
+                    : await OpenNodeConnectionAsync(proxy.Address).ConfigureAwait(false);
                 return (connection, proxy.Address);
             }
             catch (Exception error) when (error is NanocachedException or IOException
@@ -1090,6 +1106,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         ReadRepairFailures = Interlocked.Read(ref _readRepairFailures),
         RefreshFailures = Interlocked.Read(ref _refreshFailures),
         TransientRetries = Interlocked.Read(ref _transientRetries),
+        BackgroundWriteBugs = Interlocked.Read(ref _backgroundWriteBugs),
     };
 
     /// <summary>
@@ -1422,19 +1439,20 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                     completed =>
                     {
                         // D3: the try/catch inside `background` already
-                        // swallows every expected failure and counts it via
-                        // ReadRepairFailures — this observes whatever
-                        // *escaped* that (a real bug, or the deliberately
-                        // uncaught OperationCanceledException from Close()).
-                        // Reading .Exception both marks it observed (an
-                        // unfaulted background Task's exception would
+                        // swallows every expected failure and counts a
+                        // failed write-back via ReadRepairFailures — this
+                        // observes whatever *escaped* that (a real bug; the
+                        // deliberately uncaught OperationCanceledException
+                        // from Close() cancels the task instead of faulting
+                        // it). Reading .Exception marks it observed (a
+                        // faulted background Task's exception would
                         // otherwise vanish silently — no logger callback
-                        // exists in this SDK to hand it to instead) and
-                        // gets it counted in the one diagnostic channel
-                        // Stats() already exposes for this failure mode.
+                        // exists in this SDK to hand it to instead), and it
+                        // is counted as a bug, not as a failed write-back
+                        // (issue #2194, as in Java).
                         if (completed.Exception is not null)
                         {
-                            Interlocked.Increment(ref _readRepairFailures);
+                            Interlocked.Increment(ref _backgroundWriteBugs);
                         }
                         _backgroundReplicaPermits.Release();
                     },
@@ -2910,9 +2928,11 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 _ = backgroundLeg.ContinueWith(
                     completed =>
                     {
+                        // Expected failures are counted inside the leg; an
+                        // exception escaping it is a bug (issue #2194).
                         if (completed.Exception is not null)
                         {
-                            Interlocked.Increment(ref _replicaWriteFailures);
+                            Interlocked.Increment(ref _backgroundWriteBugs);
                         }
                         _backgroundReplicaPermits.Release();
                     },
@@ -3319,7 +3339,20 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             {
                 // An owner that already stored this position on the
                 // previous pass is not sent it again (see MultiSetTracker).
-                if (tracker.IsAcknowledged(idx, names[rank])) continue;
+                if (tracker.IsAcknowledged(idx, names[rank]))
+                {
+                    // If the refresh between the passes promoted this
+                    // owner to the key's primary (the old primary left the
+                    // roster), the key is stored on its primary now and is
+                    // reported so: the earlier pass recorded the
+                    // acknowledgement as a replica's (issue #2174, as in
+                    // the Python, Go and TypeScript SDKs).
+                    if (rank == 0)
+                    {
+                        lock (tracker) tracker.PrimaryAcknowledged.Add(idx);
+                    }
+                    continue;
+                }
                 if (!owners.TryGetValue(names[rank], out OwnerBatch? batch))
                 {
                     batch = new OwnerBatch();
@@ -3352,9 +3385,11 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 _ = backgroundLeg.ContinueWith(
                     completed =>
                     {
+                        // Expected failures are counted inside the leg; an
+                        // exception escaping it is a bug (issue #2194).
                         if (completed.Exception is not null)
                         {
-                            Interlocked.Increment(ref _replicaWriteFailures);
+                            Interlocked.Increment(ref _backgroundWriteBugs);
                         }
                         _backgroundReplicaPermits.Release();
                     },
@@ -3763,9 +3798,11 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 _ = background.ContinueWith(
                     completed =>
                     {
+                        // Expected failures are counted inside the leg; an
+                        // exception escaping it is a bug (issue #2194).
                         if (completed.Exception is not null)
                         {
-                            Interlocked.Increment(ref _replicaWriteFailures);
+                            Interlocked.Increment(ref _backgroundWriteBugs);
                         }
                         _backgroundReplicaPermits.Release();
                     },
@@ -4434,7 +4471,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         {
             return await operation().ConfigureAwait(false);
         }
-        catch (Exception error) when (error is WrongNodeException or ConnectionLostException)
+        // An `En` is final (issue #2230): the node would refuse the same
+        // request again after the refresh.
+        catch (Exception error) when (error is WrongNodeException
+            or ConnectionLostException and not ServerRejectedException)
         {
             if (_ring is null) throw;
             await MaybeRefreshAsync(force: true).ConfigureAwait(false);
@@ -4482,7 +4522,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         // reading made a cluster SetAsync take twice the request timeout)
         // and would re-send a write the peer may still apply. The timeout
         // is surfaced as-is instead.
-        catch (ConnectionLostException error) when (!error.TimedOut)
+        //
+        // An `En` is the node refusing this request itself (a command it
+        // does not know, one too large or malformed; issue #2230, as in
+        // Go and Rust): the same frame on a fresh connection is refused
+        // the same way, so it is surfaced as it is. The requests pipelined
+        // behind it fail as not sent (a plain ConnectionLostException)
+        // and keep this retry.
+        catch (ConnectionLostException error) when (!error.TimedOut && error is not ServerRejectedException)
         {
             return await op(await SlotConnectionAsync(slot).ConfigureAwait(false)).ConfigureAwait(false);
         }
@@ -5062,14 +5109,13 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                         {
                             // D3: ReplicaWriteAsync's own try/catch already
                             // swallows and counts every expected failure — this
-                            // observes whatever escaped it (a real bug, or the
-                            // deliberately uncaught OperationCanceledException
-                            // from Close()) instead of letting it vanish as an
-                            // unobserved task exception, and counts it in the
-                            // same ReplicaWriteFailures Stats() already exposes.
+                            // observes whatever escaped it (a real bug) instead
+                            // of letting it vanish as an unobserved task
+                            // exception, and counts it in BackgroundWriteBugs,
+                            // not as a failed replica write (issue #2194).
                             if (completed.Exception is not null)
                             {
-                                Interlocked.Increment(ref _replicaWriteFailures);
+                                Interlocked.Increment(ref _backgroundWriteBugs);
                             }
                             _backgroundReplicaPermits.Release();
                         },
@@ -5351,26 +5397,52 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// connect failure.</summary>
     private async Task<Connection> DialProxyWithFailoverAsync(string address)
     {
+        // Issue #2168: while the pinned proxy is in its cooldown, fail with
+        // the stored error without contacting discovery, as the Python and
+        // Go SDKs do. A failed failover re-arms the cooldown below, so the
+        // roster is fetched (and the candidates dialed) at most once per
+        // cooldown period during a proxy-tier outage, instead of once or
+        // twice per request.
+        if (_reconnectCooldowns.TryGetValue(address, out var cooldown) && MonotonicNow() < cooldown.Until)
+        {
+            throw cooldown.Error;
+        }
+
         try
         {
             return await DialWithCooldownAsync(address).ConfigureAwait(false);
         }
         catch (NanocachedException sameProxyError)
         {
-            IReadOnlyList<DiscoveredNode> proxies = await FetchProxyListAsync().ConfigureAwait(false);
-            if (proxies.Count == 0)
+            (Connection connection, string newAddress) connected;
+            try
             {
-                throw new ConnectionLostException(
-                    "nanocached: no proxies registered with discovery", sameProxyError);
+                IReadOnlyList<DiscoveredNode> proxies = await FetchProxyListAsync().ConfigureAwait(false);
+                if (proxies.Count == 0)
+                {
+                    throw new ConnectionLostException(
+                        "nanocached: no proxies registered with discovery", sameProxyError);
+                }
+                // The proxy that just failed is left out of the candidates
+                // (issue #2201, as in Go), unless it is the only one: a
+                // second dial of it costs a refused connection at best and
+                // the connect timeout at worst.
+                List<DiscoveredNode> others = proxies.Where(proxy => proxy.Address != address).ToList();
+                connected = await ConnectToAnyProxyAsync(others.Count > 0 ? others : proxies, throughCooldown: true)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception failoverError) when (failoverError is NanocachedException or IOException
+                or System.Net.Sockets.SocketException or AuthenticationException)
+            {
+                // Armed for the whole failover, not just the pinned
+                // proxy's own dial, so the next request in this period
+                // gets this error at once (Go arms it around its whole
+                // slot dial the same way).
+                ArmReconnectCooldown(address, failoverError);
+                throw;
             }
 
-            // The proxy that just failed is left out of the candidates
-            // (issue #2201, as in Go), unless it is the only one: a
-            // second dial of it costs a refused connection at best and
-            // the connect timeout at worst.
-            List<DiscoveredNode> others = proxies.Where(proxy => proxy.Address != address).ToList();
-            (Connection connection, string newAddress) =
-                await ConnectToAnyProxyAsync(others.Count > 0 ? others : proxies).ConfigureAwait(false);
+            (Connection connection, string newAddress) = connected;
             lock (_stateLock) { _singleAddress = newAddress; }
 
             // Issue #296: MaybeRefreshAsync's own cooldown prune
@@ -5380,12 +5452,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             // (the same-proxy retry that just failed) would otherwise sit
             // in _reconnectCooldowns forever: this client's own redial
             // path never dials it again once _singleAddress has moved on.
-            // Unconditional, not gated on newAddress != address:
-            // ConnectToAnyProxyAsync dials candidates directly, bypassing
-            // _reconnectCooldowns entirely, so `address` could in
-            // principle be the very entry that just won this failover —
-            // in which case removing its now-stale cooldown record is
-            // exactly as correct, since it was just proven reachable.
+            // Unconditional, not gated on newAddress != address: the
+            // candidates are dialed through the cooldown, so `address`
+            // (in cooldown since its dial above) cannot have won, and a
+            // winner's own entry is already cleared by its dial.
             _reconnectCooldowns.TryRemove(address, out _);
             return connection;
         }
@@ -5402,10 +5472,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             if (!_members.TryGetValue(slot, out Member? member))
             {
                 // Not sent: no connection was ever picked for this request.
-                // The ring still names a member a refresh in progress has
-                // already removed (RefreshNodeListAsync drops departed
-                // members first and swaps the ring only after dialing the
-                // new ones), and a non-idempotent op must read this as
+                // This request was routed by a ring read before a refresh
+                // removed the member (RefreshNodeListAsync swaps members
+                // and ring together, but a request may still hold the old
+                // owner names), and a non-idempotent op must read this as
                 // "refresh and reroute", not as a possibly-applied loss.
                 throw new ConnectionLostException(
                     $"nanocached: {slot} has no open connection", requestNotSent: true);
@@ -5561,36 +5631,17 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         // (leaks) the first.
         List<DiscoveredNode> nodes = DedupeDiscoveredNodes(cluster.Nodes);
 
-        var toOpen = new List<DiscoveredNode>();
+        var byName = nodes.ToDictionary(node => node.Name);
+        // Only reads here: the departed members are removed, the moved
+        // addresses updated and the ring swapped together after the dials
+        // below (issue #2197, as in Java). Removing departed members first
+        // left the old ring routing to a member that was gone for the
+        // whole dial phase (up to the connect timeout), so a request in
+        // that window failed with "has no open connection".
+        List<DiscoveredNode> toOpen;
         lock (_stateLock)
         {
-            var byName = nodes.ToDictionary(node => node.Name);
-
-            foreach (string name in _members.Keys.Where(name => !byName.ContainsKey(name)).ToList())
-            {
-                Member departed = _members[name];
-                departed.Connection?.Close();
-                _members.Remove(name);
-                // Node names are per-process UUIDs; a departed node's
-                // redial gate would otherwise leak forever (issue #12).
-                _redialGates.Remove(name);
-                // Same leak, same reason, for the per-address cooldown map:
-                // a departed node's address is never reused, so its cooldown
-                // entry (if any) would otherwise linger forever (issue #96).
-                _reconnectCooldowns.TryRemove(departed.Address, out _);
-            }
-
-            foreach (DiscoveredNode node in nodes)
-            {
-                if (_members.TryGetValue(node.Name, out Member? existing))
-                {
-                    existing.Address = node.Address;
-                }
-                else
-                {
-                    toOpen.Add(node);
-                }
-            }
+            toOpen = nodes.Where(node => !_members.ContainsKey(node.Name)).ToList();
         }
 
         // Dial every newly discovered node concurrently (issue #227), at
@@ -5614,6 +5665,28 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                     connection?.Close();
                 }
                 return;
+            }
+
+            foreach (string name in _members.Keys.Where(name => !byName.ContainsKey(name)).ToList())
+            {
+                Member departed = _members[name];
+                departed.Connection?.Close();
+                _members.Remove(name);
+                // Node names are per-process UUIDs; a departed node's
+                // redial gate would otherwise leak forever (issue #12).
+                _redialGates.Remove(name);
+                // Same leak, same reason, for the per-address cooldown map:
+                // a departed node's address is never reused, so its cooldown
+                // entry (if any) would otherwise linger forever (issue #96).
+                _reconnectCooldowns.TryRemove(departed.Address, out _);
+            }
+
+            foreach (DiscoveredNode node in nodes)
+            {
+                if (_members.TryGetValue(node.Name, out Member? existing))
+                {
+                    existing.Address = node.Address;
+                }
             }
 
             foreach (var (node, connection, error) in outcomes)
@@ -5689,13 +5762,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// initial connect fetches <c>Q</c> directly in
     /// <see cref="ConnectAsync(Options, CancellationToken)"/>'s own loop instead, since that
     /// first fetch also needs the loop's own per-address bookkeeping
-    /// (<c>_targetKey</c>, the forgotten-close warning). Unlike
-    /// <see cref="FetchNodeListAsync"/>, an address that identifies as a
-    /// plain cache node is not skipped as merely uninteresting: it means
-    /// ViaProxy is pointed at the wrong kind of address, the same
-    /// configuration error <see cref="ConnectAsync(Options, CancellationToken)"/> fails fast
-    /// on, so it is thrown here too rather than silently trying the next
-    /// address.</summary>
+    /// (<c>_targetKey</c>, the forgotten-close warning). An address that
+    /// identifies as a plain cache node is skipped like an unreachable one,
+    /// as in the other SDKs (issue #2172): the initial connect already
+    /// rejected a ViaProxy pointed at nodes, so here it is an address that
+    /// was reclaimed since. When no address yields a roster, the failure is
+    /// a not-sent <see cref="ConnectionLostException"/> carrying the last
+    /// error, never the raw socket, TLS or I/O exception: the request that
+    /// is redialing was never written.</summary>
     private async Task<IReadOnlyList<DiscoveredNode>> FetchProxyListAsync()
     {
         Exception? lastError = null;
@@ -5722,10 +5796,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             {
                 case Identify.NodeTarget node:
                     node.Stream.Dispose();
-                    Interlocked.Increment(ref _refreshFailures);
-                    throw new NanocachedException(
+                    lastError = new NanocachedException(
                         $"nanocached: ViaProxy requires discovery addresses, but {host}:{port} "
                         + "identifies as a cache node");
+                    continue;
 
                 // An empty roster is not an answer: this replica may have
                 // just restarted and not heard its proxies re-register yet,
@@ -5742,8 +5816,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         // Some address answered, with no proxies: hand back the empty list
         // so the caller reports it with the same-proxy dial error attached.
         if (sawEmptyRoster) return Array.Empty<DiscoveredNode>();
-        throw lastError ?? new NanocachedException(
-            "nanocached: could not reach any discovery address for the proxy roster");
+        throw new ConnectionLostException(
+            "nanocached: could not fetch the proxy roster from any discovery address"
+            + (lastError is null ? "" : $": {lastError.Message}"),
+            lastError!, requestNotSent: true);
     }
 
     // ── keep-alive ────────────────────────────────────────────────
