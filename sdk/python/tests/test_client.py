@@ -8627,6 +8627,58 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
             await proxy_a.close()
             await proxy_b.close()
 
+    async def test_reconnect_with_discovery_down_raises_a_not_sent_connection_error(self):
+        # The pinned proxy and every discovery address are gone: nothing
+        # says the roster is empty, so the operation fails as a dial
+        # failure (a ConnectionError, nothing sent), not as "no proxies
+        # registered".
+        proxy = await MockNode().start()
+        discovery = await MockDiscovery(nodes=[], proxies=[(NAMES[0], proxy.address)]).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True, reconnect_cooldown=0.01
+            )
+            try:
+                await discovery.close()
+                await proxy.close()
+                await wait_for(
+                    lambda: client._single is not None and client._single.closed,
+                    "the client to see the dead proxy's FIN",
+                )
+
+                with self.assertRaises(ConnectFailedError) as raised:
+                    await client.set("k", "v")
+                self.assertIsInstance(raised.exception, ConnectionError)
+                self.assertNotIn("no proxies registered", str(raised.exception))
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await proxy.close()
+
+    async def test_reconnect_to_an_empty_proxy_roster_says_no_proxies_are_registered(self):
+        proxy = await MockNode().start()
+        discovery = await MockDiscovery(nodes=[], proxies=[(NAMES[0], proxy.address)]).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True, reconnect_cooldown=0.01
+            )
+            try:
+                discovery.set_proxies([])
+                await proxy.close()
+                await wait_for(
+                    lambda: client._single is not None and client._single.closed,
+                    "the client to see the dead proxy's FIN",
+                )
+
+                with self.assertRaisesRegex(NanocachedError, "no proxies registered"):
+                    await client.set("k", "v")
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await proxy.close()
+
     async def test_reconnect_purges_cooldowns_for_addresses_other_than_the_new_proxy(self):
         # #363: _maybe_refresh no-ops in via_proxy mode (self._ring stays
         # None forever, since via_proxy never builds a ring), so the #96
