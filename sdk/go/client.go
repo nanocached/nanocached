@@ -3062,14 +3062,11 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 	// every Add happens-before that Wait (mirrors the identical guard on
 	// backgroundReplicaWG in writeWithValue() and tryReadRepair()); without it, a
 	// leg starting exactly as Close() observes the counter at zero could
-	// race sync.WaitGroup's Add/Wait and panic. A refused start needs no
-	// fallback (issue #486): for the primary leg the caller below returns
-	// ErrClosed, exactly what any operation racing Close() gets; for a
-	// hedge leg the read simply carries on with the legs already in
-	// flight (tryStartNext treats the refusal as having run out of
-	// owners), which is the right outcome while Close() is draining —
-	// a hedge is an optimization, not a guarantee, and no new work should
-	// start on connections teardown is about to close.
+	// race sync.WaitGroup's Add/Wait and panic. A refused start fails the
+	// read with ErrClosed, exactly what any operation racing Close() gets,
+	// for a hedge leg as for the primary leg (as in the other SDKs): the
+	// legs already in flight are left to finishHedge, and Close() drains
+	// them. No new work starts on connections teardown is about to close.
 	start := func(index int) bool {
 		c.mu.Lock()
 		if c.closed {
@@ -3131,19 +3128,19 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 	var lastError error
 	replicaMissed := false
 
-	// tryStartNext starts the next owner, if any remain and the client
-	// isn't closing; a start refused because the client is closing is
-	// treated as having run out of owners, same as reaching len(names).
-	tryStartNext := func() {
+	// tryStartNext starts the next owner, if any remain. It reports false
+	// only when the start was refused because the client is closing; the
+	// read then returns ErrClosed (see start).
+	tryStartNext := func() bool {
 		if nextIndex >= len(names) {
-			return
+			return true
 		}
-		if start(nextIndex) {
-			pending++
-			nextIndex++
-			return
+		if !start(nextIndex) {
+			return false
 		}
-		nextIndex = len(names)
+		pending++
+		nextIndex++
+		return true
 	}
 
 	for pending > 0 {
@@ -3182,7 +3179,10 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 				// A failed leg is replaced by the next owner, if any,
 				// right away, even while other legs (a silent primary)
 				// are still in flight.
-				tryStartNext()
+				if !tryStartNext() {
+					finishHedge(pending, nextIndex)
+					return nil, false, ErrClosed
+				}
 			case res.ok || names[res.index] == primaryName:
 				finishHedge(pending, nextIndex)
 				return res.value, res.ok, nil
@@ -3190,8 +3190,8 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 				// A non-primary clean miss: provisional only.
 				replicaMissed = true
 			}
-			if pending == 0 {
-				tryStartNext()
+			if pending == 0 && !tryStartNext() {
+				return nil, false, ErrClosed
 			}
 		case <-timeout:
 			// The hedge interval elapsed with no answer: every leg still
@@ -3202,7 +3202,10 @@ func (c *Client) readHedged(names []string, op func(*connection) ([]byte, bool, 
 					c.addLateHedgeLeg(names[i])
 				}
 			}
-			tryStartNext()
+			if !tryStartNext() {
+				finishHedge(pending, nextIndex)
+				return nil, false, ErrClosed
+			}
 		}
 	}
 
