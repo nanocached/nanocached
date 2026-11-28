@@ -9414,6 +9414,44 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
     }
   });
 
+  it("leaves no socket open after close() when concurrent requests fail over together (issue #2171)", async () => {
+    // Regression: a second forced refresh queued behind the first dialed
+    // the survivor again and replaced `target` without closing the
+    // connection the first had installed, which then outlived close().
+    for (let round = 0; round < 3; round++) {
+      const [proxyA, proxyB] = await Promise.all([startMockNode(), startMockNode()]);
+      const byAddress = new Map([
+        [proxyA.address, proxyA],
+        [proxyB.address, proxyB],
+      ]);
+      const discovery = await startMockDiscovery([]);
+      discovery.setProxies([
+        { name: "proxy-a", address: proxyA.address },
+        { name: "proxy-b", address: proxyB.address },
+      ]);
+      try {
+        const client = await NanocachedClient.connect({
+          addresses: [{ host: "127.0.0.1", port: discovery.port }],
+          viaProxy: true,
+        });
+        const landedAddress = proxyAddressOf(client);
+        const survivor = byAddress.get(landedAddress === proxyA.address ? proxyB.address : proxyA.address)!;
+        try {
+          await byAddress.get(landedAddress)!.close();
+          await Promise.allSettled(Array.from({ length: 50 }, (_, i) => client.get(`k${i}`)));
+          // Let a follow-up forced refresh (200 ms interval) run.
+          await delay(400);
+          assert.equal(survivor.openConnectionCount(), 1);
+        } finally {
+          await client.close();
+        }
+        await waitFor(() => survivor.openConnectionCount() === 0, "every socket to the surviving proxy to close");
+      } finally {
+        await Promise.all([discovery.close(), proxyA.close().catch(() => {}), proxyB.close().catch(() => {})]);
+      }
+    }
+  });
+
   const bulkOps: Array<[string, (client: NanocachedClient) => Promise<unknown>]> = [
     ["getMany", (client) => client.getMany(["k"])],
     ["setMany", (client) => client.setMany({ k: "v" })],
