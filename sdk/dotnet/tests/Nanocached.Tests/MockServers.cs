@@ -452,6 +452,15 @@ public sealed class MockNode : IDisposable
     public void GoSilentAfterHandshake() => _silent = true;
 
     /// <summary>Server-side FIN on every open connection, like the idle timeout.</summary>
+    /// <summary>From now on, close every connection on its <c>A</c>
+    /// handshake without replying (until <see cref="AcceptHandshakes"/>),
+    /// so a dial to this node fails while <see cref="ConnectionCount"/>
+    /// still counts it.</summary>
+    public void RefuseHandshakes() => _refuseHandshakes = true;
+
+    public void AcceptHandshakes() => _refuseHandshakes = false;
+    private volatile bool _refuseHandshakes;
+
     public void DropConnections()
     {
         foreach (TcpClient client in _clients.Keys) client.Close();
@@ -559,6 +568,11 @@ public sealed class MockNode : IDisposable
                         // a test needs to see were tried.
                         _lastAuthHeader = string.Join(' ', parts);
 
+                        if (_refuseHandshakes)
+                        {
+                            client.Close();
+                            return;
+                        }
                         if (parts.Length > 2 && _closeOnExtendedAuth)
                         {
                             client.Close();
