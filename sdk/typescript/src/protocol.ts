@@ -1177,10 +1177,21 @@ export function tryParseResponse(
     // mismatch. It poisons the connection like any other unexpected reply,
     // so the waiters see a `ConnectionLostError` with `requestWasSent` true
     // — never resent where the command is not idempotent.
-    case 0x45 /* 'E' */:
-      if (buf.length < 2) return null;
-      if (buf[1] === 0x6e /* 'n' */) throw new ServerRejectedError();
+    // Either way the whole line is read first, and the two are told apart
+    // by the line starting with `n`, as in the Python, Go and Rust SDKs:
+    // `En` is not taken from its first two bytes before its LF arrives.
+    case 0x45 /* 'E' */: {
+      const lineEnd = buf.indexOf(LF);
+      if (lineEnd === -1) {
+        // `E <tag>\n` is the longest legal form.
+        if (buf.length > MAX_TAGGED_FIXED_FRAME_LENGTH) {
+          throw new NanocachedError("nanocached: invalid E response (missing terminator)");
+        }
+        return null;
+      }
+      if (lineEnd > 1 && buf[1] === 0x6e /* 'n' */) throw new ServerRejectedError();
       throw new NanocachedError("nanocached: server answered E (request failed, outcome unknown)");
+    }
 
     default:
       throw new NanocachedError(`nanocached: unexpected response from server: ${String.fromCharCode(buf[0])}`);

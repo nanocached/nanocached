@@ -502,6 +502,22 @@ describe("tryParseResponse of a get-and-touch reply (issue #825)", () => {
     );
   });
 
+  it("recognises the node's En only once its line is complete", () => {
+    assert.equal(tryParseResponse(Buffer.from("En")), null);
+    assert.equal(tryParseResponse(Buffer.from("En"), true), null);
+    // `EnT\n` is a node's refusal of an `A` that asked for tags.
+    for (const wire of ["En\n", "EnT\n"]) {
+      for (const tagged of [false, true]) {
+        assert.throws(
+          () => tryParseResponse(Buffer.from(wire), tagged),
+          (error: Error) => error.name === "ServerRejectedError",
+          wire,
+        );
+      }
+    }
+    assert.throws(() => tryParseResponse(Buffer.from(`E${"x".repeat(20)}`)), /missing terminator/);
+  });
+
   it("does not call the proxy's bare E a server rejection (issue #939)", () => {
     for (const [bytes, tagged] of [
       ["E\n", false],
