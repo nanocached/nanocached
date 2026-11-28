@@ -1476,14 +1476,17 @@ async fn connect_via_proxy(
                     )));
                     continue;
                 }
+                // The first roster is final, as in the other SDKs: when none
+                // of its proxies is reachable, connect() fails here instead
+                // of asking the next discovery seed, which lists the same
+                // proxy tier.
                 let Some((address, stream, tagged)) =
                     dial_random_proxy(&proxies, auth_secret, tls).await
                 else {
-                    last_error = Some(Error::ConnectionLost(format!(
+                    return Err(Error::ConnectionLost(format!(
                         "nanocached: none of the {} proxy(es) registered with {key} are reachable",
                         proxies.len()
                     )));
-                    continue;
                 };
                 let connection = Arc::new(Connection::new(
                     stream,
@@ -6327,15 +6330,15 @@ impl NanocachedClient {
         }
     }
 
-    /// Re-fetches the proxy roster from every configured discovery
-    /// address in turn (discovery HA, mirroring `fetch_node_list`) and
-    /// dials a random, reachable entry from the first non-empty roster —
-    /// see `dial_random_proxy`. `None` once every address has been tried
-    /// and none yielded a reachable proxy. The second value is whether any
-    /// address returned a non-empty roster, so the caller can tell a failed
-    /// refresh from a usable roster whose proxies all failed to dial.
+    /// Re-fetches the proxy roster from the configured discovery addresses
+    /// in turn (discovery HA, mirroring `fetch_node_list`) and dials a
+    /// random, reachable entry from the first non-empty roster — see
+    /// `dial_random_proxy`. That roster is final, as at connect(): when
+    /// none of its proxies is reachable the result is `None` without asking
+    /// the next address. The second value is whether any address returned a
+    /// non-empty roster, so the caller can tell a failed refresh from a
+    /// usable roster whose proxies all failed to dial.
     async fn dial_a_fresh_proxy(&self) -> (Option<(String, crate::identify::Stream, bool)>, bool) {
-        let mut got_roster = false;
         for (host, port) in &self.inner.addresses {
             if let Ok(Identified::Proxies { proxies }) = connect_and_identify(
                 host,
@@ -6348,20 +6351,17 @@ impl NanocachedClient {
             .await
             {
                 if !proxies.is_empty() {
-                    got_roster = true;
-                    if let Some(result) = dial_random_proxy(
+                    let dialed = dial_random_proxy(
                         &proxies,
                         self.inner.auth_secret_bytes(),
                         self.inner.tls.as_ref(),
                     )
-                    .await
-                    {
-                        return (Some(result), true);
-                    }
+                    .await;
+                    return (dialed, true);
                 }
             }
         }
-        (None, got_roster)
+        (None, false)
     }
 }
 

@@ -10309,6 +10309,97 @@ async fn via_proxy_with_an_empty_roster_is_a_clear_connect_error() {
     discovery.stop();
 }
 
+/// Issue #2198: when every proxy in the first roster is unreachable,
+/// connect() fails, as in the other SDKs; it used to move on to the next
+/// discovery seed.
+#[tokio::test]
+async fn via_proxy_connect_fails_when_every_proxy_in_the_first_roster_is_unreachable() {
+    let dead_port = unused_port().await;
+    let other_proxy = MockNode::start().await;
+    let first = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-dead".to_string(), format!("127.0.0.1:{dead_port}"))],
+    )
+    .await;
+    let second = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-b".to_string(), other_proxy.address())],
+    )
+    .await;
+
+    let result = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", first.port), ("127.0.0.1", second.port)])
+            .via_proxy(true),
+    )
+    .await;
+
+    match result {
+        Err(Error::ConnectionLost(message)) => {
+            assert!(message.contains("reachable"), "err = {message}");
+        }
+        Ok(client) => {
+            client.close().await;
+            panic!("connect() succeeded through the second seed, want ConnectionLost");
+        }
+        Err(other) => panic!("connect() = {other}, want ConnectionLost"),
+    }
+    assert_eq!(
+        second.q_requests.load(Ordering::SeqCst),
+        0,
+        "the second seed must not be asked"
+    );
+    assert_eq!(other_proxy.state.connections.load(Ordering::SeqCst), 0);
+    first.stop();
+    second.stop();
+    other_proxy.stop();
+}
+
+/// Issue #2198, the failover side: a re-fetched roster whose proxies are
+/// all unreachable ends the failover; the next discovery seed is not asked.
+#[tokio::test]
+async fn via_proxy_failover_stops_at_the_first_roster_whose_proxies_are_all_unreachable() {
+    let proxy_a = MockNode::start().await;
+    let proxy_b = MockNode::start().await;
+    let first = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-a".to_string(), proxy_a.address())],
+    )
+    .await;
+    let second = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-b".to_string(), proxy_b.address())],
+    )
+    .await;
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", first.port), ("127.0.0.1", second.port)])
+            .via_proxy(true),
+    )
+    .await
+    .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+
+    // The first seed still lists only proxy A, which is now down.
+    proxy_a.stop();
+    assert!(client.get("k").await.is_err());
+    assert_eq!(
+        second.q_requests.load(Ordering::SeqCst),
+        0,
+        "the second seed must not be asked once the first returned a roster"
+    );
+    assert_eq!(proxy_b.state.connections.load(Ordering::SeqCst), 0);
+
+    client.close().await;
+    first.stop();
+    second.stop();
+    proxy_b.stop();
+}
+
 #[tokio::test]
 async fn via_proxy_pointed_at_a_node_address_is_a_clear_connect_error() {
     let node = MockNode::start().await;
