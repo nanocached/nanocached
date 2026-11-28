@@ -144,7 +144,8 @@ type Config struct {
 	// it happens to touch, exactly as before this option existed. Only
 	// meaningful once a ring is known and the key has at least two owners
 	// (Replication() >= 2); a single-node client, or a key with only one
-	// owner, is unaffected either way. Negative is rejected by Connect.
+	// owner, is unaffected either way. Negative, or more than 365 days
+	// (maxReadHedgeAfter), is rejected by Connect.
 	// Losing legs are never cancelled — cancelling mid-write would poison
 	// a shared connection (see connection.request) — they run to
 	// completion detached, tracked so Close() waits for them exactly like
@@ -637,6 +638,11 @@ func (c *Client) trackedConnection(netConn net.Conn, tagged bool) *connection {
 }
 
 // Connect dials the first working address and returns a ready client.
+// maxReadHedgeAfter is the largest Config.ReadHedgeAfter Connect accepts:
+// one year, the bound every SDK puts on this option. It is far past any
+// useful hedge interval.
+const maxReadHedgeAfter = 365 * 24 * time.Hour
+
 func Connect(config Config) (*Client, error) {
 	if len(config.Addresses) == 0 {
 		return nil, invalidArgumentf("nanocached: connect() needs a non-empty addresses list")
@@ -648,6 +654,10 @@ func Connect(config Config) (*Client, error) {
 	if config.ReadHedgeAfter < 0 {
 		return nil, invalidArgumentf(
 			"nanocached: ReadHedgeAfter must not be negative, got %v", config.ReadHedgeAfter)
+	}
+	if config.ReadHedgeAfter > maxReadHedgeAfter {
+		return nil, invalidArgumentf(
+			"nanocached: ReadHedgeAfter must not exceed %v, got %v", maxReadHedgeAfter, config.ReadHedgeAfter)
 	}
 	// Issue #488: an option that can have no effect in this configuration
 	// is a misconfiguration, not something to ignore quietly — a caller
