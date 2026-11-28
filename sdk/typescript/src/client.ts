@@ -4839,6 +4839,12 @@ export class NanocachedClient {
    * misleading success. */
   private async refreshProxyTarget(): Promise<void> {
     if (this.target.kind !== "proxy") return;
+    // Re-check under the refresh's single flight (issue #2171): a forced
+    // refresh queued behind an earlier one (see maybeRefreshNodeList)
+    // arrives after that one has already failed over. The connection is
+    // live again, so there is nothing to replace, and dialing another
+    // proxy would open a second connection.
+    if (!this.target.connection.isClosed()) return;
 
     const proxies = await this.fetchProxyList();
     if (proxies === null) {
@@ -4874,8 +4880,16 @@ export class NanocachedClient {
         identified.socket.destroy();
         return;
       }
+      // A same-proxy redial (proxyConnection) may have installed a live
+      // connection while this one was dialing: keep that one, so no socket
+      // is left open outside `target` (issue #2171).
+      if (this.target.kind !== "proxy" || !this.target.connection.isClosed()) {
+        identified.socket.destroy();
+        return;
+      }
 
       trackOpenTarget(this.url, [identified.socket]);
+      this.target.connection.close(); // already closed (checked above); a no-op kept for clarity
       this.target = {
         kind: "proxy",
         connection: new Connection(identified.socket, identified.tagged, () => this.transientRetries++),
@@ -4933,9 +4947,14 @@ export class NanocachedClient {
 
     const connection = await this.ensureConnected("", this.target.address);
     this.discardIfClosed(connection);
-    if (this.target.kind === "proxy" && this.target.connection.isClosed()) {
-      this.target.connection = connection;
+    // A failover (refreshProxyTarget) may have installed a live
+    // connection while this redial was in flight: use it, and close this
+    // one rather than hand out a connection nothing tracks (issue #2171).
+    if (this.target.kind === "proxy" && !this.target.connection.isClosed() && this.target.connection !== connection) {
+      connection.close();
+      return this.target.connection;
     }
+    if (this.target.kind === "proxy") this.target.connection = connection;
     return connection;
   }
 

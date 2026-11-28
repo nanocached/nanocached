@@ -119,6 +119,8 @@ export interface MockNode extends MockServerBase {
   answerStoredToGetOnce(): void;
   /** How many connections this server has ever accepted. */
   connectionCount(): number;
+  /** Connections accepted and not yet closed. */
+  openConnectionCount(): number;
   /** How many `G` requests this server has ever received. */
   getCount(): number;
   /** How many `i` (INCR, issue #129) requests this server has ever
@@ -1426,6 +1428,7 @@ export async function startMockNode(
       storedToGetReplies++;
     },
     connectionCount: () => connections,
+    openConnectionCount: () => sockets.size,
     getCount: () => gets,
     incrCount: () => incrs,
     answerIncrTtlOnce: (ttlField) => {
