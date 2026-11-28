@@ -1044,14 +1044,19 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// cluster node dial uses, since a proxy identifies exactly like one.
     /// Throws the last dial error when none connect.</summary>
     private async Task<(Connection Connection, string Address)> ConnectToAnyProxyAsync(
-        IReadOnlyList<DiscoveredNode> proxies)
+        IReadOnlyList<DiscoveredNode> proxies, bool throughCooldown = false)
     {
         Exception? lastError = null;
         foreach (DiscoveredNode proxy in ShuffleProxies(proxies))
         {
             try
             {
-                Connection connection = await OpenNodeConnectionAsync(proxy.Address).ConfigureAwait(false);
+                // A failover dials through the per-address cooldown (issue
+                // #2168): a proxy that just failed is skipped with its
+                // stored error, and one that fails now is put in cooldown.
+                Connection connection = throughCooldown
+                    ? await DialWithCooldownAsync(proxy.Address).ConfigureAwait(false)
+                    : await OpenNodeConnectionAsync(proxy.Address).ConfigureAwait(false);
                 return (connection, proxy.Address);
             }
             catch (Exception error) when (error is NanocachedException or IOException
@@ -5392,21 +5397,46 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// connect failure.</summary>
     private async Task<Connection> DialProxyWithFailoverAsync(string address)
     {
+        // Issue #2168: while the pinned proxy is in its cooldown, fail with
+        // the stored error without contacting discovery, as the Python and
+        // Go SDKs do. A failed failover re-arms the cooldown below, so the
+        // roster is fetched (and the candidates dialed) at most once per
+        // cooldown period during a proxy-tier outage, instead of once or
+        // twice per request.
+        if (_reconnectCooldowns.TryGetValue(address, out var cooldown) && MonotonicNow() < cooldown.Until)
+        {
+            throw cooldown.Error;
+        }
+
         try
         {
             return await DialWithCooldownAsync(address).ConfigureAwait(false);
         }
         catch (NanocachedException sameProxyError)
         {
-            IReadOnlyList<DiscoveredNode> proxies = await FetchProxyListAsync().ConfigureAwait(false);
-            if (proxies.Count == 0)
+            (Connection connection, string newAddress) connected;
+            try
             {
-                throw new ConnectionLostException(
-                    "nanocached: no proxies registered with discovery", sameProxyError);
+                IReadOnlyList<DiscoveredNode> proxies = await FetchProxyListAsync().ConfigureAwait(false);
+                if (proxies.Count == 0)
+                {
+                    throw new ConnectionLostException(
+                        "nanocached: no proxies registered with discovery", sameProxyError);
+                }
+                connected = await ConnectToAnyProxyAsync(proxies, throughCooldown: true).ConfigureAwait(false);
+            }
+            catch (Exception failoverError) when (failoverError is NanocachedException or IOException
+                or System.Net.Sockets.SocketException or AuthenticationException)
+            {
+                // Armed for the whole failover, not just the pinned
+                // proxy's own dial, so the next request in this period
+                // gets this error at once (Go arms it around its whole
+                // slot dial the same way).
+                ArmReconnectCooldown(address, failoverError);
+                throw;
             }
 
-            (Connection connection, string newAddress) =
-                await ConnectToAnyProxyAsync(proxies).ConfigureAwait(false);
+            (Connection connection, string newAddress) = connected;
             lock (_stateLock) { _singleAddress = newAddress; }
 
             // Issue #296: MaybeRefreshAsync's own cooldown prune
@@ -5416,12 +5446,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             // (the same-proxy retry that just failed) would otherwise sit
             // in _reconnectCooldowns forever: this client's own redial
             // path never dials it again once _singleAddress has moved on.
-            // Unconditional, not gated on newAddress != address:
-            // ConnectToAnyProxyAsync dials candidates directly, bypassing
-            // _reconnectCooldowns entirely, so `address` could in
-            // principle be the very entry that just won this failover —
-            // in which case removing its now-stale cooldown record is
-            // exactly as correct, since it was just proven reachable.
+            // Unconditional, not gated on newAddress != address: the
+            // candidates are dialed through the cooldown, so `address`
+            // (in cooldown since its dial above) cannot have won, and a
+            // winner's own entry is already cleared by its dial.
             _reconnectCooldowns.TryRemove(address, out _);
             return connection;
         }
