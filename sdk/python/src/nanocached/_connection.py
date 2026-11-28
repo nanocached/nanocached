@@ -1350,8 +1350,12 @@ class Connection:
 
         if marker == b"B":
             # `B\n` (busy) is always untagged — an unsolicited response
-            # sent before auth, so it never carries a request's tag.
-            await self._reader.readexactly(1)  # the trailing '\n'
+            # sent before auth, so it never carries a request's tag. It has
+            # no body: a byte other than its LF is a desync, as above.
+            if await self._reader.readexactly(1) != b"\n":
+                raise NanocachedError(
+                    "nanocached: unexpected byte after response marker (connection desynced)"
+                )
             return marker, None, None
 
         if marker == b"E":

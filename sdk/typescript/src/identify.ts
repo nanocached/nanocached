@@ -2,7 +2,7 @@ import type { Socket } from "node:net";
 import type { TLSSocket } from "node:tls";
 import { ConnectionLostError } from "./connection.js";
 import { NanocachedError } from "./errors.js";
-import { parseStrictInteger } from "./protocol.js";
+import { headerText, parseStrictInteger } from "./protocol.js";
 import { CONNECT_DEADLINE_MS, connectSocket } from "./socket.js";
 
 export interface IdentifyOptions {
@@ -330,7 +330,7 @@ function parseEntry(buf: Buffer, offset: number): { node: DiscoveredNode; end: n
     return { needed: 0 };
   }
 
-  const lengths = buf.subarray(offset, entryHeaderEnd).toString("ascii").split(" ");
+  const lengths = headerText(buf.subarray(offset, entryHeaderEnd)).split(" ");
   if (lengths.length !== 2) {
     throw new NanocachedError("nanocached: invalid entry header in discovery response");
   }
@@ -439,9 +439,7 @@ function readNodeListHeader(buf: Buffer): ListHeader<{ nodes: DiscoveredNode[]; 
   }
 
   if (buf[0] !== 0x4e /* 'N' */) {
-    throw new NanocachedError(
-      `nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`,
-    );
+    throw new NanocachedError(`nanocached: unexpected response from discovery server: ${headerText(buf.subarray(0, headerEnd))}`);
   }
 
   // `N <count> <r>\n` (client-side replication) — the replication factor rides along.
@@ -449,7 +447,7 @@ function readNodeListHeader(buf: Buffer): ListHeader<{ nodes: DiscoveredNode[]; 
   if (buf[1] !== 0x20 /* ' ' */) {
     throw new NanocachedError("nanocached: invalid node-list header in discovery response");
   }
-  const header = buf.subarray(2, headerEnd).toString("ascii").split(" ");
+  const header = headerText(buf.subarray(2, headerEnd)).split(" ");
   if (header.length !== 2) {
     throw new NanocachedError("nanocached: invalid node-list header in discovery response");
   }
@@ -492,15 +490,13 @@ function readProxyListHeader(buf: Buffer): ListHeader<DiscoveredNode[]> | null {
   }
 
   if (buf[0] !== 0x4e /* 'N' */) {
-    throw new NanocachedError(
-      `nanocached: unexpected response from discovery server: ${buf.subarray(0, headerEnd).toString("ascii")}`,
-    );
+    throw new NanocachedError(`nanocached: unexpected response from discovery server: ${headerText(buf.subarray(0, headerEnd))}`);
   }
 
   if (buf[1] !== 0x20 /* ' ' */) {
     throw new NanocachedError("nanocached: invalid proxy-list header in discovery response");
   }
-  const count = parseStrictInteger(buf.subarray(2, headerEnd).toString("ascii"));
+  const count = parseStrictInteger(headerText(buf.subarray(2, headerEnd)));
   if (count === undefined || count > MAX_NODE_COUNT) {
     throw new NanocachedError("nanocached: invalid proxy count in discovery response");
   }
