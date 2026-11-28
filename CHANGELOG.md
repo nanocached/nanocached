@@ -45,6 +45,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a put-if-absent re-replication copy of a key a join
+  took, arriving while that join's transfer was being rolled back, was
+  marked dead after the rollback had already undone the join's marks. The
+  copy then stayed marked with no join left to settle it: no later
+  handoff, re-replication or drain sent it, and the sweep could delete it
+  on a node that the abandoned join leaves an owner of the key. A mark
+  is no longer added once the rollback has begun, and it is queued to the
+  cache before the rollback's unmark (#2256).
+
 - `nanocached-node`: one source address could pin the whole
   `--max-in-flight-bytes` budget with uploads it never finished, and every
   value-carrying reply on other clients' connections then waited for it
