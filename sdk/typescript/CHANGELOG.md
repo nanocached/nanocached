@@ -19,6 +19,7 @@ tag: 0.4.3 was a server-only release.
 
 ### Fixed
 
+- A node's `En` refusal was recognised from its first two bytes, before the line's LF arrived. It is now recognised only on a complete line starting with `En`, as in the Python, Go and Rust SDKs; an `E` line with no LF within 13 bytes (the longest legal `E <tag>`) is a protocol error. (#2180)
 - A busy reply (`B`) did not check the byte after the marker: `BX` was read as `B\n` and the byte after it as the start of the next reply. A byte other than LF there is now a protocol error that poisons the connection, as in the Go, Java, .NET and Rust SDKs. (#2179)
 - A response or discovery header line, and an `incr` counter body, were decoded with Buffer's `"ascii"` encoding, which clears each byte's high bit: `V \xB5\n` read as `V 5\n`, so a corrupt length, count, TTL or tag could pass as a valid one. A byte at or above 0x80 there is now a protocol error that poisons the connection (or fails the discovery request), as in the other five SDKs. (#2177)
 - `get`, `getMany`, `getAndTouch` and `getManyAndTouch` (and the namespace forms, and the values a `Partial*` error carries) dropped a leading UTF-8 byte order mark from the value: a value set as `"\uFEFFabc"` came back as `"abc"`, while `getBytes` returned all six bytes. The decoder now keeps it, as the Python, Java, .NET and Rust SDKs do. (#2166)
