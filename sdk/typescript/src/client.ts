@@ -4849,8 +4849,10 @@ export class NanocachedClient {
 
     // Leave out the proxy that just failed (issue #2203), as Go does: a
     // black-holed one would cost a whole connect deadline. It stays a
-    // candidate only when the roster lists nothing else.
-    const failedAddress = this.target.address;
+    // candidate only when the roster lists nothing else. Only a closed
+    // connection marks `target.address` as failed: a live one means an
+    // earlier failover already moved to that address.
+    const failedAddress = this.target.connection.isClosed() ? this.target.address : null;
     const others = proxies.filter((proxy) => proxy.address !== failedAddress);
     const candidates = others.length > 0 ? others : proxies;
 
