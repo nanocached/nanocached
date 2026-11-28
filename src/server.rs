@@ -2102,6 +2102,9 @@ pub(crate) struct SimGates {
     /// `run_decommission`: how many entries the drain counted as left
     /// behind, stored when the transfer loop ends.
     pub(crate) drain_left_behind: AtomicUsize,
+    /// `report_complete`: how many of the next `C` reports fail without
+    /// reaching discovery, as a dial error would.
+    pub(crate) failed_reports: AtomicUsize,
 }
 
 pub(crate) struct RunHooks {
@@ -8352,6 +8355,13 @@ async fn run_migration(
     // ack read — a slot still reading as in-flight would reject it.
     // Cloned, not moved: this function's own join-flip re-replication
     // trigger (issue #266, below) needs `pre_completion_ring` again too.
+    // This slot's identity (unique per `M`), for `report_complete_while_current`.
+    let slot_identity = migration_guard
+        .slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|active| Arc::clone(&active.forward_revoked));
     migration_guard.completed(sent_count, marked_this_run, pre_completion_ring.clone());
 
     // One more drain after the stamp catches a clear that slipped in
@@ -8367,11 +8377,15 @@ async fn run_migration(
         );
     }
 
-    if let Err(error) = report_complete(&node_context, &joining_name, generation).await {
-        eprintln!(
-            "WARN migration to {joining_addr} finished but reporting completion to {} failed: {error}",
-            node_context.discovery_addr
-        );
+    if let Some(identity) = slot_identity {
+        report_complete_while_current(
+            &node_context,
+            &joining_name,
+            generation,
+            &identity,
+            forwarding_grace(sent_count),
+        )
+        .await;
     }
 
     // Issue #266: the flip above may have silently absorbed an eviction
@@ -13294,6 +13308,93 @@ async fn delete_on_joining_node(
     forward_on_shared_connection(node_context, target, ForwardedWrite::Delete { key }).await
 }
 
+/// First wait between `C` attempts in `report_complete_while_current`,
+/// doubled after each failure up to `REPORT_COMPLETE_RETRY_MAX`.
+const REPORT_COMPLETE_RETRY_FIRST: Duration = Duration::from_millis(500);
+const REPORT_COMPLETE_RETRY_MAX: Duration = Duration::from_secs(10);
+
+/// Sends `C` for the handoff to `joining_name` this node just completed,
+/// and sends it again, with backoff, after each failure (a dial, TLS or
+/// auth error, or no ack within `OUTBOUND_IO_TIMEOUT`) for as long as that
+/// handoff is still pending: its slot is still this one (`identity`, see
+/// `unconfirmed_completed_joiner`), not revoked or aborted (an `X`, an
+/// eviction, a later `M` superseding it), and not yet confirmed (the joiner
+/// in a roster means discovery has had every report). Nothing else sends
+/// `C` again — the heartbeat's pending-joiner question is answered `K`
+/// while the joiner is registered — so one lost report used to hold the
+/// join, and every join queued behind it, until discovery's migration
+/// timeout abandoned it. Discovery counts a reporter once (`handle_complete`),
+/// so a repeat after a lost ack is harmless. Bounded by `limit` (this
+/// handoff's `forwarding_grace`, which tracks discovery's migration timeout:
+/// past it the join has been decided anyway) and by shutdown.
+async fn report_complete_while_current(
+    node_context: &NodeContext,
+    joining_name: &str,
+    generation: Option<u64>,
+    identity: &Arc<AtomicBool>,
+    limit: Duration,
+) {
+    let deadline = Instant::now() + limit;
+    let mut backoff = REPORT_COMPLETE_RETRY_FIRST;
+    let mut shutdown_rx = node_context.shutdown_rx.clone();
+    let mut attempt = 1u32;
+    loop {
+        let error = match report_complete(node_context, joining_name, generation).await {
+            Ok(()) => {
+                if attempt > 1 {
+                    println!(
+                        "INFO reported the completed handoff to {joining_name} to discovery at {} \
+                         (attempt {attempt})",
+                        node_context.discovery_addr
+                    );
+                }
+                return;
+            }
+            Err(error) => error,
+        };
+        let still_pending = node_context
+            .active_migration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|active| {
+                Arc::ptr_eq(&active.forward_revoked, identity)
+                    && !active.forward_revoked.load(Ordering::SeqCst)
+                    && !active.abort_requested.load(Ordering::SeqCst)
+                    && active.completed_at.is_some()
+                    && !active.confirmed
+            });
+        if !still_pending {
+            eprintln!(
+                "WARN reporting the completed handoff to {joining_name} to discovery at {} \
+                 failed: {error}; not retried, the join has been decided since",
+                node_context.discovery_addr
+            );
+            return;
+        }
+        if Instant::now() + backoff >= deadline {
+            eprintln!(
+                "WARN reporting the completed handoff to {joining_name} to discovery at {} \
+                 failed: {error}; giving up after {attempt} attempts, the join's migration \
+                 timeout has run out",
+                node_context.discovery_addr
+            );
+            return;
+        }
+        eprintln!(
+            "WARN reporting the completed handoff to {joining_name} to discovery at {} failed: \
+             {error}; retrying in {}ms",
+            node_context.discovery_addr,
+            backoff.as_millis()
+        );
+        if wait_or_shutdown(backoff, &mut shutdown_rx).await {
+            return;
+        }
+        backoff = (backoff * 2).min(REPORT_COMPLETE_RETRY_MAX);
+        attempt += 1;
+    }
+}
+
 async fn report_complete(
     node_context: &NodeContext,
     joining_name: &str,
@@ -13303,6 +13404,20 @@ async fn report_complete(
     // `connect_and_authenticate`'s own per-leg bounds stacked in front of a
     // second `OUTBOUND_IO_TIMEOUT` for the exchange: a discovery that is
     // merely slow at each leg could otherwise hold this for twice as long.
+    #[cfg(test)]
+    if node_context
+        .gates
+        .failed_reports
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "simulated report failure",
+        ));
+    }
     timeout(OUTBOUND_IO_TIMEOUT, async {
         let mut stream = connect_and_authenticate(
             node_context,
@@ -13629,6 +13744,149 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    /// A completed, unconfirmed handoff to `joiner`, for the `C` retry tests.
+    fn completed_unconfirmed_slot() -> ActiveMigration {
+        ActiveMigration {
+            joining_name: "joiner".to_string(),
+            joining_addr: "127.0.0.1:9".to_string(),
+            joining_token: "tok-joiner".to_string(),
+            after_ring: Arc::new(HashRing::new(vec![
+                "reporter".to_string(),
+                "joiner".to_string(),
+            ])),
+            replication: 2,
+            generation: Some(7),
+            completed_at: Some(Instant::now()),
+            forwarding_grace: Duration::from_secs(60),
+            acked_entries: Some(0),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            marked_keys: Vec::new(),
+            confirmed: false,
+            pre_completion_ring: None,
+            pending_clears: PendingClears::default(),
+            forward_connection: Arc::new(AsyncMutex::new(None)),
+            forward_revoked: Arc::new(AtomicBool::new(false)),
+            lingering: Vec::new(),
+            remnant: false,
+        }
+    }
+
+    /// A fake discovery that drops the first `failures` connections as soon
+    /// as it has read the `C`, and acks every later one. Returns its address
+    /// and how many `C`s it has read.
+    async fn flaky_discovery(failures: usize) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let reports = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&reports);
+        tokio::spawn(async move {
+            loop {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let mut buffer = [0u8; 256];
+                let n = connection.read(&mut buffer).await.unwrap_or(0);
+                if !buffer[..n].starts_with(b"C ") {
+                    continue;
+                }
+                let seen = counted.fetch_add(1, Ordering::SeqCst) + 1;
+                if seen > failures {
+                    let _ = connection.write_all(b"A\n").await;
+                }
+            }
+        });
+        (addr, reports)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_completion_report_is_sent_again_while_the_handoff_is_pending() {
+        let (discovery_addr, reports) = flaky_discovery(2).await;
+        let slot = Arc::new(Mutex::new(Some(completed_unconfirmed_slot())));
+        let identity = Arc::clone(&slot.lock().unwrap().as_ref().unwrap().forward_revoked);
+        let mut node_context =
+            test_node_context("reporter", "tk-reporter", Arc::new(Mutex::new(None)), slot);
+        node_context.discovery_addr = discovery_addr;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        node_context.shutdown_rx = shutdown_rx;
+        timeout(
+            Duration::from_secs(10),
+            report_complete_while_current(
+                &node_context,
+                "joiner",
+                Some(7),
+                &identity,
+                Duration::from_secs(60),
+            ),
+        )
+        .await
+        .expect("acked on the third attempt");
+        assert_eq!(reports.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_completion_report_is_not_sent_again_once_the_join_is_decided() {
+        // Abandoned (`X` revoked the slot), confirmed (the joiner is in a
+        // roster), or replaced by another handoff: one attempt only.
+        let decided: [fn(&mut Option<ActiveMigration>); 3] = [
+            |slot| {
+                slot.as_ref()
+                    .unwrap()
+                    .forward_revoked
+                    .store(true, Ordering::SeqCst)
+            },
+            |slot| slot.as_mut().unwrap().confirmed = true,
+            |slot| *slot = Some(completed_unconfirmed_slot()),
+        ];
+        for decide in decided {
+            let (discovery_addr, reports) = flaky_discovery(usize::MAX).await;
+            let slot = Arc::new(Mutex::new(Some(completed_unconfirmed_slot())));
+            let identity = Arc::clone(&slot.lock().unwrap().as_ref().unwrap().forward_revoked);
+            decide(&mut slot.lock().unwrap());
+            let mut node_context =
+                test_node_context("reporter", "tk-reporter", Arc::new(Mutex::new(None)), slot);
+            node_context.discovery_addr = discovery_addr;
+            let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+            node_context.shutdown_rx = shutdown_rx;
+            timeout(
+                Duration::from_secs(5),
+                report_complete_while_current(
+                    &node_context,
+                    "joiner",
+                    Some(7),
+                    &identity,
+                    Duration::from_secs(60),
+                ),
+            )
+            .await
+            .expect("gives up at once");
+            assert_eq!(reports.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_completion_report_is_not_sent_again_past_the_migration_timeout() {
+        let (discovery_addr, reports) = flaky_discovery(usize::MAX).await;
+        let slot = Arc::new(Mutex::new(Some(completed_unconfirmed_slot())));
+        let identity = Arc::clone(&slot.lock().unwrap().as_ref().unwrap().forward_revoked);
+        let mut node_context =
+            test_node_context("reporter", "tk-reporter", Arc::new(Mutex::new(None)), slot);
+        node_context.discovery_addr = discovery_addr;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        node_context.shutdown_rx = shutdown_rx;
+        timeout(
+            Duration::from_secs(10),
+            report_complete_while_current(
+                &node_context,
+                "joiner",
+                Some(7),
+                &identity,
+                Duration::from_millis(1200),
+            ),
+        )
+        .await
+        .expect("bounded by the limit");
+        // Attempts at 0 s and 0.5 s; the next wait (1 s) would end past it.
+        assert_eq!(reports.load(Ordering::SeqCst), 2);
     }
 
     // The whole `C` report shares one OUTBOUND_IO_TIMEOUT: a discovery that

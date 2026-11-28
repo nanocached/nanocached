@@ -334,7 +334,10 @@ are orchestrated by discovery in stages:</p>
   coincide.</li>
   <li>When every node reports completion, discovery promotes the joiner
   into the served node list; clients pick it up on their next
-  refresh. Until it is promoted, the joiner answers <code>W</code> to
+  refresh. A node whose report fails (discovery unreachable, or no
+  acknowledgment within 10&nbsp;seconds) sends it again with backoff
+  while the join is still pending, so one lost report does not leave the
+  join to wait out its migration timeout. Until it is promoted, the joiner answers <code>W</code> to
   any client request that reaches it — no node list names it yet, but a
   connection a client dialed to the previous occupant of the same
   address can land on it — so the client refreshes and retries on an
