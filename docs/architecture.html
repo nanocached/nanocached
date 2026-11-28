@@ -119,6 +119,18 @@ unreachable.</p>
   survivor's only copy of a key re-replication hasn't delivered yet),
   and a re-replication that starts while a join is running waits for the
   join to finish first, since the join changes the ring again.</li>
+  <li>A joiner whose join is abandoned (its migration timeout ran out, a
+  source was evicted mid-join, or its own connection to discovery dropped)
+  <strong>starts over</strong> as well. What that attempt handed it is as
+  old as the attempt, and the writes and deletes made since went to the old
+  owners only; the next handoff only fills keys the joiner does not hold, so
+  the old copies would win and deleted keys would come back. When the
+  joiner asks to join again, it says that an earlier attempt ended without
+  its promotion. If discovery no longer has that attempt, it answers
+  <code>G</code> once the abandon has stopped the old sources sending, and
+  the joiner clears its cache before the join that hands it its keys
+  again. An attempt discovery still holds, because it has not noticed the
+  old connection end, simply carries on.</li>
   <li>A node that comes back after being evicted <strong>starts over</strong>
   instead of resuming. A process that was stopped, or cut off from
   discovery, for longer than the liveness timeout is evicted while it is

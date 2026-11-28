@@ -5376,7 +5376,10 @@ async fn run_cache(
 /// already-promoted member — same shape, no handoff orchestration on the
 /// other end. `rejoin_capable` adds the `G` to a `P` that tells discovery
 /// this node can clear its cache and join again if discovery answers `G\n`
-/// (it evicted the name earlier): see `discard_state_to_rejoin`.
+/// (it evicted the name earlier): see `discard_state_to_rejoin`. On a `J`,
+/// the same `G` marks a retry after an attempt that ended without `R`, which
+/// discovery answers `G\n` when that attempt is gone: see
+/// `discard_unfinished_join`.
 fn registration_message(
     letter: char,
     name: &str,
@@ -5852,6 +5855,46 @@ async fn discard_state_to_rejoin(node_context: &NodeContext, discovery_addr: &st
         "WARN discovery at {discovery_addr} evicted this node earlier and the cluster has moved \
          on without it: dropping the cache and joining again"
     );
+    reset_to_fresh_joiner(node_context).await;
+    true
+}
+
+/// The primary discovery answered this node's retried `J` (`J … G`) with
+/// `G`: the earlier attempt, whose connection ended without `R`, is gone —
+/// abandoned on its migration timeout or a source's eviction, or dropped
+/// with its connection — and the sources it stopped have rolled back. The
+/// copies that attempt handed this node are as old as the attempt, and the
+/// writes and deletes since went to the old owners only. The next join's
+/// handoff is put-if-absent, so they would win over the owners' values,
+/// and a key deleted meanwhile is not in it at all: the node would be
+/// promoted serving them. So, as for an eviction (`discard_state_to_rejoin`),
+/// the cache goes before the plain `J` that stages the new handoff.
+///
+/// Returns `false`, touching nothing, once the node is leaving or its drain
+/// has begun (`DrainState::begun`): it is on its way out and joins no more.
+/// Unlike `discard_state_to_rejoin`, it does not mark the drain evicted;
+/// the node was never a member. A promoted node never sends `J`, so never
+/// gets here.
+async fn discard_unfinished_join(node_context: &NodeContext, discovery_addr: &str) -> bool {
+    let leaving = node_context
+        .leaving
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some();
+    if leaving || node_context.drain.begun() {
+        return false;
+    }
+    eprintln!(
+        "WARN discovery at {discovery_addr} ended this node's earlier join attempt: dropping \
+         what that attempt handed it and joining again"
+    );
+    reset_to_fresh_joiner(node_context).await;
+    true
+}
+
+/// Puts the node back where a fresh joiner starts: not promoted, no
+/// membership view, an empty cache. The caller then sends `J`.
+async fn reset_to_fresh_joiner(node_context: &NodeContext) {
     // First, so that nothing is served from what is about to go.
     node_context.promoted.store(false, Ordering::SeqCst);
     for ring in [&node_context.known_ring, &node_context.latest_published] {
@@ -5861,7 +5904,6 @@ async fn discard_state_to_rejoin(node_context: &NodeContext, discovery_addr: &st
         // The cache task is gone, which only happens while shutting down.
         eprintln!("WARN could not clear the cache before joining again: {error}");
     }
-    true
 }
 
 /// Holds one long-lived connection to a single discovery replica:
@@ -5881,6 +5923,16 @@ async fn register_with_discovery(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let join = registration_message('J', &node_context.name, port, &node_context.token, false);
+    // A `J` sent again after an attempt whose connection ended without `R`
+    // (see `discard_unfinished_join`): discovery answers `G` if that attempt
+    // is gone, and the node clears what it handed it before the plain `J`.
+    let join_retry = registration_message('J', &node_context.name, port, &node_context.token, true);
+    // Whether this node may hold copies from a `J` that has not ended in
+    // `R`: set by every `J` sent, reset when the cache is cleared.
+    let mut unfinished_join = false;
+    // Cleared when discovery rejected `J … G` (`Ed`): it predates the field,
+    // and plain `J`s are all it takes.
+    let mut join_retry_supported = true;
     // Only the primary's announce can send this node back through a join:
     // its roster is the one this node adopts and its `J` the one that
     // stages a handoff. A standby replica just lists the node.
@@ -5999,7 +6051,19 @@ async fn register_with_discovery(
                     &role,
                     DiscoveryRole::Primary(promoted_tx) if !*promoted_tx.borrow()
                 );
-                let registration = if sending_join { &join } else { &announce };
+                let retrying_join = sending_join && unfinished_join && join_retry_supported;
+                let registration = if retrying_join {
+                    &join_retry
+                } else if sending_join {
+                    &join
+                } else {
+                    &announce
+                };
+                // Set before the write: a `J` that is cut off mid-write can
+                // still have registered.
+                if sending_join {
+                    unfinished_join = true;
+                }
 
                 let registration_sent = authenticated
                     && {
@@ -6047,12 +6111,28 @@ async fn register_with_discovery(
                         && &promoted == b"G\n"
                         && let DiscoveryRole::Primary(promoted_tx) = &role
                     {
-                        if discard_state_to_rejoin(&node_context, &discovery_addr).await {
+                        // To a retried `J`: its earlier attempt is gone (see
+                        // `discard_unfinished_join`).
+                        if retrying_join {
+                            if discard_unfinished_join(&node_context, &discovery_addr).await {
+                                unfinished_join = false;
+                                continue;
+                            }
+                        } else if discard_state_to_rejoin(&node_context, &discovery_addr).await {
+                            unfinished_join = false;
                             promoted_tx.send_replace(false);
                             continue;
                         }
+                    } else if retrying_join && read_promoted.is_ok() && &promoted == b"Ed" {
+                        eprintln!(
+                            "WARN discovery at {discovery_addr} does not take the G of a retried \
+                             J (an earlier version); joining with a plain J, keeping what the \
+                             earlier attempt handed this node"
+                        );
+                        join_retry_supported = false;
                     } else if read_promoted.is_ok() && &promoted == b"R\n" {
                         if sending_join {
+                            unfinished_join = false;
                             println!("INFO joined the cluster via discovery at {discovery_addr}");
                         } else {
                             println!("INFO re-registered with discovery at {discovery_addr}");
@@ -37521,6 +37601,143 @@ mod tests {
             2,
             "{events:?}"
         );
+    }
+
+    /// Runs `send_heartbeats` for an unpromoted node against a fake primary
+    /// that answers its registrations in turn from `replies` (`None`: close
+    /// without a reply; `R\n` is followed by heartbeat acks), until every
+    /// reply was used. Returns each registration frame received and, in the
+    /// same sequence, `clear` wherever the node cleared its cache.
+    async fn registrations_against(
+        replies: Vec<Option<&'static [u8]>>,
+        prepare: impl FnOnce(&NodeContext),
+    ) -> Vec<String> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+        let events: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let replies_len = replies.len();
+
+        let primary_events = Arc::clone(&events);
+        let fake_primary = tokio::spawn(async move {
+            for reply in replies {
+                let (mut connection, _) = listener.accept().await.unwrap();
+                let mut buffer = [0u8; 128];
+                let n = connection.read(&mut buffer).await.unwrap_or(0);
+                primary_events
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buffer[..n]).into_owned());
+                let Some(reply) = reply else {
+                    continue;
+                };
+                if connection.write_all(reply).await.is_err() || reply != b"R\n" {
+                    continue;
+                }
+                loop {
+                    match connection.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if connection.write_all(b"A\n").await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+
+        let (request_tx, mut request_rx) = mpsc::channel::<CacheRequest>(4);
+        let cache_events = Arc::clone(&events);
+        let cache = tokio::spawn(async move {
+            while let Some(request) = request_rx.recv().await {
+                if matches!(request.command, Command::ClearAll) {
+                    cache_events.lock().unwrap().push("clear".to_string());
+                }
+                let _ = request.response_tx.send(Response::Stored);
+            }
+        });
+
+        let mut node_context = test_node_context(
+            "test-node",
+            "tk-test-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.promoted.store(false, Ordering::SeqCst);
+        node_context.request_tx = request_tx;
+        prepare(&node_context);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                port: 8356,
+                interval: Duration::from_millis(20),
+                auth_secret: None,
+                tls_connector: None,
+            },
+            node_context,
+            mpsc::channel::<RereplicationTask>(4).1,
+            shutdown_rx,
+            mpsc::channel(1).0,
+        ));
+        for _ in 0..1000 {
+            let received = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| *event != "clear")
+                .count();
+            if received == replies_len {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        sleep(Duration::from_millis(50)).await;
+        shutdown_tx.send_replace(true);
+        heartbeat_task.await.unwrap();
+        fake_primary.abort();
+        cache.abort();
+        events.lock().unwrap().clone()
+    }
+
+    const PLAIN_J: &str = "J 9 8356 12\ntest-nodetk-test-node";
+    const RETRIED_J: &str = "J 9 8356 12 G\ntest-nodetk-test-node";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_joiner_clears_what_an_attempt_that_discovery_ended_handed_it_before_joining_again() {
+        // The first attempt's connection ends without `R`; the retry says
+        // so, discovery answers that the attempt is gone, and the cache is
+        // cleared before the plain `J` that stages the next handoff.
+        let events = registrations_against(vec![None, Some(b"G\n"), Some(b"R\n")], |_| {}).await;
+        assert_eq!(events, vec![PLAIN_J, RETRIED_J, "clear", PLAIN_J]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_joiner_whose_attempt_carries_on_keeps_what_it_was_handed() {
+        // Discovery still has the attempt (it adopts the retried `J`): the
+        // node keeps its copies, and sends `G` again only after another
+        // attempt that ended without `R`.
+        let events = registrations_against(vec![None, None, Some(b"R\n")], |_| {}).await;
+        assert_eq!(events, vec![PLAIN_J, RETRIED_J, RETRIED_J]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_draining_joiner_told_its_attempt_is_gone_keeps_its_cache() {
+        let events = registrations_against(vec![None, Some(b"G\n"), None], |node_context| {
+            node_context.drain.begin();
+        })
+        .await;
+        assert_eq!(events, vec![PLAIN_J, RETRIED_J, RETRIED_J]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_joiner_falls_back_to_plain_joins_with_a_discovery_that_rejects_the_retry_field() {
+        // A discovery of an earlier version answers the unknown field `Ed`.
+        let events =
+            registrations_against(vec![None, Some(b"Ed\n"), None, Some(b"R\n")], |_| {}).await;
+        assert_eq!(events, vec![PLAIN_J, RETRIED_J, PLAIN_J, PLAIN_J]);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -45,6 +45,22 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`, `nanocached-discovery`: a joiner whose join was
+  abandoned (migration timeout, a source evicted mid-join, or its own
+  discovery connection dropping) kept the copies that attempt had handed it
+  and simply sent `J` again. The next handoff is put-if-absent, so those
+  copies won: once promoted, the node answered the old value for keys
+  rewritten in the gap and revived keys deleted in it, often as their
+  primary. In a two-node simulation with 200 keys, all 140 keys the joiner
+  owned were wrong. A node now marks a `J` it sends after an attempt that
+  ended without `R` (`J … G`). If discovery no longer has that attempt, it
+  answers `G` (after the abandon's cancels have reached the old sources),
+  and the node clears its cache before the plain `J` that stages the new
+  handoff. An attempt discovery still holds (it has not seen the old
+  connection end yet) carries on with what it handed the node. A node that
+  is leaving or draining keeps its cache. A discovery of an earlier version
+  rejects the field, and the node then sends plain `J`s as before (#2252).
+
 - `nanocached-node`: one source address could pin the whole
   `--max-in-flight-bytes` budget with uploads it never finished, and every
   value-carrying reply on other clients' connections then waited for it
