@@ -808,6 +808,27 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await node.close()
 
+    async def test_a_byte_other_than_lf_after_a_busy_marker_poisons_the_connection(self):
+        # `B` carries no body: the next byte must be the LF of `B\n`. A
+        # different byte is a desync, not a busy answer with its LF.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                node.answer_raw_to_get_once(b"BX")
+                with self.assertRaisesRegex(
+                    NanocachedError, "unexpected byte after response marker"
+                ):
+                    await client.get("k")
+
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
     async def test_an_unterminated_value_header_poisons_the_connection_promptly(self):
         # Regression for issue #8 follow-up: readuntil()'s
         # LimitOverrunError (a ValueError subclass — neither
