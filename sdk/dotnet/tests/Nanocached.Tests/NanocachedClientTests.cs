@@ -6767,6 +6767,46 @@ public class NanocachedClientTests
         Assert.Equal(3, cluster.Discovery.ConnectionCount);
     }
 
+    [Fact]
+    public async Task ARequestDuringARefreshsSlowDialIsRoutedByTheOldRingAndItsMembers()
+    {
+        // Issue #2197: discovery drops node A (still alive) and adds node C,
+        // whose handshake takes 1.5 s. The refresh used to remove A from the
+        // members before dialing C while the old ring still routed A's keys
+        // to it, so a get in the dial window found no member for its owner.
+        // Members and ring are now published together after the dials.
+        using Cluster cluster = StartCluster(replication: 1);
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", cluster.Discovery.Port));
+        string key = KeyOwnedBy(Names[0]);
+        await client.SetAsync(key, "v");
+        MockNode nodeA = cluster.Nodes[Names[0]];
+        int getsOnA = nodeA.GetCount;
+
+        using var nodeC = new MockNode();
+        nodeC.DelayAuth(1500);
+        cluster.Discovery.SetNodes(new List<(string, string)>
+        {
+            (Names[1], cluster.Nodes[Names[1]].Address),
+            ("8c2d7e41-5a6b-4c3d-9e8f-0a1b2c3d4e5f", nodeC.Address),
+        });
+
+        MethodInfo refreshMethod = typeof(NanocachedClient)
+            .GetMethod("MaybeRefreshAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var refresh = (Task)refreshMethod.Invoke(client, new object[] { true })!;
+        DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (nodeC.ConnectionCount == 0)
+        {
+            Assert.True(DateTime.UtcNow < deadline, "the refresh never dialed the new node");
+            await Task.Delay(5);
+        }
+
+        Assert.Equal("v", await client.GetAsync(key));
+        Assert.False(refresh.IsCompleted, "the get must have run during the dial");
+        Assert.Equal(getsOnA + 1, nodeA.GetCount);
+        await refresh.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
     /// <summary>A key whose primary under <see cref="Names"/> (R=1) is
     /// <paramref name="owner"/>.</summary>
     private static string KeyOwnedBy(string owner)

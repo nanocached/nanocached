@@ -5397,10 +5397,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             if (!_members.TryGetValue(slot, out Member? member))
             {
                 // Not sent: no connection was ever picked for this request.
-                // The ring still names a member a refresh in progress has
-                // already removed (RefreshNodeListAsync drops departed
-                // members first and swaps the ring only after dialing the
-                // new ones), and a non-idempotent op must read this as
+                // This request was routed by a ring read before a refresh
+                // removed the member (RefreshNodeListAsync swaps members
+                // and ring together, but a request may still hold the old
+                // owner names), and a non-idempotent op must read this as
                 // "refresh and reroute", not as a possibly-applied loss.
                 throw new ConnectionLostException(
                     $"nanocached: {slot} has no open connection", requestNotSent: true);
@@ -5556,36 +5556,17 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         // (leaks) the first.
         List<DiscoveredNode> nodes = DedupeDiscoveredNodes(cluster.Nodes);
 
-        var toOpen = new List<DiscoveredNode>();
+        var byName = nodes.ToDictionary(node => node.Name);
+        // Only reads here: the departed members are removed, the moved
+        // addresses updated and the ring swapped together after the dials
+        // below (issue #2197, as in Java). Removing departed members first
+        // left the old ring routing to a member that was gone for the
+        // whole dial phase (up to the connect timeout), so a request in
+        // that window failed with "has no open connection".
+        List<DiscoveredNode> toOpen;
         lock (_stateLock)
         {
-            var byName = nodes.ToDictionary(node => node.Name);
-
-            foreach (string name in _members.Keys.Where(name => !byName.ContainsKey(name)).ToList())
-            {
-                Member departed = _members[name];
-                departed.Connection?.Close();
-                _members.Remove(name);
-                // Node names are per-process UUIDs; a departed node's
-                // redial gate would otherwise leak forever (issue #12).
-                _redialGates.Remove(name);
-                // Same leak, same reason, for the per-address cooldown map:
-                // a departed node's address is never reused, so its cooldown
-                // entry (if any) would otherwise linger forever (issue #96).
-                _reconnectCooldowns.TryRemove(departed.Address, out _);
-            }
-
-            foreach (DiscoveredNode node in nodes)
-            {
-                if (_members.TryGetValue(node.Name, out Member? existing))
-                {
-                    existing.Address = node.Address;
-                }
-                else
-                {
-                    toOpen.Add(node);
-                }
-            }
+            toOpen = nodes.Where(node => !_members.ContainsKey(node.Name)).ToList();
         }
 
         // Dial every newly discovered node concurrently (issue #227), at
@@ -5609,6 +5590,28 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                     connection?.Close();
                 }
                 return;
+            }
+
+            foreach (string name in _members.Keys.Where(name => !byName.ContainsKey(name)).ToList())
+            {
+                Member departed = _members[name];
+                departed.Connection?.Close();
+                _members.Remove(name);
+                // Node names are per-process UUIDs; a departed node's
+                // redial gate would otherwise leak forever (issue #12).
+                _redialGates.Remove(name);
+                // Same leak, same reason, for the per-address cooldown map:
+                // a departed node's address is never reused, so its cooldown
+                // entry (if any) would otherwise linger forever (issue #96).
+                _reconnectCooldowns.TryRemove(departed.Address, out _);
+            }
+
+            foreach (DiscoveredNode node in nodes)
+            {
+                if (_members.TryGetValue(node.Name, out Member? existing))
+                {
+                    existing.Address = node.Address;
+                }
             }
 
             foreach (var (node, connection, error) in outcomes)
