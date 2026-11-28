@@ -181,8 +181,10 @@ class ClientStats:
     ``fire_and_forget_replicas`` background write (client-side replication,
     Fire-and-forget replica writes).
 
-    ``read_repair_failures``: failures swallowed while probing owners or
-    writing back the repaired value during read repair (read repair).
+    ``read_repair_failures``: read-repair write-backs of the repaired value
+    to the primary that failed and were swallowed (read repair). A failed
+    probe of an owner, or of the primary or replica just before the
+    write-back, is not counted.
 
     ``refresh_failures``: node-list refreshes that produced no usable node
     list (counted once per refresh, however many discovery addresses it
@@ -243,9 +245,9 @@ _MAX_CONCURRENT_DIALS = 64
 # that genuinely recovers isn't shut out for long.
 _DEFAULT_RECONNECT_COOLDOWN = 1.0
 
-# Longest read_hedge_after connect() accepts: 24 hours, as in the Rust and
-# TypeScript SDKs.
-_MAX_READ_HEDGE_AFTER = 24 * 60 * 60
+# Longest read_hedge_after connect() accepts: 365 days, as in the Java and
+# .NET SDKs.
+_MAX_READ_HEDGE_AFTER = 365 * 24 * 60 * 60
 
 
 def _resolve_reconnect_cooldown(reconnect_cooldown: float | None, disable: bool) -> float:

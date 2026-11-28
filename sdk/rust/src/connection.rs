@@ -94,7 +94,33 @@ pub static REQUEST_TIMEOUT_MS: AtomicU64 = AtomicU64::new(30_000);
 /// #151, docs/protocol.html#multi) — every other marker leaves it
 /// `None`, `value`/`ttl_seconds` unused for those two markers instead.
 type RawResponse = (u8, Option<Vec<u8>>, Option<u64>, Option<Vec<MultiEntry>>);
-type RawResponseSender = oneshot::Sender<Result<RawResponse>>;
+type RawResponseSender = oneshot::Sender<std::result::Result<RawResponse, SlotError>>;
+
+/// Why the read loop failed a pending request. `sent` is true for every
+/// failure except one the node is known not to have acted on: then
+/// `single_attempt` hands `error` back as it is, and a plain
+/// [`Error::ConnectionLost`] keeps the redial and resend a non-idempotent
+/// request gets when nothing was sent (issue #2161). Otherwise it passes
+/// through `mark_sent`, because the frame was written.
+#[derive(Clone)]
+struct SlotError {
+    error: Error,
+    sent: bool,
+}
+
+impl SlotError {
+    /// A failure of a request the node never read (the requests pipelined
+    /// behind one it answered with `En`).
+    fn not_run(error: Error) -> Self {
+        Self { error, sent: false }
+    }
+}
+
+impl From<Error> for SlotError {
+    fn from(error: Error) -> Self {
+        Self { error, sent: true }
+    }
+}
 
 /// A pending request's queue slot: the sender its response ultimately
 /// resolves, plus — on a tagged connection (echoed response tags) — the tag it was
@@ -986,7 +1012,9 @@ impl Connection {
         // double-apply an effect the server already committed.
         match rx.await {
             Ok(Ok(raw)) => Ok(raw),
-            Ok(Err(error)) => Err(Self::mark_sent(error)),
+            Ok(Err(SlotError { error, sent: true })) => Err(Self::mark_sent(error)),
+            // Issue #2161: the read loop knows the node never read it.
+            Ok(Err(SlotError { error, sent: false })) => Err(error),
             Err(_) => Err(Error::ConnectionLostAfterSend(
                 "nanocached: connection is closed".to_string(),
             )),
@@ -1415,22 +1443,27 @@ async fn read_loop(
                 // merely shares the dead connection, so it gets the plain
                 // connection loss that keeps its redial and replay, not a
                 // clone of the rejection, which no retry path sends again.
+                // The node reads nothing after the frame it answers with
+                // `En` (docs/protocol.html), so those requests were never
+                // run, and are failed as not sent (issue #2161, Go's
+                // `notSent`): an incr, CAS or expiring touch among them is
+                // resent too, instead of failing as outcome unknown.
                 if matches!(&error, Error::Protocol(message) if message == SERVER_REJECTED_MESSAGE)
                 {
                     let oldest = shared.pending.lock().unwrap().pop_front();
                     if let Some(slot) = oldest {
-                        let _ = slot.tx.send(Err(error));
+                        let _ = slot.tx.send(Err(error.into()));
                     }
                     drain_pending(
                         &shared,
-                        Some(Error::ConnectionLost(
+                        Some(SlotError::not_run(Error::ConnectionLost(
                             "nanocached: the server closed the connection after rejecting a request"
                                 .to_string(),
-                        )),
+                        ))),
                     )
                     .await;
                 } else {
-                    drain_pending(&shared, Some(error)).await;
+                    drain_pending(&shared, Some(error.into())).await;
                 }
                 return;
             }
@@ -1469,8 +1502,10 @@ async fn read_loop(
         if marker == b'B' {
             let message = "nanocached: server is at its connection limit (busy)".to_string();
             shared.mark_closed(&shutdown_tx);
-            let _ = slot.tx.send(Err(Error::ConnectionLost(message.clone())));
-            drain_pending(&shared, Some(Error::ConnectionLost(message))).await;
+            let _ = slot
+                .tx
+                .send(Err(Error::ConnectionLost(message.clone()).into()));
+            drain_pending(&shared, Some(Error::ConnectionLost(message).into())).await;
             return;
         }
 
@@ -1491,8 +1526,10 @@ async fn read_loop(
             // misaligned, so it gets the same "desynced" error rather
             // than the generic "connection closed" drain_pending would
             // otherwise give it.
-            let _ = slot.tx.send(Err(Error::ConnectionLost(message.clone())));
-            drain_pending(&shared, Some(Error::ConnectionLost(message))).await;
+            let _ = slot
+                .tx
+                .send(Err(Error::ConnectionLost(message.clone()).into()));
+            drain_pending(&shared, Some(Error::ConnectionLost(message).into())).await;
             return;
         }
 
@@ -1513,8 +1550,8 @@ async fn read_loop(
                 marker as char
             );
             shared.mark_closed(&shutdown_tx);
-            let _ = slot.tx.send(Err(Error::Protocol(message.clone())));
-            drain_pending(&shared, Some(Error::ConnectionLost(message))).await;
+            let _ = slot.tx.send(Err(Error::Protocol(message.clone()).into()));
+            drain_pending(&shared, Some(Error::ConnectionLost(message).into())).await;
             return;
         }
 
@@ -1547,19 +1584,19 @@ async fn read_loop(
 /// queued request unanswered until that write ended. A request that
 /// enqueues in the window between the first rejection and the lock (it
 /// was already past its closed check) is rejected by the second one.
-async fn drain_pending(shared: &Shared, first_error: Option<Error>) {
+async fn drain_pending(shared: &Shared, first_error: Option<SlotError>) {
     reject_pending(shared, first_error.as_ref());
     let mut state = shared.write_state.lock().await;
     state.write_half = None;
     reject_pending(shared, first_error.as_ref());
 }
 
-fn reject_pending(shared: &Shared, first_error: Option<&Error>) {
+fn reject_pending(shared: &Shared, first_error: Option<&SlotError>) {
     let pending: Vec<PendingSlot> = shared.pending.lock().unwrap().drain(..).collect();
     for slot in pending {
         let error = match first_error {
             Some(error) => error.clone(),
-            None => Error::ConnectionLost("nanocached: connection closed".to_string()),
+            None => Error::ConnectionLost("nanocached: connection closed".to_string()).into(),
         };
         let _ = slot.tx.send(Err(error));
     }
