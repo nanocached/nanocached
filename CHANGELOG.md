@@ -45,6 +45,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a re-replication pass that could not send some keys
+  to a promoted owner still counted as complete. A target refused on all
+  three attempts (three refused dials take milliseconds) was written off
+  for the rest of the pass, and a target with no address or token was
+  skipped, so those keys stayed one replica short until a client wrote
+  them again. The pass now retries the keys of an unreachable target in up
+  to three more rounds (after 2 s, 8 s and 20 s), with a short backoff
+  between attempts. A pass that still leaves keys undelivered keeps its
+  ring change for the next pass to cover (#2257).
 - `nanocached-node`: one heartbeat that discovery neither answered nor
   refused (a blackholed path, a lost ack) kept the node silent for about
   20 s: the ack was waited for 10 s and the reconnect then waited out the
