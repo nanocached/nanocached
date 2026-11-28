@@ -612,8 +612,8 @@ public final class NanocachedClient implements AutoCloseable {
     // bound (each one is a short connect-and-identify, individually bounded
     // by Identify.CONNECT_TIMEOUT_MS), so a small fixed pool still dials a
     // huge cluster promptly — it just does it in waves instead of all at
-    // once.
-    private static final int MAX_BOOTSTRAP_DIALER_THREADS = 16;
+    // once. 64, as in the other five SDKs.
+    private static final int MAX_BOOTSTRAP_DIALER_THREADS = 64;
 
     // Threads available to the keep-alive scheduler: one runs the periodic
     // tick, the rest ping idle connections concurrently (see

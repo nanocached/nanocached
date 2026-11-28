@@ -336,7 +336,8 @@ public sealed class PartialServerTooOldException<T> : ServerTooOldException
 
 /// <summary>
 /// issue #825 — internal: the node answered <c>En</c> (issue #939: only
-/// that exact line; any other <c>E</c>, such as the proxy's, is a plain
+/// an <c>E</c> line whose rest starts with <c>n</c>, such as <c>En</c> or
+/// <c>EnT</c>; any other <c>E</c>, such as the proxy's bare one, is a plain
 /// <see cref="ConnectionLostException"/>). Derives
 /// from <see cref="ConnectionLostException"/> so every command other than
 /// touch keeps surfacing exactly what it always did for an unexpected
