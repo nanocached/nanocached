@@ -182,8 +182,10 @@ class ClientStats:
     ``fire_and_forget_replicas`` background write (client-side replication,
     Fire-and-forget replica writes).
 
-    ``read_repair_failures``: failures swallowed while probing owners or
-    writing back the repaired value during read repair (read repair).
+    ``read_repair_failures``: read-repair write-backs of the repaired value
+    to the primary that failed and were swallowed (read repair). A failed
+    probe of an owner, or of the primary or replica just before the
+    write-back, is not counted.
 
     ``refresh_failures``: node-list refreshes that produced no usable node
     list (counted once per refresh, however many discovery addresses it
@@ -244,9 +246,9 @@ _MAX_CONCURRENT_DIALS = 64
 # that genuinely recovers isn't shut out for long.
 _DEFAULT_RECONNECT_COOLDOWN = 1.0
 
-# Longest read_hedge_after connect() accepts: 24 hours, as in the Rust and
-# TypeScript SDKs.
-_MAX_READ_HEDGE_AFTER = 24 * 60 * 60
+# Longest read_hedge_after connect() accepts: 365 days, as in the Java and
+# .NET SDKs.
+_MAX_READ_HEDGE_AFTER = 365 * 24 * 60 * 60
 
 
 def _resolve_reconnect_cooldown(reconnect_cooldown: float | None, disable: bool) -> float:
@@ -1198,30 +1200,46 @@ class NanocachedClient:
         _redial attempt against self._single_address that got us here).
         Re-fetches the roster and dials one at random via
         _dial_one_proxy_randomly, reusing exactly the same fan-out and
-        random-order failover as the initial connect."""
+        random-order failover as the initial connect. The proxy whose
+        redial just failed is left out of the candidates unless it is the
+        only one listed, as in the Go SDK: dialing it again would cost
+        another refusal, or up to the connect deadline when its address
+        is black-holed."""
         proxies = await self._fetch_proxy_list()
+        if proxies is None:
+            # No discovery address answered: nothing was sent, and a retry
+            # once discovery (or the proxy) is back can succeed, so this is
+            # a connection failure, as in the Go, Java, Rust and TypeScript
+            # SDKs, not a claim that the roster is empty.
+            raise ConnectFailedError(
+                f"nanocached: proxy {self._single_address} is unreachable and no "
+                "discovery server answered (proxy mode reconnect)"
+            )
         if not proxies:
             raise NanocachedError(
                 "nanocached: no proxies registered with discovery (proxy mode reconnect)"
             )
-        return await self._dial_one_proxy_randomly(proxies)
+        others = [proxy for proxy in proxies if proxy.address != self._single_address]
+        return await self._dial_one_proxy_randomly(others or proxies)
 
-    async def _fetch_proxy_list(self) -> list[DiscoveredNode]:
+    async def _fetch_proxy_list(self) -> list[DiscoveredNode] | None:
         """Walks every configured discovery address (discovery HA),
-        exactly like _fetch_node_list, returning the first that answers
-        with a (possibly empty) proxy roster. A node-identifying address
-        is skipped (closed) rather than erroring, and every failure is
-        swallowed here: like _fetch_node_list, this reconnect-time fetch
-        must never itself raise something other than "no proxies were
-        found" — the caller (_reconnect_via_new_proxy) turns an empty
-        result into the same clear error an empty initial roster would
-        raise at connect(). Each failed address is counted in
+        exactly like _fetch_node_list, returning the first non-empty proxy
+        roster. A node-identifying address is skipped (closed) rather than
+        erroring, and every failure is swallowed here: like
+        _fetch_node_list, this reconnect-time fetch never raises. It
+        returns ``[]`` when some discovery server answered but none listed
+        a proxy, and ``None`` when no discovery server answered at all;
+        the caller (_reconnect_via_new_proxy) raises "no proxies
+        registered" for the first and a connection failure for the
+        second. Each failed address is counted in
         stats().refresh_failures — once per fetch that produced no usable
         roster (every address failed, or none listed a proxy), the same
         counter _refresh_node_list uses, since both are "the node/proxy
         list this client routes with just went stale" (per the spec:
         reuse the SDK's existing counters rather than adding a
         proxy-only one)."""
+        answered = False
         for address_host, address_port in self._addresses:
             try:
                 identified = await connect_and_identify_proxy(
@@ -1233,10 +1251,11 @@ class NanocachedClient:
                 identified.writer.close()
                 continue
             if not identified:
+                answered = True
                 continue
             return identified
         self._refresh_failures += 1
-        return []
+        return [] if answered else None
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -1593,7 +1612,6 @@ class NanocachedClient:
             return await self._with_wrong_node_retry(
                 lambda: self._write(namespace, key_bytes, op, primary_first=ttl_seconds == 0),
                 replay_safe=ttl_seconds != 0,
-                rejection_is_final=True,
             )
         except (NanocachedError, ConnectionError, OSError) as error:
             if _rejected_by_server(error):
@@ -1655,7 +1673,6 @@ class NanocachedClient:
                     primary_first=ttl_seconds == 0,
                 ),
                 replay_safe=ttl_seconds != 0,
-                rejection_is_final=True,
             )
         except (NanocachedError, ConnectionError, OSError) as error:
             if _rejected_by_server(error):
@@ -3443,7 +3460,6 @@ class NanocachedClient:
         operation: Callable[[], Awaitable[_T]],
         *,
         replay_safe: bool = True,
-        rejection_is_final: bool = False,
     ) -> _T:
         """Connection-level failures (and `W`) retry once, after a forced
         node-list refresh: the usual cause is a node death that discovery
@@ -3466,17 +3482,21 @@ class NanocachedClient:
         or WrongNodeError means the request never reached the server at
         all either way, so it retries regardless of ``replay_safe``.
 
-        ``rejection_is_final`` (issue #902): an ``En`` answer arrives as a
-        connection loss carrying it as the cause, and a refresh and a
-        second attempt would only ask the same node again. touch and
-        get_and_touch set it, so an old node that predates them fails the
-        call at once with the rejection."""
+        An ``En`` answer (issues #902, #2183) is final for every request
+        kind, as in the Go and Rust SDKs: it arrives as a connection loss
+        carrying the rejection as its cause, and the node refuses the
+        request itself (a command it does not know, one too large or
+        malformed), so a refresh and a second attempt would only get the
+        same ``En`` on a new connection. A touch or get_and_touch against
+        a node that predates them therefore fails at once. The requests
+        pipelined behind the rejected one fail as never sent, not as
+        rejected, and keep this retry."""
         try:
             return await operation()
         except (WrongNodeError, ConnectionError, OSError) as error:
             if not replay_safe and isinstance(error, ConnectionLostError):
                 raise
-            if rejection_is_final and _rejected_by_server(error):
+            if _rejected_by_server(error):
                 raise
             if self._ring is None:
                 raise

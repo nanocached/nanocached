@@ -1690,6 +1690,39 @@ class NanocachedClientTest {
     }
 
     @Test
+    void anEnToAGetIsFinalAndNotResentOnANewConnection() throws Exception {
+        // Issue #2182: the node refusing a request with `En` would refuse
+        // the same frame on a fresh connection, so it is not redialled and
+        // resent (Go and Rust treat it as final too).
+        try (ScriptedNode node = new ScriptedNode(header -> header.startsWith("G ") ? "En\n" : null)) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedException.ConnectionLost error =
+                        assertThrows(NanocachedException.ConnectionLost.class, () -> client.get("k"));
+                assertTrue(error instanceof NanocachedException.ServerRejected, String.valueOf(error));
+            }
+            assertEquals(1, node.frames.get(), "the refused get must be sent once");
+            assertEquals(1, node.connections.get(), "the refused get must not be redialled");
+        }
+    }
+
+    @Test
+    void anEnToAGetInAClusterIsFinalAndNotResentAfterARefresh() throws Exception {
+        // Issue #2182: in a cluster the refresh-and-retry must not resend
+        // the refused request either.
+        try (ScriptedNode node = new ScriptedNode(header -> header.startsWith("G ") ? "En\n" : null);
+                MockDiscovery discovery =
+                        new MockDiscovery(List.of(new DiscoveredNode(NAMES.get(0), "127.0.0.1:" + node.port())), 1)) {
+            try (NanocachedClient client = connect("127.0.0.1", discovery.port())) {
+                NanocachedException.ConnectionLost error =
+                        assertThrows(NanocachedException.ConnectionLost.class, () -> client.get("k"));
+                assertTrue(error instanceof NanocachedException.ServerRejected, String.valueOf(error));
+            }
+            assertEquals(1, node.frames.get(), "the refused get must be sent once");
+            assertEquals(1, node.connections.get(), "the refused get must not be redialled");
+        }
+    }
+
+    @Test
     void anEnRejectsOnlyTheOldestRequestAndAnIncrPipelinedBehindItIsRedialed() throws Exception {
         // Issue #1875: a node's `En` answers the oldest request still
         // waiting; whatever was sent behind it is never read, so an INCR
@@ -4152,7 +4185,7 @@ class NanocachedClientTest {
         // timeout: that gives this test a wide, deterministic window in
         // which to sample how many "nanocached-bootstrap-dial" threads
         // are alive at once, instead of racing a fast-failing dial.
-        int nodeCount = 20; // > the 16-thread cap (MAX_BOOTSTRAP_DIALER_THREADS)
+        int nodeCount = 70; // > the 64-thread cap (MAX_BOOTSTRAP_DIALER_THREADS)
         List<java.net.ServerSocket> silentServers = new ArrayList<>();
         List<DiscoveredNode> nodes = new ArrayList<>();
         try {
@@ -4203,9 +4236,13 @@ class NanocachedClientTest {
                     sampler.join();
                 }
 
-                assertTrue(maxObserved.get() > 0, "test never observed a dialer thread running");
+                // Issue #2204: the cap is 64, as in the other five SDKs; with 16
+                // a large roster was dialed in four times as many waves.
                 assertTrue(
-                        maxObserved.get() <= 16,
+                        maxObserved.get() > 16,
+                        "bootstrap must dial more than 16 nodes at once, observed " + maxObserved.get());
+                assertTrue(
+                        maxObserved.get() <= 64,
                         "bootstrap dialer pool must never exceed its cap, observed " + maxObserved.get());
             }
         } finally {
@@ -9745,6 +9782,53 @@ class NanocachedClientTest {
                 assertEquals(primaryOnA, failure.succeededKeys);
                 assertEquals(12, nodeA.multiSetKeyCount.get(), "every key sent to A exactly once");
                 assertEquals(12, nodeA.store.size());
+            }
+        }
+    }
+
+    @Test
+    void batchedSetReportsAKeyStoredWhenItsAcknowledgingReplicaBecomesThePrimary() throws Exception {
+        // Issue #2173: R=2 over {a, b, c}, c unreachable. The first key's
+        // primary a answers `W` and its replica b stores it; a then leaves
+        // the roster, so after the refresh the key's owners are [b, c]: b,
+        // which already stored it, is not sent the key again, and the key
+        // used to go unreported although its primary holds it. The second
+        // key's primary is c on both passes, which is what makes setMany
+        // throw the partial failure at all.
+        List<String> names = List.of(NAMES.get(0), NAMES.get(1), "9c3e2a1b-3c1a-4d7e-9f20-8b6c5d4e3f21");
+        try (MockNode nodeA = new MockNode();
+                MockNode nodeB = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 2)) {
+            // The dead port last, after every listener is bound (see
+            // startClusterWithDeadNodes).
+            List<DiscoveredNode> listed = List.of(
+                    new DiscoveredNode(names.get(0), nodeA.address()),
+                    new DiscoveredNode(names.get(1), nodeB.address()),
+                    new DiscoveredNode(names.get(2), "127.0.0.1:" + MockServers.unusedPort()));
+            discovery.nodes = listed;
+            HashRing before = new HashRing(names);
+            String promotedKey = null;
+            String unreachableKey = null;
+            for (int i = 0; promotedKey == null || unreachableKey == null; i++) {
+                String candidate = "key-" + i;
+                List<String> owners = before.owners(candidate.getBytes(StandardCharsets.UTF_8), 2);
+                if (promotedKey == null && owners.equals(List.of(names.get(0), names.get(1)))) promotedKey = candidate;
+                if (unreachableKey == null && owners.get(0).equals(names.get(2))) unreachableKey = candidate;
+            }
+            try (NanocachedClient client = connect("127.0.0.1", discovery.port())) {
+                nodeA.answerWrongNodeOnce();
+                // The refresh the `W` triggers finds a gone.
+                discovery.nodes = listed.subList(1, 3);
+                Map<String, String> batch = new java.util.LinkedHashMap<>();
+                batch.put(promotedKey, "v");
+                batch.put(unreachableKey, "w");
+                NanocachedException.PartialConnectionLostSet failure =
+                        assertThrows(NanocachedException.PartialConnectionLostSet.class, () -> client.setMany(batch));
+                assertEquals(
+                        Set.of(promotedKey),
+                        failure.succeededKeys,
+                        "the key's acknowledging replica is its primary now");
+                assertTrue(nodeB.store.containsKey(promotedKey));
             }
         }
     }

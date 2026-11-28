@@ -1872,12 +1872,14 @@ final class MockServers {
      * A node that answers each {@code t} / {@code y} frame with whatever bytes a script returns for
      * its header line, so a test can put an exact wire reply (the proxy's {@code R}, a bare {@code
      * E}, ...) in front of the client. {@code null} from the script closes the connection. Only the
-     * touch frames are understood after the handshake; each one is counted in {@link #frames} and
-     * recorded in {@link #headers}.
+     * touch, {@code i} and {@code G} frames are understood after the handshake; each one is counted
+     * in {@link #frames} and recorded in {@link #headers}. Every accepted connection is counted in
+     * {@link #connections}.
      */
     static final class ScriptedNode implements AutoCloseable {
         final ServerSocket server;
         final AtomicInteger frames = new AtomicInteger();
+        final AtomicInteger connections = new AtomicInteger();
         final List<String> headers = new CopyOnWriteArrayList<>();
         private final boolean acceptTags;
         private final java.util.function.Function<String, String> script;
@@ -1903,6 +1905,7 @@ final class MockServers {
             try {
                 while (true) {
                     Socket socket = server.accept();
+                    connections.incrementAndGet();
                     Thread worker = new Thread(() -> serve(socket), "scripted-node-conn");
                     worker.setDaemon(true);
                     worker.start();
@@ -1933,6 +1936,8 @@ final class MockServers {
                         for (int i = 0; i < count; i++) body += Integer.parseInt(p[3 + i]);
                     } else if (p[0].equals("i")) {
                         body = Integer.parseInt(p[1]) + Integer.parseInt(p[2]);
+                    } else if (p[0].equals("G")) {
+                        body = Integer.parseInt(p[1]);
                     }
                     in.readNBytes(body);
                     frames.incrementAndGet();
