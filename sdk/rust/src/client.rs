@@ -6335,6 +6335,11 @@ impl NanocachedClient {
     /// non-empty roster, so the caller can tell a failed refresh from a
     /// usable roster whose proxies all failed to dial.
     ///
+    /// `pinned` is the proxy whose redial just failed: it is left out of
+    /// the candidates unless it is the roster's only entry, as in the Go
+    /// SDK (issue #2202), so the failover does not spend a dial (up to the
+    /// connect deadline, for a black-holed address) on it again.
+    ///
     /// The candidates are dialed through the reconnect cooldown (issue
     /// #2169): one whose dial failed within the cooldown is skipped (the
     /// pinned proxy whose redial just failed among them), and a failed dial
@@ -6364,7 +6369,13 @@ impl NanocachedClient {
                                 || proxies.iter().any(|proxy| &proxy.address == address)
                         });
                     }
-                    let dialed = self.dial_proxy_candidates(&proxies).await;
+                    let others: Vec<DiscoveredNode> = proxies
+                        .iter()
+                        .filter(|proxy| proxy.address != pinned)
+                        .cloned()
+                        .collect();
+                    let candidates = if others.is_empty() { &proxies } else { &others };
+                    let dialed = self.dial_proxy_candidates(candidates).await;
                     return (dialed, true);
                 }
             }

@@ -10575,6 +10575,80 @@ async fn via_proxy_failover_is_single_flight_under_concurrent_requests() {
     proxy_b.stop();
 }
 
+/// Issue #2202: the failover after a failed redial of the pinned proxy left
+/// that proxy among the candidates, so it could be dialed a second time. The
+/// pinned proxy's port answers the handshake with garbage so each dial is
+/// counted; `others` are the rest of the roster after the loss. `cooldown`
+/// false disables the reconnect cooldown. Returns the pinned proxy's dial
+/// count and whether the get succeeded.
+async fn failover_dials_of_the_failed_proxy(
+    others: Vec<(String, String)>,
+    cooldown: bool,
+) -> (usize, bool) {
+    let proxy_a = MockNode::start().await;
+    let discovery = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-a".to_string(), proxy_a.address())],
+    )
+    .await;
+    let options = Options::new()
+        .addresses([("127.0.0.1", discovery.port)])
+        .via_proxy(true);
+    let options = if cooldown {
+        options.reconnect_cooldown(Duration::from_secs(30))
+    } else {
+        options.disable_reconnect_cooldown()
+    };
+    let client = NanocachedClient::connect(options).await.unwrap();
+    client.set("k", "v", 0).await.unwrap();
+
+    let port_a = proxy_a.port;
+    proxy_a.stop();
+    let dead_a = GarbageListener::start_on_port(port_a).await;
+    let mut roster = vec![("proxy-a".to_string(), format!("127.0.0.1:{port_a}"))];
+    roster.extend(others);
+    discovery.set_proxies(roster);
+
+    let succeeded = client.get("k").await.is_ok();
+    let dials = dead_a.accepted.load(Ordering::SeqCst);
+
+    client.close().await;
+    discovery.stop();
+    dead_a.stop();
+    (dials, succeeded)
+}
+
+#[tokio::test]
+async fn via_proxy_failover_does_not_redial_the_proxy_that_just_failed() {
+    let dead_b = format!("127.0.0.1:{}", unused_port().await);
+    let (dials, succeeded) =
+        failover_dials_of_the_failed_proxy(vec![("proxy-b".to_string(), dead_b)], true).await;
+    assert!(!succeeded);
+    assert_eq!(dials, 1, "only the redial reaches the failed proxy");
+}
+
+#[tokio::test]
+async fn via_proxy_failover_lands_on_the_survivor_without_redialing_the_failed_proxy() {
+    let proxy_b = MockNode::start().await;
+    let (dials, succeeded) =
+        failover_dials_of_the_failed_proxy(vec![("proxy-b".to_string(), proxy_b.address())], true)
+            .await;
+    assert!(succeeded);
+    assert_eq!(dials, 1, "only the redial reaches the failed proxy");
+    assert_eq!(proxy_b.state.connections.load(Ordering::SeqCst), 1);
+    proxy_b.stop();
+}
+
+#[tokio::test]
+async fn via_proxy_failover_falls_back_to_the_failed_proxy_when_it_is_the_only_one() {
+    // Without a cooldown, so that nothing but the candidate choice decides
+    // whether the failed proxy is dialed again.
+    let (dials, succeeded) = failover_dials_of_the_failed_proxy(vec![], false).await;
+    assert!(!succeeded);
+    assert_eq!(dials, 2, "the redial, then the failover's one candidate");
+}
+
 /// Issue #2169: with every proxy down while discovery still lists them, each
 /// request used to fetch the roster and dial every proxy again, ignoring the
 /// reconnect cooldown. Now the pinned proxy's cooldown returns the stored
