@@ -97,7 +97,11 @@ pub enum Error {
     /// the server sending something the wire protocol doesn't allow at
     /// all, not a well-formed rejection of credentials.
     Authentication(String),
-    /// The server said something the protocol doesn't allow.
+    /// The server said something the protocol doesn't allow, outside a
+    /// reply to a request: the handshake, discovery's node list, or a
+    /// node's `En` to a command other than touch. A reply to a request
+    /// that cannot be parsed poisons the connection and is a
+    /// [`Self::ConnectionLost`] instead, retried like one.
     Protocol(String),
     /// The caller passed something that could never be meant.
     InvalidArgument(String),
