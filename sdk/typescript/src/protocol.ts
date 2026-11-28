@@ -959,7 +959,13 @@ export function tryParseResponse(
     }
 
     case MARKER_BUSY:
-      return buf.length < 2 ? null : { response: { kind: "busy" }, consumed: 2 };
+      // `B\n` is bare even on a tagged connection; any other second byte is
+      // a desynced stream, as for the untagged status markers above.
+      if (buf.length < 2) return null;
+      if (buf[1] !== LF) {
+        throw new NanocachedError("nanocached: unexpected byte after response marker (connection desynced)");
+      }
+      return { response: { kind: "busy" }, consumed: 2 };
 
     case MARKER_VALUE: {
       const headerEnd = buf.indexOf(LF);

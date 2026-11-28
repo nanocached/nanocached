@@ -1117,6 +1117,13 @@ describe("tagged frames (echoed response tags)", () => {
     });
   });
 
+  it("throws when the byte after a B marker isn't a newline", () => {
+    for (const tagged of [false, true]) {
+      assert.throws(() => tryParseResponse(Buffer.from("BX"), tagged), /connection desynced/);
+      assert.throws(() => tryParseResponse(Buffer.from("B 7\n"), tagged), /connection desynced/);
+    }
+  });
+
   it("keeps the unsolicited busy response bare in tagged mode", () => {
     assert.deepEqual(tryParseResponse(Buffer.from("B\n"), true), {
       response: { kind: "busy" },
