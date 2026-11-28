@@ -2523,9 +2523,9 @@ async fn rejects_an_empty_addresses_list() {
 #[tokio::test]
 async fn a_malformed_value_length_poisons_the_connection_and_retries_transparently() {
     // Regression for issue #8/#12: a garbage V header poisons the
-    // connection (a Protocol error, deliberately not auto-retried), so
-    // the next request redials cleanly instead of reading stray bytes
-    // from a desynced stream.
+    // connection, so the retry redials cleanly instead of reading stray
+    // bytes from a desynced stream. Issue #2163: it is a connection loss,
+    // so the get itself is retried once on the new connection.
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
 
@@ -2533,12 +2533,6 @@ async fn a_malformed_value_length_poisons_the_connection_and_retries_transparent
     node.state
         .malformed_value_replies
         .fetch_add(1, Ordering::SeqCst);
-
-    let first = client.get("k").await;
-    assert!(
-        matches!(first, Err(Error::Protocol(_))),
-        "expected a protocol error, got {first:?}"
-    );
 
     let value = client.get("k").await.unwrap();
     assert_eq!(value, Some("v".to_string()));
@@ -2558,13 +2552,15 @@ async fn drain_pending_broadcasts_the_specific_triggering_error_to_every_queued_
     // unpopped in `pending` when the malformed reply arrives) while
     // firing several more concurrently ensures all of them are still
     // queued when the read loop dies.
+    // Issue #2163: a malformed reply is a connection loss, retried once, so
+    // every reply is malformed here for the retries to fail as well.
     let node = MockNode::start().await;
     let client = NanocachedClient::connect(options(node.port)).await.unwrap();
 
     node.state.get_delay_ms.store(300, Ordering::SeqCst);
     node.state
         .malformed_value_replies
-        .fetch_add(1, Ordering::SeqCst);
+        .fetch_add(1000, Ordering::SeqCst);
 
     let mut gets = Vec::new();
     for i in 0..6 {
@@ -2577,8 +2573,8 @@ async fn drain_pending_broadcasts_the_specific_triggering_error_to_every_queued_
     let mut messages = Vec::new();
     for task in gets {
         match task.await.unwrap() {
-            Err(Error::Protocol(message)) => messages.push(message),
-            other => panic!("expected Error::Protocol for every queued request, got {other:?}"),
+            Err(Error::ConnectionLost(message)) => messages.push(message),
+            other => panic!("expected ConnectionLost for every queued request, got {other:?}"),
         }
     }
 
@@ -2591,6 +2587,78 @@ async fn drain_pending_broadcasts_the_specific_triggering_error_to_every_queued_
     assert!(
         first.contains("invalid value length"),
         "want the specific triggering error, not a generic \"connection closed\": {first:?}"
+    );
+
+    client.close().await;
+    node.stop();
+}
+
+// ── a malformed reply is a connection loss (issue #2163) ────────────
+
+#[tokio::test]
+async fn a_malformed_reply_retries_every_pipelined_get_once_on_a_new_connection() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("a", "1", 0).await.unwrap();
+    client.set("b", "2", 0).await.unwrap();
+    // The first `G` is held, so the second is pipelined behind it, then
+    // answered with a value header that cannot be parsed.
+    node.state.get_delay_ms.store(300, Ordering::SeqCst);
+    node.state
+        .malformed_value_replies
+        .fetch_add(1, Ordering::SeqCst);
+
+    let first = {
+        let client = client.clone();
+        tokio::spawn(async move { client.get("a").await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let second = {
+        let client = client.clone();
+        tokio::spawn(async move { client.get("b").await })
+    };
+
+    assert_eq!(first.await.unwrap().unwrap().as_deref(), Some("1"));
+    assert_eq!(second.await.unwrap().unwrap().as_deref(), Some("2"));
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn an_incr_pipelined_behind_a_malformed_reply_is_not_sent_again() {
+    // The node that sent the malformed reply kept reading: the incr behind
+    // it was sent and may have been applied, so it fails as outcome unknown
+    // instead of being applied twice.
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("n", "1", 0).await.unwrap();
+    node.state.get_delay_ms.store(300, Ordering::SeqCst);
+    node.state
+        .malformed_value_replies
+        .fetch_add(1, Ordering::SeqCst);
+
+    let get = {
+        let client = client.clone();
+        tokio::spawn(async move { client.get("a").await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let incr = {
+        let client = client.clone();
+        tokio::spawn(async move { client.incr("n", 1).await })
+    };
+
+    assert_eq!(get.await.unwrap().unwrap(), None, "the get is retried");
+    let incr = incr.await.unwrap();
+    assert!(
+        matches!(incr, Err(Error::ConnectionLost(_))),
+        "incr: {incr:?}"
+    );
+    assert_eq!(
+        node.state.incrs.load(Ordering::SeqCst),
+        1,
+        "the incr is not sent again"
     );
 
     client.close().await;
@@ -2815,14 +2883,16 @@ async fn a_response_header_without_a_terminator_is_rejected_instead_of_growing_u
     // without bound waiting for a `\n` that might never come — a
     // malicious or misbehaving peer could use this to exhaust client
     // memory. It now caps the line at MAX_HEADER_LINE_LENGTH and fails
-    // fast with a Protocol error, wrapped in an outer test timeout so a
-    // regression fails loudly instead of hanging the suite.
+    // fast, wrapped in an outer test timeout so a regression fails loudly
+    // instead of hanging the suite. The listener accepts one connection
+    // only, so the retry a malformed reply gets (issue #2163) is refused.
     let listener = bind_listener(0).await;
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         let Ok((socket, _)) = listener.accept().await else {
             return;
         };
+        drop(listener);
         let mut stream = BufReader::new(socket);
         let Ok(auth) = read_line(&mut stream).await else {
             return;
@@ -2859,8 +2929,8 @@ async fn a_response_header_without_a_terminator_is_rejected_instead_of_growing_u
         .await
         .expect("get() must fail fast on a runaway header instead of hanging");
     assert!(
-        matches!(result, Err(Error::Protocol(_))),
-        "expected a protocol error, got {result:?}"
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "expected a connection loss, got {result:?}"
     );
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -3098,6 +3168,55 @@ async fn a_timeout_surfaces_as_a_plain_connection_lost_on_every_path() {
     assert!(
         matches!(delete, Err(Error::ConnectionLost(_))),
         "delete = {delete:?}"
+    );
+
+    client.close().await;
+    node.stop();
+}
+
+// Issue #2162: the requests pipelined behind one whose deadline expired
+// fail as timed out too, as in the other SDKs: they are not redialed and
+// sent again, which would wait out a second deadline and send an
+// idempotent write twice.
+#[tokio::test]
+async fn requests_pipelined_behind_a_timed_out_request_time_out_with_it() {
+    let node = MockNode::start().await;
+    let client =
+        NanocachedClient::connect(options(node.port).request_timeout(Duration::from_millis(500)))
+            .await
+            .unwrap();
+    node.state.silent.store(true, Ordering::SeqCst);
+
+    let first = {
+        let client = client.clone();
+        tokio::spawn(async move { client.get("a").await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = tokio::time::Instant::now();
+    let second = {
+        let client = client.clone();
+        tokio::spawn(async move { client.get("b").await })
+    };
+
+    let first = first.await.unwrap();
+    assert!(
+        matches!(first, Err(Error::ConnectionLost(_))),
+        "first = {first:?}"
+    );
+    let second = second.await.unwrap();
+    assert!(
+        matches!(second, Err(Error::ConnectionLost(_))),
+        "second = {second:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "the second get took {:?}, want it failed with the first",
+        started.elapsed()
+    );
+    assert_eq!(
+        node.state.connections.load(Ordering::SeqCst),
+        1,
+        "nothing is redialed"
     );
 
     client.close().await;
@@ -5547,6 +5666,76 @@ async fn the_proxys_e_to_an_incr_is_a_connection_loss_and_a_pipelined_get_is_ret
     );
     let get = get.await.unwrap();
     assert_eq!(get.unwrap().as_deref(), Some("v"));
+
+    client.close().await;
+    node.stop();
+}
+
+// ── requests behind a node's `En` were never run (issue #2161) ──────
+
+#[tokio::test]
+async fn an_incr_pipelined_behind_a_nodes_en_is_resent_once_on_a_new_connection() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("n", "1", 0).await.unwrap();
+    *node.state.touch_error_reply.lock().unwrap() = Some(b"En\n".to_vec());
+    node.state.error_reply_delay_ms.store(400, Ordering::SeqCst);
+
+    let touch = {
+        let client = client.clone();
+        tokio::spawn(async move { client.touch("k", Some(30)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let incr = {
+        let client = client.clone();
+        tokio::spawn(async move { client.incr("n", 1).await })
+    };
+
+    let touch = touch.await.unwrap();
+    assert!(
+        matches!(touch, Err(Error::ServerTooOld { command: "t" })),
+        "touch: {touch:?}"
+    );
+    // The node reads nothing after the frame it answers with `En`, so the
+    // incr was never run and is sent again, once.
+    let incr = incr.await.unwrap();
+    assert_eq!(incr.unwrap(), Some(2));
+    assert_eq!(node.state.incrs.load(Ordering::SeqCst), 1);
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn an_expiring_touch_pipelined_behind_a_nodes_en_is_resent_once_on_a_new_connection() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("p", "v", 0).await.unwrap();
+    client.set("n", "1", 0).await.unwrap();
+    *node.state.incr_error_reply.lock().unwrap() = Some(b"En\n".to_vec());
+    node.state.error_reply_delay_ms.store(400, Ordering::SeqCst);
+
+    let incr = {
+        let client = client.clone();
+        tokio::spawn(async move { client.incr("n", 1).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let touch = {
+        let client = client.clone();
+        tokio::spawn(async move { client.touch("p", Some(0)).await })
+    };
+
+    let incr = incr.await.unwrap();
+    assert!(matches!(incr, Err(Error::Protocol(_))), "incr: {incr:?}");
+    let touch = touch.await.unwrap();
+    assert!(touch.unwrap(), "the resent touch found the key");
+    assert_eq!(
+        touch_frames(&node).len(),
+        1,
+        "sent once, on the new connection"
+    );
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
 
     client.close().await;
     node.stop();
@@ -10120,6 +10309,97 @@ async fn via_proxy_with_an_empty_roster_is_a_clear_connect_error() {
     discovery.stop();
 }
 
+/// Issue #2198: when every proxy in the first roster is unreachable,
+/// connect() fails, as in the other SDKs; it used to move on to the next
+/// discovery seed.
+#[tokio::test]
+async fn via_proxy_connect_fails_when_every_proxy_in_the_first_roster_is_unreachable() {
+    let dead_port = unused_port().await;
+    let other_proxy = MockNode::start().await;
+    let first = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-dead".to_string(), format!("127.0.0.1:{dead_port}"))],
+    )
+    .await;
+    let second = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-b".to_string(), other_proxy.address())],
+    )
+    .await;
+
+    let result = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", first.port), ("127.0.0.1", second.port)])
+            .via_proxy(true),
+    )
+    .await;
+
+    match result {
+        Err(Error::ConnectionLost(message)) => {
+            assert!(message.contains("reachable"), "err = {message}");
+        }
+        Ok(client) => {
+            client.close().await;
+            panic!("connect() succeeded through the second seed, want ConnectionLost");
+        }
+        Err(other) => panic!("connect() = {other}, want ConnectionLost"),
+    }
+    assert_eq!(
+        second.q_requests.load(Ordering::SeqCst),
+        0,
+        "the second seed must not be asked"
+    );
+    assert_eq!(other_proxy.state.connections.load(Ordering::SeqCst), 0);
+    first.stop();
+    second.stop();
+    other_proxy.stop();
+}
+
+/// Issue #2198, the failover side: a re-fetched roster whose proxies are
+/// all unreachable ends the failover; the next discovery seed is not asked.
+#[tokio::test]
+async fn via_proxy_failover_stops_at_the_first_roster_whose_proxies_are_all_unreachable() {
+    let proxy_a = MockNode::start().await;
+    let proxy_b = MockNode::start().await;
+    let first = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-a".to_string(), proxy_a.address())],
+    )
+    .await;
+    let second = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-b".to_string(), proxy_b.address())],
+    )
+    .await;
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", first.port), ("127.0.0.1", second.port)])
+            .via_proxy(true),
+    )
+    .await
+    .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+
+    // The first seed still lists only proxy A, which is now down.
+    proxy_a.stop();
+    assert!(client.get("k").await.is_err());
+    assert_eq!(
+        second.q_requests.load(Ordering::SeqCst),
+        0,
+        "the second seed must not be asked once the first returned a roster"
+    );
+    assert_eq!(proxy_b.state.connections.load(Ordering::SeqCst), 0);
+
+    client.close().await;
+    first.stop();
+    second.stop();
+    proxy_b.stop();
+}
+
 #[tokio::test]
 async fn via_proxy_pointed_at_a_node_address_is_a_clear_connect_error() {
     let node = MockNode::start().await;
@@ -10712,6 +10992,10 @@ async fn connect_rejects_zero_and_overflowing_duration_options() {
         ("reconnect_cooldown", base().reconnect_cooldown(day_plus)),
         ("read_hedge_after", base().read_hedge_after(Duration::ZERO)),
         ("read_hedge_after", base().read_hedge_after(Duration::MAX)),
+        (
+            "read_hedge_after",
+            base().read_hedge_after(Duration::from_secs(365 * 24 * 60 * 60 + 1)),
+        ),
     ];
     for (name, options) in cases {
         match NanocachedClient::connect(options).await {
@@ -10728,8 +11012,9 @@ async fn connect_rejects_zero_and_overflowing_duration_options() {
     node.stop();
 }
 
-/// The boundary values stay valid: 24 hours itself, and a zero
-/// `reconnect_cooldown` (documented as "use the default").
+/// The boundary values stay valid: 24 hours itself (365 days for
+/// `read_hedge_after`, the same bound as the Java and .NET SDKs), and a
+/// zero `reconnect_cooldown` (documented as "use the default").
 #[tokio::test]
 async fn connect_accepts_duration_options_at_the_bounds() {
     let node = MockNode::start().await;
@@ -10744,6 +11029,22 @@ async fn connect_accepts_duration_options_at_the_bounds() {
     )
     .await
     .expect("bounds are valid");
+    client.close().await;
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", node.port)])
+            .read_hedge_after(Duration::from_secs(2 * 24 * 60 * 60)),
+    )
+    .await
+    .expect("a 2-day read_hedge_after is valid");
+    client.close().await;
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", node.port)])
+            .read_hedge_after(Duration::from_secs(365 * 24 * 60 * 60)),
+    )
+    .await
+    .expect("a 365-day read_hedge_after is valid");
     client.close().await;
     let client = NanocachedClient::connect(
         Options::new()
@@ -11010,6 +11311,96 @@ async fn batched_set_retries_only_the_legs_that_failed_and_reports_an_unreachabl
     for (_, node) in nodes {
         node.stop();
     }
+}
+
+/// Issue #2175: replica B acknowledges a key on the first pass while its
+/// primary A answers `W` and leaves the roster. After the refresh B is the
+/// key's primary, so the key is stored on its primary and must be in the
+/// partial keys when another key (primary C, unreachable) fails the batch.
+#[tokio::test]
+async fn set_many_reports_a_key_stored_when_its_acknowledging_replica_becomes_the_primary() {
+    let names: Vec<String> = [
+        "aaaaaaaa-1b3d-4e6f-8a90-c1d2e3f4a5b6",
+        "bbbbbbbb-7e2c-4f58-9b31-6a8d0c9e2f47",
+        "cccccccc-3c1a-4d7e-9f20-8b6c5d4e3f21",
+    ]
+    .iter()
+    .map(|name| name.to_string())
+    .collect();
+    let before = HashRing::new(names.clone());
+    let after = HashRing::new(names[1..].to_vec());
+    let owners = |ring: &HashRing, key: &str| -> Vec<String> {
+        ring.owners(b"", key.as_bytes(), 2)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    };
+    // Primary A, replica B; once A is gone, primary B.
+    let promoted = (0..)
+        .map(|i| format!("key-{i}"))
+        .find(|key| {
+            owners(&before, key) == [names[0].clone(), names[1].clone()]
+                && owners(&after, key)[0] == names[1]
+        })
+        .unwrap();
+    // Primary C (unreachable) on both rings, replica B: fails the batch.
+    let unreachable = (0..)
+        .map(|i| format!("key-{i}"))
+        .find(|key| {
+            owners(&before, key) == [names[2].clone(), names[1].clone()]
+                && owners(&after, key)[0] == names[2]
+        })
+        .unwrap();
+
+    let node_a = MockNode::start().await;
+    let node_b = MockNode::start().await;
+    let dead = format!("127.0.0.1:{}", unused_port().await);
+    let discovery = MockDiscovery::start(
+        vec![
+            (names[0].clone(), node_a.address()),
+            (names[1].clone(), node_b.address()),
+            (names[2].clone(), dead.clone()),
+        ],
+        2,
+    )
+    .await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    // A answers `W` for its one-key leg; the refresh the retry pass forces
+    // sees A gone.
+    node_a.state.wrong_node_replies.store(1, Ordering::SeqCst);
+    *discovery.nodes.lock().unwrap() = vec![
+        (names[1].clone(), node_b.address()),
+        (names[2].clone(), dead),
+    ];
+
+    let batch = HashMap::from([
+        (promoted.clone(), "v".to_string()),
+        (unreachable.clone(), "v".to_string()),
+    ]);
+    match client.set_many(&batch, 0).await {
+        Err(Error::PartialConnectionLostKeys(succeeded, _cause)) => {
+            assert_eq!(
+                succeeded,
+                std::collections::HashSet::from([promoted.clone()]),
+                "the key B stored and now owns as primary is stored"
+            );
+        }
+        other => panic!("want PartialConnectionLostKeys, got {other:?}"),
+    }
+    assert!(node_b
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(promoted.as_bytes()));
+
+    client.close().await;
+    discovery.stop();
+    node_a.stop();
+    node_b.stop();
 }
 
 // ── forced refreshes are single-flight ────────────────────────────
@@ -11465,9 +11856,10 @@ async fn a_zero_ttl_batch_touch_is_not_resent_after_a_reply_that_is_not_a_reply(
         .store(1, Ordering::SeqCst);
     let result = client.touch_many(&all, Some(0)).await;
     // Resent, the keys would come back as `false`, expired by the first frame.
+    // The reply poisons the connection: a loss after the send (issue #2163).
     assert!(
-        matches!(result, Err(Error::Protocol(_))),
-        "expected Protocol, got {result:?}"
+        matches!(result, Err(Error::ConnectionLost(_))),
+        "expected ConnectionLost, got {result:?}"
     );
     assert_eq!(
         multi_touch_frames(node_a)

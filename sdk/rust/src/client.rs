@@ -511,15 +511,29 @@ impl ReconnectCooldown {
 /// value, and low enough that `Instant::now() + duration` cannot overflow.
 const MAX_DURATION_OPTION: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Upper bound for `read_hedge_after` (365 days), the same as the Java and
+/// .NET SDKs. Still low enough that `Instant::now() + duration` cannot
+/// overflow.
+const MAX_READ_HEDGE_AFTER: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 fn check_duration_option(name: &str, duration: Duration, require_positive: bool) -> Result<()> {
+    check_duration_bound(name, duration, require_positive, MAX_DURATION_OPTION)
+}
+
+fn check_duration_bound(
+    name: &str,
+    duration: Duration,
+    require_positive: bool,
+    max: Duration,
+) -> Result<()> {
     if require_positive && duration.is_zero() {
         return Err(Error::InvalidArgument(format!(
             "nanocached: {name} must be a positive duration"
         )));
     }
-    if duration > MAX_DURATION_OPTION {
+    if duration > max {
         return Err(Error::InvalidArgument(format!(
-            "nanocached: {name} must be at most {MAX_DURATION_OPTION:?}, got {duration:?}"
+            "nanocached: {name} must be at most {max:?}, got {duration:?}"
         )));
     }
     Ok(())
@@ -720,7 +734,7 @@ impl Options {
     /// so it runs to completion detached, and [`NanocachedClient::close`]
     /// drains it exactly like a fire-and-forget replica write.
     ///
-    /// `duration` must be positive and at most 24 hours; anything else is
+    /// `duration` must be positive and at most 365 days; anything else is
     /// rejected at
     /// [`NanocachedClient::connect`] time, the same as this crate's other
     /// invalid-argument checks.
@@ -1464,14 +1478,17 @@ async fn connect_via_proxy(
                     )));
                     continue;
                 }
+                // The first roster is final, as in the other SDKs: when none
+                // of its proxies is reachable, connect() fails here instead
+                // of asking the next discovery seed, which lists the same
+                // proxy tier.
                 let Some((address, stream, tagged)) =
                     dial_random_proxy(&proxies, auth_secret, tls).await
                 else {
-                    last_error = Some(Error::ConnectionLost(format!(
+                    return Err(Error::ConnectionLost(format!(
                         "nanocached: none of the {} proxy(es) registered with {key} are reachable",
                         proxies.len()
                     )));
-                    continue;
                 };
                 let connection = Arc::new(Connection::new(
                     stream,
@@ -1634,7 +1651,7 @@ impl NanocachedClient {
         // timeout fails every request, and an extreme value overflows
         // `Instant::now() + cooldown` and panics.
         if let Some(duration) = options.read_hedge_after {
-            check_duration_option("read_hedge_after", duration, true)?;
+            check_duration_bound("read_hedge_after", duration, true, MAX_READ_HEDGE_AFTER)?;
         }
         if let Some(duration) = options.keep_alive_interval {
             check_duration_option("keep_alive_interval", duration, true)?;
@@ -4270,6 +4287,19 @@ impl NanocachedClient {
                     // previous pass is not sent it again (see
                     // MultiSetTracker).
                     if tracker.is_acknowledged(idx, &name) {
+                        // If the refresh between the passes promoted this
+                        // owner to the key's primary (the old primary left
+                        // the roster), the key is stored on its primary now
+                        // and is reported so: the earlier pass recorded the
+                        // acknowledgement as a replica's.
+                        if rank == 0 {
+                            tracker
+                                .inner
+                                .lock()
+                                .unwrap()
+                                .primary_acknowledged
+                                .insert(idx);
+                        }
                         continue;
                     }
                     let batch = owners.entry(name).or_default();
@@ -6296,13 +6326,14 @@ impl NanocachedClient {
         Some(connection)
     }
 
-    /// Re-fetches the proxy roster from every configured discovery
-    /// address in turn (discovery HA, mirroring `fetch_node_list`) and
-    /// dials a random, reachable entry from the first non-empty roster —
-    /// see `dial_random_proxy`. `None` once every address has been tried
-    /// and none yielded a reachable proxy. The second value is whether any
-    /// address returned a non-empty roster, so the caller can tell a failed
-    /// refresh from a usable roster whose proxies all failed to dial.
+    /// Re-fetches the proxy roster from the configured discovery addresses
+    /// in turn (discovery HA, mirroring `fetch_node_list`) and dials a
+    /// random, reachable entry from the first non-empty roster — see
+    /// `dial_random_proxy`. That roster is final, as at connect(): when
+    /// none of its proxies is reachable the result is `None` without asking
+    /// the next address. The second value is whether any address returned a
+    /// non-empty roster, so the caller can tell a failed refresh from a
+    /// usable roster whose proxies all failed to dial.
     ///
     /// The candidates are dialed through the reconnect cooldown (issue
     /// #2169): one whose dial failed within the cooldown is skipped (the
@@ -6314,7 +6345,6 @@ impl NanocachedClient {
         &self,
         pinned: &str,
     ) -> (Option<(String, crate::identify::Stream, bool)>, bool) {
-        let mut got_roster = false;
         for (host, port) in &self.inner.addresses {
             if let Ok(Identified::Proxies { proxies }) = connect_and_identify(
                 host,
@@ -6327,7 +6357,6 @@ impl NanocachedClient {
             .await
             {
                 if !proxies.is_empty() {
-                    got_roster = true;
                     {
                         let mut cooldowns = self.inner.reconnect_cooldowns.lock().await;
                         cooldowns.retain(|address, _| {
@@ -6335,13 +6364,12 @@ impl NanocachedClient {
                                 || proxies.iter().any(|proxy| &proxy.address == address)
                         });
                     }
-                    if let Some(result) = self.dial_proxy_candidates(&proxies).await {
-                        return (Some(result), true);
-                    }
+                    let dialed = self.dial_proxy_candidates(&proxies).await;
+                    return (dialed, true);
                 }
             }
         }
-        (None, got_roster)
+        (None, false)
     }
 
     /// `dial_random_proxy` for a failover: the same random order, but an
