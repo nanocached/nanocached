@@ -181,8 +181,10 @@ class ClientStats:
     ``fire_and_forget_replicas`` background write (client-side replication,
     Fire-and-forget replica writes).
 
-    ``read_repair_failures``: failures swallowed while probing owners or
-    writing back the repaired value during read repair (read repair).
+    ``read_repair_failures``: read-repair write-backs of the repaired value
+    to the primary that failed and were swallowed (read repair). A failed
+    probe of an owner, or of the primary or replica just before the
+    write-back, is not counted.
 
     ``refresh_failures``: node-list refreshes that produced no usable node
     list (counted once per refresh, however many discovery addresses it
