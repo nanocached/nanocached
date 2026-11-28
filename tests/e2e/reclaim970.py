@@ -6,7 +6,7 @@ deletes every e key and rewrites every k key to v2 through the SDK;
 `check` reads every key from every listed node raw (G; a non-owner
 answers W) and counts, per class, the keys some node still holds the
 pre-apply state of: an expired or deleted key present anywhere, a
-rewritten key still v1.
+rewritten key still v1 (and, per node, the k keys it serves at v2).
 """
 import asyncio, json, socket, sys
 from nanocached import NanocachedClient
@@ -47,6 +47,8 @@ def raw():
                 for nn, v in r.items():
                     if bad(v): hit[nn] += 1
         out[cls] = dict(stale_or_resurrected_keys=len(keys), per_node=hit, examples=keys[:3])
+        if cls == "k":  # a positive control: how many rewritten keys each node serves at v2
+            out[cls]["v2_per_node"] = {nn: sum(1 for i in range(n) if cs[nn].get(f"k{i}".encode()) == "V:v2") for nn in nodes}
     print(json.dumps(out))
 if mode == "check": raw()
 else: asyncio.run(main())
