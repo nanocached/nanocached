@@ -117,6 +117,26 @@ describe("NanocachedClient against a single node", () => {
     }
   });
 
+  it("keeps a leading U+FEFF in a value read back as a string", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const value = "\uFEFFabc";
+        await client.set("bom", value);
+        assert.deepEqual(await client.getBytes("bom"), Buffer.from([0xef, 0xbb, 0xbf, 0x61, 0x62, 0x63]));
+        assert.equal(await client.get("bom"), value);
+        assert.equal((await client.getMany(["bom"])).get("bom"), value);
+        assert.equal(await client.getAndTouch("bom", 60), value);
+        assert.equal((await client.getManyAndTouch(["bom"], 60)).get("bom"), value);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("stores with a TTL and rejects invalid TTLs before writing", async () => {
     const node = await startMockNode();
     try {
@@ -1113,6 +1133,22 @@ describe("NanocachedClient reconnect-on-use", () => {
     }
   });
 
+  it("a discovery list header with a high-bit byte is rejected", async () => {
+    // 0xB1 decoded as "ascii" lost its high bit and read as "1", so
+    // `N \xB1 1\n` passed as `N 1 1\n`.
+    const discovery = await startMockDiscovery([{ name: "a", address: "127.0.0.1:1" }]);
+    try {
+      const { connectAndIdentify, connectAndListProxies } = await import("../src/identify.js");
+      discovery.answerListHeaderOnce(Buffer.from([0x4e, 0x20, 0xb1, 0x20, 0x31, 0x0a]));
+      await assert.rejects(connectAndIdentify({ host: "127.0.0.1", port: discovery.port }), /invalid node count/);
+      discovery.setProxies([{ name: "p", address: "127.0.0.1:1" }]);
+      discovery.answerListHeaderOnce(Buffer.from([0x4e, 0x20, 0xb1, 0x0a]));
+      await assert.rejects(connectAndListProxies({ host: "127.0.0.1", port: discovery.port }), /invalid proxy count/);
+    } finally {
+      await discovery.close();
+    }
+  });
+
   it("an oversized node-list response fails instead of buffering unbounded memory", async () => {
     // Regression: bounds a malicious discovery server's memory pressure
     // with an aggregate cap on the whole `N ...` response (16 MiB),
@@ -1288,6 +1324,22 @@ describe("NanocachedClient reconnect-on-use", () => {
         // into this response.
         assert.equal(await client.get("k"), "v");
         assert.equal(node.connectionCount(), 2);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
+  it("an incr counter body with a high-bit byte poisons the connection", async () => {
+    // 0xB5 decoded as "ascii" lost its high bit and read as "5".
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        node.answerMalformedIncrValueOnce(Buffer.from([0xb5]));
+        await assert.rejects(client.incr("k", 1), /invalid incr value/);
       } finally {
         await client.close();
       }
@@ -6135,6 +6187,30 @@ describe("NanocachedClient touchMany/getManyAndTouch in a cluster (issue #871)",
     }
   });
 
+  it("a get the node rejects with En is final: one frame, no redial", async () => {
+    // Issue #2184: the same frame on a new connection is refused the same
+    // way, so the refresh-and-retry does not resend it (as in Go and Rust).
+    await withCluster(
+      async (client, cluster) => {
+        const key = keysWithPrimary(cluster, names[0], 1)[0];
+        const node = cluster.nodes[0].mock;
+        const connectionsBefore = node.connectionCount();
+        await assert.rejects(
+          () => client.get(key),
+          (error: unknown) => {
+            assert.ok(error instanceof ConnectionLostError);
+            assert.match(error.message, /unexpected response from server: E/);
+            return true;
+          },
+        );
+        assert.equal(node.getCount(), 1);
+        assert.equal(node.connectionCount(), connectionsBefore);
+      },
+      [{ rejectGets: true }, {}],
+      1,
+    );
+  });
+
   it("a primary that predates t is asked once by a single-key call", async () => {
     // Issue #902: `En` is final, so no redial and resend.
     for (const get of [false, true]) {
@@ -9892,9 +9968,48 @@ describe("reconnect cooldown option", () => {
     assert.equal(resolveReconnectCooldownMs({ ...base, disableReconnectCooldown: true, reconnectCooldownMs: 0 }), 0);
   });
 
-  it("rejects a readHedgeAfterMs above 24 hours (setTimeout would overflow and fire at once)", async () => {
-    await rejects({ readHedgeAfterMs: 2 ** 31 }, /readHedgeAfterMs must be a positive number of milliseconds, at most 86400000/);
-    await rejects({ readHedgeAfterMs: 24 * 60 * 60 * 1000 + 1 }, /readHedgeAfterMs must be a positive/);
+  it("rejects a readHedgeAfterMs above 365 days", async () => {
+    const yearMs = 365 * 24 * 60 * 60 * 1000;
+    await rejects(
+      { readHedgeAfterMs: yearMs + 1 },
+      /readHedgeAfterMs must be a positive number of milliseconds, at most 31536000000/,
+    );
+    await rejects({ readHedgeAfterMs: Infinity }, /readHedgeAfterMs must be a positive/);
+  });
+
+  it("accepts a readHedgeAfterMs of up to 365 days, and a value past setTimeout's range does not hedge at once", async () => {
+    const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const discovery = await startMockDiscovery(
+      [
+        { name: names[0], address: nodeA.address },
+        { name: names[1], address: nodeB.address },
+      ],
+      { replication: 2 },
+    );
+    try {
+      // 2 days and 365 days are both past 2^31-1 ms, where an unclamped
+      // setTimeout fires after about a millisecond.
+      for (const readHedgeAfterMs of [2 * 24 * 60 * 60 * 1000, 365 * 24 * 60 * 60 * 1000]) {
+        const client = await NanocachedClient.connect({
+          addresses: [{ host: "127.0.0.1", port: discovery.port }],
+          readHedgeAfterMs,
+        });
+        try {
+          await client.set("k", "v");
+          const [primaryName] = new HashRing(names).owners(Buffer.from("k"), 2);
+          const [primary, replica] = primaryName === names[0] ? [nodeA, nodeB] : [nodeB, nodeA];
+          const replicaGetsBefore = replica.getCount();
+          primary.delayGets(100);
+          assert.equal(await client.get("k"), "v");
+          assert.equal(replica.getCount(), replicaGetsBefore, "the read hedged to the replica at once");
+        } finally {
+          await client.close();
+        }
+      }
+    } finally {
+      await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+    }
   });
 
   it("throws a RangeError, not a NanocachedError, for caller mistakes in the options", async () => {
@@ -10332,8 +10447,9 @@ describe("a read whose connection is lost in flight is resent once to the same o
   async function withCluster(
     run: (client: NanocachedClient, primary: MockNode, replica: MockNode) => Promise<void>,
     clientOptions: { readHedgeAfterMs?: number; readRepair?: boolean } = {},
+    nodeOptions: { rejectGets?: boolean } = {},
   ): Promise<void> {
-    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const [nodeA, nodeB] = await Promise.all([startMockNode(nodeOptions), startMockNode(nodeOptions)]);
     const discovery = await startMockDiscovery(
       [
         { name: names[0], address: nodeA.address },
@@ -10395,6 +10511,31 @@ describe("a read whose connection is lost in flight is resent once to the same o
     } finally {
       REQUEST_TIMEOUT_TUNING.timeoutMs = saved;
     }
+  });
+
+  it("get: a read the owners refuse with En is not resent to the same owner", async () => {
+    // Issue #2184: an `En` is final, so the resend on a lost connection
+    // must not redial and ask the same owner again.
+    await withCluster(
+      async (client, primary, replica) => {
+        const primaryConnections = primary.connectionCount();
+        const replicaConnections = replica.connectionCount();
+        await assert.rejects(
+          () => client.get("k"),
+          (error: unknown) => {
+            assert.ok(error instanceof ConnectionLostError);
+            assert.match(error.message, /unexpected response from server: E/);
+            return true;
+          },
+        );
+        assert.equal(primary.getCount(), 1, "the refused read was resent to the primary");
+        assert.equal(replica.getCount(), 1, "the refused read was resent to the replica");
+        assert.equal(primary.connectionCount(), primaryConnections);
+        assert.equal(replica.connectionCount(), replicaConnections);
+      },
+      {},
+      { rejectGets: true },
+    );
   });
 
   it("hedged get: the primary's leg is resent before the read hedges onward", async () => {

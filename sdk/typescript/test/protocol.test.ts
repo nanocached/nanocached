@@ -502,6 +502,22 @@ describe("tryParseResponse of a get-and-touch reply (issue #825)", () => {
     );
   });
 
+  it("recognises the node's En only once its line is complete", () => {
+    assert.equal(tryParseResponse(Buffer.from("En")), null);
+    assert.equal(tryParseResponse(Buffer.from("En"), true), null);
+    // `EnT\n` is a node's refusal of an `A` that asked for tags.
+    for (const wire of ["En\n", "EnT\n"]) {
+      for (const tagged of [false, true]) {
+        assert.throws(
+          () => tryParseResponse(Buffer.from(wire), tagged),
+          (error: Error) => error.name === "ServerRejectedError",
+          wire,
+        );
+      }
+    }
+    assert.throws(() => tryParseResponse(Buffer.from(`E${"x".repeat(20)}`)), /missing terminator/);
+  });
+
   it("does not call the proxy's bare E a server rejection (issue #939)", () => {
     for (const [bytes, tagged] of [
       ["E\n", false],
@@ -665,6 +681,19 @@ describe("tryParseResponse", () => {
     }
     for (const wire of ["VX5 7\nhello", "MX1 - 7\n"]) {
       assert.throws(() => tryParseResponse(Buffer.from(wire), true), /malformed response header/, wire);
+    }
+  });
+
+  it("throws when a header carries a byte with the high bit set", () => {
+    // Buffer's "ascii" decoding masked the high bit: 0xB5 read as "5" and
+    // 0xB7 as "7", so each of these parsed as a valid header.
+    const hi = (prefix: string, byte: number, suffix: string) =>
+      Buffer.concat([Buffer.from(prefix), Buffer.from([byte]), Buffer.from(suffix)]);
+    for (const wire of [hi("V ", 0xb5, "\nhello"), hi("I ", 0xb1, "\n7"), hi("M ", 0xb1, " -\n")]) {
+      assert.throws(() => tryParseResponse(wire), NanocachedError, wire.toString("hex"));
+    }
+    for (const wire of [hi("V 5 ", 0xb7, "\nhello"), hi("S ", 0xb7, "\n"), hi("V ", 0xb5, " 7\nhello")]) {
+      assert.throws(() => tryParseResponse(wire, true), NanocachedError, wire.toString("hex"));
     }
   });
 
@@ -1115,6 +1144,13 @@ describe("tagged frames (echoed response tags)", () => {
       response: { kind: "stored", tag: 100 },
       consumed: 6,
     });
+  });
+
+  it("throws when the byte after a B marker isn't a newline", () => {
+    for (const tagged of [false, true]) {
+      assert.throws(() => tryParseResponse(Buffer.from("BX"), tagged), /connection desynced/);
+      assert.throws(() => tryParseResponse(Buffer.from("B 7\n"), tagged), /connection desynced/);
+    }
   });
 
   it("keeps the unsolicited busy response bare in tagged mode", () => {

@@ -833,7 +833,9 @@ error) and stays usable for the next operation.
 Every `R` a connection receives — whether retried away transparently or
 not — is counted in `client.Stats().TransientRetries`, alongside the
 other swallowed-failure counters (`ReplicaWriteFailures`,
-`ReadRepairFailures`, `RefreshFailures`). Nodes and discovery servers
+`ReadRepairFailures`, `RefreshFailures`, and `BackgroundWriteBugs`, which
+counts an unexpected exception escaping a background replica write or a
+read-repair task and must never increase). Nodes and discovery servers
 accept the capability but never send `R` today; only
 `nanocached-proxy` does, so this mainly matters in [SDK proxy
 mode](#sdk-proxy-mode) — but the SDK handles it on every connection

@@ -261,7 +261,7 @@ func (c *Client) multiTouchNS(namespace []byte, keys []string, ttlSeconds int64,
 	}
 
 	state := &multiTouchState{
-		results: make(map[int]multiEntry, len(keys)), wrongNode: map[int]bool{}, lost: map[int]bool{},
+		results: make(map[int]multiEntry, len(keys)), wrongNode: map[int]bool{}, lost: map[int]string{},
 		answeredBy: map[int]string{},
 	}
 	retry := c.multiTouchPass(namespace, keyBytes, ttlSeconds, get, nil, state)
@@ -389,11 +389,11 @@ type multiTouchState struct {
 	lastErr   error
 	rejected  bool
 	// lost holds the indices a ttlSeconds == 0 call must not resend (issue
-	// #901): their primary leg failed after the frame was written, so the
-	// node may have expired them already. lostErr is that failure, kept
-	// apart from lastErr so a later not-sent failure in the retry pass
-	// cannot replace it.
-	lost    map[int]bool
+	// #901), each mapped to the node its primary leg was sent to: that leg
+	// failed after the frame was written, so the node may have expired them
+	// already. lostErr is that failure, kept apart from lastErr so a later
+	// not-sent failure in the retry pass cannot replace it.
+	lost    map[int]string
 	lostErr error
 	// answeredBy names the node whose primary answer is in results[idx], so
 	// the deferred replica fan-out of a ttlSeconds == 0 call (issue #934)
@@ -523,7 +523,7 @@ func (c *Client) multiTouchPass(
 					// applied (issue #1602): the chunks after it never left,
 					// so they are retried like any unresolved key.
 					if lostIsFinal && i < sentEnd {
-						state.lost[idx] = true
+						state.lost[idx] = leg.name
 						continue
 					}
 				}
@@ -607,10 +607,13 @@ func (c *Client) detachReplicaLeg(fn func()) bool {
 // same class as the retry paths.
 //
 // A key whose primary reply was lost after the frame was written
-// (state.lost) is sent to every owner but the current primary too (issue
-// #2057): the primary may have expired it, and otherwise no other owner
-// would be, so a read falling back to a replica would return the value the
-// caller expired. Those legs are awaited even with FireAndForgetReplicas, so
+// (state.lost) is sent to every owner on the ring in force but the node that
+// lost the reply too (issue #2057): that node may have expired it, and
+// otherwise no other owner would be, so a read falling back to a replica
+// would return the value the caller expired. The node is skipped by name,
+// not as rank 0 (issue #2165): the refresh before a second pass may have
+// dropped it from the roster, and the new primary is then an owner that
+// must be expired too. Those legs are awaited even with FireAndForgetReplicas, so
 // the caller gets the error only once they have been answered, as for
 // Delete. A key whose primary chunk never left (unreachable on both passes,
 // its failure marked errRequestNotSent) gets no leg (issue #2138): nothing
@@ -628,12 +631,8 @@ func (c *Client) touchReplicasAfterPrimary(namespace []byte, keyBytes [][]byte, 
 			groups[id] = append(groups[id], keyBytes[idx])
 		}
 	}
-	for idx := range state.lost {
-		names := c.ownerNames(namespace, keyBytes[idx])
-		if len(names) < 2 {
-			continue
-		}
-		for _, name := range names[1:] {
+	for idx, lostOn := range state.lost {
+		for _, name := range c.ownersExcept(namespace, keyBytes[idx], lostOn) {
 			id := group{name, true}
 			groups[id] = append(groups[id], keyBytes[idx])
 		}

@@ -15,6 +15,7 @@ func TestConnectOptionErrorsAreInvalidArgument(t *testing.T) {
 		"no addresses":       {},
 		"negative threshold": {Addresses: []Address{{Host: "127.0.0.1", Port: 1}}, CompressionThreshold: -1},
 		"negative hedge":     {Addresses: []Address{{Host: "127.0.0.1", Port: 1}}, ReadHedgeAfter: -1},
+		"hedge over a year":  {Addresses: []Address{{Host: "127.0.0.1", Port: 1}}, ReadHedgeAfter: 365*24*time.Hour + 1},
 		"hedge with proxy":   {Addresses: []Address{{Host: "127.0.0.1", Port: 1}}, ViaProxy: true, ReadHedgeAfter: 1},
 		"CA without TLS":     {Addresses: []Address{{Host: "127.0.0.1", Port: 1}}, CA: "ca.pem"},
 	}
@@ -23,6 +24,21 @@ func TestConnectOptionErrorsAreInvalidArgument(t *testing.T) {
 		if !errors.Is(err, ErrInvalidArgument) {
 			t.Errorf("%s: Connect() error = %v, want ErrInvalidArgument", name, err)
 		}
+	}
+}
+
+// ReadHedgeAfter is bounded at 365 days, as in every other SDK: the bound
+// itself connects, one nanosecond more is rejected before anything is dialed.
+func TestReadHedgeAfterUpperBound(t *testing.T) {
+	node := startMockNode(t, nil)
+	client, err := Connect(Config{Addresses: []Address{addr(node.address())}, ReadHedgeAfter: 365 * 24 * time.Hour})
+	if err != nil {
+		t.Fatalf("Connect(ReadHedgeAfter: 365 days) error = %v, want nil", err)
+	}
+	client.Close()
+	_, err = Connect(Config{Addresses: []Address{addr(node.address())}, ReadHedgeAfter: 365*24*time.Hour + time.Nanosecond})
+	if !errors.Is(err, ErrInvalidArgument) || !strings.Contains(err.Error(), "must not exceed") {
+		t.Fatalf("Connect(ReadHedgeAfter: 365 days + 1ns) error = %v, want ErrInvalidArgument (must not exceed)", err)
 	}
 }
 
