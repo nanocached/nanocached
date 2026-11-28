@@ -136,7 +136,12 @@
 //!                             discovery pushes `R\n` on this same
 //!                             connection, which then becomes that node's
 //!                             ordinary heartbeat connection (`H` from
-//!                             here on).
+//!                             here on). A `J` for a name already
+//!                             `Joined` under the same token is from a
+//!                             node that missed that `R`: it is answered
+//!                             `R\n` at once, and the connection carries
+//!                             heartbeats the same way. Under another
+//!                             token it is rejected (connection closed).
 //!                             A `G` after the token lengths marks a `J`
 //!                             the node sends again after an earlier
 //!                             attempt's connection ended without `R`: the
@@ -3546,12 +3551,43 @@ fn promote_to_joined(registry: &Registry, name: &str) {
     }
 }
 
+/// Whether a `J` for `name` comes from the very process discovery already
+/// promoted under it: the entry is `Joined` and `token` (per process, see
+/// `NodeInfo::token`) is the one it registered with. That node sends `J`
+/// only while it has not seen its `R` — `wait_for_promotion` marks the entry
+/// `Joined` before writing `R`, and a write that fails, or a connection that
+/// breaks as it goes out, leaves the node unpromoted while discovery lists
+/// it. Rejected (`JoinRejection::AlreadyJoined`), it answered `W` to every
+/// key request for the whole liveness timeout, then was evicted and joined
+/// again, while its sources swept the copies they had handed it. Refreshes
+/// the entry's address and contact the way an announce does.
+fn rejoin_of_a_promoted_node(registry: &Registry, name: &str, addr: &str, token: &str) -> bool {
+    let mut guard = lock(registry);
+    let Some(info) = guard.get_mut(name) else {
+        return false;
+    };
+    if info.state != NodeState::Joined || !constant_time_eq(info.token.as_bytes(), token.as_bytes())
+    {
+        return false;
+    }
+    let address_changed = info.address != addr;
+    info.address = addr.to_string();
+    note_contact(info, name, Instant::now());
+    // Bumped under `guard`, per `bump_roster`'s invariant.
+    if address_changed {
+        bump_roster(registry);
+    }
+    true
+}
+
 /// Why `start_join` refused a registration.
 #[derive(Debug)]
 enum JoinRejection {
-    /// A `J` for an already-`Joined` name is spurious (a correct node
-    /// re-registers with `P`, never `J`) and must be rejected rather
-    /// than parked: its `Notify` was already consumed by the original
+    /// A `J` for a name already `Joined` under another token is spurious
+    /// (the node that holds the name re-registers with `P`, and a `J` of
+    /// its own under the same token is answered `R` before this is
+    /// reached, see `rejoin_of_a_promoted_node`) and must be rejected
+    /// rather than parked: its `Notify` was already consumed by the original
     /// promotion, so `wait_for_promotion` would block on it forever,
     /// holding a `MAX_CONNECTIONS` permit until the process exits.
     /// Repeated, that exhausts the connection semaphore.
@@ -6661,6 +6697,24 @@ async fn handle_connection(
 
                 let addr = registered_address(peer_ip, port);
 
+                // The node was promoted but never read its `R` (the write
+                // failed, or the connection broke as it went out), so it is
+                // still answering `W` and asks again. Answered `R` now, and
+                // the connection carries its heartbeats from here, like a
+                // `P` — see `rejoin_of_a_promoted_node`.
+                if rejoin_of_a_promoted_node(&registry, &name, &addr, &token) {
+                    log_registration(format_args!(
+                        "INFO {name} asked to join again after its promotion: it missed the R, \
+                         told again"
+                    ));
+                    *connection_name
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some((name.clone(), connection_id));
+                    write_response(&mut stream, b"R\n").await?;
+                    continue;
+                }
+
                 let promoted = start_join(
                     &registry,
                     &current_join,
@@ -9169,6 +9223,84 @@ mod tests {
                 String::from_utf8_lossy(frame)
             );
         }
+    }
+
+    /// Serves one connection on a registry where `node-a` is `Joined` under
+    /// `tk-node-a`, and sends `frame` on it.
+    async fn join_of_a_joined_name(frame: &[u8]) -> (TcpStream, Registry, watch::Sender<bool>) {
+        let registry: Registry = Arc::new(RegistryState::default());
+        lock(&registry).insert(
+            "node-a".to_string(),
+            NodeInfo::new(
+                "127.0.0.1:2222".to_string(),
+                NodeState::Joined,
+                "tk-node-a".to_string(),
+            ),
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (mut client, server) = tcp_pair().await;
+        tokio::spawn(handle_connection(
+            MaybeTls::Plain(server),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            Arc::clone(&registry),
+            Arc::new(Mutex::new(None)),
+            ConnectionConfig {
+                idle_timeout: Duration::from_secs(5),
+                list_ready_at: Instant::now(),
+                replication: 2,
+                auth_secret: None,
+                tls_acceptor: None,
+                tls_connector: None,
+                announce_limiter: Arc::new(Mutex::new(FxHashMap::default())),
+            },
+            shutdown_rx,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
+        client.write_all(frame).await.unwrap();
+        (client, registry, shutdown_tx)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_promoted_node_that_missed_its_r_is_told_again_when_it_sends_j() {
+        // Marked `Joined` before `R` went out, and that `R` was lost: the
+        // node is listed but answers `W`, and sends `J` again. It used to be
+        // rejected until its liveness eviction.
+        let (mut client, registry, _shutdown_tx) =
+            join_of_a_joined_name(b"J 6 2222 9\nnode-atk-node-a").await;
+        let mut reply = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .expect("answered at once")
+            .expect("not rejected");
+        assert_eq!(&reply, b"R\n");
+        assert_eq!(
+            lock(&registry).get("node-a").map(|info| info.state),
+            Some(NodeState::Joined)
+        );
+        // The connection carries its heartbeats from here.
+        client.write_all(b"H 6 2 9\nnode-atk-node-a").await.unwrap();
+        let mut ack = [0u8; 2];
+        timeout(Duration::from_secs(5), client.read_exact(&mut ack))
+            .await
+            .expect("heartbeat acked")
+            .unwrap();
+        assert_eq!(ack[0], b'A');
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_join_for_a_joined_name_under_another_token_is_still_rejected() {
+        let (mut client, registry, _shutdown_tx) =
+            join_of_a_joined_name(b"J 6 2222 8\nnode-aevil-tok").await;
+        let mut reply = Vec::new();
+        timeout(Duration::from_secs(5), client.read_to_end(&mut reply))
+            .await
+            .expect("closed at once")
+            .unwrap();
+        assert!(reply.is_empty(), "answered {reply:?}");
+        assert_eq!(
+            lock(&registry).get("node-a").map(|info| info.token.clone()),
+            Some("tk-node-a".to_string())
+        );
     }
 
     #[test]
