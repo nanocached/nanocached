@@ -752,7 +752,9 @@ impl Options {
     /// roster from discovery and swap onto another, randomly chosen,
     /// reachable proxy — reusing this crate's existing reconnect/refresh
     /// plumbing and `stats().refresh_failures` counter rather than a
-    /// second one. `close()` is unchanged.
+    /// second one. A failed redial starts the
+    /// [`Self::reconnect_cooldown`]; until it ends, requests fail with the
+    /// same error without asking discovery again. `close()` is unchanged.
     pub fn via_proxy(mut self, enabled: bool) -> Self {
         self.via_proxy = enabled;
         self
@@ -5790,31 +5792,6 @@ impl NanocachedClient {
     }
 
     async fn slot_connection(&self, slot: Option<&str>) -> Result<Arc<Connection>> {
-        let result = self.slot_connection_once(slot).await;
-        // Issue #1845: in proxy mode the redial of the one pinned proxy
-        // address is not the end of the road; fail over to another proxy
-        // while acquiring the connection, as the other SDKs do, so every
-        // caller of `apply_reconnecting` (the bulk ops included, which never
-        // reach `with_cluster_retry`) benefits. Nothing has been written yet
-        // at this point, so it is as safe for a non-idempotent op as the
-        // redial itself. `reconnect_proxy` is single-flight and a no-op when
-        // a sibling already installed a live connection.
-        if let Err(Error::ConnectionLost(_)) = &result {
-            if self.inner.via_proxy && slot.is_none() {
-                self.reconnect_proxy().await;
-                let current = match &self.inner.state.lock().await.target {
-                    Target::Single { connection, .. } => Some(Arc::clone(connection)),
-                    _ => None,
-                };
-                if let Some(connection) = current.filter(|connection| !connection.is_closed()) {
-                    return Ok(connection);
-                }
-            }
-        }
-        result
-    }
-
-    async fn slot_connection_once(&self, slot: Option<&str>) -> Result<Arc<Connection>> {
         let (slot_key, address, current) = {
             let state = self.inner.state.lock().await;
             match (&state.target, slot) {
@@ -5911,6 +5888,28 @@ impl NanocachedClient {
                 if let Some(cooldown) = self.inner.reconnect_cooldown {
                     let mut cooldowns = self.inner.reconnect_cooldowns.lock().await;
                     cooldowns.insert(address.clone(), (Instant::now() + cooldown, error.clone()));
+                }
+                // Issue #1845: in proxy mode the redial of the one pinned
+                // proxy address is not the end of the road; fail over to
+                // another proxy while acquiring the connection, as the
+                // other SDKs do, so every caller of `apply_reconnecting`
+                // (the bulk ops included, which never reach
+                // `with_cluster_retry`) benefits. Nothing has been written
+                // yet, so it is as safe for a non-idempotent op as the
+                // redial itself. It runs here, still under the dial gate
+                // (issue #1846: single-flight), and only after a dial of
+                // the pinned proxy failed (issue #2169): while that address
+                // is in its cooldown, the check above returns the stored
+                // error without asking discovery, so a proxy-tier outage
+                // costs one roster fetch per cooldown period, not one per
+                // request. A request that waited on the gate meanwhile
+                // finds the failover's connection in the re-check above.
+                if self.inner.via_proxy && slot.is_none() {
+                    if let Error::ConnectionLost(_) = &error {
+                        if let Some(connection) = self.reconnect_proxy(&address).await {
+                            return Ok(connection);
+                        }
+                    }
                 }
                 return Err(error);
             }
@@ -6217,39 +6216,22 @@ impl NanocachedClient {
 
     /// Proxy mode reconnect-on-loss, second half (issue #122; see
     /// `Options::via_proxy`'s doc comment). Called from `slot_connection`
-    /// once its same-proxy redial has failed (issue #1845) — the proxy
-    /// itself is down, not just this one socket — so this re-fetches the proxy roster from the
-    /// configured discovery address(es) and, if a reachable one turns up,
-    /// swaps `state.target` onto it exactly like `connect_via_proxy` built
-    /// it in the first place.
+    /// once its same-proxy redial of `pinned` has failed (issue #1845) —
+    /// the proxy itself is down, not just this one socket — so this
+    /// re-fetches the proxy roster from the configured discovery
+    /// address(es) and, if a reachable one turns up, swaps `state.target`
+    /// onto it exactly like `connect_via_proxy` built it in the first
+    /// place, and returns the new connection.
     ///
-    /// Swallows every failure the same way `refresh_node_list` does: no
-    /// error escapes this method itself (counted in
-    /// `stats().refresh_failures` instead), leaving the already-dead
-    /// connection in place — the caller's own retry runs against that
-    /// same stale target and simply fails again with a fresh dial error,
-    /// which is exactly what should surface when discovery itself has
-    /// nothing left to offer.
-    async fn reconnect_proxy(&self) {
-        // Issue #1846: single-flight. With many requests in flight when the
-        // proxy dies, each used to re-fetch `Q`, dial, then close the
-        // connection a sibling had just installed and put its own in place,
-        // so a sibling's retry ran on a connection that had been closed
-        // under it. Failovers serialise on the "" redial gate (the one
-        // `slot_connection` dials under), and a caller that gets the gate
-        // after a sibling's failover finds the current connection alive and
-        // leaves it alone.
-        let gate = {
-            let mut redials = self.inner.redials.lock().await;
-            Arc::clone(redials.entry(String::new()).or_default())
-        };
-        let _guard = gate.lock().await;
-        if let Target::Single { connection, .. } = &self.inner.state.lock().await.target {
-            if !connection.is_closed() {
-                return;
-            }
-        }
-        let (dialed, got_roster) = self.dial_a_fresh_proxy().await;
+    /// The caller holds the "" redial gate (issue #1846: single-flight —
+    /// with many requests in flight when the proxy dies, each used to
+    /// re-fetch `Q`, dial, then close the connection a sibling had just
+    /// installed). Swallows every failure the same way `refresh_node_list`
+    /// does: `None`, counted in `stats().refresh_failures` instead, leaving
+    /// the already-dead connection in place; the caller then returns the
+    /// pinned proxy's dial error.
+    async fn reconnect_proxy(&self, pinned: &str) -> Option<Arc<Connection>> {
+        let (dialed, got_roster) = self.dial_a_fresh_proxy(pinned).await;
         let Some((address, stream, tagged)) = dialed else {
             self.inner
                 .proxy_failovers_failed
@@ -6263,7 +6245,7 @@ impl NanocachedClient {
                     .refresh_failures
                     .fetch_add(1, Ordering::Relaxed);
             }
-            return;
+            return None;
         };
         let connection = Arc::new(Connection::new(
             stream,
@@ -6279,7 +6261,7 @@ impl NanocachedClient {
             // here exactly as in `slot_connection`): installing this
             // connection now would leak it past teardown.
             connection.close();
-            return;
+            return None;
         }
         let departed_address = if let Target::Single {
             address: current_address,
@@ -6288,7 +6270,7 @@ impl NanocachedClient {
         {
             current_connection.close();
             let departed = std::mem::replace(current_address, address);
-            *current_connection = connection;
+            *current_connection = Arc::clone(&connection);
             Some(departed)
         } else {
             None
@@ -6311,6 +6293,7 @@ impl NanocachedClient {
             let mut cooldowns = self.inner.reconnect_cooldowns.lock().await;
             cooldowns.remove(&departed_address);
         }
+        Some(connection)
     }
 
     /// Re-fetches the proxy roster from every configured discovery
@@ -6320,7 +6303,17 @@ impl NanocachedClient {
     /// and none yielded a reachable proxy. The second value is whether any
     /// address returned a non-empty roster, so the caller can tell a failed
     /// refresh from a usable roster whose proxies all failed to dial.
-    async fn dial_a_fresh_proxy(&self) -> (Option<(String, crate::identify::Stream, bool)>, bool) {
+    ///
+    /// The candidates are dialed through the reconnect cooldown (issue
+    /// #2169): one whose dial failed within the cooldown is skipped (the
+    /// pinned proxy whose redial just failed among them), and a failed dial
+    /// arms one. Entries for addresses that are neither in the fetched
+    /// roster nor `pinned` are dropped, since proxy mode has no node-list
+    /// refresh to prune them (issue #296).
+    async fn dial_a_fresh_proxy(
+        &self,
+        pinned: &str,
+    ) -> (Option<(String, crate::identify::Stream, bool)>, bool) {
         let mut got_roster = false;
         for (host, port) in &self.inner.addresses {
             if let Ok(Identified::Proxies { proxies }) = connect_and_identify(
@@ -6335,19 +6328,56 @@ impl NanocachedClient {
             {
                 if !proxies.is_empty() {
                     got_roster = true;
-                    if let Some(result) = dial_random_proxy(
-                        &proxies,
-                        self.inner.auth_secret_bytes(),
-                        self.inner.tls.as_ref(),
-                    )
-                    .await
                     {
+                        let mut cooldowns = self.inner.reconnect_cooldowns.lock().await;
+                        cooldowns.retain(|address, _| {
+                            address == pinned
+                                || proxies.iter().any(|proxy| &proxy.address == address)
+                        });
+                    }
+                    if let Some(result) = self.dial_proxy_candidates(&proxies).await {
                         return (Some(result), true);
                     }
                 }
             }
         }
         (None, got_roster)
+    }
+
+    /// `dial_random_proxy` for a failover: the same random order, but an
+    /// address in its reconnect cooldown is skipped and a failed dial arms
+    /// one (issue #2169).
+    async fn dial_proxy_candidates(
+        &self,
+        proxies: &[DiscoveredNode],
+    ) -> Option<(String, crate::identify::Stream, bool)> {
+        for index in shuffled_indices(proxies.len()) {
+            let address = &proxies[index].address;
+            {
+                let cooldowns = self.inner.reconnect_cooldowns.lock().await;
+                if let Some((until, _)) = cooldowns.get(address) {
+                    if Instant::now() < *until {
+                        continue;
+                    }
+                }
+            }
+            match self.open_node_stream(address).await {
+                Ok((stream, tagged)) => {
+                    self.inner.reconnect_cooldowns.lock().await.remove(address);
+                    return Some((address.clone(), stream, tagged));
+                }
+                Err(error) => {
+                    if let Some(cooldown) = self.inner.reconnect_cooldown {
+                        self.inner
+                            .reconnect_cooldowns
+                            .lock()
+                            .await
+                            .insert(address.clone(), (Instant::now() + cooldown, error));
+                    }
+                }
+            }
+        }
+        None
     }
 }
 

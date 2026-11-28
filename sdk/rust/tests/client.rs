@@ -10295,6 +10295,132 @@ async fn via_proxy_failover_is_single_flight_under_concurrent_requests() {
     proxy_b.stop();
 }
 
+/// Issue #2169: with every proxy down while discovery still lists them, each
+/// request used to fetch the roster and dial every proxy again, ignoring the
+/// reconnect cooldown. Now the pinned proxy's cooldown returns the stored
+/// error, so 50 gets cost one roster fetch and one dial per proxy. The two
+/// proxies answer the handshake with garbage, which fails the dial and
+/// counts it.
+async fn proxy_outage_costs(concurrent: bool) -> (usize, usize, usize) {
+    let proxy_a = MockNode::start().await;
+    let discovery = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-a".to_string(), proxy_a.address())],
+    )
+    .await;
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", discovery.port)])
+            .via_proxy(true)
+            .reconnect_cooldown(Duration::from_secs(30)),
+    )
+    .await
+    .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+
+    let port_a = proxy_a.port;
+    proxy_a.stop();
+    let dead_a = GarbageListener::start_on_port(port_a).await;
+    let dead_b = GarbageListener::start_on_port(0).await;
+    discovery.set_proxies(vec![
+        ("proxy-a".to_string(), format!("127.0.0.1:{port_a}")),
+        ("proxy-b".to_string(), format!("127.0.0.1:{}", dead_b.port)),
+    ]);
+    let q_before = discovery.q_requests.load(Ordering::SeqCst);
+
+    if concurrent {
+        let mut tasks = Vec::new();
+        for _ in 0..50 {
+            let client = client.clone();
+            tasks.push(tokio::spawn(async move { client.get("k").await }));
+        }
+        for task in tasks {
+            assert!(task.await.unwrap().is_err());
+        }
+    } else {
+        for _ in 0..50 {
+            assert!(client.get("k").await.is_err());
+        }
+    }
+    let costs = (
+        discovery.q_requests.load(Ordering::SeqCst) - q_before,
+        dead_a.accepted.load(Ordering::SeqCst),
+        dead_b.accepted.load(Ordering::SeqCst),
+    );
+
+    client.close().await;
+    discovery.stop();
+    dead_a.stop();
+    dead_b.stop();
+    costs
+}
+
+#[tokio::test]
+async fn via_proxy_sequential_requests_during_a_proxy_outage_fetch_the_roster_once_per_cooldown() {
+    let (fetches, dials_a, dials_b) = proxy_outage_costs(false).await;
+    assert_eq!(fetches, 1, "roster fetches for 50 gets");
+    assert_eq!(dials_a, 1, "dials of the pinned proxy");
+    assert_eq!(dials_b, 1, "dials of the other proxy");
+}
+
+#[tokio::test]
+async fn via_proxy_concurrent_requests_during_a_proxy_outage_fetch_the_roster_once_per_cooldown() {
+    let (fetches, dials_a, dials_b) = proxy_outage_costs(true).await;
+    assert_eq!(fetches, 1, "roster fetches for 50 gets");
+    assert_eq!(dials_a, 1, "dials of the pinned proxy");
+    assert_eq!(dials_b, 1, "dials of the other proxy");
+}
+
+/// Issue #2169: the cooldown only defers the next failover. Once it ends,
+/// the next request redials, fetches the roster again and lands on a proxy
+/// that came up meanwhile.
+#[tokio::test]
+async fn via_proxy_fails_over_again_once_the_cooldown_ends() {
+    let cooldown = Duration::from_millis(300);
+    let proxy_a = MockNode::start().await;
+    let discovery = MockDiscovery::start_with_proxies(
+        vec![],
+        1,
+        vec![("proxy-a".to_string(), proxy_a.address())],
+    )
+    .await;
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", discovery.port)])
+            .via_proxy(true)
+            .reconnect_cooldown(cooldown),
+    )
+    .await
+    .unwrap();
+    client.set("k", "v", 0).await.unwrap();
+
+    let address_a = proxy_a.address();
+    proxy_a.stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(client.get("k").await.is_err());
+    let q_after_outage = discovery.q_requests.load(Ordering::SeqCst);
+    assert!(client.get("k").await.is_err(), "still in the cooldown");
+    assert_eq!(discovery.q_requests.load(Ordering::SeqCst), q_after_outage);
+
+    let proxy_b = MockNode::start().await;
+    discovery.set_proxies(vec![
+        ("proxy-a".to_string(), address_a),
+        ("proxy-b".to_string(), proxy_b.address()),
+    ]);
+    tokio::time::sleep(cooldown + Duration::from_millis(100)).await;
+    assert_eq!(client.get("k").await.unwrap(), None);
+    assert_eq!(proxy_b.state.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        discovery.q_requests.load(Ordering::SeqCst),
+        q_after_outage + 1
+    );
+
+    client.close().await;
+    discovery.stop();
+    proxy_b.stop();
+}
+
 /// Issue #1822: proxy mode counts `refresh_failures` only for a refresh that
 /// yielded no usable roster; a roster whose proxies all fail to dial is not
 /// a refresh failure.
