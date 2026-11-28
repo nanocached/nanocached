@@ -1690,6 +1690,39 @@ class NanocachedClientTest {
     }
 
     @Test
+    void anEnToAGetIsFinalAndNotResentOnANewConnection() throws Exception {
+        // Issue #2182: the node refusing a request with `En` would refuse
+        // the same frame on a fresh connection, so it is not redialled and
+        // resent (Go and Rust treat it as final too).
+        try (ScriptedNode node = new ScriptedNode(header -> header.startsWith("G ") ? "En\n" : null)) {
+            try (NanocachedClient client = connect("127.0.0.1", node.port())) {
+                NanocachedException.ConnectionLost error =
+                        assertThrows(NanocachedException.ConnectionLost.class, () -> client.get("k"));
+                assertTrue(error instanceof NanocachedException.ServerRejected, String.valueOf(error));
+            }
+            assertEquals(1, node.frames.get(), "the refused get must be sent once");
+            assertEquals(1, node.connections.get(), "the refused get must not be redialled");
+        }
+    }
+
+    @Test
+    void anEnToAGetInAClusterIsFinalAndNotResentAfterARefresh() throws Exception {
+        // Issue #2182: in a cluster the refresh-and-retry must not resend
+        // the refused request either.
+        try (ScriptedNode node = new ScriptedNode(header -> header.startsWith("G ") ? "En\n" : null);
+                MockDiscovery discovery =
+                        new MockDiscovery(List.of(new DiscoveredNode(NAMES.get(0), "127.0.0.1:" + node.port())), 1)) {
+            try (NanocachedClient client = connect("127.0.0.1", discovery.port())) {
+                NanocachedException.ConnectionLost error =
+                        assertThrows(NanocachedException.ConnectionLost.class, () -> client.get("k"));
+                assertTrue(error instanceof NanocachedException.ServerRejected, String.valueOf(error));
+            }
+            assertEquals(1, node.frames.get(), "the refused get must be sent once");
+            assertEquals(1, node.connections.get(), "the refused get must not be redialled");
+        }
+    }
+
+    @Test
     void anEnRejectsOnlyTheOldestRequestAndAnIncrPipelinedBehindItIsRedialed() throws Exception {
         // Issue #1875: a node's `En` answers the oldest request still
         // waiting; whatever was sent behind it is never read, so an INCR
