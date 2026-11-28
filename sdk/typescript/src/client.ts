@@ -261,8 +261,10 @@ export interface ClientStats {
    * fireAndForgetReplicas background write (client-side replication,
    * Fire-and-forget replica writes). */
   replicaWriteFailures: number;
-  /** Failures swallowed while probing owners or writing back the repaired
-   * value during read repair (read repair). */
+  /** Read-repair write-backs that failed: the repaired value could not be
+   * written to the primary (read repair). A failed probe of an owner,
+   * including the re-probe of the primary and that replica just before the
+   * write-back, is swallowed without being counted. */
   readRepairFailures: number;
   /** Node-list refreshes that did not produce a usable list: every
    * configured discovery address was unreachable, still warming up, no
