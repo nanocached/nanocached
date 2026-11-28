@@ -50,6 +50,13 @@ export interface MockNode extends MockServerBase {
    * stream desync where every later response answers the previous
    * request. */
   swallowGetOnce(): void;
+  /** Destroy the connection, with no reply, on the `G`/`g` that arrives
+   * after `skip` more of them (the next one by default) — a connection to
+   * a live node lost while a read is in flight. Later reads, on a new
+   * connection, are answered normally. */
+  dropGetOnce(skip?: number): void;
+  /** `dropGetOnce` for the next `m` (batched get). */
+  dropMultiGetOnce(): void;
   /** Issue #225: applies the next `i` request to the store exactly as
    * normal, then destroys the connection instead of writing the `I`
    * reply — the "primary applied it, the ack was lost" shape a
@@ -101,8 +108,9 @@ export interface MockNode extends MockServerBase {
    * counter body carries a leading `+` (issue #462) instead of the real
    * incremented value — same "well-formed enough to fool a bare `Number()`
    * parse" shape as answerPlusSignValueLengthOnce, but for INCR's counter
-   * grammar (which never allows a leading `+`, unlike a length or a tag). */
-  answerMalformedIncrValueOnce(): void;
+   * grammar (which never allows a leading `+`, unlike a length or a tag).
+   * `body` replaces the `+5` counter body. */
+  answerMalformedIncrValueOnce(body?: Buffer): void;
   /** Queue a one-off `V` reply for the next G request whose header is
    * never terminated by an LF — streams chunks of non-newline bytes
    * (until the socket is destroyed, or a large safety cap is hit)
@@ -247,7 +255,7 @@ export interface MockDiscovery extends MockServerBase {
   /** Replace the header line (`N <count> <r>\n` for `L`, `N <count>\n`
    * for `Q`) of the next list reply with `header`, verbatim; the entries
    * still follow. */
-  answerListHeaderOnce(header: string): void;
+  answerListHeaderOnce(header: string | Buffer): void;
   /** SDK proxy mode (issue #122): sets the roster `Q` serves — entirely
    * separate from `setNodes`' node list, mirroring the real server's
    * separate `proxies`/`nodes` registries. Callable mid-test to simulate
@@ -391,6 +399,9 @@ export async function startMockNode(
      * echoed tag on a tagged connection) and close — the proxy's "request
      * failed / outcome unknown", not the node's `En\n`. */
     proxyStyleError?: boolean;
+    /** Answer every `G`/`g` with the node's `En\n` refusal and close, as
+     * the real node does for a request it will not run. */
+    rejectGets?: boolean;
   } = {},
 ): Promise<MockNode> {
   const store = new Map<string, Buffer>();
@@ -435,9 +446,13 @@ export async function startMockNode(
   let wrongNodeOnSetReplies = 0;
   let wrongTagReplies = 0;
   let swallowedGets = 0;
+  // Indices (in `gets`) of the `G`s whose connection is destroyed.
+  const dropGetsAt = new Set<number>();
+  let dropMultiGet = false;
   let malformedValueReplies = 0;
   let plusSignValueLengthReplies = 0;
   let malformedIncrValueReplies = 0;
+  let malformedIncrValueBody: Buffer = Buffer.from("+5");
   let unterminatedValueReplies = 0;
   let unterminatedBytesSent = 0;
   let storedToGetReplies = 0;
@@ -564,6 +579,17 @@ export async function startMockNode(
             const key = buffer.subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength).toString("utf8");
             buffer = buffer.subarray(bodyStart + namespaceLength + keyLength);
             gets++;
+
+            if (dropGetsAt.delete(gets)) {
+              socket.destroy();
+              return;
+            }
+
+            if (options.rejectGets) {
+              socket.write("En\n");
+              socket.end();
+              return;
+            }
 
             if (silent) break;
 
@@ -752,6 +778,12 @@ export async function startMockNode(
             // to, header overhead included.
             multiGetFrameBytes.push(bodyStart + namespaceLength + totalKeyLength);
 
+            if (dropMultiGet) {
+              dropMultiGet = false;
+              socket.destroy();
+              return;
+            }
+
             if (silent) break;
 
             if (retryableReplies > 0) {
@@ -929,7 +961,7 @@ export async function startMockNode(
               // length or a tag), so a pre-fix bare `Number("+5")` parse
               // would have accepted this as counter value 5 instead of
               // rejecting the malformed grammar.
-              socket.write(`I 2${tag}\n+5`);
+              socket.write(Buffer.concat([Buffer.from(`I ${malformedIncrValueBody.length}${tag}\n`), malformedIncrValueBody]));
               break;
             }
 
@@ -1382,6 +1414,12 @@ export async function startMockNode(
     answerWrongTagOnce: () => {
       wrongTagReplies++;
     },
+    dropGetOnce: (skip = 0) => {
+      dropGetsAt.add(gets + 1 + skip);
+    },
+    dropMultiGetOnce: () => {
+      dropMultiGet = true;
+    },
     swallowGetOnce: () => {
       swallowedGets++;
     },
@@ -1415,7 +1453,8 @@ export async function startMockNode(
     answerPlusSignValueLengthOnce: () => {
       plusSignValueLengthReplies++;
     },
-    answerMalformedIncrValueOnce: () => {
+    answerMalformedIncrValueOnce: (body = Buffer.from("+5")) => {
+      malformedIncrValueBody = body;
       malformedIncrValueReplies++;
     },
     answerUnterminatedValueOnce: () => {
@@ -1485,7 +1524,7 @@ export async function startMockDiscovery(
   let unterminatedListBytesSent = 0;
   let listCalls = 0;
   let listProxiesCalls = 0;
-  let listHeaderOnce: string | undefined;
+  let listHeaderOnce: string | Buffer | undefined;
   // Default 1 (no replication) so single-placement assertions in tests
   // stay exact; replication tests opt in explicitly. The real server
   // defaults to 2.
