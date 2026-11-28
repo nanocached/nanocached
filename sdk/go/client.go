@@ -454,7 +454,7 @@ type redialCooldown struct {
 
 // Stats holds counters for failures this SDK deliberately swallows
 // (client-side replication / fire-and-forget replica writes / read repair) — observability for silently degrading
-// replication or a stuck node-list refresh that would otherwise have no
+// replication or a stuck node-list (or, with ViaProxy, proxy-roster) refresh that would otherwise have no
 // visible symptom until reads start missing more often than expected.
 // Every field is monotonic and never reset.
 type Stats struct {
@@ -1033,7 +1033,9 @@ func (c *Client) dialRandomProxy(proxies []discoveredNode) (conn *connection, ad
 // fetchProxyList walks every configured discovery address (discovery HA)
 // for the registered-proxy roster (`Q`), mirroring fetchNodeList's own
 // address-walk exactly — ok=false just means none could be reached (or
-// identified as discovery, or listed any proxies) right now.
+// identified as discovery, or listed any proxies) right now. Such a fetch
+// counts once in Stats().RefreshFailures, the counter a failed node-list
+// refresh uses: either way the roster this client routes with is stale.
 func (c *Client) fetchProxyList() ([]discoveredNode, bool) {
 	for _, addr := range c.addresses {
 		result, err := connectAndIdentifyProxies(addr.String(), c.authSecret, c.tlsConfig)
@@ -1049,6 +1051,7 @@ func (c *Client) fetchProxyList() ([]discoveredNode, bool) {
 		}
 		return result.nodes, true
 	}
+	c.stats.refreshFailures.Add(1)
 	return nil, false
 }
 
