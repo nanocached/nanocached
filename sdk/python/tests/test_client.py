@@ -2481,6 +2481,28 @@ class TouchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((marker, payload, tag), (b"V", (b"v", 30), None))
 
 
+class ServerRejectionClusterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_get_the_node_rejects_is_not_resent_after_a_refresh(self):
+        # An `En` refuses the request itself: the same frame on a new
+        # connection is refused the same way, so the cluster retry must
+        # not redial and resend it (as for a touch).
+        node = await MockNode().start()
+        discovery = await MockDiscovery([(NAMES[0], node.address)], replication=1).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                await client.set("k", "v")
+                node.answer_raw_to_get_once(b"En\n")
+                with self.assertRaises(ConnectionLostError):
+                    await client.get("k")
+                self.assertEqual(node.connection_count, 1)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await node.close()
+
+
 class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
     # Touch (issue #825) in a cluster: idempotent, so every owner is sent
     # it (like a set) and a lost reply is retried (unlike incr).
