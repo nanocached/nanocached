@@ -10381,6 +10381,22 @@ describe("a read whose connection is lost in flight is resent once to the same o
     });
   });
 
+  it("get: a read that timed out is not resent to the same owner", async () => {
+    const saved = REQUEST_TIMEOUT_TUNING.timeoutMs;
+    REQUEST_TIMEOUT_TUNING.timeoutMs = 100;
+    try {
+      await withCluster(async (client, primary, replica) => {
+        primary.store.set("k", Buffer.from("v"));
+        replica.store.set("k", Buffer.from("from-replica"));
+        primary.swallowGetOnce();
+        assert.equal(await client.get("k"), "from-replica");
+        assert.equal(primary.getCount(), 1, "the timed-out read was resent to the primary");
+      });
+    } finally {
+      REQUEST_TIMEOUT_TUNING.timeoutMs = saved;
+    }
+  });
+
   it("hedged get: the primary's leg is resent before the read hedges onward", async () => {
     await withCluster(
       async (client, primary, replica) => {
