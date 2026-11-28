@@ -4268,6 +4268,19 @@ impl NanocachedClient {
                     // previous pass is not sent it again (see
                     // MultiSetTracker).
                     if tracker.is_acknowledged(idx, &name) {
+                        // If the refresh between the passes promoted this
+                        // owner to the key's primary (the old primary left
+                        // the roster), the key is stored on its primary now
+                        // and is reported so: the earlier pass recorded the
+                        // acknowledgement as a replica's.
+                        if rank == 0 {
+                            tracker
+                                .inner
+                                .lock()
+                                .unwrap()
+                                .primary_acknowledged
+                                .insert(idx);
+                        }
                         continue;
                     }
                     let batch = owners.entry(name).or_default();
