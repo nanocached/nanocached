@@ -455,6 +455,47 @@ func TestExpiringBatchTouchWhosePrimaryReplyWasLostStillExpiresTheReplica(t *tes
 	}
 }
 
+// The other owners of a key whose primary reply was lost are the owners on
+// the ring in force minus the node that lost it, by name. Here the primary's
+// first chunk is applied and its reply lost, the second chunk never leaves,
+// and the refresh before the second pass drops the primary from the roster:
+// the replica is now the keys' primary, and it must still be sent the lost
+// chunk's expiring touch, or it keeps serving values the caller expired.
+func TestExpiringBatchTouchExpiresTheNewPrimaryWhenTheRefreshDroppedTheNodeThatLostTheReply(t *testing.T) {
+	for _, call := range expiringBatchCalls {
+		t.Run(call.name, func(t *testing.T) {
+			keys := keysWithPrimary(testNames[0], 2*maxBatchKeys, "drop")
+			pc := startPrimaryFirstCluster(t, keys[0])
+			if _, err := pc.client.SetMany(valuesFor(keys), 0); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, func() bool { return pc.replica.hasKey(keys[0]) && pc.replica.hasKey(keys[len(keys)-1]) },
+				"the replica to store the values")
+			// Discovery no longer lists the primary; the client learns it on
+			// the forced refresh the unresolved second chunk triggers.
+			pc.discovery.setNodes([]discoveredNode{{Name: pc.replicaName, Address: pc.replica.address()}})
+			time.Sleep(forcedRefreshMinInterval + 50*time.Millisecond)
+			pc.primary.applyThenCloseTouchTimes(1)
+
+			if _, _, err := call.do(pc.client, keys, 0); !errors.Is(err, ErrConnectionLost) {
+				t.Fatalf("%s err = %v, want ErrConnectionLost", call.name, err)
+			}
+			if owners := pc.client.ownerNames(nil, []byte(keys[0])); len(owners) != 1 || owners[0] != pc.replicaName {
+				t.Fatalf("owners after the call = %v, want the refresh to leave only the replica %s", owners, pc.replicaName)
+			}
+			left := 0
+			for _, key := range keys {
+				if pc.replica.hasKey(key) {
+					left++
+				}
+			}
+			if left != 0 {
+				t.Fatalf("the replica, now the primary, still holds %d of %d keys; frames = %d", left, len(keys), len(pc.replica.yFramesSeen()))
+			}
+		})
+	}
+}
+
 // As for a single key: the keys whose primary stayed unreachable on both
 // passes never left, so the replica is sent nothing, the error is the
 // not-sent kind, and the resend after discovery dropped the primary still
