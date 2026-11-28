@@ -45,6 +45,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: one heartbeat that discovery neither answered nor
+  refused (a blackholed path, a lost ack) kept the node silent for about
+  20 s: the ack was waited for 10 s and the reconnect then waited out the
+  5 s interval. Past the 15 s liveness timeout, discovery evicted the node
+  and its next announce could send it back through a join with an empty
+  cache. The whole heartbeat exchange is now bounded by the 5 s interval
+  and the node reconnects at once when it runs out, so one lost heartbeat
+  leaves a gap of about 10 s (#2253).
+
 - `nanocached-proxy`: a failed dial to a node (a TLS mismatch, a certificate
   without the node's IP, a refused secret, a node at its connection cap) is
   logged as `WARN dial to backend <addr> failed: <error>`. It used to show
