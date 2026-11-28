@@ -53,8 +53,10 @@ export { contentDigest } from "./protocol.js";
 // A value decoded by get() must be exactly what set() would have encoded —
 // no silent U+FFFD replacement for bytes that aren't valid UTF-8. A single
 // shared instance is fine: decode() carries no state across calls unless
-// `stream: true` is passed, which this SDK never does.
-const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+// `stream: true` is passed, which this SDK never does. `ignoreBOM` keeps a
+// leading U+FEFF in the value: without it decode() drops a leading EF BB BF,
+// so a value set as "\uFEFFabc" would come back as "abc".
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** Thrown by get/set/delete when called after close(). Not thrown by
  * close() itself, which is idempotent (see NanocachedClient.close). */
@@ -261,8 +263,10 @@ export interface ClientStats {
    * fireAndForgetReplicas background write (client-side replication,
    * Fire-and-forget replica writes). */
   replicaWriteFailures: number;
-  /** Failures swallowed while probing owners or writing back the repaired
-   * value during read repair (read repair). */
+  /** Read-repair write-backs that failed: the repaired value could not be
+   * written to the primary (read repair). A failed probe of an owner,
+   * including the re-probe of the primary and that replica just before the
+   * write-back, is swallowed without being counted. */
   readRepairFailures: number;
   /** Node-list refreshes that did not produce a usable list: every
    * configured discovery address was unreachable, still warming up, no
@@ -370,8 +374,9 @@ export interface NanocachedClientOptions {
    * an owner that has *failed*, so one slow-but-alive owner bounds every
    * read that touches it at its full round trip. Only applies when the
    * key has at least 2 owners (`replication >= 2`); with a single copy
-   * there is nobody to hedge to. Must be a positive number when set — a
-   * non-positive value is rejected at `connect()`, and so is setting it
+   * there is nobody to hedge to. Must be a positive number of at most 365
+   * days when set — any other value is rejected at `connect()`, and so is
+   * setting it
    * together with `viaProxy` (issue #488): a proxy connection is
    * single-connection mode, so there is never a second owner to hedge to
    * either. */
@@ -414,10 +419,16 @@ export function resolveReconnectCooldownMs(options: NanocachedClientOptions): nu
 
 const DEFAULT_COMPRESSION_THRESHOLD = 256;
 
-/** Longest `readHedgeAfterMs` accepted: 24 hours, as in the Rust SDK. Anything
- * above 2^31-1 would also overflow `setTimeout`, which then fires after about
- * a millisecond and turns hedging into an immediate second request. */
-const MAX_READ_HEDGE_AFTER_MS = 24 * 60 * 60 * 1000;
+/** Longest `readHedgeAfterMs` accepted: 365 days, as in the Java and .NET
+ * SDKs. */
+const MAX_READ_HEDGE_AFTER_MS = 365 * 24 * 60 * 60 * 1000;
+
+/** Longest delay `setTimeout` takes: above 2^31-1 ms it overflows and fires
+ * after about a millisecond, which would turn hedging into an immediate
+ * second request. The hedge timer is capped at this (about 24.8 days); a
+ * read's legs time out long before either delay elapses, so the cap never
+ * changes when a hedge starts. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 // TTL a read-repair write uses (read repair), in whole seconds —
 // the protocol's TTL unit throughout (see encodeSet in protocol.ts). The
@@ -3747,7 +3758,7 @@ export class NanocachedClient {
       if (nextIndex < names.length || uncounted) {
         racers.push(
           new Promise<"timeout">((resolve) => {
-            timer = setTimeout(() => resolve("timeout"), hedgeAfterMs);
+            timer = setTimeout(() => resolve("timeout"), Math.min(hedgeAfterMs, MAX_TIMER_DELAY_MS));
           }),
         );
       }

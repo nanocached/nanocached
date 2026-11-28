@@ -668,6 +668,19 @@ describe("tryParseResponse", () => {
     }
   });
 
+  it("throws when a header carries a byte with the high bit set", () => {
+    // Buffer's "ascii" decoding masked the high bit: 0xB5 read as "5" and
+    // 0xB7 as "7", so each of these parsed as a valid header.
+    const hi = (prefix: string, byte: number, suffix: string) =>
+      Buffer.concat([Buffer.from(prefix), Buffer.from([byte]), Buffer.from(suffix)]);
+    for (const wire of [hi("V ", 0xb5, "\nhello"), hi("I ", 0xb1, "\n7"), hi("M ", 0xb1, " -\n")]) {
+      assert.throws(() => tryParseResponse(wire), NanocachedError, wire.toString("hex"));
+    }
+    for (const wire of [hi("V 5 ", 0xb7, "\nhello"), hi("S ", 0xb7, "\n"), hi("V ", 0xb5, " 7\nhello")]) {
+      assert.throws(() => tryParseResponse(wire, true), NanocachedError, wire.toString("hex"));
+    }
+  });
+
   it("parses a value response", () => {
     const parsed = tryParseResponse(Buffer.from("V 5\nhello"));
     assert.equal(parsed?.consumed, 9);
@@ -1115,6 +1128,13 @@ describe("tagged frames (echoed response tags)", () => {
       response: { kind: "stored", tag: 100 },
       consumed: 6,
     });
+  });
+
+  it("throws when the byte after a B marker isn't a newline", () => {
+    for (const tagged of [false, true]) {
+      assert.throws(() => tryParseResponse(Buffer.from("BX"), tagged), /connection desynced/);
+      assert.throws(() => tryParseResponse(Buffer.from("B 7\n"), tagged), /connection desynced/);
+    }
   });
 
   it("keeps the unsolicited busy response bare in tagged mode", () => {
