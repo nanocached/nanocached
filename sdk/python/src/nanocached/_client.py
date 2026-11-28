@@ -1199,7 +1199,11 @@ class NanocachedClient:
         _redial attempt against self._single_address that got us here).
         Re-fetches the roster and dials one at random via
         _dial_one_proxy_randomly, reusing exactly the same fan-out and
-        random-order failover as the initial connect."""
+        random-order failover as the initial connect. The proxy whose
+        redial just failed is left out of the candidates unless it is the
+        only one listed, as in the Go SDK: dialing it again would cost
+        another refusal, or up to the connect deadline when its address
+        is black-holed."""
         proxies = await self._fetch_proxy_list()
         if proxies is None:
             # No discovery address answered: nothing was sent, and a retry
@@ -1214,7 +1218,8 @@ class NanocachedClient:
             raise NanocachedError(
                 "nanocached: no proxies registered with discovery (proxy mode reconnect)"
             )
-        return await self._dial_one_proxy_randomly(proxies)
+        others = [proxy for proxy in proxies if proxy.address != self._single_address]
+        return await self._dial_one_proxy_randomly(others or proxies)
 
     async def _fetch_proxy_list(self) -> list[DiscoveredNode] | None:
         """Walks every configured discovery address (discovery HA),
