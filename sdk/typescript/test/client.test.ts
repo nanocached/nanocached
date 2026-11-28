@@ -9319,6 +9319,35 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
     }
   });
 
+  it("rejects connect once every proxy in the first roster is unreachable, without asking the next discovery address (issue #2199)", async () => {
+    const live = await startMockNode();
+    const [first, second] = await Promise.all([startMockDiscovery([]), startMockDiscovery([])]);
+    first.setProxies([
+      { name: "proxy-a", address: `127.0.0.1:${unreachablePort()}` },
+      { name: "proxy-b", address: `127.0.0.1:${unreachablePort()}` },
+    ]);
+    second.setProxies([{ name: "proxy-live", address: live.address }]);
+    try {
+      await assert.rejects(
+        NanocachedClient.connect({
+          addresses: [
+            { host: "127.0.0.1", port: first.port },
+            { host: "127.0.0.1", port: second.port },
+          ],
+          viaProxy: true,
+        }),
+        (error: unknown) =>
+          error instanceof ConnectionLostError &&
+          error.requestWasSent === false &&
+          (error.cause as NodeJS.ErrnoException).code === "ECONNREFUSED",
+      );
+      assert.equal(second.listProxiesCount(), 0);
+      assert.equal(live.connectionCount(), 0);
+    } finally {
+      await Promise.all([first.close(), second.close(), live.close()]);
+    }
+  });
+
   it("rejects connect with a clear error when no proxies are registered", async () => {
     const discovery = await startMockDiscovery([]);
     try {
