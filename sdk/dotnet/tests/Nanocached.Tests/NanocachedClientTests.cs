@@ -3909,6 +3909,34 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task AnExceptionEscapingAReadRepairIsABackgroundBugNotAReadRepairFailure()
+    {
+        // Issue #2194: ReadRepairFailures counts failed write-backs only. An
+        // unexpected exception escaping the repair task (here the primary's
+        // connection is swapped, right after the replica's hit, for one whose
+        // stream throws InvalidOperationException, so the repair's recheck of
+        // the primary throws it) is a bug, counted in BackgroundWriteBugs as
+        // the Java SDK does.
+        using Cluster cluster = StartCluster(replication: 2);
+        IReadOnlyList<string> owners = OwnersOf("k");
+        cluster.Nodes[owners[1]].Store[MockNode.KeyOf(Bytes("k"))] = Bytes("from-replica");
+
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(new NanocachedClient.Options
+        {
+            Addresses = { ("127.0.0.1", cluster.Discovery.Port) },
+            ReadRepair = true,
+        });
+        cluster.Nodes[owners[1]].AfterNextGetHit(
+            () => ReplaceMemberConnection(client, owners[0], new Connection(new ThrowingStream())));
+
+        Assert.Equal(Bytes("from-replica"), await client.GetBytesAsync("k"));
+
+        await WaitForAsync(() => client.Stats().BackgroundWriteBugs > 0, "the escaped exception to be counted");
+        Assert.Equal(0, client.Stats().ReadRepairFailures);
+        Assert.False(cluster.Nodes[owners[0]].Store.ContainsKey(MockNode.KeyOf(Bytes("k"))));
+    }
+
+    [Fact]
     public async Task AnUnreachableAddressDuringRefreshIncrementsRefreshFailures()
     {
         using Cluster cluster = StartCluster(replication: 1);
@@ -4076,7 +4104,7 @@ public class NanocachedClientTests
     // TaskScheduler.UnobservedTaskException once the faulted Task is
     // finalized. This proves the fix actually reads `completed.Exception`
     // (nothing is ever raised as unobserved) and still counts the failure
-    // via Stats(), the one diagnostic channel this SDK has for it.
+    // via Stats(), in BackgroundWriteBugs (issue #2194).
     [Fact]
     public async Task AnEscapedExceptionOnAFireAndForgetReplicaLegIsObservedNotLeaked()
     {
@@ -4099,12 +4127,14 @@ public class NanocachedClientTests
             string replica = OwnersOf("k")[1];
             ReplaceMemberConnection(client, replica, new Connection(new ThrowingStream()));
 
-            Assert.Equal(0, client.Stats().ReplicaWriteFailures);
+            Assert.Equal(0, client.Stats().BackgroundWriteBugs);
             // The primary write still succeeds; the replica leg's bug is
             // backgrounded, so this must not throw.
             await client.SetAsync("k", "v");
             await WaitForAsync(
-                () => client.Stats().ReplicaWriteFailures > 0, "the escaped replica exception to be counted");
+                () => client.Stats().BackgroundWriteBugs > 0, "the escaped replica exception to be counted");
+            // Issue #2194: a bug, not a failed replica write.
+            Assert.Equal(0, client.Stats().ReplicaWriteFailures);
 
             // Force finalization: an exception left genuinely unobserved
             // (the pre-fix behavior) only gets reported by the runtime

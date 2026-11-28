@@ -215,6 +215,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
 
         /// <summary>Every <c>R</c> (transient-failure) response received.</summary>
         public long TransientRetries { get; init; }
+
+        /// <summary>Programming bugs (an unexpected exception, never an
+        /// expected failure, which the counters above already count) that
+        /// escaped a background replica write or a read-repair task, as in
+        /// the Java SDK's <c>backgroundWriteBugs</c>. Must never increase:
+        /// it exists so a bug in this SDK's background handling cannot
+        /// vanish silently.</summary>
+        public long BackgroundWriteBugs { get; init; }
     }
 
     // The server rejects (and drops the connection for) any request frame
@@ -448,6 +456,9 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     private long _replicaWriteFailures;
     private long _readRepairFailures;
     private long _refreshFailures;
+    // An unexpected exception that escaped a background replica write or
+    // read-repair task (issue #2194) — see ClientStats.BackgroundWriteBugs.
+    private long _backgroundWriteBugs;
     // issue #125 — retryable-error status R: every R any connection this
     // client owns has received, whether transparently retried away or
     // ultimately surfaced as RetryableException — see NewConnection's
@@ -1090,6 +1101,7 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         ReadRepairFailures = Interlocked.Read(ref _readRepairFailures),
         RefreshFailures = Interlocked.Read(ref _refreshFailures),
         TransientRetries = Interlocked.Read(ref _transientRetries),
+        BackgroundWriteBugs = Interlocked.Read(ref _backgroundWriteBugs),
     };
 
     /// <summary>
@@ -1422,19 +1434,20 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                     completed =>
                     {
                         // D3: the try/catch inside `background` already
-                        // swallows every expected failure and counts it via
-                        // ReadRepairFailures — this observes whatever
-                        // *escaped* that (a real bug, or the deliberately
-                        // uncaught OperationCanceledException from Close()).
-                        // Reading .Exception both marks it observed (an
-                        // unfaulted background Task's exception would
+                        // swallows every expected failure and counts a
+                        // failed write-back via ReadRepairFailures — this
+                        // observes whatever *escaped* that (a real bug; the
+                        // deliberately uncaught OperationCanceledException
+                        // from Close() cancels the task instead of faulting
+                        // it). Reading .Exception marks it observed (a
+                        // faulted background Task's exception would
                         // otherwise vanish silently — no logger callback
-                        // exists in this SDK to hand it to instead) and
-                        // gets it counted in the one diagnostic channel
-                        // Stats() already exposes for this failure mode.
+                        // exists in this SDK to hand it to instead), and it
+                        // is counted as a bug, not as a failed write-back
+                        // (issue #2194, as in Java).
                         if (completed.Exception is not null)
                         {
-                            Interlocked.Increment(ref _readRepairFailures);
+                            Interlocked.Increment(ref _backgroundWriteBugs);
                         }
                         _backgroundReplicaPermits.Release();
                     },
@@ -2910,9 +2923,11 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 _ = backgroundLeg.ContinueWith(
                     completed =>
                     {
+                        // Expected failures are counted inside the leg; an
+                        // exception escaping it is a bug (issue #2194).
                         if (completed.Exception is not null)
                         {
-                            Interlocked.Increment(ref _replicaWriteFailures);
+                            Interlocked.Increment(ref _backgroundWriteBugs);
                         }
                         _backgroundReplicaPermits.Release();
                     },
@@ -3352,9 +3367,11 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 _ = backgroundLeg.ContinueWith(
                     completed =>
                     {
+                        // Expected failures are counted inside the leg; an
+                        // exception escaping it is a bug (issue #2194).
                         if (completed.Exception is not null)
                         {
-                            Interlocked.Increment(ref _replicaWriteFailures);
+                            Interlocked.Increment(ref _backgroundWriteBugs);
                         }
                         _backgroundReplicaPermits.Release();
                     },
@@ -3763,9 +3780,11 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                 _ = background.ContinueWith(
                     completed =>
                     {
+                        // Expected failures are counted inside the leg; an
+                        // exception escaping it is a bug (issue #2194).
                         if (completed.Exception is not null)
                         {
-                            Interlocked.Increment(ref _replicaWriteFailures);
+                            Interlocked.Increment(ref _backgroundWriteBugs);
                         }
                         _backgroundReplicaPermits.Release();
                     },
@@ -5062,14 +5081,13 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                         {
                             // D3: ReplicaWriteAsync's own try/catch already
                             // swallows and counts every expected failure — this
-                            // observes whatever escaped it (a real bug, or the
-                            // deliberately uncaught OperationCanceledException
-                            // from Close()) instead of letting it vanish as an
-                            // unobserved task exception, and counts it in the
-                            // same ReplicaWriteFailures Stats() already exposes.
+                            // observes whatever escaped it (a real bug) instead
+                            // of letting it vanish as an unobserved task
+                            // exception, and counts it in BackgroundWriteBugs,
+                            // not as a failed replica write (issue #2194).
                             if (completed.Exception is not null)
                             {
-                                Interlocked.Increment(ref _replicaWriteFailures);
+                                Interlocked.Increment(ref _backgroundWriteBugs);
                             }
                             _backgroundReplicaPermits.Release();
                         },
