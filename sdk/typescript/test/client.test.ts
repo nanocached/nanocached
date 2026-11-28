@@ -9892,9 +9892,48 @@ describe("reconnect cooldown option", () => {
     assert.equal(resolveReconnectCooldownMs({ ...base, disableReconnectCooldown: true, reconnectCooldownMs: 0 }), 0);
   });
 
-  it("rejects a readHedgeAfterMs above 24 hours (setTimeout would overflow and fire at once)", async () => {
-    await rejects({ readHedgeAfterMs: 2 ** 31 }, /readHedgeAfterMs must be a positive number of milliseconds, at most 86400000/);
-    await rejects({ readHedgeAfterMs: 24 * 60 * 60 * 1000 + 1 }, /readHedgeAfterMs must be a positive/);
+  it("rejects a readHedgeAfterMs above 365 days", async () => {
+    const yearMs = 365 * 24 * 60 * 60 * 1000;
+    await rejects(
+      { readHedgeAfterMs: yearMs + 1 },
+      /readHedgeAfterMs must be a positive number of milliseconds, at most 31536000000/,
+    );
+    await rejects({ readHedgeAfterMs: Infinity }, /readHedgeAfterMs must be a positive/);
+  });
+
+  it("accepts a readHedgeAfterMs of up to 365 days, and a value past setTimeout's range does not hedge at once", async () => {
+    const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const discovery = await startMockDiscovery(
+      [
+        { name: names[0], address: nodeA.address },
+        { name: names[1], address: nodeB.address },
+      ],
+      { replication: 2 },
+    );
+    try {
+      // 2 days and 365 days are both past 2^31-1 ms, where an unclamped
+      // setTimeout fires after about a millisecond.
+      for (const readHedgeAfterMs of [2 * 24 * 60 * 60 * 1000, 365 * 24 * 60 * 60 * 1000]) {
+        const client = await NanocachedClient.connect({
+          addresses: [{ host: "127.0.0.1", port: discovery.port }],
+          readHedgeAfterMs,
+        });
+        try {
+          await client.set("k", "v");
+          const [primaryName] = new HashRing(names).owners(Buffer.from("k"), 2);
+          const [primary, replica] = primaryName === names[0] ? [nodeA, nodeB] : [nodeB, nodeA];
+          const replicaGetsBefore = replica.getCount();
+          primary.delayGets(100);
+          assert.equal(await client.get("k"), "v");
+          assert.equal(replica.getCount(), replicaGetsBefore, "the read hedged to the replica at once");
+        } finally {
+          await client.close();
+        }
+      }
+    } finally {
+      await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+    }
   });
 
   it("throws a RangeError, not a NanocachedError, for caller mistakes in the options", async () => {
