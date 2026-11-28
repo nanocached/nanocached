@@ -45,6 +45,15 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: one heartbeat that discovery neither answered nor
+  refused (a blackholed path, a lost ack) kept the node silent for about
+  20 s: the ack was waited for 10 s and the reconnect then waited out the
+  5 s interval. Past the 15 s liveness timeout, discovery evicted the node
+  and its next announce could send it back through a join with an empty
+  cache. The whole heartbeat exchange is now bounded by the 5 s interval
+  and the node reconnects at once when it runs out, so one lost heartbeat
+  leaves a gap of about 10 s (#2253).
+
 - `nanocached-node`: one source address could pin the whole
   `--max-in-flight-bytes` budget with uploads it never finished, and every
   value-carrying reply on other clients' connections then waited for it
