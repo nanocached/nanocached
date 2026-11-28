@@ -4402,11 +4402,11 @@ export class NanocachedClient {
     } catch (error) {
       // An `En` is the node refusing the request itself (a command it does
       // not know, one too large or malformed), a final answer for every
-      // request kind (issues #902, #2184): a refresh and a second attempt
-      // would only send the same frame and be refused the same way, as Go
-      // and Rust treat it. The requests pipelined behind it fail with a
-      // never-sent ConnectionLostError instead (see Connection.onData) and
-      // keep this retry.
+      // single-key request that comes through here (issues #902, #2184):
+      // a refresh and a second attempt would only send the same frame and
+      // be refused the same way, as Go and Rust treat it. The requests
+      // pipelined behind it fail with a never-sent ConnectionLostError
+      // instead (see Connection.onData) and keep this retry.
       if (wasRejectedByServer(error)) throw error;
       // Connection-level failures retry the same way `W` does: the usual
       // cause is a node death that discovery has since noticed, so a
