@@ -1461,8 +1461,12 @@ export class NanocachedClient {
       }
       // Every listed proxy was unreachable: unlike cluster bootstrap
       // (issue #67), a proxy target needs exactly one live connection to
-      // start with — there is no connectionless-member fallback to install
-      // — so fall through to the next discovery address instead.
+      // start with — there is no connectionless-member fallback to install.
+      // The first non-empty roster is the one connect() commits to, as in
+      // the Python, Go, Java and .NET SDKs: another discovery address
+      // serves the same registry, so fail with the last dial error now
+      // instead of asking it (issue #2199).
+      throw lastError ?? new NanocachedError("nanocached: could not connect to any proxy");
     }
 
     throw lastError ?? new NanocachedError("nanocached: could not connect to any address");

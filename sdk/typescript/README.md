@@ -354,7 +354,10 @@ const client = await NanocachedClient.connect({
 registered proxy roster from discovery (rather than the node list) and
 connects to one proxy chosen at random, spreading a fleet of clients across
 the available proxies; if the chosen proxy is unreachable, the client fails
-over through the rest of the roster in random order. If the first address
+over through the rest of the roster in random order. When every proxy in
+the first non-empty roster is unreachable, `connect()` fails with the last
+dial error; it does not ask the next discovery address, which serves the
+same registry. If the first address
 reached turns out to be a cache node instead of a discovery server,
 `connect()` fails fast with a clear error, since proxy mode has no
 direct-node fallback.
