@@ -466,12 +466,19 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReadHedgeAfterRangeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_rejects_zero_negative_non_numeric_and_above_24_hours(self):
-        for bad in (0, -1, float("nan"), 24 * 60 * 60 + 1, float("inf")):
+    async def test_rejects_zero_negative_non_numeric_and_above_365_days(self):
+        for bad in (0, -1, float("nan"), 365 * 24 * 60 * 60 + 1, float("inf")):
             with self.assertRaisesRegex(
                 ValueError, "read_hedge_after must be a positive number of seconds"
             ):
                 await NanocachedClient.connect([("127.0.0.1", 1)], read_hedge_after=bad)
+
+    async def test_accepts_up_to_365_days(self):
+        # Accepted: connect() gets as far as dialing (nothing listens on
+        # port 1) instead of rejecting the option.
+        for good in (2 * 24 * 60 * 60, 365 * 24 * 60 * 60):
+            with self.assertRaises(ConnectFailedError):
+                await NanocachedClient.connect([("127.0.0.1", 1)], read_hedge_after=good)
 
 
 class ReconnectCooldownOptionTests(unittest.IsolatedAsyncioTestCase):
@@ -799,6 +806,27 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
                 await client.set("k", "v")
                 node.answer_raw_to_get_once(b"VX1\nx")
                 with self.assertRaisesRegex(NanocachedError, "malformed response header"):
+                    await client.get("k")
+
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_a_byte_other_than_lf_after_a_busy_marker_poisons_the_connection(self):
+        # `B` carries no body: the next byte must be the LF of `B\n`. A
+        # different byte is a desync, not a busy answer with its LF.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                node.answer_raw_to_get_once(b"BX")
+                with self.assertRaisesRegex(
+                    NanocachedError, "unexpected byte after response marker"
+                ):
                     await client.get("k")
 
                 self.assertEqual(await client.get("k"), "v")
@@ -8678,6 +8706,58 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             await proxy_a.close()
             await proxy_b.close()
+
+    async def test_reconnect_with_discovery_down_raises_a_not_sent_connection_error(self):
+        # The pinned proxy and every discovery address are gone: nothing
+        # says the roster is empty, so the operation fails as a dial
+        # failure (a ConnectionError, nothing sent), not as "no proxies
+        # registered".
+        proxy = await MockNode().start()
+        discovery = await MockDiscovery(nodes=[], proxies=[(NAMES[0], proxy.address)]).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True, reconnect_cooldown=0.01
+            )
+            try:
+                await discovery.close()
+                await proxy.close()
+                await wait_for(
+                    lambda: client._single is not None and client._single.closed,
+                    "the client to see the dead proxy's FIN",
+                )
+
+                with self.assertRaises(ConnectFailedError) as raised:
+                    await client.set("k", "v")
+                self.assertIsInstance(raised.exception, ConnectionError)
+                self.assertNotIn("no proxies registered", str(raised.exception))
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await proxy.close()
+
+    async def test_reconnect_to_an_empty_proxy_roster_says_no_proxies_are_registered(self):
+        proxy = await MockNode().start()
+        discovery = await MockDiscovery(nodes=[], proxies=[(NAMES[0], proxy.address)]).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True, reconnect_cooldown=0.01
+            )
+            try:
+                discovery.set_proxies([])
+                await proxy.close()
+                await wait_for(
+                    lambda: client._single is not None and client._single.closed,
+                    "the client to see the dead proxy's FIN",
+                )
+
+                with self.assertRaisesRegex(NanocachedError, "no proxies registered"):
+                    await client.set("k", "v")
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await proxy.close()
 
     async def test_reconnect_purges_cooldowns_for_addresses_other_than_the_new_proxy(self):
         # #363: _maybe_refresh no-ops in via_proxy mode (self._ring stays
