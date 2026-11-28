@@ -8627,6 +8627,58 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
             await proxy_a.close()
             await proxy_b.close()
 
+    async def test_failover_does_not_redial_the_proxy_that_just_failed(self):
+        # Discovery still lists the pinned proxy after it died. After the
+        # one redial of it fails, the failover must pick among the other
+        # proxies only. The shuffle is pinned so the dead proxy would be
+        # tried first if it were still a candidate.
+        from nanocached import _client as client_module
+
+        proxy_a = await MockNode().start()
+        proxy_b = await MockNode().start()
+        discovery = await MockDiscovery(
+            nodes=[],
+            proxies=[(NAMES[0], proxy_a.address), (NAMES[1], proxy_b.address)],
+        ).start()
+
+        def dead_first(proxies):
+            proxies.sort(key=lambda proxy: proxy.address != proxy_a.address)
+
+        real_dial = client_module.connect_and_identify
+        dialed: list[int] = []
+
+        async def counting(host, port, *args, **kwargs):
+            dialed.append(port)
+            return await real_dial(host, port, *args, **kwargs)
+
+        try:
+            with (
+                mock.patch.object(client_module.random, "shuffle", dead_first),
+                mock.patch.object(client_module, "connect_and_identify", counting),
+            ):
+                client = await NanocachedClient.connect(
+                    [("127.0.0.1", discovery.port)], via_proxy=True, reconnect_cooldown=0.01
+                )
+                try:
+                    self.assertEqual(client._single_address, proxy_a.address)
+                    await proxy_a.close()
+                    await wait_for(
+                        lambda: client._single is not None and client._single.closed,
+                        "the client to see the dead proxy's FIN",
+                    )
+                    dialed.clear()
+
+                    await client.set("k", "v")
+
+                    self.assertEqual(client._single_address, proxy_b.address)
+                    self.assertEqual(dialed, [proxy_a.port, proxy_b.port])
+                finally:
+                    await client.close()
+        finally:
+            await discovery.close()
+            await proxy_a.close()
+            await proxy_b.close()
+
     async def test_reconnect_purges_cooldowns_for_addresses_other_than_the_new_proxy(self):
         # #363: _maybe_refresh no-ops in via_proxy mode (self._ring stays
         # None forever, since via_proxy never builds a ring), so the #96
