@@ -11187,6 +11187,96 @@ async fn batched_set_retries_only_the_legs_that_failed_and_reports_an_unreachabl
     }
 }
 
+/// Issue #2175: replica B acknowledges a key on the first pass while its
+/// primary A answers `W` and leaves the roster. After the refresh B is the
+/// key's primary, so the key is stored on its primary and must be in the
+/// partial keys when another key (primary C, unreachable) fails the batch.
+#[tokio::test]
+async fn set_many_reports_a_key_stored_when_its_acknowledging_replica_becomes_the_primary() {
+    let names: Vec<String> = [
+        "aaaaaaaa-1b3d-4e6f-8a90-c1d2e3f4a5b6",
+        "bbbbbbbb-7e2c-4f58-9b31-6a8d0c9e2f47",
+        "cccccccc-3c1a-4d7e-9f20-8b6c5d4e3f21",
+    ]
+    .iter()
+    .map(|name| name.to_string())
+    .collect();
+    let before = HashRing::new(names.clone());
+    let after = HashRing::new(names[1..].to_vec());
+    let owners = |ring: &HashRing, key: &str| -> Vec<String> {
+        ring.owners(b"", key.as_bytes(), 2)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    };
+    // Primary A, replica B; once A is gone, primary B.
+    let promoted = (0..)
+        .map(|i| format!("key-{i}"))
+        .find(|key| {
+            owners(&before, key) == [names[0].clone(), names[1].clone()]
+                && owners(&after, key)[0] == names[1]
+        })
+        .unwrap();
+    // Primary C (unreachable) on both rings, replica B: fails the batch.
+    let unreachable = (0..)
+        .map(|i| format!("key-{i}"))
+        .find(|key| {
+            owners(&before, key) == [names[2].clone(), names[1].clone()]
+                && owners(&after, key)[0] == names[2]
+        })
+        .unwrap();
+
+    let node_a = MockNode::start().await;
+    let node_b = MockNode::start().await;
+    let dead = format!("127.0.0.1:{}", unused_port().await);
+    let discovery = MockDiscovery::start(
+        vec![
+            (names[0].clone(), node_a.address()),
+            (names[1].clone(), node_b.address()),
+            (names[2].clone(), dead.clone()),
+        ],
+        2,
+    )
+    .await;
+    let client = NanocachedClient::connect(options(discovery.port))
+        .await
+        .unwrap();
+
+    // A answers `W` for its one-key leg; the refresh the retry pass forces
+    // sees A gone.
+    node_a.state.wrong_node_replies.store(1, Ordering::SeqCst);
+    *discovery.nodes.lock().unwrap() = vec![
+        (names[1].clone(), node_b.address()),
+        (names[2].clone(), dead),
+    ];
+
+    let batch = HashMap::from([
+        (promoted.clone(), "v".to_string()),
+        (unreachable.clone(), "v".to_string()),
+    ]);
+    match client.set_many(&batch, 0).await {
+        Err(Error::PartialConnectionLostKeys(succeeded, _cause)) => {
+            assert_eq!(
+                succeeded,
+                std::collections::HashSet::from([promoted.clone()]),
+                "the key B stored and now owns as primary is stored"
+            );
+        }
+        other => panic!("want PartialConnectionLostKeys, got {other:?}"),
+    }
+    assert!(node_b
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .contains_key(promoted.as_bytes()));
+
+    client.close().await;
+    discovery.stop();
+    node_a.stop();
+    node_b.stop();
+}
+
 // ── forced refreshes are single-flight ────────────────────────────
 
 #[tokio::test]
