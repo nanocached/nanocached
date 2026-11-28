@@ -4368,9 +4368,8 @@ async fn handle_connection(
                 if if_absent
                     && matches!(response, Response::Stored)
                     && let Some(node_context) = &config.node_context
-                    && join_took(node_context, &key)
                 {
-                    mark_migrated(&request_tx, &key).await;
+                    mark_if_join_took(node_context, &request_tx, &key).await;
                 }
                 // If this node has a join for the key that discovery has
                 // not confirmed yet, relay it to that joiner too — and only
@@ -7810,11 +7809,17 @@ impl MigrationGuard {
     /// cleared when the guard drops, and `run_migration` knows only the
     /// marks it made itself. Empty when the slot is no longer this guard's
     /// (another handoff replaced it; its marks are its own).
+    ///
+    /// Issue #2256: also sets `abort_requested`, under the same lock, so
+    /// that `join_took` marks nothing more in a slot whose marks are gone:
+    /// the slot stays in place until the guard drops, after the rollback's
+    /// unmark, and a mark added in between was never rolled back.
     fn take_join_marks(&self) -> Vec<Key> {
         let mut slot = self
             .slot
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.abort_requested.store(true, Ordering::SeqCst);
         match slot.as_mut() {
             Some(active) if Arc::ptr_eq(&active.abort_requested, &self.abort_requested) => {
                 std::mem::take(&mut active.marked_keys)
@@ -12881,7 +12886,38 @@ fn unconfirmed_join_target_for(node_context: &NodeContext, key: &Key) -> Option<
 /// never this node's to mark (a ring newer than the handoff's, a leaver's,
 /// may be giving it the key). The key joins `marked_keys`, so an abandon
 /// rolls the mark back with the handoff's own.
-fn join_took(node_context: &NodeContext, key: &Key) -> bool {
+///
+/// Issue #2256: the mark is queued to the cache while the slot lock is
+/// held, with a channel slot reserved beforehand. A rollback takes the
+/// slot's marks under that lock and queues its unmark after, so the cache
+/// always applies this mark first; queued after the lock was released, it
+/// could land after the unmark and outlive the slot. And once a rollback
+/// has begun (`abort_requested`, which `MigrationGuard::take_join_marks`
+/// sets) nothing is marked: the slot is about to go and the key with it
+/// would never be unmarked.
+async fn mark_if_join_took(
+    node_context: &NodeContext,
+    request_tx: &mpsc::Sender<CacheRequest>,
+    key: &Key,
+) {
+    let Ok(permit) = request_tx.reserve().await else {
+        // The cache task is gone (shutting down): nothing to mark.
+        return;
+    };
+    let (response_tx, response_rx) = oneshot::channel();
+    if join_took(node_context, key, move |key| {
+        permit.send(CacheRequest {
+            command: Command::MarkMigrated { key },
+            response_tx,
+        });
+    }) {
+        let _ = response_rx.await;
+    }
+}
+
+/// `mark_if_join_took`'s judgement, under the slot lock; `mark` is called
+/// with the key, still under the lock, when the join took it.
+fn join_took(node_context: &NodeContext, key: &Key, mark: impl FnOnce(Key)) -> bool {
     let key_hash = KeyHash::of(key);
     let mut slot = node_context
         .active_migration
@@ -12893,7 +12929,7 @@ fn join_took(node_context: &NodeContext, key: &Key) -> bool {
     let Some(active) = slot.as_mut() else {
         return false;
     };
-    if active.remnant || active.confirmed {
+    if active.remnant || active.confirmed || active.abort_requested.load(Ordering::SeqCst) {
         return false;
     }
     let ring = &active.after_ring;
@@ -12913,6 +12949,7 @@ fn join_took(node_context: &NodeContext, key: &Key) -> bool {
             Bytes::copy_from_slice(&key.namespace),
             Bytes::copy_from_slice(&key.name),
         ));
+        mark(key.clone());
     }
     taken
 }
@@ -25124,6 +25161,138 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_put_if_absent_handoff_during_a_rollback_leaves_no_mark_behind() {
+        // Issue #2256: `run_migration` rolls a failed or cancelled transfer
+        // back in three steps — `take_join_marks`, `unmark_migrated_many`
+        // (a cache round trip), the guard's drop — and the slot stays in
+        // place, unconfirmed and in flight, until the last. A
+        // re-replication `U` for a key the join took, handled in that
+        // window, went through `join_took`: its mark was pushed into a
+        // slot about to be dropped, after the rollback had taken the
+        // list, and stayed on this node's copy with no handoff left to
+        // roll it back or confirm it. The copy was then dead (no handoff,
+        // re-replication or drain would send it) and the sweep removed it,
+        // on a node the abandoned join leaves an owner of the key.
+        let (request_tx, request_rx) = mpsc::channel(4);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (_frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+            "other".to_string(),
+        ]));
+        let taken = (0..200)
+            .map(|i| format!("k{i}"))
+            .find(|name| {
+                let hash = KeyHash::of(&key(name.as_bytes()));
+                !after_ring.is_owner_hashed(hash, "ready-node", 2)
+                    && after_ring.is_owner_hashed(hash, "joiner-0", 2)
+            })
+            .expect("a key the join took");
+
+        let mut node_context = test_node_context(
+            "ready-node",
+            "tk-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        let joined = vec![
+            ("ready-node".to_string(), "127.0.0.1:1".to_string()),
+            ("other".to_string(), "127.0.0.1:2".to_string()),
+        ];
+        let guard = MigrationGuard::new(
+            Arc::clone(&node_context.active_migration),
+            "joiner-0".to_string(),
+            peer_addr,
+            "tok-joiner-0".to_string(),
+            after_ring,
+            2,
+            None,
+            &joined,
+            &node_context.known_ring,
+            &node_context.ring_history,
+        )
+        .unwrap_new();
+        let slot = Arc::clone(&node_context.active_migration);
+
+        let (mut client, server) = tcp_pair().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (forward_tx, mut forward_rx) = mpsc::channel::<MigrationTask>(4);
+        let forward_relay = tokio::spawn(async move {
+            while let Some(task) = forward_rx.recv().await {
+                task.await;
+            }
+        });
+        let connection_task = tokio::spawn(handle_connection(
+            ServerStream::Plain(server),
+            test_client_addr(),
+            request_tx.clone(),
+            ConnectionConfig {
+                idle_timeout: IDLE_TIMEOUT,
+                auth_secret: None,
+                tls_acceptor: None,
+                node_context: Some(node_context),
+                migration_tx: mpsc::channel(1).0,
+                forward_tx,
+                forward_queues: Arc::new(ForwardQueues::default()),
+                in_flight_bytes: InFlightBudget::new(DEFAULT_MAX_IN_FLIGHT_BYTES),
+            },
+            shutdown_rx,
+        ));
+
+        // The rollback starts: the marks are taken...
+        let restore = guard.take_join_marks();
+
+        // ...and the `U` lands before the slot is gone.
+        let frame = format!("U 0 {} 2 13 A\ntk-ready-node{taken}v1", taken.len());
+        client.write_all(frame.as_bytes()).await.unwrap();
+        let mut reply = [0_u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .expect("a reply within 5 s")
+            .unwrap();
+        assert_eq!(&reply, b"S\n");
+
+        // The rest of the rollback.
+        unmark_migrated_many(&request_tx, restore).await;
+        drop(guard);
+        assert!(
+            slot.lock().unwrap().is_none(),
+            "the rollback cleared the slot"
+        );
+
+        client.shutdown().await.unwrap();
+        connection_task.await.unwrap().unwrap();
+
+        let live = match execute_command(
+            &request_tx,
+            Command::PeekLiveEntry {
+                key: key(taken.as_bytes()),
+            },
+        )
+        .await
+        .unwrap()
+        {
+            Response::Entries(entries) => entries.len(),
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(
+            live, 1,
+            "the copy stored during the rollback must stay live: no handoff is left to settle a \
+             mark on it"
+        );
+
+        drop(request_tx);
+        cache_task.await.unwrap();
+        drop(forward_relay);
+        peer_task.abort();
+    }
+
     async fn frames_relayed_to_the_slot_joiner(
         confirmed: bool,
         requests: &[(&str, &[u8])],
@@ -29869,6 +30038,63 @@ mod tests {
                 .marked_keys,
             vec![key(b"theirs")]
         );
+    }
+
+    #[test]
+    fn join_took_queues_its_mark_while_holding_the_slot_lock() {
+        // Issue #2256: a rollback takes the slot's marks under this lock and
+        // queues its unmark after it. A mark queued only once the lock was
+        // released could reach the cache after that unmark and outlive the
+        // slot; queued under it, the cache applies it first.
+        let node_context = test_node_context(
+            "ready-node",
+            "tok-ready-node",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        let after_ring = Arc::new(HashRing::new(vec![
+            "ready-node".to_string(),
+            "joiner-0".to_string(),
+            "other".to_string(),
+        ]));
+        let taken = (0..200)
+            .map(|i| key(format!("k{i}").as_bytes()))
+            .find(|key| {
+                let hash = KeyHash::of(key);
+                !after_ring.is_owner_hashed(hash, "ready-node", 2)
+                    && after_ring.is_owner_hashed(hash, "joiner-0", 2)
+            })
+            .expect("a key the join took");
+        let joined = vec![
+            ("ready-node".to_string(), "127.0.0.1:1".to_string()),
+            ("other".to_string(), "127.0.0.1:2".to_string()),
+        ];
+        let guard = MigrationGuard::new(
+            Arc::clone(&node_context.active_migration),
+            "joiner-0".to_string(),
+            "127.0.0.1:9".to_string(),
+            "tok-joiner-0".to_string(),
+            after_ring,
+            2,
+            None,
+            &joined,
+            &node_context.known_ring,
+            &node_context.ring_history,
+        )
+        .unwrap_new();
+
+        let mut locked_while_marking = None;
+        assert!(join_took(&node_context, &taken, |marked| {
+            assert_eq!(marked, taken);
+            locked_while_marking = Some(node_context.active_migration.try_lock().is_err());
+        }));
+        assert_eq!(locked_while_marking, Some(true));
+
+        // Once the rollback has the marks, nothing more is marked.
+        assert_eq!(guard.take_join_marks(), vec![taken.clone()]);
+        assert!(!join_took(&node_context, &taken, |_| panic!(
+            "marked during a rollback"
+        )));
     }
 
     #[test]
