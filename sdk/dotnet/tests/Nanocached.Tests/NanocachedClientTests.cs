@@ -6492,6 +6492,55 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task ViaProxyFailoverDoesNotRedialTheProxyThatJustFailed()
+    {
+        // Issue #2201: the failover picked from the whole roster, so with two
+        // proxies it redialed the one that had just failed about half the
+        // time. Twenty fresh clients make that near-certain before the fix
+        // (all twenty avoiding it has probability 2^-20).
+        using var proxyA = new MockNode();
+        using var proxyB = new MockNode();
+        var proxies = new[] { proxyA, proxyB };
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.SetProxies(new[] { ("proxy-a", proxyA.Address), ("proxy-b", proxyB.Address) });
+
+        // How many connections one failed dial of a refusing proxy opens
+        // (the handshake falls back through its probe forms).
+        int perDial;
+        using (NanocachedClient probe = await NanocachedClient.ConnectAsync(
+            ViaProxyAddress("127.0.0.1", discovery.Port)))
+        {
+            proxyA.RefuseHandshakes();
+            int before = proxyA.ConnectionCount;
+            MethodInfo dial = typeof(NanocachedClient)
+                .GetMethod("OpenNodeConnectionAsync", BindingFlags.NonPublic | BindingFlags.Instance)!;
+            await Assert.ThrowsAnyAsync<NanocachedException>(
+                () => (Task<Connection>)dial.Invoke(probe, new object[] { proxyA.Address })!);
+            perDial = proxyA.ConnectionCount - before;
+            proxyA.AcceptHandshakes();
+        }
+        Assert.True(perDial > 0);
+
+        for (int i = 0; i < 20; i++)
+        {
+            using NanocachedClient client = await NanocachedClient.ConnectAsync(
+                ViaProxyAddress("127.0.0.1", discovery.Port));
+            MockNode pinned = proxies.Single(p => p.Address == GetSingleAddress(client));
+            MockNode other = proxies.Single(p => p != pinned);
+            pinned.RefuseHandshakes();
+            pinned.DropConnections();
+            await Task.Delay(50); // let the FIN land
+            int dials = pinned.ConnectionCount;
+
+            await client.SetAsync($"k{i}", "v");
+
+            Assert.Equal(other.Address, GetSingleAddress(client));
+            Assert.Equal(dials + perDial, pinned.ConnectionCount); // the same-proxy retry only
+            pinned.AcceptHandshakes();
+        }
+    }
+
+    [Fact]
     public async Task ViaProxySkipsAWarmingUpDiscoverySeedAndFetchesQFromTheNext()
     {
         using var proxy = new MockNode();

@@ -5364,8 +5364,13 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                     "nanocached: no proxies registered with discovery", sameProxyError);
             }
 
+            // The proxy that just failed is left out of the candidates
+            // (issue #2201, as in Go), unless it is the only one: a
+            // second dial of it costs a refused connection at best and
+            // the connect timeout at worst.
+            List<DiscoveredNode> others = proxies.Where(proxy => proxy.Address != address).ToList();
             (Connection connection, string newAddress) =
-                await ConnectToAnyProxyAsync(proxies).ConfigureAwait(false);
+                await ConnectToAnyProxyAsync(others.Count > 0 ? others : proxies).ConfigureAwait(false);
             lock (_stateLock) { _singleAddress = newAddress; }
 
             // Issue #296: MaybeRefreshAsync's own cooldown prune
