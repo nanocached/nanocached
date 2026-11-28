@@ -381,7 +381,11 @@ connection that real traffic has left idle for 15 seconds or more, so a
 healthy connection never goes much past 45 seconds without traffic and an
 idle timeout never severs a
 healthy client. A request that finds its connection already closed (a node
-restart, a network blip) redials it before sending. In cluster mode and in
+restart, a network blip) redials it before sending. In cluster mode a read
+(`get`, a hedge leg, a `getMany` chunk, a read-repair probe or recheck)
+whose connection to an owner is lost while it is in flight is resent once to
+that owner on a new connection before it moves on to the next owner; one that
+timed out, or that the node refused with `En`, is not. In cluster mode and in
 proxy mode a request whose connection is lost is also retried once, after a
 node-list (cluster) or proxy-roster (proxy) refresh (an idempotent request
 always; `incr`/`decr` and the compare-and-set calls only when the SDK can

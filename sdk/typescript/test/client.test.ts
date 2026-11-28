@@ -10325,3 +10325,123 @@ describe("a roster address with an IPv6 host", () => {
     });
   }
 });
+
+describe("a read whose connection is lost in flight is resent once to the same owner (issue #2186)", () => {
+  const names = ["5f8a9c2e-1b3d-4e6f-8a90-c1d2e3f4a5b6", "0d47b1a9-7e2c-4f58-9b31-6a8d0c9e2f47"];
+
+  async function withCluster(
+    run: (client: NanocachedClient, primary: MockNode, replica: MockNode) => Promise<void>,
+    clientOptions: { readHedgeAfterMs?: number; readRepair?: boolean } = {},
+  ): Promise<void> {
+    const [nodeA, nodeB] = await Promise.all([startMockNode(), startMockNode()]);
+    const discovery = await startMockDiscovery(
+      [
+        { name: names[0], address: nodeA.address },
+        { name: names[1], address: nodeB.address },
+      ],
+      { replication: 2 },
+    );
+    const client = await NanocachedClient.connect({
+      addresses: [{ host: "127.0.0.1", port: discovery.port }],
+      ...clientOptions,
+    });
+    try {
+      // Every test reads "k"; only its primary holds it, so a read that
+      // moves on to the replica sees a miss.
+      const [primaryName] = new HashRing(names).owners(Buffer.from("k"), 2);
+      const [primary, replica] = primaryName === names[0] ? [nodeA, nodeB] : [nodeB, nodeA];
+      await run(client, primary, replica);
+    } finally {
+      await client.close();
+      await Promise.all([discovery.close(), nodeA.close(), nodeB.close()]);
+    }
+  }
+
+  it("get: the primary's second connection serves the value", async () => {
+    await withCluster(async (client, primary, replica) => {
+      primary.store.set("k", Buffer.from("v"));
+      const connectionsBefore = primary.connectionCount();
+      primary.dropGetOnce();
+      assert.equal(await client.get("k"), "v");
+      assert.equal(primary.getCount(), 2);
+      assert.equal(primary.connectionCount(), connectionsBefore + 1);
+      assert.equal(replica.getCount(), 0, "the read moved on to the replica");
+    });
+  });
+
+  it("get: a second loss on the same owner moves on to the next owner", async () => {
+    await withCluster(async (client, primary, replica) => {
+      primary.store.set("k", Buffer.from("v"));
+      replica.store.set("k", Buffer.from("from-replica"));
+      primary.dropGetOnce();
+      primary.dropGetOnce(1);
+      assert.equal(await client.get("k"), "from-replica");
+      assert.equal(primary.getCount(), 2, "the primary got more than one resend");
+      assert.equal(replica.getCount(), 1);
+    });
+  });
+
+  it("hedged get: the primary's leg is resent before the read hedges onward", async () => {
+    await withCluster(
+      async (client, primary, replica) => {
+        primary.store.set("k", Buffer.from("v"));
+        primary.dropGetOnce();
+        assert.equal(await client.get("k"), "v");
+        assert.equal(primary.getCount(), 2);
+        assert.equal(replica.getCount(), 0, "the read hedged to the replica");
+      },
+      { readHedgeAfterMs: 5_000 },
+    );
+  });
+
+  it("getMany: the owner's chunk is resent on its second connection", async () => {
+    await withCluster(async (client, primary, replica) => {
+      primary.store.set("k", Buffer.from("v"));
+      primary.dropMultiGetOnce();
+      assert.deepEqual(await client.getMany(["k"]), new Map([["k", "v"]]));
+      assert.equal(primary.multiGetCount(), 2);
+      assert.equal(replica.multiGetCount(), 0, "the chunk moved on to the replica");
+    });
+  });
+
+  it("read repair: a probe of the replica is resent", async () => {
+    await withCluster(
+      async (client, primary, replica) => {
+        replica.store.set("k", Buffer.from("from-replica"));
+        replica.dropGetOnce();
+        assert.equal(await client.get("k"), "from-replica");
+        await waitFor(() => primary.store.has("k"), "the write-back");
+        assert.equal(replica.getCount(), 3, "probe, its resend, and the recheck");
+      },
+      { readRepair: true },
+    );
+  });
+
+  it("read repair: a recheck of the replica is resent and the write-back happens", async () => {
+    await withCluster(
+      async (client, primary, replica) => {
+        replica.store.set("k", Buffer.from("from-replica"));
+        // The replica's first G is the probe; the second is the recheck.
+        replica.dropGetOnce(1);
+        assert.equal(await client.get("k"), "from-replica");
+        await waitFor(() => primary.store.has("k"), "the write-back");
+        assert.equal(replica.getCount(), 3, "probe, recheck, and its resend");
+      },
+      { readRepair: true },
+    );
+  });
+
+  it("read repair: a recheck of the primary is resent", async () => {
+    await withCluster(
+      async (client, primary, replica) => {
+        replica.store.set("k", Buffer.from("from-replica"));
+        // The primary's first G is the read that missed; the second is the recheck.
+        primary.dropGetOnce(1);
+        assert.equal(await client.get("k"), "from-replica");
+        await waitFor(() => primary.store.has("k"), "the write-back");
+        assert.equal(primary.getCount(), 3, "read, recheck, and its resend");
+      },
+      { readRepair: true },
+    );
+  });
+});

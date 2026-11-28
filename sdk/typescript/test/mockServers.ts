@@ -50,6 +50,13 @@ export interface MockNode extends MockServerBase {
    * stream desync where every later response answers the previous
    * request. */
   swallowGetOnce(): void;
+  /** Destroy the connection, with no reply, on the `G`/`g` that arrives
+   * after `skip` more of them (the next one by default) — a connection to
+   * a live node lost while a read is in flight. Later reads, on a new
+   * connection, are answered normally. */
+  dropGetOnce(skip?: number): void;
+  /** `dropGetOnce` for the next `m` (batched get). */
+  dropMultiGetOnce(): void;
   /** Issue #225: applies the next `i` request to the store exactly as
    * normal, then destroys the connection instead of writing the `I`
    * reply — the "primary applied it, the ack was lost" shape a
@@ -435,6 +442,9 @@ export async function startMockNode(
   let wrongNodeOnSetReplies = 0;
   let wrongTagReplies = 0;
   let swallowedGets = 0;
+  // Indices (in `gets`) of the `G`s whose connection is destroyed.
+  const dropGetsAt = new Set<number>();
+  let dropMultiGet = false;
   let malformedValueReplies = 0;
   let plusSignValueLengthReplies = 0;
   let malformedIncrValueReplies = 0;
@@ -564,6 +574,11 @@ export async function startMockNode(
             const key = buffer.subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength).toString("utf8");
             buffer = buffer.subarray(bodyStart + namespaceLength + keyLength);
             gets++;
+
+            if (dropGetsAt.delete(gets)) {
+              socket.destroy();
+              return;
+            }
 
             if (silent) break;
 
@@ -751,6 +766,12 @@ export async function startMockNode(
             // real per-request bytes the server's own 1 MiB cap applies
             // to, header overhead included.
             multiGetFrameBytes.push(bodyStart + namespaceLength + totalKeyLength);
+
+            if (dropMultiGet) {
+              dropMultiGet = false;
+              socket.destroy();
+              return;
+            }
 
             if (silent) break;
 
@@ -1381,6 +1402,12 @@ export async function startMockNode(
     },
     answerWrongTagOnce: () => {
       wrongTagReplies++;
+    },
+    dropGetOnce: (skip = 0) => {
+      dropGetsAt.add(gets + 1 + skip);
+    },
+    dropMultiGetOnce: () => {
+      dropMultiGet = true;
     },
     swallowGetOnce: () => {
       swallowedGets++;

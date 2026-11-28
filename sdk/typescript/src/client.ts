@@ -180,6 +180,16 @@ function wasNeverSent(error: unknown): boolean {
   return error instanceof ConnectionLostError && error.requestWasSent === false;
 }
 
+/** Whether a read that failed with `error` is resent once to the same owner
+ * on a fresh connection (see `readOnOwner`): its connection was lost (a
+ * peer FIN or RST, a desynced reply, a request pipelined behind another's
+ * `En`). Not a request timeout: the node accepted the frame and did not
+ * answer, so a resend would most likely wait out another full window. Not
+ * the node's own `En`: it would refuse the same frame again. */
+function isReadResendable(error: unknown): boolean {
+  return error instanceof ConnectionLostError && !error.requestTimedOut && !wasRejectedByServer(error);
+}
+
 /** `connectAndIdentify` for the paths that dial a member after the client
  * is up (a redial, a refresh's dial of a freshly listed node). An address
  * that does not complete the `A` handshake — it answers with something that
@@ -1669,8 +1679,7 @@ export class NanocachedClient {
     for (const name of names.slice(1)) {
       let value: Buffer | null;
       try {
-        const connection = await this.memberConnection(name);
-        value = await connection.get(key, namespace);
+        value = await this.readOnOwner(name, (connection) => connection.get(key, namespace));
       } catch (error) {
         if (!isSwallowable(error)) throw error;
         continue;
@@ -1709,10 +1718,9 @@ export class NanocachedClient {
           await new Promise((resolve) => setTimeout(resolve, waitMs));
           if (this.closed) return;
           try {
-            const primary = await this.memberConnection(primaryName);
-            if ((await primary.get(repair.key, namespace)) !== null) return;
-            const replica = await this.memberConnection(replicaName);
-            const again = await replica.get(repair.key, namespace);
+            const stillThere = await this.readOnOwner(primaryName, (connection) => connection.get(repair.key, namespace));
+            if (stillThere !== null) return;
+            const again = await this.readOnOwner(replicaName, (connection) => connection.get(repair.key, namespace));
             if (again === null || !again.equals(repair.value!)) return;
           } catch (error) {
             if (!isSwallowable(error)) throw error;
@@ -2957,7 +2965,7 @@ export class NanocachedClient {
     ): Promise<{ groupIndices: number[]; entries: MultiEntry[]; error: unknown; resolved: number }> => {
       const groupKeyBytes = groupIndices.map((index) => keyBytes[index]);
       try {
-        const entries = await this.multiGetChunked(() => this.memberConnection(owner), namespace, groupKeyBytes);
+        const entries = await this.multiGetChunked(() => this.memberConnection(owner), namespace, groupKeyBytes, true);
         return { groupIndices, entries, error: undefined, resolved: groupIndices.length };
       } catch (error) {
         // issue #411: this owner's group already got chunked into more
@@ -3028,18 +3036,29 @@ export class NanocachedClient {
    * MAX_MULTI_HEADER_LENGTH, and no request frame risks exceeding the
    * server's own per-request cap. `connectionFor` is called fresh for
    * every chunk (not resolved once up front), so a mid-batch reconnect
-   * is handled exactly the way a single-key get/set handles one today. */
+   * is handled exactly the way a single-key get/set handles one today.
+   * With `resendOnLoss` (a cluster owner's group), a chunk whose
+   * connection was lost in flight is resent once on a fresh connection
+   * from `connectionFor`, as `readOnOwner` does for a single-key read. */
   private async multiGetChunked(
     connectionFor: () => Promise<Connection>,
     namespace: Uint8Array,
     keyBytes: readonly Buffer[],
+    resendOnLoss = false,
   ): Promise<MultiEntry[]> {
     const entries: MultiEntry[] = new Array(keyBytes.length);
     for (let start = 0; start < keyBytes.length;) {
       const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]));
       try {
+        const chunk = keyBytes.slice(start, end);
         const connection = await connectionFor();
-        const chunkEntries = await connection.multiGet(keyBytes.slice(start, end), namespace);
+        let chunkEntries: MultiEntry[];
+        try {
+          chunkEntries = await connection.multiGet(chunk, namespace);
+        } catch (error) {
+          if (!resendOnLoss || !isReadResendable(error)) throw error;
+          chunkEntries = await (await connectionFor()).multiGet(chunk, namespace);
+        }
         for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];
       } catch (error) {
         // issue #411: chunk `start`/`end` covers keyBytes[start..end); a
@@ -3615,16 +3634,8 @@ export class NanocachedClient {
     let lastError: Error | null = null;
 
     for (const name of names) {
-      let connection: Connection;
       try {
-        connection = await this.memberConnection(name);
-      } catch (error) {
-        lastError = error as Error;
-        continue;
-      }
-
-      try {
-        return await op(connection);
+        return await this.readOnOwner(name, op);
       } catch (error) {
         if (error instanceof WrongNodeError) throw error;
         lastError = error as Error;
@@ -3632,6 +3643,28 @@ export class NanocachedClient {
     }
 
     throw lastError ?? new ConnectionLostError("nanocached: no owner is reachable for this key");
+  }
+
+  /** Runs the read `op` against owner `name`, and once more on a fresh
+   * connection to the same owner when the first attempt's connection was
+   * lost in flight (`isReadResendable`), before the caller moves on to the
+   * next owner — the redial-and-resend wrapper the Go, Rust, Java and .NET
+   * SDKs run every owner's read through. Without it a read whose
+   * connection to a live primary dropped went straight to the replica,
+   * whose miss (it may simply lack the copy) was then returned as the
+   * answer. A failed dial, a request timeout and the node's `En` are not
+   * retried, as in those SDKs, so an owner gets at most one redial and
+   * one resend per read. Used by the sequential
+   * owner walk, every hedge leg, and read repair's probes and rechecks;
+   * `multiGetChunked` does the same per chunk. */
+  private async readOnOwner<T>(name: string, op: (connection: Connection) => Promise<T>): Promise<T> {
+    const connection = await this.memberConnection(name);
+    try {
+      return await op(connection);
+    } catch (error) {
+      if (!isReadResendable(error)) throw error;
+      return await op(await this.memberConnection(name));
+    }
   }
 
   /** Hedged reads (issue #64): one slow — not dead — owner otherwise
@@ -3689,12 +3722,10 @@ export class NanocachedClient {
       // sees a set that only shrinks. A read that lost this race fails the
       // same way its own closed-check would have.
       if (this.closed) throw new AlreadyClosedError();
-      const outcome: Promise<Outcome> = this.memberConnection(names[index])
-        .then((connection) => op(connection))
-        .then(
-          (value): Outcome => ({ index, ok: true, value }),
-          (error): Outcome => ({ index, ok: false, error }),
-        );
+      const outcome: Promise<Outcome> = this.readOnOwner(names[index], op).then(
+        (value): Outcome => ({ index, ok: true, value }),
+        (error): Outcome => ({ index, ok: false, error }),
+      );
       this.hedgedReads.add(outcome);
       // Self-removing: once this leg settles — whether it's the winner or
       // a loser left running past the read's return — it no longer needs
