@@ -45,6 +45,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-discovery`: a joiner is marked `Joined` before its `R` is
+  written. If that `R` was lost (the write failed, or the connection broke
+  as it went out), the node was listed in `L` but answered `W` to every key
+  request, and its re-sent `J` was rejected as already joined until the
+  liveness eviction about 15 s later, while its sources swept the copies
+  they had handed it. A `J` for a `Joined` name under the token it
+  registered with (the same process) is now answered `R` at once, and the
+  connection carries the node's heartbeats from there. A `J` under another
+  token is still rejected (#2255).
+
 - `nanocached-node`: one source address could pin the whole
   `--max-in-flight-bytes` budget with uploads it never finished, and every
   value-carrying reply on other clients' connections then waited for it
