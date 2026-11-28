@@ -10775,6 +10775,10 @@ async fn connect_rejects_zero_and_overflowing_duration_options() {
         ("reconnect_cooldown", base().reconnect_cooldown(day_plus)),
         ("read_hedge_after", base().read_hedge_after(Duration::ZERO)),
         ("read_hedge_after", base().read_hedge_after(Duration::MAX)),
+        (
+            "read_hedge_after",
+            base().read_hedge_after(Duration::from_secs(365 * 24 * 60 * 60 + 1)),
+        ),
     ];
     for (name, options) in cases {
         match NanocachedClient::connect(options).await {
@@ -10791,8 +10795,9 @@ async fn connect_rejects_zero_and_overflowing_duration_options() {
     node.stop();
 }
 
-/// The boundary values stay valid: 24 hours itself, and a zero
-/// `reconnect_cooldown` (documented as "use the default").
+/// The boundary values stay valid: 24 hours itself (365 days for
+/// `read_hedge_after`, the same bound as the Java and .NET SDKs), and a
+/// zero `reconnect_cooldown` (documented as "use the default").
 #[tokio::test]
 async fn connect_accepts_duration_options_at_the_bounds() {
     let node = MockNode::start().await;
@@ -10807,6 +10812,22 @@ async fn connect_accepts_duration_options_at_the_bounds() {
     )
     .await
     .expect("bounds are valid");
+    client.close().await;
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", node.port)])
+            .read_hedge_after(Duration::from_secs(2 * 24 * 60 * 60)),
+    )
+    .await
+    .expect("a 2-day read_hedge_after is valid");
+    client.close().await;
+    let client = NanocachedClient::connect(
+        Options::new()
+            .addresses([("127.0.0.1", node.port)])
+            .read_hedge_after(Duration::from_secs(365 * 24 * 60 * 60)),
+    )
+    .await
+    .expect("a 365-day read_hedge_after is valid");
     client.close().await;
     let client = NanocachedClient::connect(
         Options::new()

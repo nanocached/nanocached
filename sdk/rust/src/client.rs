@@ -511,15 +511,29 @@ impl ReconnectCooldown {
 /// value, and low enough that `Instant::now() + duration` cannot overflow.
 const MAX_DURATION_OPTION: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Upper bound for `read_hedge_after` (365 days), the same as the Java and
+/// .NET SDKs. Still low enough that `Instant::now() + duration` cannot
+/// overflow.
+const MAX_READ_HEDGE_AFTER: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
 fn check_duration_option(name: &str, duration: Duration, require_positive: bool) -> Result<()> {
+    check_duration_bound(name, duration, require_positive, MAX_DURATION_OPTION)
+}
+
+fn check_duration_bound(
+    name: &str,
+    duration: Duration,
+    require_positive: bool,
+    max: Duration,
+) -> Result<()> {
     if require_positive && duration.is_zero() {
         return Err(Error::InvalidArgument(format!(
             "nanocached: {name} must be a positive duration"
         )));
     }
-    if duration > MAX_DURATION_OPTION {
+    if duration > max {
         return Err(Error::InvalidArgument(format!(
-            "nanocached: {name} must be at most {MAX_DURATION_OPTION:?}, got {duration:?}"
+            "nanocached: {name} must be at most {max:?}, got {duration:?}"
         )));
     }
     Ok(())
@@ -720,7 +734,7 @@ impl Options {
     /// so it runs to completion detached, and [`NanocachedClient::close`]
     /// drains it exactly like a fire-and-forget replica write.
     ///
-    /// `duration` must be positive and at most 24 hours; anything else is
+    /// `duration` must be positive and at most 365 days; anything else is
     /// rejected at
     /// [`NanocachedClient::connect`] time, the same as this crate's other
     /// invalid-argument checks.
@@ -1632,7 +1646,7 @@ impl NanocachedClient {
         // timeout fails every request, and an extreme value overflows
         // `Instant::now() + cooldown` and panics.
         if let Some(duration) = options.read_hedge_after {
-            check_duration_option("read_hedge_after", duration, true)?;
+            check_duration_bound("read_hedge_after", duration, true, MAX_READ_HEDGE_AFTER)?;
         }
         if let Some(duration) = options.keep_alive_interval {
             check_duration_option("keep_alive_interval", duration, true)?;
