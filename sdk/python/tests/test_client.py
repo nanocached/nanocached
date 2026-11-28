@@ -4135,6 +4135,40 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     await self.stop(client, discovery, nodes)
 
+    async def test_a_lost_expiring_chunk_expires_the_new_primary_after_a_ring_change(self):
+        # The primary P loses the first chunk's reply; the second chunk is
+        # unresolved, so the forced refresh before the retry pass runs, and
+        # the new roster no longer lists P. The replica R is now the keys'
+        # rank 0. The lost keys' expiry legs skip P (the node that lost the
+        # reply), not the new rank 0, so R expires them too.
+        from nanocached._client import _MAX_BATCH_KEYS
+
+        for get in (False, True):
+            with self.subTest(get=get):
+                nodes, discovery = await self.start_cluster()
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    primary, replica = nodes[NAMES[0]], nodes[NAMES[1]]
+                    keys = self.keys_by_primary(NAMES[0], _MAX_BATCH_KEYS + 50, "lostring")
+                    await client.set_many(dict.fromkeys(keys, "v"))
+                    lost = keys[:_MAX_BATCH_KEYS]
+                    await asyncio.sleep(_FORCED_REFRESH_MIN_INTERVAL + 0.05)
+                    primary.fail_multi_touch_after(0)
+                    discovery.nodes = [(NAMES[1], replica.address)]
+
+                    if get:
+                        # The 50 keys the retry pass resolved ride along.
+                        with self.assertRaises(PartialConnectionLostError):
+                            await client.get_many_and_touch(keys, 0)
+                    else:
+                        with self.assertRaises(ConnectionLostError):
+                            await client.touch_many(keys, 0)
+
+                    self.assertEqual(sum(k.encode() in replica.store for k in lost), 0)
+                    self.assertIsNone(await client.get(lost[0]))
+                finally:
+                    await self.stop(client, discovery, nodes)
+
     async def test_a_batch_touch_is_scoped_to_its_namespace_in_a_cluster(self):
         nodes, discovery = await self.start_cluster()
         client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])

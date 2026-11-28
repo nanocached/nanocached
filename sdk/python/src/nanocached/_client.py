@@ -139,9 +139,10 @@ class _MultiTouchState:
     ``last_cause`` the most recent primary-leg connection failure and
     ``rejected`` whether any primary leg was answered ``En`` (a node that
     predates ``y``). ``answered_by`` names the node behind each result.
-    ``lost`` holds the indices a ``ttl_seconds == 0``
-    call must not resend (issue #901): their primary leg failed after the
-    frame was written, so the node may have expired them already;
+    ``lost`` maps the indices a ``ttl_seconds == 0``
+    call must not resend (issue #901) to the node their primary leg went
+    to: that leg failed after the frame was written, so the node may have
+    expired them already;
     ``lost_cause`` is that failure, kept apart from ``last_cause`` so a
     later not-sent failure in the retry pass cannot replace it.
     Single-threaded (asyncio), so no locking."""
@@ -165,7 +166,7 @@ class _MultiTouchState:
         self.last_cause: BaseException | None = None
         self.lost_cause: BaseException | None = None
         self.rejected = False
-        self.lost: set[int] = set()
+        self.lost: dict[int, str] = {}
 
 
 @dataclass(frozen=True)
@@ -2818,7 +2819,7 @@ class NanocachedClient:
                         # never left, so they are retried like any other
                         # unresolved key.
                         if lost_is_final and pos < sent_end:
-                            state.lost.add(idx)
+                            state.lost[idx] = name
                             continue
                     leg_retry.append(idx)
             return leg_retry
@@ -2856,10 +2857,10 @@ class NanocachedClient:
         the same class as the retry paths.
 
         A key whose primary reply was lost after the frame was written
-        (``state.lost``) is sent to every owner but the current primary
-        too (issue #2055): the primary may have expired it, and otherwise
-        no other owner would be, so a read falling back to a replica
-        would return the value the caller expired. Those legs are awaited
+        (``state.lost``) is sent to every current owner but the node that
+        lost the reply too (issue #2055): that node may have expired it,
+        and otherwise no other owner would be, so a read falling back to a
+        replica would return the value the caller expired. Those legs are awaited
         even with fire_and_forget_replicas, so the caller's error comes
         only once they have been answered, as for a delete. A key whose
         primary leg never left (unreachable on both passes) gets no leg
@@ -2873,8 +2874,14 @@ class NanocachedClient:
                 if name != answered_by:
                     legs.setdefault((name, False), []).append(idx)
         for idx in sorted(state.lost):
-            for name in self._owner_names(namespace, key_bytes_list[idx])[1:]:
-                legs.setdefault((name, True), []).append(idx)
+            # Skipped by name, not by rank (issue #2164): the forced
+            # refresh before the second pass may have dropped that node
+            # from the ring, and the new primary is then an owner whose
+            # copy nothing else expires.
+            lost_on = state.lost[idx]
+            for name in self._owner_names(namespace, key_bytes_list[idx]):
+                if name != lost_on:
+                    legs.setdefault((name, True), []).append(idx)
         if not legs:
             return
 
