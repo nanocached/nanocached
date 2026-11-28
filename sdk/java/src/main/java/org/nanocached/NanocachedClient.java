@@ -612,8 +612,8 @@ public final class NanocachedClient implements AutoCloseable {
     // bound (each one is a short connect-and-identify, individually bounded
     // by Identify.CONNECT_TIMEOUT_MS), so a small fixed pool still dials a
     // huge cluster promptly — it just does it in waves instead of all at
-    // once.
-    private static final int MAX_BOOTSTRAP_DIALER_THREADS = 16;
+    // once. 64, as in the other five SDKs.
+    private static final int MAX_BOOTSTRAP_DIALER_THREADS = 64;
 
     // Threads available to the keep-alive scheduler: one runs the periodic
     // tick, the rest ping idle connections concurrently (see
@@ -3016,7 +3016,7 @@ public final class NanocachedClient implements AutoCloseable {
         boolean expiring = expiresAtOnce(wireTtl);
         ConnectionOp<Boolean> op = connection -> connection.touch(ownedNamespace, ownedKey, wireTtl);
         try {
-            return withTouchRetry(expiring, () -> write(namespace, key, op, null, null, !expiring, true, expiring));
+            return withTouchRetry(expiring, () -> write(namespace, key, op, null, null, !expiring, expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
         } catch (NanocachedException.ConnectionLost primaryFailure) {
@@ -3090,7 +3090,6 @@ public final class NanocachedClient implements AutoCloseable {
                             // the wire for nothing.
                             connection -> connection.touch(ownedNamespace, ownedKey, wireTtl),
                             !expiring,
-                            true,
                             expiring));
         } catch (NanocachedException.ServerRejected rejected) {
             throw new NanocachedException.ServerTooOld(rejected);
@@ -3690,7 +3689,7 @@ public final class NanocachedClient implements AutoCloseable {
             try {
                 chunkEntries = expiring
                         ? applyReconnectingUnlessSent(connectionFor, chunkOp)
-                        : applyReconnecting(connectionFor, chunkOp, true);
+                        : applyReconnecting(connectionFor, chunkOp);
             } catch (NanocachedException.ConnectionLost failure) {
                 // Issue #901: with ttl 0 a chunk whose frame may have been
                 // applied (not provably unsent, and not an `En`, which
@@ -3936,7 +3935,7 @@ public final class NanocachedClient implements AutoCloseable {
         // a key that existed.
         ConnectionOp<Boolean> op = connection -> connection.delete(ownedNamespace, ownedKey);
         try {
-            return withWrongNodeRetry(() -> write(namespace, key, op, null, null, true, false, true));
+            return withWrongNodeRetry(() -> write(namespace, key, op, null, null, true, true));
         } catch (NanocachedException.ConnectionLost primaryFailure) {
             applyOnOtherOwners(namespace, key, op, primaryFailure);
             throw primaryFailure;
@@ -4325,7 +4324,15 @@ public final class NanocachedClient implements AutoCloseable {
             for (int rank = 0; rank < names.size(); rank++) {
                 // An owner that already stored this position on the
                 // previous pass is not sent it again (see MultiSetTracker).
-                if (tracker.isAcknowledged(idx, names.get(rank))) continue;
+                if (tracker.isAcknowledged(idx, names.get(rank))) {
+                    // Issue #2173: if the refresh between the passes made
+                    // this owner the key's primary (the old primary left
+                    // the roster), the key is stored on its primary now
+                    // and is reported so; the earlier pass recorded the
+                    // acknowledgement as a replica's.
+                    if (rank == 0) tracker.primaryAcknowledged.add(idx);
+                    continue;
+                }
                 OwnerBatch batch = owners.computeIfAbsent(names.get(rank), name -> new OwnerBatch());
                 batch.indices.add(idx);
                 batch.isPrimary.add(rank == 0);
@@ -5184,6 +5191,9 @@ public final class NanocachedClient implements AutoCloseable {
             maybeRefresh(true);
             return operation.get();
         } catch (NanocachedException.ConnectionLost error) {
+            // An `En` is final (issue #2182): the node would refuse the
+            // same request again after the refresh.
+            if (error instanceof NanocachedException.ServerRejected) throw error;
             // Without retryConnectionFailure only a request that provably
             // never reached the wire (notSent) may be resent.
             if (ring == null || (!retryConnectionFailure && !error.notSent())) throw error;
@@ -5248,24 +5258,20 @@ public final class NanocachedClient implements AutoCloseable {
      * resending after <em>any</em> connection failure could double-apply an INCR or report an
      * already-succeeded CAS as a mismatch, if the primary actually applied the op and only its
      * reply was lost. See {@link #applyReconnectingNonIdempotent} instead.
+     *
+     * <p>An {@code En} (the node refusing the request itself) is never resent: the same node would
+     * refuse it again.
      */
     private <T> T applyReconnecting(java.util.function.Supplier<Connection> source, ConnectionOp<T> op) {
-        return applyReconnecting(source, op, false);
-    }
-
-    /**
-     * As {@link #applyReconnecting(java.util.function.Supplier, ConnectionOp)}; with {@code
-     * rejectionIsFinal} an {@code En} (a node that predates the command) is surfaced as it is
-     * instead of being redialled and resent. The same node would answer {@code En} again, so the
-     * resend only costs a dial and a round trip. Only batched touch asks for it: every other
-     * command keeps the retry it always had.
-     */
-    private <T> T applyReconnecting(
-            java.util.function.Supplier<Connection> source, ConnectionOp<T> op, boolean rejectionIsFinal) {
         try {
             return op.apply(source.get());
         } catch (NanocachedException.ConnectionLost retryable) {
-            if (rejectionIsFinal && retryable instanceof NanocachedException.ServerRejected) throw retryable;
+            // An `En` is the node refusing this request itself (issue
+            // #2182, as in Go and Rust): the same frame on a fresh
+            // connection is refused the same way, so it is surfaced as it
+            // is for every command. Requests pipelined behind it fail
+            // not-sent (a plain ConnectionLost) and keep this retry.
+            if (retryable instanceof NanocachedException.ServerRejected) throw retryable;
             // A request timeout is not the idle-FIN case this retry exists
             // for: the peer accepted the frame and simply never answered
             // within the request deadline, so a redial-and-resend would
@@ -5899,10 +5905,10 @@ public final class NanocachedClient implements AutoCloseable {
             ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
             ConnectionOp<?> replicaOp) {
-        return write(namespace, key, op, backgroundSafeOp, replicaOp, true, false);
+        return write(namespace, key, op, backgroundSafeOp, replicaOp, true);
     }
 
-    /** As the seven-argument {@code write}, with {@code rejectionIsFinal} false. */
+    /** As the seven-argument {@code write}, with {@code replicasAfterPrimary} false. */
     private <T> T write(
             byte[] namespace,
             byte[] key,
@@ -5913,26 +5919,13 @@ public final class NanocachedClient implements AutoCloseable {
         return write(namespace, key, op, backgroundSafeOp, replicaOp, primaryReplaySafe, false);
     }
 
-    /** As the eight-argument {@code write}, with {@code replicasAfterPrimary} false. */
-    private <T> T write(
-            byte[] namespace,
-            byte[] key,
-            ConnectionOp<T> op,
-            java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
-            ConnectionOp<?> replicaOp,
-            boolean primaryReplaySafe,
-            boolean rejectionIsFinal) {
-        return write(namespace, key, op, backgroundSafeOp, replicaOp, primaryReplaySafe, rejectionIsFinal, false);
-    }
-
     /**
      * As the five-argument {@code write}; with {@code primaryReplaySafe} false (issue #901: a touch
      * whose TTL expires the entry) the primary leg is redialled and resent only when the request
      * provably never reached the wire (see {@link #applyReconnectingUnlessSent}). A replica leg
      * keeps its plain retry: only the primary's answer is reported, so a replica that already
-     * expired the entry changes nothing. With {@code rejectionIsFinal} (issue #902, touch) an
-     * {@code En} from a node, a replica leg included (issue #924), is surfaced as it is instead of
-     * being redialled and resent.
+     * expired the entry changes nothing. An {@code En} from a node, a replica leg included, is
+     * surfaced as it is instead of being redialled and resent (see {@link #applyReconnecting}).
      *
      * <p>With {@code replicasAfterPrimary} (issue #934, a touch whose TTL expires the entry) the
      * other owners are sent their leg only after the primary has answered, as the result fan-out of
@@ -5951,11 +5944,10 @@ public final class NanocachedClient implements AutoCloseable {
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
             ConnectionOp<?> replicaOp,
             boolean primaryReplaySafe,
-            boolean rejectionIsFinal,
             boolean replicasAfterPrimary) {
         if (ring == null) {
             return primaryReplaySafe
-                    ? applyReconnecting(this::singleConnection, op, rejectionIsFinal)
+                    ? applyReconnecting(this::singleConnection, op)
                     : applyReconnectingUnlessSent(this::singleConnection, op);
         }
 
@@ -5966,15 +5958,14 @@ public final class NanocachedClient implements AutoCloseable {
 
         List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
         if (!replicasAfterPrimary) {
-            replicaWrites.addAll(startReplicaWrites(
-                    names.subList(1, names.size()), op, backgroundSafeOp, replicaOp, rejectionIsFinal));
+            replicaWrites.addAll(startReplicaWrites(names.subList(1, names.size()), op, backgroundSafeOp, replicaOp));
         }
 
         T value = null;
         RuntimeException primaryError = null;
         try {
             value = primaryReplaySafe
-                    ? applyReconnecting(() -> memberConnection(names.get(0)), op, rejectionIsFinal)
+                    ? applyReconnecting(() -> memberConnection(names.get(0)), op)
                     : applyReconnectingUnlessSent(() -> memberConnection(names.get(0)), op);
         } catch (RuntimeException error) {
             primaryError = error;
@@ -5988,7 +5979,7 @@ public final class NanocachedClient implements AutoCloseable {
             // force now, minus the node that answered.
             List<String> others = new ArrayList<>(ownerNames(namespace, key));
             others.remove(names.get(0));
-            replicaWrites.addAll(startReplicaWrites(others, op, backgroundSafeOp, replicaOp, rejectionIsFinal));
+            replicaWrites.addAll(startReplicaWrites(others, op, backgroundSafeOp, replicaOp));
         }
 
         // Always drain the synchronous replica legs — for close()'s
@@ -6042,8 +6033,7 @@ public final class NanocachedClient implements AutoCloseable {
             List<String> replicas,
             ConnectionOp<T> op,
             java.util.function.Supplier<ConnectionOp<T>> backgroundSafeOp,
-            ConnectionOp<?> replicaOp,
-            boolean rejectionIsFinal) {
+            ConnectionOp<?> replicaOp) {
         ConnectionOp<T> backgroundOp = null; // lazily built at most once; see write()'s javadoc (issue #326)
         List<CompletableFuture<Void>> replicaWrites = new ArrayList<>();
         for (String replica : replicas) {
@@ -6060,7 +6050,7 @@ public final class NanocachedClient implements AutoCloseable {
                 ConnectionOp<?> legOp = replicaOp != null ? replicaOp : backgroundOp;
                 Runnable replicaWrite = () -> {
                     try {
-                        applyReconnecting(() -> memberConnection(replica), legOp, rejectionIsFinal);
+                        applyReconnecting(() -> memberConnection(replica), legOp);
                     } catch (NanocachedException ignored) {
                         // Swallowed by design (client-side replication): a dead or
                         // disagreeing
@@ -6101,7 +6091,7 @@ public final class NanocachedClient implements AutoCloseable {
             ConnectionOp<?> syncLegOp = replicaOp != null ? replicaOp : op;
             Runnable replicaWrite = () -> {
                 try {
-                    applyReconnecting(() -> memberConnection(replica), syncLegOp, rejectionIsFinal);
+                    applyReconnecting(() -> memberConnection(replica), syncLegOp);
                 } catch (NanocachedException ignored) {
                     // Swallowed by design (client-side replication) — see the
                     // matching catch in the fire-and-forget branch above for
@@ -6546,11 +6536,22 @@ public final class NanocachedClient implements AutoCloseable {
      * reusing the exact same per-address cooldown bookkeeping {@link #connectToOneProxy}'s initial
      * pick and every ordinary node redial already use, rather than a second reconnect machine built
      * for this mode.
+     *
+     * <p>While the proxy in use is in its cooldown, this fails at once with the stored error and
+     * neither asks discovery nor dials anything: a failover (roster fetch plus dials) happens at
+     * most once per cooldown period, as in the Python and Go SDKs.
      */
     private Connection reconnectProxy() {
         String previousAddress = singleAddress;
+        // Issue #2167: the cooldown error is not a fresh dial failure. Treating
+        // it as one fetched the roster from discovery on every request while
+        // the proxy tier was down (two fetches per get, with its resend).
+        CooldownEntry pinned = reconnectCooldowns.get(previousAddress);
+        if (pinned != null && System.nanoTime() < pinned.untilNanos) {
+            throw pinned.error;
+        }
         try {
-            return dialWithCooldown(singleAddress);
+            return dialWithCooldown(previousAddress);
         } catch (RuntimeException sameProxyFailed) {
             List<DiscoveredNode> proxies = fetchProxyRoster();
             if (proxies == null || proxies.isEmpty()) {
@@ -6571,6 +6572,12 @@ public final class NanocachedClient implements AutoCloseable {
             for (DiscoveredNode proxy : proxies) {
                 rosterAddresses.add(proxy.address());
             }
+            // The proxy in use keeps the cooldown its failed dial just armed,
+            // even if discovery no longer lists it: until a failover succeeds
+            // it is still the address the next request redials, and that
+            // cooldown is what holds the next failover off (issue #2167). A
+            // successful swap below removes it.
+            rosterAddresses.add(previousAddress);
             reconnectCooldowns.keySet().retainAll(rosterAddresses);
 
             List<DiscoveredNode> shuffled = new ArrayList<>(proxies);

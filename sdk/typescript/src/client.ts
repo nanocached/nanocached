@@ -53,8 +53,10 @@ export { contentDigest } from "./protocol.js";
 // A value decoded by get() must be exactly what set() would have encoded —
 // no silent U+FFFD replacement for bytes that aren't valid UTF-8. A single
 // shared instance is fine: decode() carries no state across calls unless
-// `stream: true` is passed, which this SDK never does.
-const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+// `stream: true` is passed, which this SDK never does. `ignoreBOM` keeps a
+// leading U+FEFF in the value: without it decode() drops a leading EF BB BF,
+// so a value set as "\uFEFFabc" would come back as "abc".
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** Thrown by get/set/delete when called after close(). Not thrown by
  * close() itself, which is idempotent (see NanocachedClient.close). */
@@ -180,6 +182,16 @@ function wasNeverSent(error: unknown): boolean {
   return error instanceof ConnectionLostError && error.requestWasSent === false;
 }
 
+/** Whether a read that failed with `error` is resent once to the same owner
+ * on a fresh connection (see `readOnOwner`): its connection was lost (a
+ * peer FIN or RST, a desynced reply, a request pipelined behind another's
+ * `En`). Not a request timeout: the node accepted the frame and did not
+ * answer, so a resend would most likely wait out another full window. Not
+ * the node's own `En`: it would refuse the same frame again. */
+function isReadResendable(error: unknown): boolean {
+  return error instanceof ConnectionLostError && !error.requestTimedOut && !wasRejectedByServer(error);
+}
+
 /** `connectAndIdentify` for the paths that dial a member after the client
  * is up (a redial, a refresh's dial of a freshly listed node). An address
  * that does not complete the `A` handshake — it answers with something that
@@ -261,8 +273,10 @@ export interface ClientStats {
    * fireAndForgetReplicas background write (client-side replication,
    * Fire-and-forget replica writes). */
   replicaWriteFailures: number;
-  /** Failures swallowed while probing owners or writing back the repaired
-   * value during read repair (read repair). */
+  /** Read-repair write-backs that failed: the repaired value could not be
+   * written to the primary (read repair). A failed probe of an owner,
+   * including the re-probe of the primary and that replica just before the
+   * write-back, is swallowed without being counted. */
   readRepairFailures: number;
   /** Node-list refreshes that did not produce a usable list: every
    * configured discovery address was unreachable, still warming up, no
@@ -370,8 +384,9 @@ export interface NanocachedClientOptions {
    * an owner that has *failed*, so one slow-but-alive owner bounds every
    * read that touches it at its full round trip. Only applies when the
    * key has at least 2 owners (`replication >= 2`); with a single copy
-   * there is nobody to hedge to. Must be a positive number when set — a
-   * non-positive value is rejected at `connect()`, and so is setting it
+   * there is nobody to hedge to. Must be a positive number of at most 365
+   * days when set — any other value is rejected at `connect()`, and so is
+   * setting it
    * together with `viaProxy` (issue #488): a proxy connection is
    * single-connection mode, so there is never a second owner to hedge to
    * either. */
@@ -414,10 +429,16 @@ export function resolveReconnectCooldownMs(options: NanocachedClientOptions): nu
 
 const DEFAULT_COMPRESSION_THRESHOLD = 256;
 
-/** Longest `readHedgeAfterMs` accepted: 24 hours, as in the Rust SDK. Anything
- * above 2^31-1 would also overflow `setTimeout`, which then fires after about
- * a millisecond and turns hedging into an immediate second request. */
-const MAX_READ_HEDGE_AFTER_MS = 24 * 60 * 60 * 1000;
+/** Longest `readHedgeAfterMs` accepted: 365 days, as in the Java and .NET
+ * SDKs. */
+const MAX_READ_HEDGE_AFTER_MS = 365 * 24 * 60 * 60 * 1000;
+
+/** Longest delay `setTimeout` takes: above 2^31-1 ms it overflows and fires
+ * after about a millisecond, which would turn hedging into an immediate
+ * second request. The hedge timer is capped at this (about 24.8 days); a
+ * read's legs time out long before either delay elapses, so the cap never
+ * changes when a hedge starts. */
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 // TTL a read-repair write uses (read repair), in whole seconds —
 // the protocol's TTL unit throughout (see encodeSet in protocol.ts). The
@@ -1461,8 +1482,12 @@ export class NanocachedClient {
       }
       // Every listed proxy was unreachable: unlike cluster bootstrap
       // (issue #67), a proxy target needs exactly one live connection to
-      // start with — there is no connectionless-member fallback to install
-      // — so fall through to the next discovery address instead.
+      // start with — there is no connectionless-member fallback to install.
+      // The first non-empty roster is the one connect() commits to, as in
+      // the Python, Go, Java and .NET SDKs: another discovery address
+      // serves the same registry, so fail with the last dial error now
+      // instead of asking it (issue #2199).
+      throw lastError ?? new NanocachedError("nanocached: could not connect to any proxy");
     }
 
     throw lastError ?? new NanocachedError("nanocached: could not connect to any address");
@@ -1669,8 +1694,7 @@ export class NanocachedClient {
     for (const name of names.slice(1)) {
       let value: Buffer | null;
       try {
-        const connection = await this.memberConnection(name);
-        value = await connection.get(key, namespace);
+        value = await this.readOnOwner(name, (connection) => connection.get(key, namespace));
       } catch (error) {
         if (!isSwallowable(error)) throw error;
         continue;
@@ -1709,10 +1733,9 @@ export class NanocachedClient {
           await new Promise((resolve) => setTimeout(resolve, waitMs));
           if (this.closed) return;
           try {
-            const primary = await this.memberConnection(primaryName);
-            if ((await primary.get(repair.key, namespace)) !== null) return;
-            const replica = await this.memberConnection(replicaName);
-            const again = await replica.get(repair.key, namespace);
+            const stillThere = await this.readOnOwner(primaryName, (connection) => connection.get(repair.key, namespace));
+            if (stillThere !== null) return;
+            const again = await this.readOnOwner(replicaName, (connection) => connection.get(repair.key, namespace));
             if (again === null || !again.equals(repair.value!)) return;
           } catch (error) {
             if (!isSwallowable(error)) throw error;
@@ -2159,7 +2182,7 @@ export class NanocachedClient {
             : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) =>
                 connection.touch(key, ttlSeconds, namespace),
               ),
-        { nonIdempotent: expiring, rejectionIsFinal: true },
+        { nonIdempotent: expiring },
       );
     } catch (error) {
       if (wasRejectedByServer(error)) throw new ServerTooOldError();
@@ -2204,7 +2227,7 @@ export class NanocachedClient {
             : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) =>
                 connection.getAndTouch(key, ttlSeconds, namespace),
               ),
-        { nonIdempotent: expiring, rejectionIsFinal: true },
+        { nonIdempotent: expiring },
       );
     } catch (error) {
       if (wasRejectedByServer(error)) throw new ServerTooOldError();
@@ -2957,7 +2980,7 @@ export class NanocachedClient {
     ): Promise<{ groupIndices: number[]; entries: MultiEntry[]; error: unknown; resolved: number }> => {
       const groupKeyBytes = groupIndices.map((index) => keyBytes[index]);
       try {
-        const entries = await this.multiGetChunked(() => this.memberConnection(owner), namespace, groupKeyBytes);
+        const entries = await this.multiGetChunked(() => this.memberConnection(owner), namespace, groupKeyBytes, true);
         return { groupIndices, entries, error: undefined, resolved: groupIndices.length };
       } catch (error) {
         // issue #411: this owner's group already got chunked into more
@@ -3028,18 +3051,29 @@ export class NanocachedClient {
    * MAX_MULTI_HEADER_LENGTH, and no request frame risks exceeding the
    * server's own per-request cap. `connectionFor` is called fresh for
    * every chunk (not resolved once up front), so a mid-batch reconnect
-   * is handled exactly the way a single-key get/set handles one today. */
+   * is handled exactly the way a single-key get/set handles one today.
+   * With `resendOnLoss` (a cluster owner's group), a chunk whose
+   * connection was lost in flight is resent once on a fresh connection
+   * from `connectionFor`, as `readOnOwner` does for a single-key read. */
   private async multiGetChunked(
     connectionFor: () => Promise<Connection>,
     namespace: Uint8Array,
     keyBytes: readonly Buffer[],
+    resendOnLoss = false,
   ): Promise<MultiEntry[]> {
     const entries: MultiEntry[] = new Array(keyBytes.length);
     for (let start = 0; start < keyBytes.length;) {
       const end = nextChunkEnd(namespace, keyBytes.length, start, (i) => multiGetEntryCost(keyBytes[i]));
       try {
+        const chunk = keyBytes.slice(start, end);
         const connection = await connectionFor();
-        const chunkEntries = await connection.multiGet(keyBytes.slice(start, end), namespace);
+        let chunkEntries: MultiEntry[];
+        try {
+          chunkEntries = await connection.multiGet(chunk, namespace);
+        } catch (error) {
+          if (!resendOnLoss || !isReadResendable(error)) throw error;
+          chunkEntries = await (await connectionFor()).multiGet(chunk, namespace);
+        }
         for (let i = start; i < end; i++) entries[i] = chunkEntries[i - start];
       } catch (error) {
         // issue #411: chunk `start`/`end` covers keyBytes[start..end); a
@@ -3615,16 +3649,8 @@ export class NanocachedClient {
     let lastError: Error | null = null;
 
     for (const name of names) {
-      let connection: Connection;
       try {
-        connection = await this.memberConnection(name);
-      } catch (error) {
-        lastError = error as Error;
-        continue;
-      }
-
-      try {
-        return await op(connection);
+        return await this.readOnOwner(name, op);
       } catch (error) {
         if (error instanceof WrongNodeError) throw error;
         lastError = error as Error;
@@ -3632,6 +3658,28 @@ export class NanocachedClient {
     }
 
     throw lastError ?? new ConnectionLostError("nanocached: no owner is reachable for this key");
+  }
+
+  /** Runs the read `op` against owner `name`, and once more on a fresh
+   * connection to the same owner when the first attempt's connection was
+   * lost in flight (`isReadResendable`), before the caller moves on to the
+   * next owner — the redial-and-resend wrapper the Go, Rust, Java and .NET
+   * SDKs run every owner's read through. Without it a read whose
+   * connection to a live primary dropped went straight to the replica,
+   * whose miss (it may simply lack the copy) was then returned as the
+   * answer. A failed dial, a request timeout and the node's `En` are not
+   * retried, as in those SDKs, so an owner gets at most one redial and
+   * one resend per read. Used by the sequential
+   * owner walk, every hedge leg, and read repair's probes and rechecks;
+   * `multiGetChunked` does the same per chunk. */
+  private async readOnOwner<T>(name: string, op: (connection: Connection) => Promise<T>): Promise<T> {
+    const connection = await this.memberConnection(name);
+    try {
+      return await op(connection);
+    } catch (error) {
+      if (!isReadResendable(error)) throw error;
+      return await op(await this.memberConnection(name));
+    }
   }
 
   /** Hedged reads (issue #64): one slow — not dead — owner otherwise
@@ -3689,12 +3737,10 @@ export class NanocachedClient {
       // sees a set that only shrinks. A read that lost this race fails the
       // same way its own closed-check would have.
       if (this.closed) throw new AlreadyClosedError();
-      const outcome: Promise<Outcome> = this.memberConnection(names[index])
-        .then((connection) => op(connection))
-        .then(
-          (value): Outcome => ({ index, ok: true, value }),
-          (error): Outcome => ({ index, ok: false, error }),
-        );
+      const outcome: Promise<Outcome> = this.readOnOwner(names[index], op).then(
+        (value): Outcome => ({ index, ok: true, value }),
+        (error): Outcome => ({ index, ok: false, error }),
+      );
       this.hedgedReads.add(outcome);
       // Self-removing: once this leg settles — whether it's the winner or
       // a loser left running past the read's return — it no longer needs
@@ -3747,7 +3793,7 @@ export class NanocachedClient {
       if (nextIndex < names.length || uncounted) {
         racers.push(
           new Promise<"timeout">((resolve) => {
-            timer = setTimeout(() => resolve("timeout"), hedgeAfterMs);
+            timer = setTimeout(() => resolve("timeout"), Math.min(hedgeAfterMs, MAX_TIMER_DELAY_MS));
           }),
         );
       }
@@ -4396,16 +4442,18 @@ export class NanocachedClient {
    * connection error propagates as-is instead of being retried.
    * `WrongNodeError` stays retryable regardless: a `W` response means the
    * node explicitly declined to apply the op, so nothing was written. */
-  private async withWrongNodeRetry<T>(
-    operation: () => Promise<T>,
-    options?: { nonIdempotent?: boolean; rejectionIsFinal?: boolean },
-  ): Promise<T> {
+  private async withWrongNodeRetry<T>(operation: () => Promise<T>, options?: { nonIdempotent?: boolean }): Promise<T> {
     try {
       return await operation();
     } catch (error) {
-      // An `En` is a final answer from that node (issue #902): a refresh
-      // and a second attempt would only ask it again.
-      if (options?.rejectionIsFinal && wasRejectedByServer(error)) throw error;
+      // An `En` is the node refusing the request itself (a command it does
+      // not know, one too large or malformed), a final answer for every
+      // single-key request that comes through here (issues #902, #2184):
+      // a refresh and a second attempt would only send the same frame and
+      // be refused the same way, as Go and Rust treat it. The requests
+      // pipelined behind it fail with a never-sent ConnectionLostError
+      // instead (see Connection.onData) and keep this retry.
+      if (wasRejectedByServer(error)) throw error;
       // Connection-level failures retry the same way `W` does: the usual
       // cause is a node death that discovery has since noticed, so a
       // forced refresh re-ranks the key onto survivors. The retry window
@@ -4822,10 +4870,10 @@ export class NanocachedClient {
   }
 
   /** Proxy mode's reconnect-on-loss (issue #122): only ever reached via a
-   * *forced* `maybeRefreshNodeList`, itself only triggered once
-   * `proxyConnection`'s own same-address redial has already failed (see
-   * `withWrongNodeRetry`) — so this always starts from "the connected
-   * proxy is confirmed unreachable, right now." Re-fetches the roster
+   * *forced* `maybeRefreshNodeList`, triggered once `proxyConnection`'s
+   * own same-address redial has failed (issue #2170) or a request on the
+   * connection was lost (`withWrongNodeRetry`) — so this always starts
+   * from "the connected proxy was just seen failing." Re-fetches the roster
    * (`fetchProxyList`) and dials candidates in random order — the same
    * random-spread/failover shape `connectViaProxy`'s bootstrap uses —
    * until one connects, swapping it into `target`.
@@ -4839,6 +4887,12 @@ export class NanocachedClient {
    * misleading success. */
   private async refreshProxyTarget(): Promise<void> {
     if (this.target.kind !== "proxy") return;
+    // Re-check under the refresh's single flight (issue #2171): a forced
+    // refresh queued behind an earlier one (see maybeRefreshNodeList)
+    // arrives after that one has already failed over. The connection is
+    // live again, so there is nothing to replace, and dialing another
+    // proxy would open a second connection.
+    if (!this.target.connection.isClosed()) return;
 
     const proxies = await this.fetchProxyList();
     if (proxies === null) {
@@ -4883,8 +4937,16 @@ export class NanocachedClient {
         identified.socket.destroy();
         return;
       }
+      // A same-proxy redial (proxyConnection) may have installed a live
+      // connection while this one was dialing: keep that one, so no socket
+      // is left open outside `target` (issue #2171).
+      if (this.target.kind !== "proxy" || !this.target.connection.isClosed()) {
+        identified.socket.destroy();
+        return;
+      }
 
       trackOpenTarget(this.url, [identified.socket]);
+      this.target.connection.close(); // already closed (checked above); a no-op kept for clarity
       this.target = {
         kind: "proxy",
         connection: new Connection(identified.socket, identified.tagged, () => this.transientRetries++),
@@ -4933,18 +4995,41 @@ export class NanocachedClient {
    * drastic, since the proxy may have simply restarted — except the
    * address it redials is `target.address` rather than the fixed
    * `this.url`: a `refreshProxyTarget` can have swapped it to a different
-   * proxy since the connection this call finds dead was opened. */
+   * proxy since the connection this call finds dead was opened.
+   *
+   * When that redial fails (or the address is still in its reconnect
+   * cooldown), this fails over to another proxy right here, through a
+   * forced refresh (`refreshProxyTarget`), and returns the connection it
+   * installs (issue #2170). Every operation acquires its connection
+   * here, so the bulk operations, the batched touches and clear, which
+   * have no `withWrongNodeRetry` around them, fail over too, as in the
+   * other SDKs. When no other proxy is reachable, the redial's own error
+   * is thrown. */
   private async proxyConnection(): Promise<Connection> {
     if (this.target.kind !== "proxy") {
       throw new NanocachedError("nanocached: internal error — proxyConnection on a non-proxy target");
     }
     if (!this.target.connection.isClosed()) return this.target.connection;
 
-    const connection = await this.ensureConnected("", this.target.address);
-    this.discardIfClosed(connection);
-    if (this.target.kind === "proxy" && this.target.connection.isClosed()) {
-      this.target.connection = connection;
+    let connection: Connection;
+    try {
+      connection = await this.ensureConnected("", this.target.address);
+    } catch (error) {
+      if (!isConnectionError(error)) throw error;
+      await this.maybeRefreshNodeList({ force: true });
+      if (this.closed) throw new AlreadyClosedError();
+      if (this.target.kind === "proxy" && !this.target.connection.isClosed()) return this.target.connection;
+      throw error;
     }
+    this.discardIfClosed(connection);
+    // A failover (refreshProxyTarget) may have installed a live
+    // connection while this redial was in flight: use it, and close this
+    // one rather than hand out a connection nothing tracks (issue #2171).
+    if (this.target.kind === "proxy" && !this.target.connection.isClosed() && this.target.connection !== connection) {
+      connection.close();
+      return this.target.connection;
+    }
+    if (this.target.kind === "proxy") this.target.connection = connection;
     return connection;
   }
 

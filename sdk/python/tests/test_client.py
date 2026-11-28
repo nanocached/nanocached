@@ -466,12 +466,19 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReadHedgeAfterRangeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_rejects_zero_negative_non_numeric_and_above_24_hours(self):
-        for bad in (0, -1, float("nan"), 24 * 60 * 60 + 1, float("inf")):
+    async def test_rejects_zero_negative_non_numeric_and_above_365_days(self):
+        for bad in (0, -1, float("nan"), 365 * 24 * 60 * 60 + 1, float("inf")):
             with self.assertRaisesRegex(
                 ValueError, "read_hedge_after must be a positive number of seconds"
             ):
                 await NanocachedClient.connect([("127.0.0.1", 1)], read_hedge_after=bad)
+
+    async def test_accepts_up_to_365_days(self):
+        # Accepted: connect() gets as far as dialing (nothing listens on
+        # port 1) instead of rejecting the option.
+        for good in (2 * 24 * 60 * 60, 365 * 24 * 60 * 60):
+            with self.assertRaises(ConnectFailedError):
+                await NanocachedClient.connect([("127.0.0.1", 1)], read_hedge_after=good)
 
 
 class ReconnectCooldownOptionTests(unittest.IsolatedAsyncioTestCase):
@@ -799,6 +806,27 @@ class MalformedResponseTests(unittest.IsolatedAsyncioTestCase):
                 await client.set("k", "v")
                 node.answer_raw_to_get_once(b"VX1\nx")
                 with self.assertRaisesRegex(NanocachedError, "malformed response header"):
+                    await client.get("k")
+
+                self.assertEqual(await client.get("k"), "v")
+                self.assertEqual(node.connection_count, 2)
+            finally:
+                await client.close()
+        finally:
+            await node.close()
+
+    async def test_a_byte_other_than_lf_after_a_busy_marker_poisons_the_connection(self):
+        # `B` carries no body: the next byte must be the LF of `B\n`. A
+        # different byte is a desync, not a busy answer with its LF.
+        node = await MockNode().start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", node.port)])
+            try:
+                await client.set("k", "v")
+                node.answer_raw_to_get_once(b"BX")
+                with self.assertRaisesRegex(
+                    NanocachedError, "unexpected byte after response marker"
+                ):
                     await client.get("k")
 
                 self.assertEqual(await client.get("k"), "v")
@@ -2451,6 +2479,28 @@ class TouchTests(unittest.IsolatedAsyncioTestCase):
         connection._tagged = False
         marker, payload, tag = await Connection._read_one_response(connection)
         self.assertEqual((marker, payload, tag), (b"V", (b"v", 30), None))
+
+
+class ServerRejectionClusterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_get_the_node_rejects_is_not_resent_after_a_refresh(self):
+        # An `En` refuses the request itself: the same frame on a new
+        # connection is refused the same way, so the cluster retry must
+        # not redial and resend it (as for a touch).
+        node = await MockNode().start()
+        discovery = await MockDiscovery([(NAMES[0], node.address)], replication=1).start()
+        try:
+            client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+            try:
+                await client.set("k", "v")
+                node.answer_raw_to_get_once(b"En\n")
+                with self.assertRaises(ConnectionLostError):
+                    await client.get("k")
+                self.assertEqual(node.connection_count, 1)
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await node.close()
 
 
 class TouchClusterTests(unittest.IsolatedAsyncioTestCase):
@@ -4132,6 +4182,40 @@ class MultiTouchClusterTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(
                         frames[2][1], [k.encode() for k in keys[2 * _MAX_BATCH_KEYS :]]
                     )
+                finally:
+                    await self.stop(client, discovery, nodes)
+
+    async def test_a_lost_expiring_chunk_expires_the_new_primary_after_a_ring_change(self):
+        # The primary P loses the first chunk's reply; the second chunk is
+        # unresolved, so the forced refresh before the retry pass runs, and
+        # the new roster no longer lists P. The replica R is now the keys'
+        # rank 0. The lost keys' expiry legs skip P (the node that lost the
+        # reply), not the new rank 0, so R expires them too.
+        from nanocached._client import _MAX_BATCH_KEYS
+
+        for get in (False, True):
+            with self.subTest(get=get):
+                nodes, discovery = await self.start_cluster()
+                client = await NanocachedClient.connect([("127.0.0.1", discovery.port)])
+                try:
+                    primary, replica = nodes[NAMES[0]], nodes[NAMES[1]]
+                    keys = self.keys_by_primary(NAMES[0], _MAX_BATCH_KEYS + 50, "lostring")
+                    await client.set_many(dict.fromkeys(keys, "v"))
+                    lost = keys[:_MAX_BATCH_KEYS]
+                    await asyncio.sleep(_FORCED_REFRESH_MIN_INTERVAL + 0.05)
+                    primary.fail_multi_touch_after(0)
+                    discovery.nodes = [(NAMES[1], replica.address)]
+
+                    if get:
+                        # The 50 keys the retry pass resolved ride along.
+                        with self.assertRaises(PartialConnectionLostError):
+                            await client.get_many_and_touch(keys, 0)
+                    else:
+                        with self.assertRaises(ConnectionLostError):
+                            await client.touch_many(keys, 0)
+
+                    self.assertEqual(sum(k.encode() in replica.store for k in lost), 0)
+                    self.assertIsNone(await client.get(lost[0]))
                 finally:
                     await self.stop(client, discovery, nodes)
 
@@ -5820,6 +5904,86 @@ class SharedBackgroundReplicaPoolTests(unittest.IsolatedAsyncioTestCase):
             await discovery.close()
             for node in nodes.values():
                 await node.close()
+
+
+class ReadRedialTests(unittest.IsolatedAsyncioTestCase):
+    """A cluster read whose connection is lost in flight is resent once on a
+    new connection to the same owner before moving on to the next owner,
+    as in the Go, Rust, Java and .NET SDKs. The owners hold different
+    values so the answer says which one served it."""
+
+    async def asyncSetUp(self):
+        self.nodes = {NAMES[0]: await MockNode().start(), NAMES[1]: await MockNode().start()}
+        self.discovery = await MockDiscovery(
+            [(name, node.address) for name, node in self.nodes.items()], replication=2
+        ).start()
+        primary_name, replica_name = HashRing(NAMES).owners(b"k", 2)
+        self.primary, self.replica = self.nodes[primary_name], self.nodes[replica_name]
+        self.primary.store[b"k"] = b"from-primary"
+        self.replica.store[b"k"] = b"from-replica"
+
+    async def asyncTearDown(self):
+        await self.discovery.close()
+        for node in self.nodes.values():
+            await node.close()
+
+    async def connect(self, **options):
+        client = await NanocachedClient.connect([("127.0.0.1", self.discovery.port)], **options)
+        self.addAsyncCleanup(client.close)
+        return client
+
+    async def test_a_read_whose_connection_drops_is_resent_to_the_same_owner(self):
+        client = await self.connect()
+        self.primary.drop_next_get()
+
+        self.assertEqual(await client.get("k"), "from-primary")
+        self.assertEqual(self.primary.connection_count, 2)
+        self.assertEqual(self.replica.get_count, 0)
+
+    async def test_an_owner_gets_one_resend_before_the_next_owner(self):
+        client = await self.connect()
+        self.primary.drop_next_get()
+        self.primary.drop_next_get()
+
+        self.assertEqual(await client.get("k"), "from-replica")
+        self.assertEqual(self.primary.get_count, 2)
+        self.assertEqual(self.primary.connection_count, 2)
+
+    async def test_an_en_is_not_resent_to_the_same_owner(self):
+        client = await self.connect()
+        self.primary.answer_raw_to_get_once(b"En\n")
+
+        self.assertEqual(await client.get("k"), "from-replica")
+        self.assertEqual(self.primary.get_count, 1)
+        self.assertEqual(self.primary.connection_count, 1)
+
+    async def test_a_timed_out_read_is_not_resent_to_the_same_owner(self):
+        from nanocached import _connection as connection_module
+
+        client = await self.connect()
+        self.primary.delay_next_get(1.0)
+        with mock.patch.object(connection_module, "_REQUEST_TIMEOUT", 0.2):
+            self.assertEqual(await client.get("k"), "from-replica")
+        self.assertEqual(self.primary.get_count, 1)
+        self.assertEqual(self.primary.connection_count, 1)
+
+    async def test_a_hedge_leg_whose_connection_drops_is_resent_to_the_same_owner(self):
+        # A hedge interval far longer than the test: only a failed leg
+        # would start the replica.
+        client = await self.connect(read_hedge_after=30)
+        self.primary.drop_next_get()
+
+        self.assertEqual(await client.get("k"), "from-primary")
+        self.assertEqual(self.primary.connection_count, 2)
+        self.assertEqual(self.replica.get_count, 0)
+
+    async def test_a_read_repair_probe_whose_connection_drops_is_resent(self):
+        client = await self.connect(read_repair=True)
+        del self.primary.store[b"k"]
+        self.replica.drop_next_get()
+
+        self.assertEqual(await client.get("k"), "from-replica")
+        self.assertEqual(self.replica.connection_count, 2)
 
 
 class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
@@ -8627,6 +8791,110 @@ class ProxyModeTests(unittest.IsolatedAsyncioTestCase):
             await proxy_a.close()
             await proxy_b.close()
 
+    async def test_failover_does_not_redial_the_proxy_that_just_failed(self):
+        # Discovery still lists the pinned proxy after it died. After the
+        # one redial of it fails, the failover must pick among the other
+        # proxies only. The shuffle is pinned so the dead proxy would be
+        # tried first if it were still a candidate.
+        from nanocached import _client as client_module
+
+        proxy_a = await MockNode().start()
+        proxy_b = await MockNode().start()
+        discovery = await MockDiscovery(
+            nodes=[],
+            proxies=[(NAMES[0], proxy_a.address), (NAMES[1], proxy_b.address)],
+        ).start()
+
+        def dead_first(proxies):
+            proxies.sort(key=lambda proxy: proxy.address != proxy_a.address)
+
+        real_dial = client_module.connect_and_identify
+        dialed: list[int] = []
+
+        async def counting(host, port, *args, **kwargs):
+            dialed.append(port)
+            return await real_dial(host, port, *args, **kwargs)
+
+        try:
+            with (
+                mock.patch.object(client_module.random, "shuffle", dead_first),
+                mock.patch.object(client_module, "connect_and_identify", counting),
+            ):
+                client = await NanocachedClient.connect(
+                    [("127.0.0.1", discovery.port)], via_proxy=True, reconnect_cooldown=0.01
+                )
+                try:
+                    self.assertEqual(client._single_address, proxy_a.address)
+                    await proxy_a.close()
+                    await wait_for(
+                        lambda: client._single is not None and client._single.closed,
+                        "the client to see the dead proxy's FIN",
+                    )
+                    dialed.clear()
+
+                    await client.set("k", "v")
+
+                    self.assertEqual(client._single_address, proxy_b.address)
+                    self.assertEqual(dialed, [proxy_a.port, proxy_b.port])
+                finally:
+                    await client.close()
+        finally:
+            await discovery.close()
+            await proxy_a.close()
+            await proxy_b.close()
+
+    async def test_reconnect_with_discovery_down_raises_a_not_sent_connection_error(self):
+        # The pinned proxy and every discovery address are gone: nothing
+        # says the roster is empty, so the operation fails as a dial
+        # failure (a ConnectionError, nothing sent), not as "no proxies
+        # registered".
+        proxy = await MockNode().start()
+        discovery = await MockDiscovery(nodes=[], proxies=[(NAMES[0], proxy.address)]).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True, reconnect_cooldown=0.01
+            )
+            try:
+                await discovery.close()
+                await proxy.close()
+                await wait_for(
+                    lambda: client._single is not None and client._single.closed,
+                    "the client to see the dead proxy's FIN",
+                )
+
+                with self.assertRaises(ConnectFailedError) as raised:
+                    await client.set("k", "v")
+                self.assertIsInstance(raised.exception, ConnectionError)
+                self.assertNotIn("no proxies registered", str(raised.exception))
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await proxy.close()
+
+    async def test_reconnect_to_an_empty_proxy_roster_says_no_proxies_are_registered(self):
+        proxy = await MockNode().start()
+        discovery = await MockDiscovery(nodes=[], proxies=[(NAMES[0], proxy.address)]).start()
+        try:
+            client = await NanocachedClient.connect(
+                [("127.0.0.1", discovery.port)], via_proxy=True, reconnect_cooldown=0.01
+            )
+            try:
+                discovery.set_proxies([])
+                await proxy.close()
+                await wait_for(
+                    lambda: client._single is not None and client._single.closed,
+                    "the client to see the dead proxy's FIN",
+                )
+
+                with self.assertRaisesRegex(NanocachedError, "no proxies registered"):
+                    await client.set("k", "v")
+            finally:
+                await client.close()
+        finally:
+            await discovery.close()
+            await proxy.close()
+
     async def test_reconnect_purges_cooldowns_for_addresses_other_than_the_new_proxy(self):
         # #363: _maybe_refresh no-ops in via_proxy mode (self._ring stays
         # None forever, since via_proxy never builds a ring), so the #96
@@ -9250,11 +9518,10 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
         # Issue #485: in cluster mode a connection-level failure on chunk
         # N>1 of one owner's group used to throw away the chunks that
         # had already succeeded and resend the whole group. The resolved
-        # prefix is kept and only the tail moves on — and, since a
-        # connection-level failure sends a key to its next owner (the
-        # same walk a single get() does), the tail is read from the
-        # replica, in one frame carrying only the tail's keys; the
-        # primary is not asked again.
+        # prefix is kept and only the failed chunk is resent: once, on a
+        # new connection to the same owner (issue #2185, as a single get()
+        # does), in one frame carrying only that chunk's keys. The
+        # primary answers it, so the replica is not asked.
         from nanocached._client import _MAX_BATCH_KEYS
 
         nodes, discovery = await self.start_cluster()
@@ -9283,13 +9550,14 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(await client.get_many(keys), values)
 
-                # The primary saw chunk 1 and the failed chunk 2, nothing
-                # more; the replica saw exactly one frame, carrying only
-                # chunk 2's keys — not the whole group again.
-                self.assertEqual(primary.multi_get_count, 2)
-                self.assertEqual(replica.multi_get_count, 1)
-                sizes = primary.multi_get_frame_sizes
-                tail = replica.multi_get_frame_sizes[0]
+                # The primary saw chunk 1, the failed chunk 2 and chunk 2
+                # again on the new connection — not the whole group
+                # again; the replica saw nothing.
+                self.assertEqual(primary.multi_get_count, 3)
+                self.assertEqual(replica.multi_get_count, 0)
+                self.assertEqual(primary.connection_count, 2)
+                sizes = primary.multi_get_frame_sizes[:2]
+                tail = primary.multi_get_frame_sizes[2]
                 self.assertLess(
                     tail, sizes[0], f"the moved frame should carry only the tail: {sizes} / {tail}"
                 )
