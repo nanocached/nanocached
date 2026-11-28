@@ -12,6 +12,7 @@ There is no `sdk/go/v0.4.3` tag because 0.4.3 was a server-only release.
 
 ### Changed
 
+- `Connect` rejects a `ReadHedgeAfter` over 365 days with `ErrInvalidArgument`, as it rejects a negative one. There was no upper bound; every SDK now accepts at most 365 days. (#2191)
 - **Breaking:** `HashRing`, `NewHashRing`, `DefaultCompressionThreshold` and `DefaultReconnectCooldown` are no longer exported. No public function took or returned a `HashRing`, and the two defaults were exported by no other SDK; `Config` documents them (256 bytes and 1 s; `CompressionThreshold: 0` means the default, and `1` compresses every non-empty value).
 - A connection-limit `B` that arrives while requests are pending now matches `ErrConnectionLost`. It was an untyped error, so the cluster retry and the redial skipped it; the other SDKs treat it as a lost connection.
 - `Connect`'s option checks (no addresses, a negative `CompressionThreshold` or `ReadHedgeAfter`, `ReadHedgeAfter` with `ViaProxy`, `CA` without `TLS`, an unreadable or empty CA file) now match `ErrInvalidArgument`, and a malformed handshake or discovery response matches `ErrProtocol`. They were untyped `fmt.Errorf` errors that matched no sentinel; messages are unchanged.
