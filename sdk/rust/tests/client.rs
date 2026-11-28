@@ -3104,6 +3104,55 @@ async fn a_timeout_surfaces_as_a_plain_connection_lost_on_every_path() {
     node.stop();
 }
 
+// Issue #2162: the requests pipelined behind one whose deadline expired
+// fail as timed out too, as in the other SDKs: they are not redialed and
+// sent again, which would wait out a second deadline and send an
+// idempotent write twice.
+#[tokio::test]
+async fn requests_pipelined_behind_a_timed_out_request_time_out_with_it() {
+    let node = MockNode::start().await;
+    let client =
+        NanocachedClient::connect(options(node.port).request_timeout(Duration::from_millis(500)))
+            .await
+            .unwrap();
+    node.state.silent.store(true, Ordering::SeqCst);
+
+    let first = {
+        let client = client.clone();
+        tokio::spawn(async move { client.get("a").await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = tokio::time::Instant::now();
+    let second = {
+        let client = client.clone();
+        tokio::spawn(async move { client.get("b").await })
+    };
+
+    let first = first.await.unwrap();
+    assert!(
+        matches!(first, Err(Error::ConnectionLost(_))),
+        "first = {first:?}"
+    );
+    let second = second.await.unwrap();
+    assert!(
+        matches!(second, Err(Error::ConnectionLost(_))),
+        "second = {second:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "the second get took {:?}, want it failed with the first",
+        started.elapsed()
+    );
+    assert_eq!(
+        node.state.connections.load(Ordering::SeqCst),
+        1,
+        "nothing is redialed"
+    );
+
+    client.close().await;
+    node.stop();
+}
+
 // ── addresses ─────────────────────────────────────────────────────────
 
 #[tokio::test]

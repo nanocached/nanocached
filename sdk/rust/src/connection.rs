@@ -161,6 +161,12 @@ struct Shared {
     /// held across an `.await`.
     pending: std::sync::Mutex<VecDeque<PendingSlot>>,
     closed: AtomicBool,
+    /// Set (before `closed` wakes the read task) when the connection was
+    /// closed because a request's deadline expired, so the read loop's
+    /// drain fails every request queued with it as timed out too (issue
+    /// #2162) rather than as a plain loss that would be redialed and sent
+    /// again.
+    timed_out: AtomicBool,
     /// Milliseconds since `epoch` of the last request — what the
     /// keep-alive timer checks against its interval.
     last_used_ms: AtomicU64,
@@ -193,8 +199,17 @@ impl Shared {
     /// explicit `close()`, a write cancelled mid-flight) can call this
     /// directly without coordinating with the others.
     fn mark_closed(&self, shutdown: &watch::Sender<bool>) {
+        self.mark_closed_because(shutdown, false);
+    }
+
+    /// As [`Self::mark_closed`], recording whether a request deadline is
+    /// the cause (`timed_out`) when this call is the one that closes it.
+    fn mark_closed_because(&self, shutdown: &watch::Sender<bool>, timed_out: bool) {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
+        }
+        if timed_out {
+            self.timed_out.store(true, Ordering::SeqCst);
         }
         if let Some(key) = &self.tracking_key {
             crate::open_targets::decrement(key);
@@ -395,6 +410,7 @@ impl Connection {
             }),
             pending: std::sync::Mutex::new(VecDeque::new()),
             closed: AtomicBool::new(false),
+            timed_out: AtomicBool::new(false),
             last_used_ms: AtomicU64::new(0),
             last_response_ms: AtomicU64::new(0),
             keepalive_ping_in_flight: AtomicBool::new(false),
@@ -435,6 +451,7 @@ impl Connection {
                 }),
                 pending: std::sync::Mutex::new(VecDeque::new()),
                 closed: AtomicBool::new(true),
+                timed_out: AtomicBool::new(false),
                 last_used_ms: AtomicU64::new(0),
                 last_response_ms: AtomicU64::new(0),
                 keepalive_ping_in_flight: AtomicBool::new(false),
@@ -842,7 +859,9 @@ impl Connection {
                         wait = timeout - since_last;
                         continue;
                     }
-                    self.close();
+                    // Issue #2162: every request pipelined behind this one
+                    // is failed as timed out with it (see `reject_pending`).
+                    self.shared.mark_closed_because(&self.shutdown, true);
                     return Err(Error::ConnectionLostTimedOut(format!(
                         "nanocached: request timed out after {timeout:?} with no response from the server"
                     )));
@@ -1596,6 +1615,15 @@ fn reject_pending(shared: &Shared, first_error: Option<&SlotError>) {
     for slot in pending {
         let error = match first_error {
             Some(error) => error.clone(),
+            // Issue #2162: closed because a request ahead of this one ran
+            // out its deadline with no response at all, which this one
+            // would wait out again if it were redialed and sent again. The
+            // other SDKs fail it as timed out too; the client does not
+            // resend a timed-out request.
+            None if shared.timed_out.load(Ordering::SeqCst) => Error::ConnectionLostTimedOut(
+                "nanocached: request timed out: a request ahead of it on the connection got no response from the server within the request timeout".to_string(),
+            )
+            .into(),
             None => Error::ConnectionLost("nanocached: connection closed".to_string()).into(),
         };
         let _ = slot.tx.send(Err(error));
