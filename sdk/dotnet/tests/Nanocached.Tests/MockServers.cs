@@ -451,7 +451,6 @@ public sealed class MockNode : IDisposable
     /// name.</summary>
     public void GoSilentAfterHandshake() => _silent = true;
 
-    /// <summary>Server-side FIN on every open connection, like the idle timeout.</summary>
     /// <summary>From now on, close every connection on its <c>A</c>
     /// handshake without replying (until <see cref="AcceptHandshakes"/>),
     /// so a dial to this node fails while <see cref="ConnectionCount"/>
@@ -461,6 +460,7 @@ public sealed class MockNode : IDisposable
     public void AcceptHandshakes() => _refuseHandshakes = false;
     private volatile bool _refuseHandshakes;
 
+    /// <summary>Server-side FIN on every open connection, like the idle timeout.</summary>
     public void DropConnections()
     {
         foreach (TcpClient client in _clients.Keys) client.Close();
