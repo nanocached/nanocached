@@ -108,6 +108,23 @@ class NanocachedClientTest {
         return captured.toString(StandardCharsets.UTF_8);
     }
 
+    @Test
+    void aMockNodeCannotShareItsPortWithAnotherLoopbackListener() throws Exception {
+        // Issue #2261: MockNode listened on the wildcard address. On macOS
+        // that bind succeeds on a port another process already listens on
+        // at 127.0.0.1, and the client's dial to 127.0.0.1 then reaches that
+        // process, which never answers `A`: the cluster tests lost a node
+        // after the 5 s connect timeout. On the loopback address the
+        // clash is a bind error instead.
+        try (java.net.ServerSocket other = new java.net.ServerSocket()) {
+            other.setReuseAddress(true);
+            other.bind(new java.net.InetSocketAddress(MockServers.LOOPBACK, 0));
+            assertThrows(
+                    java.net.BindException.class,
+                    () -> MockNode.onPort(other.getLocalPort()).close());
+        }
+    }
+
     // ── 単一ノード ────────────────────────────────────────────────
 
     @Test
