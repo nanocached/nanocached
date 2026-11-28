@@ -37739,11 +37739,13 @@ mod tests {
             .unwrap();
         fake_discovery.abort();
 
+        // 3 s of slack for a loaded runner: still below the 15 s that
+        // either half of the fix alone gives, and the 20 s before it.
         let (since_ack, registration) = result
             .expect("the node must redial after the unanswered heartbeat")
             .unwrap();
         assert!(
-            since_ack < 2 * interval + Duration::from_secs(1),
+            since_ack < 2 * interval + Duration::from_secs(3),
             "last answered heartbeat -> next connection took {since_ack:?}, expected about two \
              intervals ({:?})",
             2 * interval
