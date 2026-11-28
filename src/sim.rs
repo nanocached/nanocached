@@ -2768,3 +2768,55 @@ async fn a_node_asked_to_leave_before_it_re_registered_with_a_restarted_discover
         "A left without handing its keys off: {out:?}"
     );
 }
+
+/// B's first `C` for J's join fails (as a dial error to discovery would)
+/// while A's lands. Returns how long J took to be listed, if it was within
+/// `limit` of starting.
+async fn scenario_failed_completion_report(limit: Duration) -> Option<Duration> {
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pj) = (Port::reserve(), Port::reserve(), Port::reserve());
+    let (dport, a, b) = (dp.number, pa.number, pb.number);
+    let disc = start_discovery(&mut dp, Duration::from_secs(15));
+    settle().await;
+    let mut client = Client::new();
+    let na = start_node(&mut pa, dport, Some("node-a"));
+    run_for(Duration::from_secs(20)).await;
+    let nb = start_node(&mut pb, dport, Some("node-b"));
+    run_for(Duration::from_secs(25)).await;
+    assert_eq!(roster(dport).await.len(), 2);
+    for i in 0..50 {
+        let key = format!("k{i}");
+        for port in [a, b] {
+            assert_eq!(client.set(port, &key, "v").await, "S");
+        }
+    }
+
+    nb.gates
+        .failed_reports
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let nj = start_node(&mut pj, dport, Some("node-j"));
+    let mut listed = None;
+    while started.elapsed() < limit {
+        if roster(dport).await.len() == 3 {
+            listed = Some(started.elapsed());
+            break;
+        }
+        run_for(Duration::from_millis(250)).await;
+    }
+    disc.abort();
+    for n in [na, nb, nj] {
+        n.abort();
+    }
+    listed
+}
+
+/// One failed `C` used to leave the join waiting out its 60 s migration
+/// timeout, then abandoned; B now sends it again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_join_goes_through_when_a_sources_first_completion_report_fails() {
+    let _spin = spin();
+    let listed = scenario_failed_completion_report(Duration::from_secs(40)).await;
+    eprintln!("listed after {listed:?}");
+    assert!(listed.is_some(), "J was not listed within 40 s of starting");
+}

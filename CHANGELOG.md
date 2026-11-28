@@ -45,6 +45,17 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: a node whose migration-complete report (`C`) to
+  discovery failed (a dial, TLS or auth error, or no ack within 10 s) only
+  logged it, and nothing sent it again. If every other source had
+  reported, the join waited out its migration timeout (60 s or more, up
+  to 2 h for a large cluster), holding up every join queued behind it,
+  and was then abandoned and run again. The node now sends `C` again with
+  backoff (0.5 s doubling to 10 s) while that handoff is still pending: not
+  cancelled, superseded or confirmed, within its forwarding window, and not
+  shutting down. Discovery counts each reporter once, so a repeat after a
+  lost ack is harmless (#2254).
+
 - `nanocached-node`: one source address could pin the whole
   `--max-in-flight-bytes` budget with uploads it never finished, and every
   value-carrying reply on other clients' connections then waited for it
