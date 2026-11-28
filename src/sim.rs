@@ -2768,3 +2768,172 @@ async fn a_node_asked_to_leave_before_it_re_registered_with_a_restarted_discover
         "A left without handing its keys off: {out:?}"
     );
 }
+
+#[derive(Debug)]
+struct AbandonedJoinerOutcome {
+    /// Keys the joiner owns once promoted.
+    j_keys: usize,
+    /// Of those, rewritten in the gap but answered with the old value.
+    j_stale_rewritten: usize,
+    /// Of those, deleted in the gap but answered with the old value.
+    j_resurrected_deleted: usize,
+    /// Of those, answered with anything else that is wrong.
+    j_wrong_other: usize,
+    /// Wrong answers from the other two nodes, for the keys they own.
+    owners_bad: usize,
+    j_promoted: bool,
+}
+
+/// A and B at R=2 hold 200 keys at `v1`. J joins; with `abandon`, B's
+/// transfer is held past the migration timeout, so the join is abandoned
+/// after A has handed J its share. The client then rewrites the even keys
+/// to `v2` and deletes the odd ones on their owners under `{A, B}`, and J's
+/// next join is let through.
+async fn scenario_abandoned_joiner(abandon: bool) -> AbandonedJoinerOutcome {
+    use crate::hash_ring::HashRing;
+    use crate::key::Key;
+
+    let mut dp = Port::reserve();
+    let (mut pa, mut pb, mut pj) = (Port::reserve(), Port::reserve(), Port::reserve());
+    let (dport, a, b, j) = (dp.number, pa.number, pb.number, pj.number);
+    let keys: Vec<String> = (0..200).map(|i| format!("q{i}")).collect();
+    let disc = start_discovery(&mut dp, Duration::from_secs(15));
+    settle().await;
+    let mut client = Client::new();
+    let na = start_node(&mut pa, dport, Some("node-a"));
+    run_for(Duration::from_secs(20)).await;
+    let nb = start_node(&mut pb, dport, Some("node-b"));
+    run_for(Duration::from_secs(25)).await;
+    let r = roster(dport).await;
+    assert_eq!(r.len(), 2, "{r:?}");
+    for key in &keys {
+        for port in [a, b] {
+            assert_eq!(client.set(port, key, "v1").await, "S", "{key} on {port}");
+        }
+    }
+    run_for(Duration::from_secs(10)).await;
+
+    if abandon {
+        nb.gates.transfer.hold();
+    }
+    let nj = start_node(&mut pj, dport, Some("node-j"));
+    // The migration timeout is 60 s plus 5 ms an entry; then a sweep tick.
+    run_for(Duration::from_secs(62)).await;
+    nb.gates.transfer.release();
+    run_for(Duration::from_millis(1500)).await;
+
+    // The client writes by the roster it gets now, to every owner.
+    let r = roster(dport).await;
+    let port_of = |name: &str| -> u16 {
+        let addr = &r.iter().find(|(n, _)| n == name).unwrap().1;
+        addr.rsplit(':').next().unwrap().parse().unwrap()
+    };
+    let ring_now = HashRing::new(r.iter().map(|(n, _)| n.clone()).collect());
+    for (index, key) in keys.iter().enumerate() {
+        let k = Key::unnamespaced(Bytes::from(key.clone()));
+        for owner in ring_now.owners(&k, 2) {
+            let port = port_of(owner);
+            if index % 2 == 0 {
+                assert_eq!(client.set(port, key, "v2").await, "S", "{key} on {port}");
+            } else {
+                let reply = client.delete(port, key).await;
+                assert_ne!(reply, "W", "{key} on {port}");
+            }
+        }
+    }
+    let mut waited = Duration::ZERO;
+    let mut promoted = false;
+    while waited < Duration::from_secs(90) {
+        if roster(dport).await.len() == 3 {
+            promoted = true;
+            break;
+        }
+        run_for(Duration::from_millis(250)).await;
+        waited += Duration::from_millis(250);
+    }
+    run_for(Duration::from_secs(2)).await;
+    let r = roster(dport).await;
+    let names: Vec<String> = r.iter().map(|(n, _)| n.clone()).collect();
+    let ring = HashRing::new(names);
+    let jname = name_at(&r, j);
+    let aname = name_at(&r, a);
+    let mut out = AbandonedJoinerOutcome {
+        j_keys: 0,
+        j_stale_rewritten: 0,
+        j_resurrected_deleted: 0,
+        j_wrong_other: 0,
+        owners_bad: 0,
+        j_promoted: promoted,
+    };
+    for (index, key) in keys.iter().enumerate() {
+        let k = Key::unnamespaced(Bytes::from(key.clone()));
+        let owners = ring.owners(&k, 2);
+        for owner in &owners {
+            if *owner == jname.as_str() {
+                continue;
+            }
+            let port = if *owner == aname.as_str() { a } else { b };
+            let v = client.value(port, key).await;
+            let good = if index % 2 == 0 {
+                v.as_deref() == Some("v2")
+            } else {
+                v.is_none()
+            };
+            if !good {
+                out.owners_bad += 1;
+            }
+        }
+        if !owners.contains(&jname.as_str()) {
+            continue;
+        }
+        out.j_keys += 1;
+        let v = client.value(j, key).await;
+        match (index % 2 == 0, v.as_deref()) {
+            (true, Some("v2")) | (false, None) => {}
+            (true, Some("v1")) => out.j_stale_rewritten += 1,
+            (false, Some("v1")) => out.j_resurrected_deleted += 1,
+            _ => out.j_wrong_other += 1,
+        }
+    }
+    disc.abort();
+    for n in [na, nb, nj] {
+        n.abort();
+    }
+    out
+}
+
+/// The joiner of an abandoned join held the copies A had handed it, and
+/// the next join's put-if-absent handoff could not replace them: promoted,
+/// it answered the old value for every key rewritten or deleted in the gap.
+/// It now clears them before it joins again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_joiner_whose_join_was_abandoned_does_not_keep_that_attempts_copies() {
+    let _spin = spin();
+    let out = scenario_abandoned_joiner(true).await;
+    eprintln!("{out:?}");
+    assert!(out.j_promoted, "{out:?}");
+    assert!(out.j_keys > 0, "nothing to check: {out:?}");
+    assert_eq!(out.owners_bad, 0, "{out:?}");
+    assert_eq!(
+        out.j_stale_rewritten + out.j_resurrected_deleted + out.j_wrong_other,
+        0,
+        "the joiner serves what the abandoned attempt handed it: {out:?}"
+    );
+}
+
+/// The same timeline without the abandon: the baseline the test above
+/// compares against.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_joiner_whose_join_went_through_serves_the_writes_made_after_it() {
+    let _spin = spin();
+    let out = scenario_abandoned_joiner(false).await;
+    eprintln!("{out:?}");
+    assert!(out.j_promoted, "{out:?}");
+    assert!(out.j_keys > 0, "nothing to check: {out:?}");
+    assert_eq!(out.owners_bad, 0, "{out:?}");
+    assert_eq!(
+        out.j_stale_rewritten + out.j_resurrected_deleted + out.j_wrong_other,
+        0,
+        "{out:?}"
+    );
+}
