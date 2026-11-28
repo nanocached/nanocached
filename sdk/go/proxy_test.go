@@ -9,6 +9,7 @@ package nanocached
 // G/S/D/g/s/d/c/F, never W.
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -350,5 +351,54 @@ func TestViaProxyFailoverDropsTheDeadProxysCooldownEntry(t *testing.T) {
 	}
 	if hasCooldown(deadAddress) {
 		t.Fatalf("expected the failover to drop the cooldown entry for %s", deadAddress)
+	}
+}
+
+// A failover whose proxy-roster fetch finds no usable roster (discovery
+// lists no proxies, or cannot be reached) counts once in
+// Stats().RefreshFailures, the counter a failed node-list refresh uses,
+// as in the other SDKs.
+func TestViaProxyFailedRosterFetchCountsInRefreshFailures(t *testing.T) {
+	proxyA := startMockNode(t, nil)
+	discovery := startMockDiscovery(t, nil, 2)
+	discovery.setProxies([]discoveredNode{{Name: "proxy-a", Address: proxyA.address()}})
+
+	client, err := Connect(Config{
+		Addresses:         []Address{addr(discovery.address())},
+		ViaProxy:          true,
+		ReconnectCooldown: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.Set("k", "v1", 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := client.Stats().RefreshFailures; got != 0 {
+		t.Fatalf("Stats().RefreshFailures after connect = %d, want 0", got)
+	}
+
+	proxyA.dropConnections()
+	proxyA.close()
+
+	// Discovery answers but lists no proxies.
+	discovery.setProxies(nil)
+	if err := client.Set("k", "v2", 0); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Set() with no proxy registered error = %v, want ErrConnectionLost", err)
+	}
+	if got := client.Stats().RefreshFailures; got != 1 {
+		t.Fatalf("Stats().RefreshFailures after an empty roster = %d, want 1", got)
+	}
+
+	// Discovery cannot be reached at all. Wait out the dead proxy's
+	// redial cooldown first, or the write fails on it without a fetch.
+	_ = discovery.listener.Close()
+	time.Sleep(80 * time.Millisecond)
+	if err := client.Set("k", "v3", 0); !errors.Is(err, ErrConnectionLost) {
+		t.Fatalf("Set() with discovery unreachable error = %v, want ErrConnectionLost", err)
+	}
+	if got := client.Stats().RefreshFailures; got != 2 {
+		t.Fatalf("Stats().RefreshFailures after discovery went unreachable = %d, want 2", got)
 	}
 }

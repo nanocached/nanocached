@@ -82,7 +82,11 @@ that can never take effect is a misconfiguration. Namespaces, `clear`/`clear_all
 keep-alive all work unchanged. If the proxy connection is lost, the same
 proxy is redialed first (it may simply have restarted); only if that
 also fails does the client re-fetch the roster from discovery and swap
-onto another, randomly chosen, reachable proxy. Pointing `via_proxy` at
+onto another, randomly chosen, reachable proxy. A failed redial starts the
+reconnect cooldown (`Options::reconnect_cooldown`, 1 s by default). Until it
+ends, requests fail at once with the same error and discovery is not asked
+again, so a proxy-tier outage costs one roster fetch per cooldown period.
+Pointing `via_proxy` at
 an address that turns out to be a cache node, not a discovery server,
 fails `connect()` fast with `Error::InvalidArgument`; an empty (or
 wholly unreachable) proxy roster is a normal connect error.
@@ -763,7 +767,7 @@ left; this is how to read it.
 
 | `Error` | Retry the call? |
 |---|---|
-| `ConnectionLost` | `get`/`set`/`delete`/`clear`/`touch` and the batched forms: yes, they are idempotent. `incr`/`decr`, `put_if_absent`, `replace_if_present`, `replace`, `delete_if_matches`: **the outcome is unknown** (the request may have been applied before the reply was lost), so read the key first, or accept a possible double apply. A request that timed out is `ConnectionLost` too; the node was reachable and did not answer in time. |
+| `ConnectionLost` | `get`/`set`/`delete`/`clear`/`touch` and the batched forms: yes, they are idempotent. `incr`/`decr`, `put_if_absent`, `replace_if_present`, `replace`, `delete_if_matches`: **the outcome is unknown** (the request may have been applied before the reply was lost), so read the key first, or accept a possible double apply. A request that timed out is `ConnectionLost` too; the node was reachable and did not answer in time. So is a reply the SDK could not parse: the connection is closed and the reply counts as lost. |
 | `Retryable` | Yes, later. The connection is fine and stays open; the SDK has already retried this request a few times. |
 | `DiscoveryBusy` | Yes, shortly, or with another discovery address. |
 | `WrongNode` | The SDK refreshed the node list and retried once already; it escapes when that failed too, or in single-node mode. A retry helps only once membership has settled. |

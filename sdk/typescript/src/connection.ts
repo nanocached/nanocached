@@ -15,6 +15,7 @@ import {
   encodeMultiSet,
   encodeMultiTouch,
   encodeSet,
+  headerText,
   MAX_RESPONSE_FRAME_LENGTH,
   parseCounterValue,
   peekMultiFrameLength,
@@ -441,11 +442,11 @@ export class Connection {
     if (response.kind === "incremented") {
       const raw = response.value ?? Buffer.alloc(0);
       // Strict decimal-ASCII-with-optional-leading-minus grammar (issue
-      // #462) — bare `Number(raw.toString("ascii"))` would silently accept
+      // #462) — bare `Number(headerText(raw))` would silently accept
       // "+5", " 5", "1e2", etc. as if the server had answered with a
       // legitimate counter, instead of the desynced-stream signal it
       // actually is.
-      const value = parseCounterValue(raw.toString("ascii"));
+      const value = parseCounterValue(headerText(raw));
       if (value === undefined) {
         throw this.desynced("invalid incr value in response");
       }

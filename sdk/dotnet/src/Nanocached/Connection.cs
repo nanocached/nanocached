@@ -1373,8 +1373,10 @@ internal sealed class Connection
                 // just sent. It closes the connection right after; consume
                 // the rest of the line so the failure carries its own type.
                 //
-                // Issue #939: only that exact line is a server that is too
-                // old. Any other E — the bare `E\n` nanocached-proxy answers
+                // Issue #939: only a line starting with `n` is a server that
+                // is too old (`En`, and the `EnT` a failed tagged `A` gets;
+                // the same prefix test as the Python, Go and Rust SDKs, issue
+                // #2181). Any other E — the bare `E\n` nanocached-proxy answers
                 // when an expiring touch's outcome is unknown or a request
                 // failed transiently (untagged even on a tagged connection),
                 // or an E that carries a tag — is a fatal
@@ -1382,7 +1384,7 @@ internal sealed class Connection
                 // error every other command gets, which a ttl=0 touch and
                 // Incr/CAS never resend.
                 string rest = await ReadLineAsync(stripLeadingSpace: false).ConfigureAwait(false);
-                if (rest == "n") throw new ServerRejectedException();
+                if (rest.StartsWith('n')) throw new ServerRejectedException();
                 throw new ConnectionLostException(
                     $"nanocached: unexpected response from server: E{rest}");
             case (byte)'B':

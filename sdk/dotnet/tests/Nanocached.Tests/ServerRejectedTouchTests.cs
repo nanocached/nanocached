@@ -86,6 +86,25 @@ public class ServerRejectedTouchTests
         Assert.Equal(1, FramesSeen(node, op));
     }
 
+    /// <summary>issue #2181: an <c>E</c> line whose rest starts with
+    /// <c>n</c> is a node's rejection, not only the exact <c>En</c> — the
+    /// <c>EnT</c> a node and the proxy answer a failed tagged <c>A</c> too,
+    /// as in the Python, Go and Rust SDKs.</summary>
+    [Theory]
+    [InlineData("En\n")]
+    [InlineData("EnT\n")]
+    public async Task AnyELineStartingWithNIsAServerRejection(string reply)
+    {
+        using var node = new MockNode();
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(SingleAddress(node.Port));
+        await client.SetAsync("k", "v", 100);
+        node.RejectTouchWith(reply);
+
+        await Assert.ThrowsAsync<ServerTooOldException>(() => client.TouchAsync("k", 30));
+
+        Assert.Single(node.TouchFrames);
+    }
+
     /// <summary>A node's <c>En</c> answers only the oldest request and the
     /// node closes the connection right after, so an incr pipelined behind
     /// the rejected touch was never run: it must be drained as not sent and
