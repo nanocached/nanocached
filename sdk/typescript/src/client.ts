@@ -4822,10 +4822,10 @@ export class NanocachedClient {
   }
 
   /** Proxy mode's reconnect-on-loss (issue #122): only ever reached via a
-   * *forced* `maybeRefreshNodeList`, itself only triggered once
-   * `proxyConnection`'s own same-address redial has already failed (see
-   * `withWrongNodeRetry`) — so this always starts from "the connected
-   * proxy is confirmed unreachable, right now." Re-fetches the roster
+   * *forced* `maybeRefreshNodeList`, triggered once `proxyConnection`'s
+   * own same-address redial has failed (issue #2170) or a request on the
+   * connection was lost (`withWrongNodeRetry`) — so this always starts
+   * from "the connected proxy was just seen failing." Re-fetches the roster
    * (`fetchProxyList`) and dials candidates in random order — the same
    * random-spread/failover shape `connectViaProxy`'s bootstrap uses —
    * until one connects, swapping it into `target`.
@@ -4924,14 +4924,32 @@ export class NanocachedClient {
    * drastic, since the proxy may have simply restarted — except the
    * address it redials is `target.address` rather than the fixed
    * `this.url`: a `refreshProxyTarget` can have swapped it to a different
-   * proxy since the connection this call finds dead was opened. */
+   * proxy since the connection this call finds dead was opened.
+   *
+   * When that redial fails (or the address is still in its reconnect
+   * cooldown), this fails over to another proxy right here, through a
+   * forced refresh (`refreshProxyTarget`), and returns the connection it
+   * installs (issue #2170). Every operation acquires its connection
+   * here, so the bulk operations, the batched touches and clear, which
+   * have no `withWrongNodeRetry` around them, fail over too, as in the
+   * other SDKs. When no other proxy is reachable, the redial's own error
+   * is thrown. */
   private async proxyConnection(): Promise<Connection> {
     if (this.target.kind !== "proxy") {
       throw new NanocachedError("nanocached: internal error — proxyConnection on a non-proxy target");
     }
     if (!this.target.connection.isClosed()) return this.target.connection;
 
-    const connection = await this.ensureConnected("", this.target.address);
+    let connection: Connection;
+    try {
+      connection = await this.ensureConnected("", this.target.address);
+    } catch (error) {
+      if (!isConnectionError(error)) throw error;
+      await this.maybeRefreshNodeList({ force: true });
+      if (this.closed) throw new AlreadyClosedError();
+      if (this.target.kind === "proxy" && !this.target.connection.isClosed()) return this.target.connection;
+      throw error;
+    }
     this.discardIfClosed(connection);
     if (this.target.kind === "proxy" && this.target.connection.isClosed()) {
       this.target.connection = connection;

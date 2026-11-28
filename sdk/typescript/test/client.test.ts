@@ -9309,6 +9309,52 @@ describe("NanocachedClient SDK proxy mode (issue #122, viaProxy)", () => {
     }
   });
 
+  const bulkOps: Array<[string, (client: NanocachedClient) => Promise<unknown>]> = [
+    ["getMany", (client) => client.getMany(["k"])],
+    ["setMany", (client) => client.setMany({ k: "v" })],
+    ["touchMany", (client) => client.touchMany(["k"], 60)],
+    ["getManyAndTouch", (client) => client.getManyAndTouch(["k"], 60)],
+    ["clear", (client) => client.namespace("ns").clear()],
+    ["clearAll", (client) => client.clearAll()],
+  ];
+  for (const [name, op] of bulkOps) {
+    it(`${name} fails over to the surviving proxy once the pinned one is gone (issue #2170)`, async () => {
+      // Regression: only the single-key operations' retry wrapper reached
+      // refreshProxyTarget, so a client using only these kept redialing
+      // the dead proxy and failing with ECONNREFUSED.
+      const [proxyA, proxyB] = await Promise.all([startMockNode(), startMockNode()]);
+      const byAddress = new Map([
+        [proxyA.address, proxyA],
+        [proxyB.address, proxyB],
+      ]);
+      const discovery = await startMockDiscovery([]);
+      discovery.setProxies([
+        { name: "proxy-a", address: proxyA.address },
+        { name: "proxy-b", address: proxyB.address },
+      ]);
+      try {
+        const client = await NanocachedClient.connect({
+          addresses: [{ host: "127.0.0.1", port: discovery.port }],
+          viaProxy: true,
+        });
+        try {
+          const landedAddress = proxyAddressOf(client);
+          const survivorAddress = landedAddress === proxyA.address ? proxyB.address : proxyA.address;
+          await byAddress.get(landedAddress)!.close();
+          await waitFor(() => singleConnectionClosed(client), "the client to notice the dead proxy");
+
+          await op(client);
+          assert.equal(proxyAddressOf(client), survivorAddress);
+          assert.ok(byAddress.get(survivorAddress)!.connectionCount() > 0);
+        } finally {
+          await client.close();
+        }
+      } finally {
+        await Promise.all([discovery.close(), proxyA.close().catch(() => {}), proxyB.close().catch(() => {})]);
+      }
+    });
+  }
+
   it("prunes the departed proxy's reconnect cooldown once refreshProxyTarget swaps to a new one (issue #296)", async () => {
     // Regression: refreshProxyTarget used to swap `target.address` to the
     // new proxy without ever deleting the old address's entry from
