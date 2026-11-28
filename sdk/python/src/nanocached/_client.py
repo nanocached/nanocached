@@ -1201,28 +1201,39 @@ class NanocachedClient:
         _dial_one_proxy_randomly, reusing exactly the same fan-out and
         random-order failover as the initial connect."""
         proxies = await self._fetch_proxy_list()
+        if proxies is None:
+            # No discovery address answered: nothing was sent, and a retry
+            # once discovery (or the proxy) is back can succeed, so this is
+            # a connection failure, as in the Go, Java, Rust and TypeScript
+            # SDKs, not a claim that the roster is empty.
+            raise ConnectFailedError(
+                f"nanocached: proxy {self._single_address} is unreachable and no "
+                "discovery server answered (proxy mode reconnect)"
+            )
         if not proxies:
             raise NanocachedError(
                 "nanocached: no proxies registered with discovery (proxy mode reconnect)"
             )
         return await self._dial_one_proxy_randomly(proxies)
 
-    async def _fetch_proxy_list(self) -> list[DiscoveredNode]:
+    async def _fetch_proxy_list(self) -> list[DiscoveredNode] | None:
         """Walks every configured discovery address (discovery HA),
-        exactly like _fetch_node_list, returning the first that answers
-        with a (possibly empty) proxy roster. A node-identifying address
-        is skipped (closed) rather than erroring, and every failure is
-        swallowed here: like _fetch_node_list, this reconnect-time fetch
-        must never itself raise something other than "no proxies were
-        found" — the caller (_reconnect_via_new_proxy) turns an empty
-        result into the same clear error an empty initial roster would
-        raise at connect(). Each failed address is counted in
+        exactly like _fetch_node_list, returning the first non-empty proxy
+        roster. A node-identifying address is skipped (closed) rather than
+        erroring, and every failure is swallowed here: like
+        _fetch_node_list, this reconnect-time fetch never raises. It
+        returns ``[]`` when some discovery server answered but none listed
+        a proxy, and ``None`` when no discovery server answered at all;
+        the caller (_reconnect_via_new_proxy) raises "no proxies
+        registered" for the first and a connection failure for the
+        second. Each failed address is counted in
         stats().refresh_failures — once per fetch that produced no usable
         roster (every address failed, or none listed a proxy), the same
         counter _refresh_node_list uses, since both are "the node/proxy
         list this client routes with just went stale" (per the spec:
         reuse the SDK's existing counters rather than adding a
         proxy-only one)."""
+        answered = False
         for address_host, address_port in self._addresses:
             try:
                 identified = await connect_and_identify_proxy(
@@ -1234,10 +1245,11 @@ class NanocachedClient:
                 identified.writer.close()
                 continue
             if not identified:
+                answered = True
                 continue
             return identified
         self._refresh_failures += 1
-        return []
+        return [] if answered else None
 
     # ── Public API ───────────────────────────────────────────────────
 
