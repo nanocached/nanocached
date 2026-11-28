@@ -5684,13 +5684,14 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
     /// initial connect fetches <c>Q</c> directly in
     /// <see cref="ConnectAsync(Options, CancellationToken)"/>'s own loop instead, since that
     /// first fetch also needs the loop's own per-address bookkeeping
-    /// (<c>_targetKey</c>, the forgotten-close warning). Unlike
-    /// <see cref="FetchNodeListAsync"/>, an address that identifies as a
-    /// plain cache node is not skipped as merely uninteresting: it means
-    /// ViaProxy is pointed at the wrong kind of address, the same
-    /// configuration error <see cref="ConnectAsync(Options, CancellationToken)"/> fails fast
-    /// on, so it is thrown here too rather than silently trying the next
-    /// address.</summary>
+    /// (<c>_targetKey</c>, the forgotten-close warning). An address that
+    /// identifies as a plain cache node is skipped like an unreachable one,
+    /// as in the other SDKs (issue #2172): the initial connect already
+    /// rejected a ViaProxy pointed at nodes, so here it is an address that
+    /// was reclaimed since. When no address yields a roster, the failure is
+    /// a not-sent <see cref="ConnectionLostException"/> carrying the last
+    /// error, never the raw socket, TLS or I/O exception: the request that
+    /// is redialing was never written.</summary>
     private async Task<IReadOnlyList<DiscoveredNode>> FetchProxyListAsync()
     {
         Exception? lastError = null;
@@ -5717,10 +5718,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
             {
                 case Identify.NodeTarget node:
                     node.Stream.Dispose();
-                    Interlocked.Increment(ref _refreshFailures);
-                    throw new NanocachedException(
+                    lastError = new NanocachedException(
                         $"nanocached: ViaProxy requires discovery addresses, but {host}:{port} "
                         + "identifies as a cache node");
+                    continue;
 
                 // An empty roster is not an answer: this replica may have
                 // just restarted and not heard its proxies re-register yet,
@@ -5737,8 +5738,10 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
         // Some address answered, with no proxies: hand back the empty list
         // so the caller reports it with the same-proxy dial error attached.
         if (sawEmptyRoster) return Array.Empty<DiscoveredNode>();
-        throw lastError ?? new NanocachedException(
-            "nanocached: could not reach any discovery address for the proxy roster");
+        throw new ConnectionLostException(
+            "nanocached: could not fetch the proxy roster from any discovery address"
+            + (lastError is null ? "" : $": {lastError.Message}"),
+            lastError!, requestNotSent: true);
     }
 
     // ── keep-alive ────────────────────────────────────────────────

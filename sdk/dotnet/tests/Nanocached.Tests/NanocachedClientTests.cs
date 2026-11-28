@@ -6492,6 +6492,58 @@ public class NanocachedClientTests
     }
 
     [Fact]
+    public async Task ViaProxyFailoverWithEveryDiscoveryAddressDownIsANotSentConnectionLoss()
+    {
+        // Issue #2172: the roster fetch's raw SocketException used to reach
+        // the caller.
+        var proxy = new MockNode();
+        var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.SetProxies(new[] { ("proxy-1", proxy.Address) });
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(
+            ViaProxyAddress("127.0.0.1", discovery.Port));
+        await client.SetAsync("k", "v");
+
+        proxy.Dispose();
+        discovery.Dispose();
+        await Task.Delay(50); // let the FIN land
+
+        ConnectionLostException error =
+            await Assert.ThrowsAnyAsync<ConnectionLostException>(() => client.GetAsync("k"));
+        Assert.True(error.RequestNotSent);
+        Assert.NotNull(error.InnerException);
+    }
+
+    [Fact]
+    public async Task ViaProxyFailoverSkipsADiscoveryAddressThatAnswersAsANode()
+    {
+        // Issue #2172: a discovery address that answers as a node (reclaimed
+        // since the connect) is skipped like an unreachable one, as in the
+        // other SDKs, instead of failing the operation.
+        var first = new MockNode();
+        using var second = new MockNode();
+        using var node = new MockNode();
+        var firstDiscovery = new MockDiscovery(Array.Empty<(string, string)>());
+        using var lastDiscovery = new MockDiscovery(Array.Empty<(string, string)>());
+        firstDiscovery.SetProxies(new[] { ("proxy-1", first.Address) });
+        lastDiscovery.SetProxies(new[] { ("proxy-2", second.Address) });
+
+        var options = new NanocachedClient.Options { ViaProxy = true };
+        options.Addresses.Add(("127.0.0.1", firstDiscovery.Port));
+        options.Addresses.Add(("127.0.0.1", node.Port));
+        options.Addresses.Add(("127.0.0.1", lastDiscovery.Port));
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(options);
+        Assert.Equal(first.Address, GetSingleAddress(client));
+
+        first.Dispose();
+        firstDiscovery.Dispose();
+        await Task.Delay(50);
+
+        await client.SetAsync("k", "v");
+        Assert.Equal(second.Address, GetSingleAddress(client));
+        Assert.Equal(0, client.Stats().RefreshFailures);
+    }
+
+    [Fact]
     public async Task ViaProxySkipsAWarmingUpDiscoverySeedAndFetchesQFromTheNext()
     {
         using var proxy = new MockNode();
