@@ -1,7 +1,7 @@
 import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { connect, createServer, type AddressInfo, type Server, type Socket } from "node:net";
-import { Connection, ConnectionLostError } from "../src/connection.js";
+import { Connection, ConnectionLostError, wasRejectedByServer } from "../src/connection.js";
 import { connectAndIdentify, connectAndListProxies } from "../src/identify.js";
 
 // Regression tests for the O(n^2) re-copying of a large response while it
@@ -105,6 +105,32 @@ describe("Connection copies a large response once, not once per fragment", () =>
     assert.deepEqual(got, value);
     assert.equal(miss, null);
     assert.ok(counter.bytes() <= 2 * payload.length, `${counter.bytes()} bytes concatenated for a ${payload.length}-byte stream`);
+  });
+});
+
+describe("Connection reads a node's En as a whole line", () => {
+  it("waits for the LF of an En that arrives in two pieces", async () => {
+    let serverSocket: Socket | undefined;
+    const port = await listen((socket) => {
+      serverSocket = socket;
+      socket.on("error", () => {});
+      socket.once("data", () => socket.write("En"));
+    });
+    const socket = connect(port, "127.0.0.1");
+    await new Promise<void>((resolve) => socket.once("connect", resolve));
+    const connection = new Connection(socket);
+
+    let settled = false;
+    const pending = connection.get("k").finally(() => {
+      settled = true;
+    });
+    pending.catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(settled, false, "the request settled before the En's LF arrived");
+
+    serverSocket!.write("\n");
+    await assert.rejects(pending, (error: Error) => wasRejectedByServer(error));
+    connection.close();
   });
 });
 

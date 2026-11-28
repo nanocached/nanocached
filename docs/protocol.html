@@ -162,8 +162,14 @@ echoes the capability as <code>OnT</code>/<code>OdT</code>.</div>
 and <code>R</code>, in that order. Every other token is reserved: a node
 answers <code>En</code>, a discovery server <code>Ed</code> and
 <code>nanocached-proxy</code> a bare <code>E</code>, and the connection is
-closed. That refusal is also how an SDK learns that a server does not know a
-capability it asked for, and falls back to asking for less. A later release
+closed. The SDKs do not read that refusal as a missing capability: an
+<code>E</code> answer to <code>A</code>, the refusal of an unknown token
+included, is reported as an authentication failure and the handshake is not
+tried again. They ask for less only when the server closes the connection
+without answering, which is how a server from before a capability existed
+treats the longer <code>A</code>: <code>A &lt;len&gt; T R</code> first, then
+<code>A &lt;len&gt; T</code>, then a plain <code>A &lt;len&gt;</code>, one
+step at a time. A later release
 may define a new token, only as an opt-in capability a client asks for, never
 as a change to what a request without it does. <code>V</code> is set aside for
 versioned writes (a version carried on write requests and replies, so that the
