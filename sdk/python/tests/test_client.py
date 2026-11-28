@@ -5906,6 +5906,86 @@ class SharedBackgroundReplicaPoolTests(unittest.IsolatedAsyncioTestCase):
                 await node.close()
 
 
+class ReadRedialTests(unittest.IsolatedAsyncioTestCase):
+    """A cluster read whose connection is lost in flight is resent once on a
+    new connection to the same owner before moving on to the next owner,
+    as in the Go, Rust, Java and .NET SDKs. The owners hold different
+    values so the answer says which one served it."""
+
+    async def asyncSetUp(self):
+        self.nodes = {NAMES[0]: await MockNode().start(), NAMES[1]: await MockNode().start()}
+        self.discovery = await MockDiscovery(
+            [(name, node.address) for name, node in self.nodes.items()], replication=2
+        ).start()
+        primary_name, replica_name = HashRing(NAMES).owners(b"k", 2)
+        self.primary, self.replica = self.nodes[primary_name], self.nodes[replica_name]
+        self.primary.store[b"k"] = b"from-primary"
+        self.replica.store[b"k"] = b"from-replica"
+
+    async def asyncTearDown(self):
+        await self.discovery.close()
+        for node in self.nodes.values():
+            await node.close()
+
+    async def connect(self, **options):
+        client = await NanocachedClient.connect([("127.0.0.1", self.discovery.port)], **options)
+        self.addAsyncCleanup(client.close)
+        return client
+
+    async def test_a_read_whose_connection_drops_is_resent_to_the_same_owner(self):
+        client = await self.connect()
+        self.primary.drop_next_get()
+
+        self.assertEqual(await client.get("k"), "from-primary")
+        self.assertEqual(self.primary.connection_count, 2)
+        self.assertEqual(self.replica.get_count, 0)
+
+    async def test_an_owner_gets_one_resend_before_the_next_owner(self):
+        client = await self.connect()
+        self.primary.drop_next_get()
+        self.primary.drop_next_get()
+
+        self.assertEqual(await client.get("k"), "from-replica")
+        self.assertEqual(self.primary.get_count, 2)
+        self.assertEqual(self.primary.connection_count, 2)
+
+    async def test_an_en_is_not_resent_to_the_same_owner(self):
+        client = await self.connect()
+        self.primary.answer_raw_to_get_once(b"En\n")
+
+        self.assertEqual(await client.get("k"), "from-replica")
+        self.assertEqual(self.primary.get_count, 1)
+        self.assertEqual(self.primary.connection_count, 1)
+
+    async def test_a_timed_out_read_is_not_resent_to_the_same_owner(self):
+        from nanocached import _connection as connection_module
+
+        client = await self.connect()
+        self.primary.delay_next_get(1.0)
+        with mock.patch.object(connection_module, "_REQUEST_TIMEOUT", 0.2):
+            self.assertEqual(await client.get("k"), "from-replica")
+        self.assertEqual(self.primary.get_count, 1)
+        self.assertEqual(self.primary.connection_count, 1)
+
+    async def test_a_hedge_leg_whose_connection_drops_is_resent_to_the_same_owner(self):
+        # A hedge interval far longer than the test: only a failed leg
+        # would start the replica.
+        client = await self.connect(read_hedge_after=30)
+        self.primary.drop_next_get()
+
+        self.assertEqual(await client.get("k"), "from-primary")
+        self.assertEqual(self.primary.connection_count, 2)
+        self.assertEqual(self.replica.get_count, 0)
+
+    async def test_a_read_repair_probe_whose_connection_drops_is_resent(self):
+        client = await self.connect(read_repair=True)
+        del self.primary.store[b"k"]
+        self.replica.drop_next_get()
+
+        self.assertEqual(await client.get("k"), "from-replica")
+        self.assertEqual(self.replica.connection_count, 2)
+
+
 class HedgedReadTests(unittest.IsolatedAsyncioTestCase):
     """Hedged reads (issue #64): read_hedge_after sends a read to the next
     owner when the primary hasn't answered in time — a slow node no longer
@@ -9438,11 +9518,10 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
         # Issue #485: in cluster mode a connection-level failure on chunk
         # N>1 of one owner's group used to throw away the chunks that
         # had already succeeded and resend the whole group. The resolved
-        # prefix is kept and only the tail moves on — and, since a
-        # connection-level failure sends a key to its next owner (the
-        # same walk a single get() does), the tail is read from the
-        # replica, in one frame carrying only the tail's keys; the
-        # primary is not asked again.
+        # prefix is kept and only the failed chunk is resent: once, on a
+        # new connection to the same owner (issue #2185, as a single get()
+        # does), in one frame carrying only that chunk's keys. The
+        # primary answers it, so the replica is not asked.
         from nanocached._client import _MAX_BATCH_KEYS
 
         nodes, discovery = await self.start_cluster()
@@ -9471,13 +9550,14 @@ class MultiClusterTests(unittest.IsolatedAsyncioTestCase):
 
                 self.assertEqual(await client.get_many(keys), values)
 
-                # The primary saw chunk 1 and the failed chunk 2, nothing
-                # more; the replica saw exactly one frame, carrying only
-                # chunk 2's keys — not the whole group again.
-                self.assertEqual(primary.multi_get_count, 2)
-                self.assertEqual(replica.multi_get_count, 1)
-                sizes = primary.multi_get_frame_sizes
-                tail = replica.multi_get_frame_sizes[0]
+                # The primary saw chunk 1, the failed chunk 2 and chunk 2
+                # again on the new connection — not the whole group
+                # again; the replica saw nothing.
+                self.assertEqual(primary.multi_get_count, 3)
+                self.assertEqual(replica.multi_get_count, 0)
+                self.assertEqual(primary.connection_count, 2)
+                sizes = primary.multi_get_frame_sizes[:2]
+                tail = primary.multi_get_frame_sizes[2]
                 self.assertLess(
                     tail, sizes[0], f"the moved frame should carry only the tail: {sizes} / {tail}"
                 )

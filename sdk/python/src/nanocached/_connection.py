@@ -402,6 +402,15 @@ class _ServerRejectedError(NanocachedError):
     ServerTooOldError."""
 
 
+class _RequestTimedOutError(ConnectionError):
+    """The poison a request timeout (``_REQUEST_TIMEOUT``) fails the
+    connection's requests with. Private: it reaches a sent request as the
+    ``__cause__`` of its ConnectionLostError, and tells the client's
+    redial-and-resend not to resend: the peer accepted the frame and did
+    not answer, so a resend would most likely wait out another full
+    timeout, as in the Go, Rust, Java and .NET SDKs."""
+
+
 class _PendingSlot:
     """One pipelined request's entry in ``Connection._pending`` (request
     pipelining) — the tag its request was sent under (None on an
@@ -887,7 +896,7 @@ class Connection:
         # also unblocks the read loop with EOF), and the retry layer
         # redials.
         self._poison(
-            ConnectionError(
+            _RequestTimedOutError(
                 f"nanocached: no response from server within {_REQUEST_TIMEOUT}s "
                 "(request timed out)"
             )
