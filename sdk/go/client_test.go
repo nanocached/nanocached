@@ -5988,7 +5988,7 @@ func TestAHedgedReadRacingCloseFailsWithErrClosed(t *testing.T) {
 	// second leg: the refused leg fails the read with ErrClosed, as in the
 	// other SDKs, instead of the read waiting for the primary's value.
 	nodes, discovery := startCluster(t, 2)
-	hedgeAfter := 300 * time.Millisecond
+	hedgeAfter := 500 * time.Millisecond
 	client, err := Connect(Config{
 		Addresses:      []Address{addr(discovery.address())},
 		ReadHedgeAfter: hedgeAfter,
