@@ -5552,6 +5552,76 @@ async fn the_proxys_e_to_an_incr_is_a_connection_loss_and_a_pipelined_get_is_ret
     node.stop();
 }
 
+// ── requests behind a node's `En` were never run (issue #2161) ──────
+
+#[tokio::test]
+async fn an_incr_pipelined_behind_a_nodes_en_is_resent_once_on_a_new_connection() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("n", "1", 0).await.unwrap();
+    *node.state.touch_error_reply.lock().unwrap() = Some(b"En\n".to_vec());
+    node.state.error_reply_delay_ms.store(400, Ordering::SeqCst);
+
+    let touch = {
+        let client = client.clone();
+        tokio::spawn(async move { client.touch("k", Some(30)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let incr = {
+        let client = client.clone();
+        tokio::spawn(async move { client.incr("n", 1).await })
+    };
+
+    let touch = touch.await.unwrap();
+    assert!(
+        matches!(touch, Err(Error::ServerTooOld { command: "t" })),
+        "touch: {touch:?}"
+    );
+    // The node reads nothing after the frame it answers with `En`, so the
+    // incr was never run and is sent again, once.
+    let incr = incr.await.unwrap();
+    assert_eq!(incr.unwrap(), Some(2));
+    assert_eq!(node.state.incrs.load(Ordering::SeqCst), 1);
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+
+    client.close().await;
+    node.stop();
+}
+
+#[tokio::test]
+async fn an_expiring_touch_pipelined_behind_a_nodes_en_is_resent_once_on_a_new_connection() {
+    let node = MockNode::start().await;
+    let client = NanocachedClient::connect(options(node.port)).await.unwrap();
+    client.set("p", "v", 0).await.unwrap();
+    client.set("n", "1", 0).await.unwrap();
+    *node.state.incr_error_reply.lock().unwrap() = Some(b"En\n".to_vec());
+    node.state.error_reply_delay_ms.store(400, Ordering::SeqCst);
+
+    let incr = {
+        let client = client.clone();
+        tokio::spawn(async move { client.incr("n", 1).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let touch = {
+        let client = client.clone();
+        tokio::spawn(async move { client.touch("p", Some(0)).await })
+    };
+
+    let incr = incr.await.unwrap();
+    assert!(matches!(incr, Err(Error::Protocol(_))), "incr: {incr:?}");
+    let touch = touch.await.unwrap();
+    assert!(touch.unwrap(), "the resent touch found the key");
+    assert_eq!(
+        touch_frames(&node).len(),
+        1,
+        "sent once, on the new connection"
+    );
+    assert_eq!(node.state.connections.load(Ordering::SeqCst), 2);
+
+    client.close().await;
+    node.stop();
+}
+
 // ── a failed chunk of an expiring touch_many (issue #941) ───────────
 
 #[tokio::test]
