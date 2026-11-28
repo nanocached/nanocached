@@ -716,6 +716,17 @@ const MAX_MULTI_HEADER_LENGTH = 4096;
 // only so tests can shrink it, mirroring REQUEST_TIMEOUT_TUNING.
 export const MULTI_GET_TUNING = { maxResponseBytes: 64 * 1024 * 1024 };
 
+// The text of a header line or a counter body, for the strict field
+// grammars below. These are ASCII on the wire, but Buffer's "ascii"
+// decoding masks off each byte's high bit, so `[0x56, 0x20, 0xB5]` read as
+// `V 5`: a corrupt header passed as a valid length or tag. latin1 maps a
+// byte >= 0x80 to a non-ASCII character instead, which no field grammar
+// here (ASCII digits, an optional `-`) accepts, so such a header is a
+// protocol error, as in the other five SDKs.
+export function headerText(bytes: Buffer): string {
+  return bytes.toString("latin1");
+}
+
 // Strict decimal-digits-only, matching Rust/Go/Python's integer parsing —
 // bare `Number(field)` also accepts scientific notation ("1e2"), leading
 // whitespace (" 5"), and a leading sign ("+5"), any of which would parse a
@@ -809,7 +820,7 @@ function headerFields(buf: Buffer, headerEnd: number): string[] {
   if (buf[1] !== 0x20 /* ' ' */) {
     throw new NanocachedError("nanocached: malformed response header line (connection desynced)");
   }
-  return buf.subarray(2, headerEnd).toString("ascii").split(" ");
+  return headerText(buf.subarray(2, headerEnd)).split(" ");
 }
 
 // Shared by tryParseResponse's MARKER_MULTI/MARKER_MULTI_ACK cases and
@@ -954,7 +965,7 @@ export function tryParseResponse(
         throw new NanocachedError("nanocached: response is missing its tag (connection desynced)");
       }
 
-      const tag = parseTag(buf.subarray(2, headerEnd).toString("ascii"));
+      const tag = parseTag(headerText(buf.subarray(2, headerEnd)));
       return { response: { kind, tag }, consumed: headerEnd + 1 };
     }
 
