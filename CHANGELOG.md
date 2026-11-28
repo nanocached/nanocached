@@ -45,6 +45,16 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-proxy`: a failed dial to a node (a TLS mismatch, a certificate
+  without the node's IP, a refused secret, a node at its connection cap) is
+  logged as `WARN dial to backend <addr> failed: <error>`. It used to show
+  only as `R`, `B` or `E` at the client, with nothing in the proxy log. On a
+  plaintext proxy whose node hung up on the handshake, the line ends with the
+  hint that `--tls-ca` may be missing. Like the backend connection lines,
+  they are rate-limited per address (three every ten seconds, then one
+  summary line), so a dead node under load does not fill the log. The proxy's
+  announce and deregister warnings carry the same hint (#2260).
+
 - `nanocached-node`: one source address could pin the whole
   `--max-in-flight-bytes` budget with uploads it never finished, and every
   value-carrying reply on other clients' connections then waited for it
