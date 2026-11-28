@@ -5423,7 +5423,13 @@ public sealed class NanocachedClient : IDisposable, IAsyncDisposable
                     throw new ConnectionLostException(
                         "nanocached: no proxies registered with discovery", sameProxyError);
                 }
-                connected = await ConnectToAnyProxyAsync(proxies, throughCooldown: true).ConfigureAwait(false);
+                // The proxy that just failed is left out of the candidates
+                // (issue #2201, as in Go), unless it is the only one: a
+                // second dial of it costs a refused connection at best and
+                // the connect timeout at worst.
+                List<DiscoveredNode> others = proxies.Where(proxy => proxy.Address != address).ToList();
+                connected = await ConnectToAnyProxyAsync(others.Count > 0 ? others : proxies, throughCooldown: true)
+                    .ConfigureAwait(false);
             }
             catch (Exception failoverError) when (failoverError is NanocachedException or IOException
                 or System.Net.Sockets.SocketException or AuthenticationException)
