@@ -96,11 +96,12 @@ public class RedialFailureRerouteTests
         Assert.Null(await client.IncrAsync(key, 1));
     }
 
-    // issue #1525 — while a refresh dials a newly listed node, the member
-    // table has already lost the departed node but the ring still names
-    // it. A non-idempotent op on one of its keys found no member: that is
-    // a request that was never written, not a lost reply, so it waits for
-    // the refresh and reroutes like an idempotent op does.
+    // issue #1525 — while a refresh dials a newly listed node, the ring
+    // still names the departed node. A non-idempotent op on one of its
+    // keys that cannot reach it (issue #2197: the member is kept until the
+    // refresh swaps members and ring together, so here the node is dead
+    // and its redial fails) was never written, not a lost reply, so it
+    // waits for the refresh and reroutes like an idempotent op does.
     private static Task StartRefresh(NanocachedClient client)
     {
         MethodInfo method = typeof(NanocachedClient)
@@ -140,7 +141,10 @@ public class RedialFailureRerouteTests
         nodeB.Store[MockNode.KeyOf(Encoding.UTF8.GetBytes(key))] = Encoding.UTF8.GetBytes("5");
         discovery.SetNodes(new List<(string, string)> { (Names[1], nodeB.Address), (NewNodeName, slow.Address) });
 
-        // The refresh drops A at once, then spends 1.5 s dialing the slow node.
+        nodeA.Dispose();
+        await Task.Delay(50); // let the FIN land
+
+        // The refresh drops A, but only after spending 1.5 s dialing the slow node.
         Task refresh = StartRefresh(client);
         await Task.Delay(300);
         Assert.False(refresh.IsCompleted, "the refresh must still be dialing");
