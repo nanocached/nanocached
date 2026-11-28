@@ -1042,9 +1042,10 @@ impl Connection {
 
     /// Reclassifies a plain [`Error::ConnectionLost`] as
     /// [`Error::ConnectionLostAfterSend`] — see that variant's doc comment.
-    /// Any other error (a tag-mismatch/desync `Protocol`, say) is already
-    /// never replayed by `apply_reconnecting`/`apply_reconnecting_no_replay`
-    /// regardless of this distinction, so it passes through unchanged.
+    /// Any other error (the `Protocol` a node's `En` gives the request it
+    /// refuses, say) is already never replayed by
+    /// `apply_reconnecting`/`apply_reconnecting_no_replay` regardless of
+    /// this distinction, so it passes through unchanged.
     fn mark_sent(error: Error) -> Error {
         match error {
             Error::ConnectionLost(message) => Error::ConnectionLostAfterSend(message),
@@ -1482,7 +1483,7 @@ async fn read_loop(
                     )
                     .await;
                 } else {
-                    drain_pending(&shared, Some(error.into())).await;
+                    drain_pending(&shared, Some(poisoned(error).into())).await;
                 }
                 return;
             }
@@ -1569,7 +1570,11 @@ async fn read_loop(
                 marker as char
             );
             shared.mark_closed(&shutdown_tx);
-            let _ = slot.tx.send(Err(Error::Protocol(message.clone()).into()));
+            // Issue #2163: a connection loss after the send, as for a reply
+            // that cannot be parsed (see `poisoned`).
+            let _ = slot
+                .tx
+                .send(Err(Error::ConnectionLost(message.clone()).into()));
             drain_pending(&shared, Some(Error::ConnectionLost(message).into())).await;
             return;
         }
@@ -1578,6 +1583,21 @@ async fn read_loop(
         // its write completed (see `Connection::request`) — nothing to
         // do, the queue position was already correctly consumed above.
         let _ = slot.tx.send(Ok((marker, value, ttl_seconds, entries)));
+    }
+}
+
+/// The error a reply the read loop could not parse fails the queued
+/// requests with (issue #2163). The stream is desynced, so the connection
+/// is poisoned, and the message names what was wrong with the reply, but
+/// it is a connection loss: `single_attempt` marks it as after the send
+/// (every queued frame was written), so the retry layer redials and resends
+/// an idempotent request once and fails a non-idempotent one as outcome
+/// unknown, as in the other SDKs. A `Protocol` error kept the connection's
+/// whole queue from ever being retried. Any other error passes through.
+fn poisoned(error: Error) -> Error {
+    match error {
+        Error::Protocol(message) => Error::ConnectionLost(message),
+        other => other,
     }
 }
 
@@ -2306,8 +2326,8 @@ mod tests {
 
         let first = connection.get(b"", b"key").await;
         assert!(
-            matches!(first, Err(Error::Protocol(ref message)) if message.contains("invalid value length")),
-            "a malformed value length must be a protocol error, got {first:?}"
+            matches!(first, Err(Error::ConnectionLostAfterSend(ref message)) if message.contains("invalid value length")),
+            "a malformed value length must be a connection lost after the send (issue #2163), got {first:?}"
         );
 
         let second = connection.get(b"", b"key2").await;
