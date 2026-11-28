@@ -8845,6 +8845,93 @@ class NanocachedClientTest {
     }
 
     @Test
+    void viaProxyAsksDiscoveryOncePerCooldownWhileEveryProxyIsDown() throws Exception {
+        // Issue #2167: with every proxy down but still listed, the cooldown
+        // error of the proxy in use was taken as a fresh dial failure, so
+        // every request fetched the roster from discovery again (100
+        // fetches for 50 gets). The failover runs once; the rest fail with
+        // the stored error until the cooldown ends.
+        try (MockNode proxyA = new MockNode();
+                MockNode proxyB = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.proxies = List.of(
+                    new DiscoveredNode("proxy-a", proxyA.address()), new DiscoveredNode("proxy-b", proxyB.address()));
+
+            try (NanocachedClient client = NanocachedClient.connect(
+                    viaProxyOptions(discovery.port()).reconnectCooldown(Duration.ofHours(1)))) {
+                client.set("k", "v");
+                proxyA.close();
+                proxyB.close();
+                Thread.sleep(50); // let the failure land
+
+                int fetchesBefore = discovery.connectionCount.get();
+                for (int i = 0; i < 50; i++) {
+                    assertThrows(NanocachedException.class, () -> client.get("k"));
+                }
+                assertEquals(
+                        1,
+                        discovery.connectionCount.get() - fetchesBefore,
+                        "one roster fetch per cooldown period, not one per request");
+            }
+        }
+    }
+
+    @Test
+    void viaProxyAsksDiscoveryOncePerCooldownWhenTheProxyInUseIsNoLongerListed() throws Exception {
+        // Issue #2167: the failover prunes cooldowns for addresses not in the
+        // fetched roster. It must keep the one the proxy in use just armed,
+        // or the next request redials it as if fresh and fetches again.
+        try (MockNode proxy = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.proxies = List.of(new DiscoveredNode("proxy-a", proxy.address()));
+
+            try (NanocachedClient client = NanocachedClient.connect(
+                    viaProxyOptions(discovery.port()).reconnectCooldown(Duration.ofHours(1)))) {
+                client.set("k", "v");
+                proxy.close();
+                Thread.sleep(50);
+                // Another proxy, also down, replaces it in the roster. The
+                // dead port last, after every listener is bound.
+                discovery.proxies = List.of(new DiscoveredNode("proxy-b", "127.0.0.1:" + MockServers.unusedPort()));
+
+                int fetchesBefore = discovery.connectionCount.get();
+                for (int i = 0; i < 50; i++) {
+                    assertThrows(NanocachedException.class, () -> client.get("k"));
+                }
+                assertEquals(1, discovery.connectionCount.get() - fetchesBefore);
+            }
+        }
+    }
+
+    @Test
+    void viaProxyFailsOverAgainOnceTheCooldownHasPassed() throws Exception {
+        // Issue #2167: holding the failover off for the cooldown must not
+        // hold it off for good: after the cooldown a request fetches the
+        // roster again and lands on a proxy that has joined since.
+        try (MockNode proxyA = new MockNode();
+                MockNode proxyB = new MockNode();
+                MockNode joined = new MockNode();
+                MockDiscovery discovery = new MockDiscovery(List.of(), 1)) {
+            discovery.proxies = List.of(
+                    new DiscoveredNode("proxy-a", proxyA.address()), new DiscoveredNode("proxy-b", proxyB.address()));
+
+            try (NanocachedClient client = NanocachedClient.connect(
+                    viaProxyOptions(discovery.port()).reconnectCooldown(Duration.ofMillis(300)))) {
+                client.set("k", "v");
+                proxyA.close();
+                proxyB.close();
+                Thread.sleep(50);
+                assertThrows(NanocachedException.class, () -> client.get("k"));
+
+                discovery.proxies = List.of(new DiscoveredNode("proxy-joined", joined.address()));
+                Thread.sleep(400);
+                assertEquals(Optional.empty(), client.get("k"));
+                assertEquals(1, joined.connectionCount.get());
+            }
+        }
+    }
+
+    @Test
     void connectRejectsReadHedgeAfterWithViaProxy() throws Exception {
         // Issue #488: a proxy connection has no replicas to hedge to, so a
         // configured readHedgeAfter can never take effect — connect()
