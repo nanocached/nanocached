@@ -108,7 +108,9 @@ unreachable.</p>
   A promoted owner that cannot be reached gets its keys in up to three
   more rounds, about 30&nbsp;s in all; keys still undelivered after that,
   or bound for an owner the pass had no address for, are sent by the next
-  pass, whatever ring change triggers it.
+  pass, whatever ring change triggers it. A pass that cannot start because
+  the roster fetch from discovery fails is handed to the next pass the
+  same way.
   While the pass runs, and for 60&nbsp;s after it, each sender also
   mirrors the client writes it accepts to that promoted owner, as it
   would to a decommission&rsquo;s entrant: a client keeps its node list

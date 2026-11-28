@@ -45,6 +45,13 @@ framework adapters at one version, whether or not a component changed.
 
 ### Fixed
 
+- `nanocached-node`: when the roster fetch a re-replication pass starts
+  with failed or took more than 10 s, the pass was dropped. The WARN said a
+  later ring change would retrigger it, but a later pass heals only the
+  keys its own change re-ranks, so the owners this change promoted never
+  got their copies. The ring change is now kept for the next pass to cover
+  as well, from both the eviction trigger and the join-flip trigger
+  (#2258).
 - `nanocached-node`: a re-replication pass that could not send some keys
   to a promoted owner still counted as complete. A target refused on all
   three attempts (three refused dials take milliseconds) was written off
