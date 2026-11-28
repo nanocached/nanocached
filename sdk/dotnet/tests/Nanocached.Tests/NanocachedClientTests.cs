@@ -6491,6 +6491,45 @@ public class NanocachedClientTests
         Assert.Equal(fetches, client.Stats().RefreshFailures);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ViaProxyFetchesTheRosterAtMostOncePerCooldownWhileEveryProxyIsDown(bool concurrent)
+    {
+        // Issue #2168: with every proxy down but still listed, each request
+        // used to fetch the roster (twice, with its own retry) and dial
+        // every proxy, ignoring the reconnect cooldown.
+        var proxyA = new MockNode();
+        var proxyB = new MockNode();
+        using var discovery = new MockDiscovery(Array.Empty<(string, string)>());
+        discovery.SetProxies(new[] { ("proxy-a", proxyA.Address), ("proxy-b", proxyB.Address) });
+        var options = ViaProxyAddress("127.0.0.1", discovery.Port);
+        // Long enough that the 50 gets cannot straddle two periods.
+        options.ReconnectCooldown = TimeSpan.FromSeconds(30);
+        using NanocachedClient client = await NanocachedClient.ConnectAsync(options);
+        await client.SetAsync("k", "v");
+
+        proxyA.Dispose();
+        proxyB.Dispose();
+        await Task.Delay(50); // let the FIN land
+        int before = discovery.ConnectionCount;
+
+        if (concurrent)
+        {
+            await Task.WhenAll(Enumerable.Range(0, 50).Select(_ =>
+                Assert.ThrowsAnyAsync<NanocachedException>(() => client.GetAsync("k"))));
+        }
+        else
+        {
+            for (int i = 0; i < 50; i++)
+            {
+                await Assert.ThrowsAnyAsync<NanocachedException>(() => client.GetAsync("k"));
+            }
+        }
+
+        Assert.Equal(1, discovery.ConnectionCount - before);
+    }
+
     [Fact]
     public async Task ViaProxySkipsAWarmingUpDiscoverySeedAndFetchesQFromTheNext()
     {
