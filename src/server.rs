@@ -1100,6 +1100,21 @@ static CONNECTION_ERROR_LOG: LogLimiter =
 /// still stack up to several multiples of this before failing. See
 /// `FORWARD_TIMEOUT` for the bound that actually caps the whole call.
 const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one heartbeat exchange with a discovery replica may take, from
+/// the heartbeat's write to the last line of its ack (the roster and, when
+/// asked, the pending joiner's verdict). Issue #2253: no longer than the
+/// heartbeat interval, so that a heartbeat that goes unanswered is given up
+/// on one interval after it was sent and the node redials at once
+/// (`register_with_discovery`): the next contact reaches discovery about
+/// two intervals after the last answered heartbeat, inside the smallest
+/// liveness timeout discovery accepts (three intervals). With
+/// `OUTBOUND_IO_TIMEOUT` here and the interval's wait after it, one lost
+/// heartbeat kept the node silent for four intervals and got it evicted.
+/// A constant, not derived from the interval, so that tests running the
+/// loop on a 20 ms interval do not give up on a discovery that is merely
+/// busy; `heartbeat_exchange_fits_in_one_heartbeat_interval` (src/main.rs)
+/// ties it to the node's interval.
+pub(crate) const HEARTBEAT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Issue #1281: how long the decommission waits between two roster fetches
 /// while discovery is not ready to answer its `T`.
 const ROSTER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -5868,7 +5883,12 @@ async fn discard_state_to_rejoin(node_context: &NodeContext, discovery_addr: &st
 /// registers (`J` for the primary's first time, `P` otherwise — see
 /// `DiscoveryRole`), then sends a heartbeat on it every `interval`,
 /// reconnecting (and re-registering under the same name) on any I/O
-/// error after waiting out the interval.
+/// error. The redial waits out the interval, counted from the last
+/// heartbeat sent on the connection when there was one (issue #2253): a
+/// heartbeat given up on after `HEARTBEAT_EXCHANGE_TIMEOUT` is redialed at
+/// once, while a connection that fails as soon as it is used still waits
+/// about an interval, so a discovery that drops every connection is not
+/// redialed in a tight loop.
 #[allow(clippy::too_many_arguments)]
 async fn register_with_discovery(
     discovery_addr: String,
@@ -5893,6 +5913,10 @@ async fn register_with_discovery(
     );
 
     loop {
+        // When the last heartbeat on this connection was sent (issue
+        // #2253); the redial at the bottom waits out the interval from it.
+        let mut last_heartbeat_sent: Option<Instant> = None;
+
         // A standby must not announce a node the primary hasn't promoted yet:
         // that would make it visible in the standby's `L` before its staged node join
         // handoff has run, which is exactly the state `J`'s staging exists to
@@ -6108,9 +6132,18 @@ async fn register_with_discovery(
                                 pending_joiner.as_ref().map(|(name, _)| name.as_str()),
                             );
 
+                            // Issue #2253: one deadline for the whole
+                            // exchange — the write, the ack and the
+                            // verdict below — so that an unanswered
+                            // heartbeat is redialed one interval after it
+                            // was sent, not after a full
+                            // `OUTBOUND_IO_TIMEOUT` per leg.
+                            let sent_at = Instant::now();
+                            last_heartbeat_sent = Some(sent_at);
+                            let exchange_deadline = sent_at + HEARTBEAT_EXCHANGE_TIMEOUT;
                             let heartbeat_written = tokio::select! {
                                 _ = shutdown_rx.changed() => return,
-                                result = infra::write_all_within(&mut stream, &heartbeat, OUTBOUND_IO_TIMEOUT) => result,
+                                result = infra::write_all_within(&mut stream, &heartbeat, HEARTBEAT_EXCHANGE_TIMEOUT) => result,
                             };
                             if heartbeat_written.is_err() {
                                 break;
@@ -6124,7 +6157,7 @@ async fn register_with_discovery(
                             // to the redial below.
                             let read_ack = tokio::select! {
                                 _ = shutdown_rx.changed() => return,
-                                result = timeout(OUTBOUND_IO_TIMEOUT, read_heartbeat_ack(&mut stream)) => result,
+                                result = tokio::time::timeout_at(exchange_deadline, read_heartbeat_ack(&mut stream)) => result,
                             };
 
                             let roster = match read_ack {
@@ -6141,7 +6174,7 @@ async fn register_with_discovery(
                             if let Some((joiner, identity)) = pending_joiner.as_ref() {
                                 let verdict = tokio::select! {
                                     _ = shutdown_rx.changed() => return,
-                                    result = timeout(OUTBOUND_IO_TIMEOUT, read_pending_joiner_verdict(&mut stream)) => result,
+                                    result = tokio::time::timeout_at(exchange_deadline, read_pending_joiner_verdict(&mut stream)) => result,
                                 };
                                 match verdict {
                                     Ok(Ok(PendingJoinerVerdict::Known)) => {}
@@ -6313,7 +6346,15 @@ async fn register_with_discovery(
             }
         }
 
-        if wait_or_shutdown(interval, &mut shutdown_rx).await {
+        // Issue #2253: from the last heartbeat sent, when this connection
+        // got that far. An exchange given up on at its deadline has used
+        // up the interval already, and waiting another one on top kept
+        // the node silent past the liveness timeout.
+        let redial_in = match last_heartbeat_sent {
+            Some(sent_at) => (sent_at + interval).saturating_duration_since(Instant::now()),
+            None => interval,
+        };
+        if wait_or_shutdown(redial_in, &mut shutdown_rx).await {
             return;
         }
     }
@@ -37929,7 +37970,7 @@ mod tests {
         // unlike the write right above it — a discovery server that
         // accepted a heartbeat but never acked (crashed-but-socket-open,
         // a blackholed route) would hang this connection forever instead
-        // of giving up within `OUTBOUND_IO_TIMEOUT` and redialing.
+        // of giving up within `HEARTBEAT_EXCHANGE_TIMEOUT` and redialing.
         //
         // Real time, not `start_paused`, on purpose: this exercises a
         // genuine multi-round-trip TCP handshake (connect, join, "R\n",
@@ -37985,7 +38026,95 @@ mod tests {
 
         assert!(
             matches!(redialed, Ok(Ok(()))),
-            "expected the ack timeout to fire and trigger a redial within OUTBOUND_IO_TIMEOUT"
+            "expected the ack timeout to fire and trigger a redial within HEARTBEAT_EXCHANGE_TIMEOUT"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_unacked_heartbeat_is_redialed_two_intervals_after_the_last_ack() {
+        // Issue #2253: the ack was read under `OUTBOUND_IO_TIMEOUT` (10 s)
+        // and the redial then waited out the interval (5 s), so one
+        // heartbeat that was neither answered nor refused kept the node
+        // silent to discovery for about 20 s after its last answered one —
+        // past the 15 s liveness timeout, which evicted it and cost it its
+        // cache. It must reach discovery again about two intervals after
+        // the last ack, as the docs and discovery's `CONTACT_BREAK` assume.
+        //
+        // The node binary's real interval, and real time for the reason
+        // given in `send_heartbeats_redials_when_the_ack_never_arrives`.
+        let interval = Duration::from_secs(5);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+        let (done_tx, done_rx) = oneshot::channel::<(Duration, Vec<u8>)>();
+        let fake_discovery = tokio::spawn(async move {
+            // Acks the first heartbeat and swallows the second: no ack,
+            // no FIN, no RST.
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"R\n").await.unwrap();
+            let mut seen = 0usize;
+            let mut buf = vec![0u8; 4096];
+            let mut acked_at = None;
+            while seen < 2 {
+                let n = first.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the node closed the first connection");
+                for _ in String::from_utf8_lossy(&buf[..n]).matches("H ") {
+                    seen += 1;
+                    if seen == 1 {
+                        first.write_all(b"A\n").await.unwrap();
+                        acked_at = Some(Instant::now());
+                    }
+                }
+            }
+            let (mut second, _) = listener.accept().await.unwrap();
+            let since_ack = acked_at.unwrap().elapsed();
+            let n = second.read(&mut buf).await.unwrap();
+            let _ = done_tx.send((since_ack, buf[..n].to_vec()));
+            drop(first);
+        });
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                port: 8356,
+                interval,
+                auth_secret: None,
+                tls_connector: None,
+            },
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            ),
+            mpsc::channel::<RereplicationTask>(4).1,
+            shutdown_rx,
+            mpsc::channel(1).0,
+        ));
+
+        let result = timeout(Duration::from_secs(40), done_rx).await;
+        shutdown_tx.send_replace(true);
+        timeout(Duration::from_secs(10), heartbeat_task)
+            .await
+            .expect("the heartbeat task must stop on shutdown")
+            .unwrap();
+        fake_discovery.abort();
+
+        // 3 s of slack for a loaded runner: still below the 15 s that
+        // either half of the fix alone gives, and the 20 s before it.
+        let (since_ack, registration) = result
+            .expect("the node must redial after the unanswered heartbeat")
+            .unwrap();
+        assert!(
+            since_ack < 2 * interval + Duration::from_secs(3),
+            "last answered heartbeat -> next connection took {since_ack:?}, expected about two \
+             intervals ({:?})",
+            2 * interval
+        );
+        assert!(
+            registration.starts_with(b"P "),
+            "the redial must re-register with an announce, got {:?}",
+            String::from_utf8_lossy(&registration)
         );
     }
 
