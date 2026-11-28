@@ -466,12 +466,19 @@ class CompressionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ReadHedgeAfterRangeTests(unittest.IsolatedAsyncioTestCase):
-    async def test_rejects_zero_negative_non_numeric_and_above_24_hours(self):
-        for bad in (0, -1, float("nan"), 24 * 60 * 60 + 1, float("inf")):
+    async def test_rejects_zero_negative_non_numeric_and_above_365_days(self):
+        for bad in (0, -1, float("nan"), 365 * 24 * 60 * 60 + 1, float("inf")):
             with self.assertRaisesRegex(
                 ValueError, "read_hedge_after must be a positive number of seconds"
             ):
                 await NanocachedClient.connect([("127.0.0.1", 1)], read_hedge_after=bad)
+
+    async def test_accepts_up_to_365_days(self):
+        # Accepted: connect() gets as far as dialing (nothing listens on
+        # port 1) instead of rejecting the option.
+        for good in (2 * 24 * 60 * 60, 365 * 24 * 60 * 60):
+            with self.assertRaises(ConnectFailedError):
+                await NanocachedClient.connect([("127.0.0.1", 1)], read_hedge_after=good)
 
 
 class ReconnectCooldownOptionTests(unittest.IsolatedAsyncioTestCase):
