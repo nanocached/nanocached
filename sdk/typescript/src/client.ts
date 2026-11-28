@@ -2170,7 +2170,7 @@ export class NanocachedClient {
             : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) =>
                 connection.touch(key, ttlSeconds, namespace),
               ),
-        { nonIdempotent: expiring, rejectionIsFinal: true },
+        { nonIdempotent: expiring },
       );
     } catch (error) {
       if (wasRejectedByServer(error)) throw new ServerTooOldError();
@@ -2215,7 +2215,7 @@ export class NanocachedClient {
             : this.dialForWrite(() => this.connectionForSingleTarget()).then((connection) =>
                 connection.getAndTouch(key, ttlSeconds, namespace),
               ),
-        { nonIdempotent: expiring, rejectionIsFinal: true },
+        { nonIdempotent: expiring },
       );
     } catch (error) {
       if (wasRejectedByServer(error)) throw new ServerTooOldError();
@@ -4407,16 +4407,18 @@ export class NanocachedClient {
    * connection error propagates as-is instead of being retried.
    * `WrongNodeError` stays retryable regardless: a `W` response means the
    * node explicitly declined to apply the op, so nothing was written. */
-  private async withWrongNodeRetry<T>(
-    operation: () => Promise<T>,
-    options?: { nonIdempotent?: boolean; rejectionIsFinal?: boolean },
-  ): Promise<T> {
+  private async withWrongNodeRetry<T>(operation: () => Promise<T>, options?: { nonIdempotent?: boolean }): Promise<T> {
     try {
       return await operation();
     } catch (error) {
-      // An `En` is a final answer from that node (issue #902): a refresh
-      // and a second attempt would only ask it again.
-      if (options?.rejectionIsFinal && wasRejectedByServer(error)) throw error;
+      // An `En` is the node refusing the request itself (a command it does
+      // not know, one too large or malformed), a final answer for every
+      // single-key request that comes through here (issues #902, #2184):
+      // a refresh and a second attempt would only send the same frame and
+      // be refused the same way, as Go and Rust treat it. The requests
+      // pipelined behind it fail with a never-sent ConnectionLostError
+      // instead (see Connection.onData) and keep this retry.
+      if (wasRejectedByServer(error)) throw error;
       // Connection-level failures retry the same way `W` does: the usual
       // cause is a node death that discovery has since noticed, so a
       // forced refresh re-ranks the key onto survivors. The retry window

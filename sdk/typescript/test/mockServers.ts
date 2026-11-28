@@ -392,6 +392,9 @@ export async function startMockNode(
      * echoed tag on a tagged connection) and close — the proxy's "request
      * failed / outcome unknown", not the node's `En\n`. */
     proxyStyleError?: boolean;
+    /** Answer every `G`/`g` with the node's `En\n` refusal and close, as
+     * the real node does for a request it will not run. */
+    rejectGets?: boolean;
   } = {},
 ): Promise<MockNode> {
   const store = new Map<string, Buffer>();
@@ -566,6 +569,12 @@ export async function startMockNode(
             const key = buffer.subarray(bodyStart + namespaceLength, bodyStart + namespaceLength + keyLength).toString("utf8");
             buffer = buffer.subarray(bodyStart + namespaceLength + keyLength);
             gets++;
+
+            if (options.rejectGets) {
+              socket.write("En\n");
+              socket.end();
+              return;
+            }
 
             if (silent) break;
 
