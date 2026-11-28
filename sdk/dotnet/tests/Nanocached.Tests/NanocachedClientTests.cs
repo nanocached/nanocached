@@ -6731,6 +6731,54 @@ public class NanocachedClientTests
         Assert.Equal(12, nodeA.Store.Count);
     }
 
+    [Fact]
+    public async Task BatchedSetReportsAKeyStoredWhenItsAcknowledgingReplicaBecomesThePrimary()
+    {
+        // Issue #2174. R=2 over {a, b, c}, c unreachable. The first key's
+        // primary a answers W and its replica b acknowledges; a then
+        // leaves the roster, so after the refresh the key's primary is b:
+        // b, already acknowledged, is not sent the key again, and used to
+        // go unrecorded as its primary. The second key's primary is c on
+        // both passes, which is what makes SetManyAsync report at all: the
+        // first key must be among the keys reported stored.
+        string[] names =
+        {
+            "aaaaaaaa-1b3d-4e6f-8a90-c1d2e3f4a5b6",
+            "bbbbbbbb-7e2c-4f58-9b31-6a8d0c9e2f47",
+            "cccccccc-3c1a-4d7e-9f20-8b6c5d4e3f21",
+        };
+        using var nodeA = new MockNode();
+        using var nodeB = new MockNode();
+        string deadAddress = $"127.0.0.1:{Wire.DeadNodePort()}";
+        var listed = new List<(string, string)>
+        {
+            (names[0], nodeA.Address), (names[1], nodeB.Address), (names[2], deadAddress),
+        };
+        using var discovery = new MockDiscovery(listed, replication: 2);
+
+        var before = new HashRing(names);
+        var after = new HashRing(names.Skip(1).ToList());
+        // a's `o` frame must hold only the first key (the mock's W answers
+        // the whole frame), so the second key's owners are [c, b].
+        string promotedKey = Enumerable.Range(0, 10_000).Select(i => $"key-{i}").First(key =>
+            before.Owners(Bytes(key), 2).SequenceEqual(new[] { names[0], names[1] })
+            && after.Owners(Bytes(key), 2)[0] == names[1]);
+        string unreachableKey = Enumerable.Range(0, 10_000).Select(i => $"key-{i}").First(key =>
+            before.Owners(Bytes(key), 2).SequenceEqual(new[] { names[2], names[1] }));
+
+        using NanocachedClient client =
+            await NanocachedClient.ConnectAsync(SingleAddress("127.0.0.1", discovery.Port));
+        nodeA.AnswerWrongNodeOnce();
+        // The refresh the W triggers finds a gone.
+        discovery.SetNodes(listed.Skip(1).ToList());
+
+        var failure = await Assert.ThrowsAsync<PartialConnectionLostException<HashSet<string>>>(
+            () => client.SetManyAsync(new Dictionary<string, string> { [promotedKey] = "v", [unreachableKey] = "w" }));
+
+        Assert.Equal(new HashSet<string> { promotedKey }, failure.PartialValues);
+        Assert.True(nodeB.Store.ContainsKey(MockNode.KeyOf(Bytes(promotedKey))));
+    }
+
     // ── forced refreshes are single-flight ──────────────────────────
 
     [Fact]
