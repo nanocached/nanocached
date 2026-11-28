@@ -1100,6 +1100,21 @@ static CONNECTION_ERROR_LOG: LogLimiter =
 /// still stack up to several multiples of this before failing. See
 /// `FORWARD_TIMEOUT` for the bound that actually caps the whole call.
 const OUTBOUND_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one heartbeat exchange with a discovery replica may take, from
+/// the heartbeat's write to the last line of its ack (the roster and, when
+/// asked, the pending joiner's verdict). Issue #2253: no longer than the
+/// heartbeat interval, so that a heartbeat that goes unanswered is given up
+/// on one interval after it was sent and the node redials at once
+/// (`register_with_discovery`): the next contact reaches discovery about
+/// two intervals after the last answered heartbeat, inside the smallest
+/// liveness timeout discovery accepts (three intervals). With
+/// `OUTBOUND_IO_TIMEOUT` here and the interval's wait after it, one lost
+/// heartbeat kept the node silent for four intervals and got it evicted.
+/// A constant, not derived from the interval, so that tests running the
+/// loop on a 20 ms interval do not give up on a discovery that is merely
+/// busy; `heartbeat_exchange_fits_in_one_heartbeat_interval` (src/main.rs)
+/// ties it to the node's interval.
+pub(crate) const HEARTBEAT_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Issue #1281: how long the decommission waits between two roster fetches
 /// while discovery is not ready to answer its `T`.
 const ROSTER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -5867,7 +5882,12 @@ async fn discard_state_to_rejoin(node_context: &NodeContext, discovery_addr: &st
 /// registers (`J` for the primary's first time, `P` otherwise — see
 /// `DiscoveryRole`), then sends a heartbeat on it every `interval`,
 /// reconnecting (and re-registering under the same name) on any I/O
-/// error after waiting out the interval.
+/// error. The redial waits out the interval, counted from the last
+/// heartbeat sent on the connection when there was one (issue #2253): a
+/// heartbeat given up on after `HEARTBEAT_EXCHANGE_TIMEOUT` is redialed at
+/// once, while a connection that fails as soon as it is used still waits
+/// about an interval, so a discovery that drops every connection is not
+/// redialed in a tight loop.
 #[allow(clippy::too_many_arguments)]
 async fn register_with_discovery(
     discovery_addr: String,
@@ -5892,6 +5912,10 @@ async fn register_with_discovery(
     );
 
     loop {
+        // When the last heartbeat on this connection was sent (issue
+        // #2253); the redial at the bottom waits out the interval from it.
+        let mut last_heartbeat_sent: Option<Instant> = None;
+
         // A standby must not announce a node the primary hasn't promoted yet:
         // that would make it visible in the standby's `L` before its staged node join
         // handoff has run, which is exactly the state `J`'s staging exists to
@@ -6107,9 +6131,18 @@ async fn register_with_discovery(
                                 pending_joiner.as_ref().map(|(name, _)| name.as_str()),
                             );
 
+                            // Issue #2253: one deadline for the whole
+                            // exchange — the write, the ack and the
+                            // verdict below — so that an unanswered
+                            // heartbeat is redialed one interval after it
+                            // was sent, not after a full
+                            // `OUTBOUND_IO_TIMEOUT` per leg.
+                            let sent_at = Instant::now();
+                            last_heartbeat_sent = Some(sent_at);
+                            let exchange_deadline = sent_at + HEARTBEAT_EXCHANGE_TIMEOUT;
                             let heartbeat_written = tokio::select! {
                                 _ = shutdown_rx.changed() => return,
-                                result = infra::write_all_within(&mut stream, &heartbeat, OUTBOUND_IO_TIMEOUT) => result,
+                                result = infra::write_all_within(&mut stream, &heartbeat, HEARTBEAT_EXCHANGE_TIMEOUT) => result,
                             };
                             if heartbeat_written.is_err() {
                                 break;
@@ -6123,7 +6156,7 @@ async fn register_with_discovery(
                             // to the redial below.
                             let read_ack = tokio::select! {
                                 _ = shutdown_rx.changed() => return,
-                                result = timeout(OUTBOUND_IO_TIMEOUT, read_heartbeat_ack(&mut stream)) => result,
+                                result = tokio::time::timeout_at(exchange_deadline, read_heartbeat_ack(&mut stream)) => result,
                             };
 
                             let roster = match read_ack {
@@ -6140,7 +6173,7 @@ async fn register_with_discovery(
                             if let Some((joiner, identity)) = pending_joiner.as_ref() {
                                 let verdict = tokio::select! {
                                     _ = shutdown_rx.changed() => return,
-                                    result = timeout(OUTBOUND_IO_TIMEOUT, read_pending_joiner_verdict(&mut stream)) => result,
+                                    result = tokio::time::timeout_at(exchange_deadline, read_pending_joiner_verdict(&mut stream)) => result,
                                 };
                                 match verdict {
                                     Ok(Ok(PendingJoinerVerdict::Known)) => {}
@@ -6312,7 +6345,15 @@ async fn register_with_discovery(
             }
         }
 
-        if wait_or_shutdown(interval, &mut shutdown_rx).await {
+        // Issue #2253: from the last heartbeat sent, when this connection
+        // got that far. An exchange given up on at its deadline has used
+        // up the interval already, and waiting another one on top kept
+        // the node silent past the liveness timeout.
+        let redial_in = match last_heartbeat_sent {
+            Some(sent_at) => (sent_at + interval).saturating_duration_since(Instant::now()),
+            None => interval,
+        };
+        if wait_or_shutdown(redial_in, &mut shutdown_rx).await {
             return;
         }
     }
@@ -7362,14 +7403,17 @@ struct ActiveRereplication {
     /// Set once `run_rereplication` returns (whether it finished,
     /// aborted, or gave up on the roster fetch) — `Instant`-free, unlike
     /// `ActiveMigration::completed_at`: nothing here needs to measure a
-    /// forwarding grace, only to know the run is over.
+    /// forwarding grace, only to know the run is over. A run that did not
+    /// finish stays in the slot once done, for the next pass to take its
+    /// `unfinished_baselines` over (issue #2257).
     done: AtomicBool,
     /// The rings this run still owes a pass from: the one its own change
     /// started from, plus those of earlier runs it took over from that were
     /// aborted before they had considered every key. Emptied once the run
-    /// has considered every key, so a successor starts from its own ring
-    /// only; left as is when the run is aborted, for the successor to pick
-    /// up (issue #1522). Bounded and free of repeats: see
+    /// has delivered every key it owed, so a successor starts from its own
+    /// ring only; left as is when the run is aborted, or (issue #2257) a
+    /// target's keys could not be delivered, for the successor to pick up
+    /// (issue #1522). Bounded and free of repeats: see
     /// `fold_unfinished_baselines` (issue #1606).
     unfinished_baselines: Mutex<Vec<RereplicationBaseline>>,
 }
@@ -8276,9 +8320,11 @@ async fn run_migration(
     // member as the joiner). So, unlike the old "reuse what `M` already
     // carried" shortcut, this now pays for the same `fetch_roster_once`
     // (issue #295: self-authenticated, tokens included) fetch
-    // `spawn_or_supersede_rereplication` does — a failure here just skips
+    // `spawn_or_supersede_rereplication` does — a failure here skips
     // this trigger (logged), same as that function's own failure
-    // handling: the next ring-changing event retries.
+    // handling, and parks its ring change for the next ring-changing
+    // event's pass to cover too (`park_rereplication_baseline`, issue
+    // #2258).
     if let Some(previous_membership) = pre_completion_ring {
         let previous_ring = Arc::clone(&previous_membership.ring);
         if ring_dropped_a_member(&previous_ring, &after_ring) {
@@ -8296,18 +8342,19 @@ async fn run_migration(
                     Ok(Err(error)) => {
                         eprintln!(
                             "WARN re-replication: fetching the roster with addresses for the \
-                             join-flip trigger failed: {error} — giving up; a later ring \
-                             change will retrigger it if the cluster is still \
-                             under-replicated"
+                             join-flip trigger failed: {error} — giving up on this pass; the \
+                             next ring change's pass covers this change too"
                         );
+                        park_rereplication_baseline(&node_context, previous_ring);
                         return;
                     }
                     Err(_) => {
                         eprintln!(
                             "WARN re-replication: fetching the roster with addresses for the \
-                             join-flip trigger timed out — giving up; a later ring change will \
-                             retrigger it if the cluster is still under-replicated"
+                             join-flip trigger timed out — giving up on this pass; the next \
+                             ring change's pass covers this change too"
                         );
+                        park_rereplication_baseline(&node_context, previous_ring);
                         return;
                     }
                 };
@@ -9573,11 +9620,14 @@ async fn wait_for_rereplication_to_clear(node_context: &NodeContext, abort_reque
         if abort_requested.load(Ordering::SeqCst) {
             return;
         }
+        // Issue #2257: a finished run can stay in the slot to hand its
+        // unfinished baselines on; only one still running is waited for.
         let busy = node_context
             .active_rereplication
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some();
+            .as_ref()
+            .is_some_and(|current| !current.done.load(Ordering::SeqCst));
         if !busy {
             return;
         }
@@ -9757,6 +9807,23 @@ impl RereplicationBaseline {
 /// The most baselines a pass heals from at once. Each costs a
 /// `is_owner_hashed` and an `owners_hashed` per key, and holds its ring.
 const MAX_UNFINISHED_BASELINES: usize = 8;
+
+/// Issue #2257: how long `run_rereplication` waits before each further
+/// round over the keys whose delivery failed (a target unreachable on
+/// every attempt, or written off for that). Each round starts with no
+/// target written off, so a target that failed briefly gets its keys after
+/// all, and one that stays down costs `KEY_TRANSFER_ATTEMPTS` dials per
+/// round, not per key. The total stays well under `RING_CHANGE_HANDOFF_WAIT`,
+/// which a join waiting on this pass (`wait_for_rereplication_to_clear`)
+/// gives it.
+#[cfg(not(test))]
+const REREPLICATION_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(8),
+    Duration::from_secs(20),
+];
+#[cfg(test)]
+const REREPLICATION_RETRY_DELAYS: [Duration; 3] = [Duration::from_millis(20); 3];
 
 /// Issue #1606: bounds the baselines a pass takes over from the runs it
 /// superseded, oldest first, `own` (this pass's starting ring) last. A run of
@@ -10021,14 +10088,6 @@ async fn run_superseding_rereplication(
     )
     .await;
 
-    if completed {
-        state
-            .unfinished_baselines
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-    }
-    state.done.store(true, Ordering::SeqCst);
     {
         // Stamp this pass's own window only: a later pass may already
         // have put its own in the slot.
@@ -10042,15 +10101,74 @@ async fn run_superseding_rereplication(
             window.completed_at = Some(Instant::now());
         }
     }
+    // Issue #2257: an unfinished run stays in the slot, done, so the next
+    // pass takes its baselines over (as it would from a run it aborted)
+    // instead of healing only from its own ring change. Not at shutdown:
+    // there is no next pass.
+    //
+    // Issue #2258: a finished run drops only the baselines it ran from; one
+    // `park_rereplication_baseline` added meanwhile stays. Under the slot
+    // lock, the lock that function takes first, so a baseline is never
+    // added to a run that has just left the slot.
     let mut slot = node_context
         .active_rereplication
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if slot
-        .as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, &state))
+    let unfinished = {
+        let mut own = state
+            .unfinished_baselines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if completed {
+            own.retain(|left| {
+                !baselines.iter().any(|ran| {
+                    Arc::ptr_eq(&ran.ring, &left.ring)
+                        && ran.every_other_owner == left.every_other_owner
+                })
+            });
+        }
+        !own.is_empty()
+    };
+    state.done.store(true, Ordering::SeqCst);
+    if (!unfinished || *shutdown_rx.borrow())
+        && slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &state))
     {
         *slot = None;
+    }
+}
+
+/// Issue #2258: records the ring change `before_ring` started from for the
+/// next pass to cover, when this change's own pass cannot run (its roster
+/// fetch failed). Added to the run in the slot, running or parked (issue
+/// #2257) — a running one keeps it past its own finish, see
+/// `run_superseding_rereplication` — or, with the slot empty, parked there
+/// in a run of its own that is already done. Bounded by
+/// `fold_unfinished_baselines`; nothing reschedules a pass from here, the
+/// next ring change does.
+fn park_rereplication_baseline(node_context: &NodeContext, before_ring: Arc<HashRing>) {
+    let mut slot = node_context
+        .active_rereplication
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match slot.as_ref() {
+        Some(current) => {
+            let mut own = current
+                .unfinished_baselines
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut baselines = std::mem::take(&mut *own);
+            baselines.push(RereplicationBaseline::plain(before_ring));
+            *own = fold_unfinished_baselines(baselines, &node_context.name);
+        }
+        None => {
+            *slot = Some(Arc::new(ActiveRereplication {
+                abort_requested: AtomicBool::new(false),
+                done: AtomicBool::new(true),
+                unfinished_baselines: Mutex::new(vec![RereplicationBaseline::plain(before_ring)]),
+            }));
+        }
     }
 }
 
@@ -10059,7 +10177,10 @@ async fn run_superseding_rereplication(
 /// change that dropped a member. Fetches the roster with addresses (the
 /// heartbeat ack carries names only) and waits out any join migration in
 /// progress (`wait_for_migration_to_clear`) before handing off to
-/// `run_superseding_rereplication` for the rest.
+/// `run_superseding_rereplication` for the rest. A failed fetch parks
+/// `before_ring` for the next pass (`park_rereplication_baseline`, issue
+/// #2258) rather than retrying here: a retry that succeeded late could take
+/// over from a newer change's pass with an older ring.
 async fn spawn_or_supersede_rereplication(
     node_context: NodeContext,
     discovery_addr: String,
@@ -10080,17 +10201,19 @@ async fn spawn_or_supersede_rereplication(
         Ok(Err(error)) => {
             eprintln!(
                 "WARN re-replication: fetching the roster with addresses from {discovery_addr} \
-                 failed: {error} — giving up; a later ring change will retrigger it if the \
-                 cluster is still under-replicated"
+                 failed: {error} — giving up on this pass; the next ring change's pass covers \
+                 this change too"
             );
+            park_rereplication_baseline(&node_context, before_ring);
             return;
         }
         Err(_) => {
             eprintln!(
                 "WARN re-replication: fetching the roster with addresses from {discovery_addr} \
-                 timed out — giving up; a later ring change will retrigger it if the cluster is \
-                 still under-replicated"
+                 timed out — giving up on this pass; the next ring change's pass covers this \
+                 change too"
             );
+            park_rereplication_baseline(&node_context, before_ring);
             return;
         }
     };
@@ -10129,8 +10252,15 @@ async fn spawn_or_supersede_rereplication(
 /// it. (`baselines` are this run's own starting ring and, widening that
 /// to the changes of runs this one superseded before they finished (issue
 /// #1522), theirs, bounded by `fold_unfinished_baselines` (issue #1606);
-/// the return value says whether this run considered every key, i.e. was
-/// neither aborted nor cut short by shutdown.)
+/// the return value says whether this run delivered every key it owed,
+/// i.e. was neither aborted nor cut short by shutdown, and (issue #2257)
+/// left no target's keys undelivered.)
+///
+/// Issue #2257: a key whose target was unreachable on every attempt, or
+/// written off for that, is retried in up to `REREPLICATION_RETRY_DELAYS`
+/// further rounds, each after its delay and with no target written off. A
+/// target with no address, no token or that answered `R` is not retried
+/// here (the maps are fixed for the run) and leaves the run unfinished.
 ///
 /// Issue #295: a target this node has no membership token for (missing
 /// from `tokens`) is skipped exactly like a target with no address —
@@ -10199,171 +10329,266 @@ async fn run_rereplication(
     // `keys` arrive grouped by namespace, and a namespace can be ~1 MiB:
     // hash each distinct one once rather than per key.
     let mut hasher = KeyHasher::default();
+    // Issue #2257: a target this pass could not send to for good — no
+    // address, no token, or an `R` — so a later pass has to cover this
+    // pass's ring change again (the return value).
+    let mut unhealed = false;
+    // Targets written off in an earlier round: their failure lines are
+    // repeats too.
+    let mut failed_before: HashSet<String> = HashSet::new();
+    // Targets that answered `R`: written off for the rest of the run, since
+    // whoever holds that address now will answer the same.
+    let mut refused_targets: HashSet<String> = HashSet::new();
+    // Issue #2257: the keys, and their targets, whose delivery failed this
+    // round; retried after a `REREPLICATION_RETRY_DELAYS` wait.
+    let mut retry: Vec<(Key, Vec<String>)> = Vec::new();
+    let mut round_keys: Vec<(Key, Option<Vec<String>>)> =
+        keys.into_iter().map(|key| (key, None)).collect();
 
-    for key in keys {
-        if abort_requested.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
-            break;
-        }
-
-        let targets = rereplication_targets_since(
-            baselines,
-            after_ring,
-            hasher.hash(&key),
-            replication,
-            self_name,
-        );
-        if targets.is_empty() {
-            continue;
-        }
-
-        // Live re-peek, same reasoning as the join transfer and the
-        // decommission's own: a concurrent client write must win over
-        // whatever this snapshot held.
-        let Some((_, value, ttl)) =
-            peek_entry_for_handoff(&node_context.request_tx, &key, skip_dead).await
-        else {
-            continue;
-        };
-        let dead = !skip_dead
-            && !joiners.is_empty()
-            && peek_entry_for_handoff(&node_context.request_tx, &key, true)
-                .await
-                .is_none();
-
-        for target in targets {
-            if dead && joiners.contains(&target) {
-                skipped += 1;
-                continue;
-            }
-            let Some(addr) = addresses.get(&target) else {
-                skipped += 1;
-                continue;
-            };
-            let Some(token) = tokens.get(&target) else {
-                skipped += 1;
-                continue;
-            };
-
-            if *shutdown_rx.borrow() {
+    'rounds: for round in 0..=REREPLICATION_RETRY_DELAYS.len() {
+        if round > 0 {
+            if retry.is_empty() {
                 break;
             }
-            if failed_targets
-                .get(addr)
-                .is_some_and(|failed_at| failed_at.elapsed() < FORWARD_FAIL_FAST_WINDOW)
-            {
-                skipped += 1;
-                continue;
-            }
-            // A target that failed before, whose window has since passed:
-            // its failure lines are repeats (see `log_failure`).
-            let repeat = failed_targets.contains_key(addr);
-
-            let mut delivered = false;
-            let mut failed_attempts = 0u32;
-            let mut refused_by_address = false;
-            for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
+            let deadline = Instant::now() + REREPLICATION_RETRY_DELAYS[round - 1];
+            loop {
                 if abort_requested.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
+                    break 'rounds;
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
                     break;
                 }
-                if !streams.contains_key(addr) {
-                    // Raced against shutdown: the dial/TLS/auth legs are
-                    // each bounded by `OUTBOUND_IO_TIMEOUT`, but only
-                    // *between* attempts was shutdown noticed, so a target
-                    // that stopped answering held the exit (and with it the
-                    // heartbeat task `run` awaits) for a whole leg or more.
-                    // Same shape as `run_decommission`'s.
-                    let connected = tokio::select! {
+                tokio::select! {
+                    _ = sleep(left.min(Duration::from_millis(100))) => {}
+                    changed = shutdown_rx.changed() => {
+                        // A dropped sender answers at once: sleep
+                        // instead of spinning.
+                        if changed.is_err() {
+                            sleep(left.min(Duration::from_millis(100))).await;
+                        }
+                    }
+                }
+            }
+            failed_before.extend(failed_targets.drain().map(|(addr, _)| addr));
+            round_keys = std::mem::take(&mut retry)
+                .into_iter()
+                .map(|(key, targets)| (key, Some(targets)))
+                .collect();
+        }
+
+        for (key, retry_targets) in round_keys.drain(..) {
+            if abort_requested.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
+                break 'rounds;
+            }
+
+            let targets = match retry_targets {
+                Some(targets) => targets,
+                None => rereplication_targets_since(
+                    baselines,
+                    after_ring,
+                    hasher.hash(&key),
+                    replication,
+                    self_name,
+                ),
+            };
+            if targets.is_empty() {
+                continue;
+            }
+
+            // Live re-peek, same reasoning as the join transfer and the
+            // decommission's own: a concurrent client write must win over
+            // whatever this snapshot held.
+            let Some((_, value, ttl)) =
+                peek_entry_for_handoff(&node_context.request_tx, &key, skip_dead).await
+            else {
+                continue;
+            };
+            let dead = !skip_dead
+                && !joiners.is_empty()
+                && peek_entry_for_handoff(&node_context.request_tx, &key, true)
+                    .await
+                    .is_none();
+
+            let mut failed: Vec<String> = Vec::new();
+            for target in targets {
+                if dead && joiners.contains(&target) {
+                    skipped += 1;
+                    continue;
+                }
+                let Some(addr) = addresses.get(&target) else {
+                    skipped += 1;
+                    unhealed = true;
+                    continue;
+                };
+                let Some(token) = tokens.get(&target) else {
+                    skipped += 1;
+                    unhealed = true;
+                    continue;
+                };
+
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                if refused_targets.contains(addr) {
+                    skipped += 1;
+                    unhealed = true;
+                    continue;
+                }
+                if failed_targets
+                    .get(addr)
+                    .is_some_and(|failed_at| failed_at.elapsed() < FORWARD_FAIL_FAST_WINDOW)
+                {
+                    failed.push(target);
+                    continue;
+                }
+                // A target that failed before, whose window has since passed:
+                // its failure lines are repeats (see `log_failure`).
+                let repeat = failed_targets.contains_key(addr) || failed_before.contains(addr);
+
+                let mut delivered = false;
+                let mut failed_attempts = 0u32;
+                let mut refused_by_address = false;
+                for attempt in 1..=KEY_TRANSFER_ATTEMPTS {
+                    // Issue #2257: the same short backoff between attempts as
+                    // `run_decommission`'s, so a target fast-failing (e.g.
+                    // ECONNREFUSED) is not hit three times back-to-back.
+                    if attempt > 1 {
+                        tokio::select! {
+                            _ = sleep(Duration::from_millis(100 * u64::from(attempt - 1))) => {}
+                            _ = shutdown_rx.changed() => {}
+                        }
+                    }
+                    if abort_requested.load(Ordering::SeqCst) || *shutdown_rx.borrow() {
+                        break;
+                    }
+                    if !streams.contains_key(addr) {
+                        // Raced against shutdown: the dial/TLS/auth legs are
+                        // each bounded by `OUTBOUND_IO_TIMEOUT`, but only
+                        // *between* attempts was shutdown noticed, so a target
+                        // that stopped answering held the exit (and with it the
+                        // heartbeat task `run` awaits) for a whole leg or more.
+                        // Same shape as `run_decommission`'s.
+                        let connected = tokio::select! {
+                            biased;
+                            _ = shutdown_requested(shutdown_rx) => break,
+                            result = connect_and_authenticate(node_context, addr, AuthPeer::Node) => {
+                                result
+                            }
+                        };
+                        match connected {
+                            Ok(stream) => {
+                                streams.insert(addr.clone(), stream);
+                            }
+                            Err(error) => {
+                                failed_attempts += 1;
+                                log_failure(
+                                    repeat,
+                                    format_args!(
+                                        "WARN re-replication: connecting to {addr} failed (attempt \
+                                     {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                                    ),
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    let Some(stream) = streams.get_mut(addr) else {
+                        continue;
+                    };
+                    #[cfg(test)]
+                    node_context.gates.pass.wait().await;
+                    let sent_one = tokio::select! {
                         biased;
-                        _ = shutdown_requested(shutdown_rx) => break,
-                        result = connect_and_authenticate(node_context, addr, AuthPeer::Node) => {
-                            result
+                        _ = shutdown_requested(shutdown_rx) => None,
+                        result = send_handoff_set(stream, &key, &value, ttl, true, token) => {
+                            Some(result)
                         }
                     };
-                    match connected {
-                        Ok(stream) => {
-                            streams.insert(addr.clone(), stream);
+                    match sent_one {
+                        // Interrupted mid-send: the stream's state is unknown.
+                        None => {
+                            streams.remove(addr);
+                            break;
                         }
-                        Err(error) => {
-                            failed_attempts += 1;
+                        Some(Ok(())) => {
+                            delivered = true;
+                            break;
+                        }
+                        Some(Err(error)) => {
+                            // As in `run_decommission`: a refusal of one entry
+                            // does not count toward writing the target off, an
+                            // `R` writes it off at once and is not retried.
+                            match classify_handoff_failure(&error) {
+                                HandoffFailure::Unreachable => failed_attempts += 1,
+                                HandoffFailure::AddressRefused => refused_by_address = true,
+                                HandoffFailure::EntryRefused => {}
+                            }
                             log_failure(
                                 repeat,
                                 format_args!(
-                                    "WARN re-replication: connecting to {addr} failed (attempt \
-                                     {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                                    "WARN re-replication: transfer to {addr} failed (attempt \
+                                 {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
                                 ),
                             );
-                            continue;
+                            streams.remove(addr);
+                            if refused_by_address {
+                                break;
+                            }
                         }
                     }
                 }
-                let Some(stream) = streams.get_mut(addr) else {
-                    continue;
-                };
-                #[cfg(test)]
-                node_context.gates.pass.wait().await;
-                let sent_one = tokio::select! {
-                    biased;
-                    _ = shutdown_requested(shutdown_rx) => None,
-                    result = send_handoff_set(stream, &key, &value, ttl, true, token) => {
-                        Some(result)
-                    }
-                };
-                match sent_one {
-                    // Interrupted mid-send: the stream's state is unknown.
-                    None => {
-                        streams.remove(addr);
-                        break;
-                    }
-                    Some(Ok(())) => {
-                        delivered = true;
-                        break;
-                    }
-                    Some(Err(error)) => {
-                        // As in `run_decommission`: a refusal of one entry
-                        // does not count toward writing the target off, an
-                        // `R` writes it off at once and is not retried.
-                        match classify_handoff_failure(&error) {
-                            HandoffFailure::Unreachable => failed_attempts += 1,
-                            HandoffFailure::AddressRefused => refused_by_address = true,
-                            HandoffFailure::EntryRefused => {}
-                        }
+
+                if delivered {
+                    sent += 1;
+                    owners_reached.insert(target);
+                } else {
+                    // Only a target that failed every attempt, or refused the
+                    // address with `R`, is written off (not one the loop left
+                    // because of shutdown or an abort).
+                    if refused_by_address {
+                        refused_targets.insert(addr.clone());
                         log_failure(
                             repeat,
                             format_args!(
-                                "WARN re-replication: transfer to {addr} failed (attempt \
-                                 {attempt}/{KEY_TRANSFER_ATTEMPTS}): {error}"
+                                "WARN re-replication: giving up on {addr} for this pass (it \
+                                 answered R); its remaining keys are skipped"
                             ),
                         );
-                        streams.remove(addr);
+                    } else if failed_attempts == KEY_TRANSFER_ATTEMPTS {
+                        failed_targets.insert(addr.clone(), Instant::now());
+                        log_failure(
+                            repeat,
+                            format_args!(
+                                "WARN re-replication: giving up on {addr} for now; its \
+                                 remaining keys are retried in a later round"
+                            ),
+                        );
+                    }
+                    // Issue #2257: an unreachable target is retried next
+                    // round; an `R` comes from whoever holds the address now,
+                    // which a retry against the same address map won't change.
+                    // A refusal of just this entry is not retried either.
+                    if failed_attempts == KEY_TRANSFER_ATTEMPTS && !refused_by_address {
+                        failed.push(target);
+                    } else {
+                        skipped += 1;
                         if refused_by_address {
-                            break;
+                            unhealed = true;
                         }
                     }
                 }
             }
-
-            if delivered {
-                sent += 1;
-                owners_reached.insert(target);
-            } else {
-                skipped += 1;
-                // Only a target that failed every attempt, or refused the
-                // address with `R`, is written off (not one the loop left
-                // because of shutdown or an abort).
-                if refused_by_address || failed_attempts == KEY_TRANSFER_ATTEMPTS {
-                    failed_targets.insert(addr.clone(), Instant::now());
-                    log_failure(
-                        repeat,
-                        format_args!(
-                            "WARN re-replication: giving up on {addr} for {}s; its remaining \
-                             keys are skipped",
-                            FORWARD_FAIL_FAST_WINDOW.as_secs()
-                        ),
-                    );
-                }
+            if !failed.is_empty() {
+                retry.push((key, failed));
             }
         }
     }
+    // Issue #2257: what is still failing after the last round.
+    skipped += retry
+        .iter()
+        .map(|(_, targets)| targets.len())
+        .sum::<usize>();
 
     println!(
         "INFO re-replication after membership change: sent {sent} entries to {} owner(s) ({} \
@@ -10371,9 +10596,13 @@ async fn run_rereplication(
         owners_reached.len(),
         skipped
     );
-    // False when an abort or a shutdown cut the pass short, so a successor
-    // knows this run's ring change is not fully covered yet.
-    !abort_requested.load(Ordering::SeqCst) && !*shutdown_rx.borrow()
+    // False when an abort or a shutdown cut the pass short, or (issue
+    // #2257) a target could not be sent its keys, so a later pass knows
+    // this run's ring change is not fully covered yet.
+    !abort_requested.load(Ordering::SeqCst)
+        && !*shutdown_rx.borrow()
+        && !unhealed
+        && retry.is_empty()
 }
 
 async fn list_keys(request_tx: &mpsc::Sender<CacheRequest>) -> Option<Vec<Key>> {
@@ -33527,7 +33756,7 @@ mod tests {
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
         LOGGED_FAILURES.with(|lines| lines.borrow_mut().clear());
 
-        run_rereplication(
+        let completed = run_rereplication(
             &node_context,
             &plain_baselines(&before_ring),
             &after_ring,
@@ -33539,16 +33768,25 @@ mod tests {
         )
         .await;
 
+        // Issue #2257: each round (the first and the retries) spends its
+        // attempts on one key only.
+        let rounds = 1 + REREPLICATION_RETRY_DELAYS.len();
         assert_eq!(
             accepts.load(Ordering::SeqCst),
-            KEY_TRANSFER_ATTEMPTS as usize,
-            "only the first key may spend attempts on the dead target"
+            KEY_TRANSFER_ATTEMPTS as usize * rounds,
+            "only the first key of each round may spend attempts on the dead target"
         );
-        // The first key's attempt lines and the give-up line, nothing per
-        // later key.
-        assert_eq!(
-            LOGGED_FAILURES.with(|lines| lines.borrow().len()),
-            KEY_TRANSFER_ATTEMPTS as usize + 1
+        // At most each round's first key's attempt lines and give-up line
+        // (later rounds' are repeats, rate-limited), nothing per later key.
+        let lines = LOGGED_FAILURES.with(|lines| lines.borrow().len());
+        assert!(
+            (KEY_TRANSFER_ATTEMPTS as usize + 1..=(KEY_TRANSFER_ATTEMPTS as usize + 1) * rounds)
+                .contains(&lines),
+            "{lines} failure lines"
+        );
+        assert!(
+            !completed,
+            "keys left undelivered leave the pass unfinished"
         );
 
         peer_task.abort();
@@ -33757,6 +33995,447 @@ mod tests {
         );
 
         refusing_task.abort();
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// Issue #2257: a target that fails every attempt on the first round
+    /// but answers afterwards still gets its keys from the same pass, and
+    /// the pass counts as complete.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_rereplication_retries_the_keys_of_a_target_that_recovers() {
+        let (request_tx, request_rx) = mpsc::channel(64);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let before_ring = HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ]);
+        let after_ring = HashRing::new(vec!["node-a".to_string(), "node-b".to_string()]);
+        let replication = 2;
+        let stored: Vec<Key> = (0..2000)
+            .map(|index| key(format!("key-{index}").as_bytes()))
+            .filter(|candidate| {
+                rereplication_targets(
+                    &before_ring,
+                    &after_ring,
+                    KeyHash::of(candidate),
+                    replication,
+                    "node-a",
+                ) == vec!["node-b".to_string()]
+            })
+            .take(10)
+            .collect();
+        assert_eq!(stored.len(), 10);
+        for stored_key in &stored {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: stored_key.clone(),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        // Drops the first round's dials, then answers as a node does.
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames_tx, frames_rx) = oneshot::channel();
+        let peer_task = tokio::spawn(async move {
+            for _ in 0..KEY_TRANSFER_ATTEMPTS {
+                let (connection, _) = peer_listener.accept().await.unwrap();
+                drop(connection);
+            }
+            let (frames, task) = spawn_recording_peer(peer_listener);
+            let _ = frames_tx.send(frames);
+            let _ = task.await;
+        });
+
+        let mut node_context = test_node_context(
+            "node-a",
+            "tok-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        let addresses = HashMap::from([("node-b".to_string(), peer_addr)]);
+        let tokens = HashMap::from([("node-b".to_string(), "tok-b".to_string())]);
+        let abort_requested = AtomicBool::new(false);
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        let completed = timeout(
+            Duration::from_secs(30),
+            run_rereplication(
+                &node_context,
+                &plain_baselines(&before_ring),
+                &after_ring,
+                replication,
+                &addresses,
+                &tokens,
+                &abort_requested,
+                &mut shutdown_rx,
+            ),
+        )
+        .await
+        .expect("the pass finishes");
+
+        let frames = timeout(Duration::from_secs(5), frames_rx)
+            .await
+            .expect("the peer recovered")
+            .unwrap();
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            stored.len(),
+            "every key reaches the target once it answers"
+        );
+        assert!(completed, "nothing is left undelivered");
+
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// Issue #2257: a pass that could not deliver a target's keys (here: no
+    /// address for it) stays in the slot, done, with its baseline, so the
+    /// next pass sends them even though its own ring change re-ranks none
+    /// of them. A join is not kept waiting on the parked state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unfinished_rereplication_pass_is_covered_by_the_next_one() {
+        let (request_tx, request_rx) = mpsc::channel(64);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let before_ring = Arc::new(HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+        ]));
+        let replication = 2;
+        let stored: Vec<Key> = (0..2000)
+            .map(|index| key(format!("key-{index}").as_bytes()))
+            .filter(|candidate| {
+                rereplication_targets(
+                    &before_ring,
+                    &after_ring,
+                    KeyHash::of(candidate),
+                    replication,
+                    "node-a",
+                ) == vec!["node-b".to_string()]
+            })
+            .take(10)
+            .collect();
+        assert_eq!(stored.len(), 10);
+        for stored_key in &stored {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: stored_key.clone(),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut node_context = test_node_context(
+            "node-a",
+            "tok-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        node_context.shutdown_rx = shutdown_rx.clone();
+
+        // node-b is missing from the first pass's maps.
+        timeout(
+            Duration::from_secs(30),
+            run_superseding_rereplication(
+                node_context.clone(),
+                Arc::clone(&before_ring),
+                Arc::clone(&after_ring),
+                replication,
+                HashMap::new(),
+                HashMap::new(),
+                shutdown_rx.clone(),
+            ),
+        )
+        .await
+        .expect("the first pass finishes");
+        let parked = node_context
+            .active_rereplication
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the unfinished pass stays in the slot");
+        assert!(parked.done.load(Ordering::SeqCst));
+        assert!(!parked.unfinished_baselines.lock().unwrap().is_empty());
+        timeout(
+            Duration::from_secs(1),
+            wait_for_rereplication_to_clear(&node_context, &AtomicBool::new(false)),
+        )
+        .await
+        .expect("a parked pass does not hold a join up");
+
+        // The second pass's own change re-ranks nothing.
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+        timeout(
+            Duration::from_secs(30),
+            run_superseding_rereplication(
+                node_context.clone(),
+                Arc::clone(&after_ring),
+                Arc::clone(&after_ring),
+                replication,
+                HashMap::from([("node-b".to_string(), peer_addr)]),
+                HashMap::from([("node-b".to_string(), "tok-b".to_string())]),
+                shutdown_rx,
+            ),
+        )
+        .await
+        .expect("the second pass finishes");
+
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            stored.len(),
+            "the next pass delivers what the first could not"
+        );
+        assert!(
+            node_context.active_rereplication.lock().unwrap().is_none(),
+            "a finished pass leaves the slot empty"
+        );
+
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// Issue #2258: ten keys `node-a` must hand to `node-b` when
+    /// `[node-a, node-b, node-c]` drops `node-c` at R=2, stored in a fresh
+    /// cache; returns the rings, the keys and the cache's sender.
+    async fn rereplication_fixture() -> (
+        Arc<HashRing>,
+        Arc<HashRing>,
+        Vec<Key>,
+        mpsc::Sender<CacheRequest>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (request_tx, request_rx) = mpsc::channel(64);
+        let cache_task = tokio::spawn(run_cache(request_rx, MAX_CACHE_MEMORY_BYTES, Vec::new()));
+        let before_ring = Arc::new(HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ]));
+        let after_ring = Arc::new(HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+        ]));
+        let stored: Vec<Key> = (0..2000)
+            .map(|index| key(format!("key-{index}").as_bytes()))
+            .filter(|candidate| {
+                rereplication_targets(
+                    &before_ring,
+                    &after_ring,
+                    KeyHash::of(candidate),
+                    2,
+                    "node-a",
+                ) == vec!["node-b".to_string()]
+            })
+            .take(10)
+            .collect();
+        assert_eq!(stored.len(), 10);
+        for stored_key in &stored {
+            send_command(
+                &request_tx,
+                Command::Set {
+                    key: stored_key.clone(),
+                    value: Bytes::from_static(b"v"),
+                    ttl: None,
+                },
+            )
+            .await;
+        }
+        (before_ring, after_ring, stored, request_tx, cache_task)
+    }
+
+    /// A discovery address nothing listens on: the roster fetch fails at
+    /// once.
+    async fn unreachable_discovery_addr() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        addr
+    }
+
+    /// Issue #2258: a ring change whose roster fetch fails is covered by
+    /// the next pass, even though that pass's own change re-ranks none of
+    /// its keys.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ring_change_whose_roster_fetch_failed_is_covered_by_the_next_pass() {
+        let (before_ring, after_ring, stored, request_tx, cache_task) =
+            rereplication_fixture().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut node_context = test_node_context(
+            "node-a",
+            "tok-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        node_context.shutdown_rx = shutdown_rx.clone();
+
+        timeout(
+            Duration::from_secs(30),
+            spawn_or_supersede_rereplication(
+                node_context.clone(),
+                unreachable_discovery_addr().await,
+                Arc::clone(&before_ring),
+                Arc::new(Membership {
+                    ring: Arc::clone(&after_ring),
+                    replication: 2,
+                }),
+                shutdown_rx.clone(),
+            ),
+        )
+        .await
+        .expect("the failed trigger returns");
+        let parked = node_context
+            .active_rereplication
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the ring change is parked in the slot");
+        assert!(parked.done.load(Ordering::SeqCst));
+        timeout(
+            Duration::from_secs(1),
+            wait_for_rereplication_to_clear(&node_context, &AtomicBool::new(false)),
+        )
+        .await
+        .expect("a parked ring change does not hold a join up");
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+        timeout(
+            Duration::from_secs(30),
+            run_superseding_rereplication(
+                node_context.clone(),
+                Arc::clone(&after_ring),
+                Arc::clone(&after_ring),
+                2,
+                HashMap::from([("node-b".to_string(), peer_addr)]),
+                HashMap::from([("node-b".to_string(), "tok-b".to_string())]),
+                shutdown_rx,
+            ),
+        )
+        .await
+        .expect("the next pass finishes");
+
+        assert_eq!(
+            frames.lock().unwrap().len(),
+            stored.len(),
+            "the next pass delivers the keys of the change it could not run"
+        );
+        assert!(node_context.active_rereplication.lock().unwrap().is_none());
+
+        peer_task.abort();
+        drop(node_context);
+        drop(request_tx);
+        cache_task.await.unwrap();
+    }
+
+    /// Issue #2258: a ring change parked while another pass is running
+    /// outlives that pass's finish, instead of being cleared with the
+    /// baselines that pass ran from.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_ring_change_parked_during_a_pass_outlives_its_finish() {
+        let (before_ring, after_ring, stored, request_tx, cache_task) =
+            rereplication_fixture().await;
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut node_context = test_node_context(
+            "node-a",
+            "tok-a",
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        );
+        node_context.request_tx = request_tx.clone();
+        node_context.shutdown_rx = shutdown_rx.clone();
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap().to_string();
+        let (frames, peer_task) = spawn_recording_peer(peer_listener);
+
+        node_context.gates.pass.hold();
+        let running = tokio::spawn(run_superseding_rereplication(
+            node_context.clone(),
+            Arc::clone(&before_ring),
+            Arc::clone(&after_ring),
+            2,
+            HashMap::from([("node-b".to_string(), peer_addr)]),
+            HashMap::from([("node-b".to_string(), "tok-b".to_string())]),
+            shutdown_rx.clone(),
+        ));
+        let running_state = timeout(Duration::from_secs(30), async {
+            loop {
+                let installed = node_context.active_rereplication.lock().unwrap().clone();
+                if let Some(state) = installed {
+                    break state;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the pass installs itself");
+
+        // Another change, whose fetch fails, while the pass is running.
+        let other_before = Arc::new(HashRing::new(vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-d".to_string(),
+        ]));
+        timeout(
+            Duration::from_secs(30),
+            spawn_or_supersede_rereplication(
+                node_context.clone(),
+                unreachable_discovery_addr().await,
+                Arc::clone(&other_before),
+                Arc::new(Membership {
+                    ring: Arc::clone(&after_ring),
+                    replication: 2,
+                }),
+                shutdown_rx,
+            ),
+        )
+        .await
+        .expect("the failed trigger returns");
+        node_context.gates.pass.release();
+        timeout(Duration::from_secs(30), running)
+            .await
+            .expect("the pass finishes")
+            .unwrap();
+
+        assert_eq!(frames.lock().unwrap().len(), stored.len());
+        let left = node_context
+            .active_rereplication
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the parked change keeps the finished pass in the slot");
+        assert!(Arc::ptr_eq(&left, &running_state));
+        assert!(left.done.load(Ordering::SeqCst));
+        let baselines = left.unfinished_baselines.lock().unwrap().clone();
+        assert_eq!(baselines.len(), 1);
+        assert!(Arc::ptr_eq(&baselines[0].ring, &other_before));
+
         peer_task.abort();
         drop(node_context);
         drop(request_tx);
@@ -37794,7 +38473,7 @@ mod tests {
         // unlike the write right above it — a discovery server that
         // accepted a heartbeat but never acked (crashed-but-socket-open,
         // a blackholed route) would hang this connection forever instead
-        // of giving up within `OUTBOUND_IO_TIMEOUT` and redialing.
+        // of giving up within `HEARTBEAT_EXCHANGE_TIMEOUT` and redialing.
         //
         // Real time, not `start_paused`, on purpose: this exercises a
         // genuine multi-round-trip TCP handshake (connect, join, "R\n",
@@ -37850,7 +38529,95 @@ mod tests {
 
         assert!(
             matches!(redialed, Ok(Ok(()))),
-            "expected the ack timeout to fire and trigger a redial within OUTBOUND_IO_TIMEOUT"
+            "expected the ack timeout to fire and trigger a redial within HEARTBEAT_EXCHANGE_TIMEOUT"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_unacked_heartbeat_is_redialed_two_intervals_after_the_last_ack() {
+        // Issue #2253: the ack was read under `OUTBOUND_IO_TIMEOUT` (10 s)
+        // and the redial then waited out the interval (5 s), so one
+        // heartbeat that was neither answered nor refused kept the node
+        // silent to discovery for about 20 s after its last answered one —
+        // past the 15 s liveness timeout, which evicted it and cost it its
+        // cache. It must reach discovery again about two intervals after
+        // the last ack, as the docs and discovery's `CONTACT_BREAK` assume.
+        //
+        // The node binary's real interval, and real time for the reason
+        // given in `send_heartbeats_redials_when_the_ack_never_arrives`.
+        let interval = Duration::from_secs(5);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let discovery_addr = listener.local_addr().unwrap().to_string();
+        let (done_tx, done_rx) = oneshot::channel::<(Duration, Vec<u8>)>();
+        let fake_discovery = tokio::spawn(async move {
+            // Acks the first heartbeat and swallows the second: no ack,
+            // no FIN, no RST.
+            let (mut first, _) = listener.accept().await.unwrap();
+            first.write_all(b"R\n").await.unwrap();
+            let mut seen = 0usize;
+            let mut buf = vec![0u8; 4096];
+            let mut acked_at = None;
+            while seen < 2 {
+                let n = first.read(&mut buf).await.unwrap();
+                assert!(n > 0, "the node closed the first connection");
+                for _ in String::from_utf8_lossy(&buf[..n]).matches("H ") {
+                    seen += 1;
+                    if seen == 1 {
+                        first.write_all(b"A\n").await.unwrap();
+                        acked_at = Some(Instant::now());
+                    }
+                }
+            }
+            let (mut second, _) = listener.accept().await.unwrap();
+            let since_ack = acked_at.unwrap().elapsed();
+            let n = second.read(&mut buf).await.unwrap();
+            let _ = done_tx.send((since_ack, buf[..n].to_vec()));
+            drop(first);
+        });
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let heartbeat_task = tokio::spawn(send_heartbeats(
+            HeartbeatConfig {
+                discovery_addrs: vec![discovery_addr],
+                port: 8356,
+                interval,
+                auth_secret: None,
+                tls_connector: None,
+            },
+            test_node_context(
+                "test-node",
+                "tk-test-node",
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+            ),
+            mpsc::channel::<RereplicationTask>(4).1,
+            shutdown_rx,
+            mpsc::channel(1).0,
+        ));
+
+        let result = timeout(Duration::from_secs(40), done_rx).await;
+        shutdown_tx.send_replace(true);
+        timeout(Duration::from_secs(10), heartbeat_task)
+            .await
+            .expect("the heartbeat task must stop on shutdown")
+            .unwrap();
+        fake_discovery.abort();
+
+        // 3 s of slack for a loaded runner: still below the 15 s that
+        // either half of the fix alone gives, and the 20 s before it.
+        let (since_ack, registration) = result
+            .expect("the node must redial after the unanswered heartbeat")
+            .unwrap();
+        assert!(
+            since_ack < 2 * interval + Duration::from_secs(3),
+            "last answered heartbeat -> next connection took {since_ack:?}, expected about two \
+             intervals ({:?})",
+            2 * interval
+        );
+        assert!(
+            registration.starts_with(b"P "),
+            "the redial must re-register with an announce, got {:?}",
+            String::from_utf8_lossy(&registration)
         );
     }
 

@@ -1615,7 +1615,10 @@ async fn run_refresher(
                         if let Err(error) =
                             announce_to(addr, secret_ref, tls_ref, identity, port_val).await
                         {
-                            eprintln!("WARN proxy announce to {addr} failed: {error}");
+                            eprintln!(
+                                "WARN proxy announce to {addr} failed: {error}{}",
+                                plaintext_hint(tls_ref, &error)
+                            );
                         }
                     }) as Pin<Box<dyn Future<Output = ()> + Send>>
                 })
@@ -1680,7 +1683,10 @@ async fn run_refresher(
             .map(|addr| {
                 Box::pin(async move {
                     if let Err(error) = deregister_from(addr, secret_ref, tls_ref, identity).await {
-                        eprintln!("WARN proxy deregister to {addr} failed: {error}");
+                        eprintln!(
+                            "WARN proxy deregister to {addr} failed: {error}{}",
+                            plaintext_hint(tls_ref, &error)
+                        );
                     }
                 }) as Pin<Box<dyn Future<Output = ()> + Send>>
             })
@@ -3282,15 +3288,19 @@ async fn next_reply_slot<S: AsyncRead + Unpin, T>(
 const BACKEND_EXIT_LOG_LINES: u32 = 3;
 const BACKEND_EXIT_LOG_WINDOW: Duration = Duration::from_secs(10);
 
-/// One address's exit-line budgets. Issue #1824: the WARN for a connection
-/// poisoned by a frame the node rejected is the diagnosis for a real
-/// fault, so it has a budget of its own: a flapping address that closes
-/// connections cleanly spends `ordinary` and cannot hide a poisoning.
-/// Both stay bounded per window, so a flapping address still logs a
-/// bounded number of lines.
+/// One address's connection-line budgets. Issue #1824: the WARN for a
+/// connection poisoned by a frame the node rejected is the diagnosis for a
+/// real fault, so it has a budget of its own: a flapping address that
+/// closes connections cleanly spends `ordinary` and cannot hide a
+/// poisoning. Issue #2260: a failed dial (a TLS mismatch, a bad
+/// certificate, a refused secret, a node at its connection cap) has one
+/// too, so neither kind of exit line can hide why the next dial fails.
+/// All stay bounded per window, so a dead or flapping address under load
+/// still logs a bounded number of lines.
 struct BackendExitLog {
     ordinary: LogLimiter,
     poison: LogLimiter,
+    dial: LogLimiter,
 }
 
 impl BackendExitLog {
@@ -3298,6 +3308,7 @@ impl BackendExitLog {
         Self {
             ordinary: LogLimiter::new(BACKEND_EXIT_LOG_LINES, BACKEND_EXIT_LOG_WINDOW),
             poison: LogLimiter::new(BACKEND_EXIT_LOG_LINES, BACKEND_EXIT_LOG_WINDOW),
+            dial: LogLimiter::new(BACKEND_EXIT_LOG_LINES, BACKEND_EXIT_LOG_WINDOW),
         }
     }
 
@@ -3305,14 +3316,17 @@ impl BackendExitLog {
     /// `now` (a live address that stopped flapping).
     fn take_summary_after_window(&self, addr: &str, now: tokio::time::Instant) -> Option<String> {
         let suppressed = self.ordinary.take_suppressed_after_window(now)
-            + self.poison.take_suppressed_after_window(now);
+            + self.poison.take_suppressed_after_window(now)
+            + self.dial.take_suppressed_after_window(now);
         (suppressed > 0).then(|| backend_exit_summary(addr, suppressed))
     }
 
     /// The summary line for lines that were counted and never written,
     /// `None` when there are none; takes the counts.
     fn take_summary(&self, addr: &str) -> Option<String> {
-        let suppressed = self.ordinary.take_suppressed() + self.poison.take_suppressed();
+        let suppressed = self.ordinary.take_suppressed()
+            + self.poison.take_suppressed()
+            + self.dial.take_suppressed();
         (suppressed > 0).then(|| backend_exit_summary(addr, suppressed))
     }
 }
@@ -3332,6 +3346,18 @@ fn backend_exit_lines(
     now: tokio::time::Instant,
 ) -> Vec<String> {
     let limiter = if poison { &log.poison } else { &log.ordinary };
+    limited_backend_lines(limiter, addr, line, now)
+}
+
+/// `line` through `limiter` at `now`: nothing when its budget is spent (the
+/// line is counted), otherwise the line, preceded by a summary of the lines
+/// dropped since the last one written.
+fn limited_backend_lines(
+    limiter: &LogLimiter,
+    addr: &str,
+    line: String,
+    now: tokio::time::Instant,
+) -> Vec<String> {
     let Some(suppressed) = limiter.admit_at(now) else {
         return Vec::new();
     };
@@ -3340,6 +3366,33 @@ fn backend_exit_lines(
     } else {
         vec![line]
     }
+}
+
+/// The `WARN` line for a failed dial to a backend (the TCP connect, the TLS
+/// handshake or the tagged `A`): the error, plus the plaintext hint when it
+/// looks like a TLS-only node hanging up on a plaintext dial.
+fn backend_dial_failure_line(
+    addr: &str,
+    tls_connector: &Option<TlsConnector>,
+    error: &io::Error,
+) -> String {
+    format!(
+        "WARN dial to backend {addr} failed: {error}{}",
+        plaintext_hint(tls_connector, error)
+    )
+}
+
+/// What to write for one failed dial to `addr` at `now`, under the
+/// address's dial budget (see `limited_backend_lines`).
+fn backend_dial_failure_lines(
+    log: &BackendExitLog,
+    addr: &str,
+    tls_connector: &Option<TlsConnector>,
+    error: &io::Error,
+    now: tokio::time::Instant,
+) -> Vec<String> {
+    let line = backend_dial_failure_line(addr, tls_connector, error);
+    limited_backend_lines(&log.dial, addr, line, now)
 }
 
 fn log_backend_exit(log: &BackendExitLog, addr: &str, line: String, poison: bool) {
@@ -4238,6 +4291,7 @@ impl SharedBackends {
                         if self.dial_recently_failed(addr) {
                             return PendingReply::failed(not_sent(dial_backoff_error(addr)));
                         }
+                        let exit_log = self.exit_log(addr);
                         match BackendHandle::connect(
                             addr,
                             &context.secret,
@@ -4245,7 +4299,7 @@ impl SharedBackends {
                             Arc::clone(&slot),
                             Arc::clone(&self.dialed),
                             self.keepalive_interval,
-                            self.exit_log(addr),
+                            Arc::clone(&exit_log),
                         )
                         .await
                         {
@@ -4258,6 +4312,22 @@ impl SharedBackends {
                             }
                             Err(error) => {
                                 self.note_dial_failure(addr);
+                                // Issue #2260: the caller turns this into an
+                                // `R`, a `B` or an `E` without saying why, so
+                                // this is the only place a TLS mismatch, a
+                                // bad certificate or a refused secret shows.
+                                // `DIAL_BACKOFF` already holds the address to
+                                // one real dial a second; the budget bounds
+                                // the lines further.
+                                for line in backend_dial_failure_lines(
+                                    &exit_log,
+                                    addr,
+                                    &context.tls_connector,
+                                    &error,
+                                    tokio::time::Instant::now(),
+                                ) {
+                                    eprintln!("{line}");
+                                }
                                 return PendingReply::failed(not_sent(error));
                             }
                         }
@@ -16072,6 +16142,101 @@ mod tests {
             Some(format!(
                 "WARN 2 more backend connection lines for {addr} (not logged individually)"
             ))
+        );
+    }
+
+    #[test]
+    fn a_failed_backend_dial_is_logged_with_the_plaintext_hint_under_its_own_budget() {
+        // Issue #2260: a failed dial was never logged, so a TLS mismatch or
+        // a refused secret showed only as `R`/`B` at the client.
+        let log = BackendExitLog::new();
+        let addr = "10.0.0.1:8356";
+        let start = tokio::time::Instant::now();
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed mid-frame");
+        // Ordinary exits spending their budget do not hide a dial failure.
+        for _ in 0..100 {
+            backend_exit_lines(&log, addr, "INFO exit".to_string(), false, start);
+        }
+        let lines = backend_dial_failure_lines(&log, addr, &None, &eof, start);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with(
+                "WARN dial to backend 10.0.0.1:8356 failed: connection closed mid-frame"
+            ),
+            "{lines:?}"
+        );
+        assert!(lines[0].ends_with("is --tls-ca missing?)"), "{lines:?}");
+        let (_acceptor, connector) = self_signed_tls();
+        assert!(
+            !backend_dial_failure_line(addr, &Some(connector), &eof).contains("--tls-ca"),
+            "a TLS dial gets no plaintext hint"
+        );
+        // A dead address under load logs a bounded number of lines.
+        let written = (0..1000)
+            .map(|_| backend_dial_failure_lines(&log, addr, &None, &eof, start).len())
+            .sum::<usize>();
+        assert_eq!(written, BACKEND_EXIT_LOG_LINES as usize - 1);
+        let later = start + BACKEND_EXIT_LOG_WINDOW;
+        assert_eq!(
+            backend_dial_failure_lines(&log, addr, &None, &eof, later)[0],
+            backend_exit_summary(addr, 998)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_backend_dial_spends_the_addresss_dial_budget() {
+        // A peer that hangs up on the handshake, as a TLS-only node does on
+        // a plaintext dial.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let acceptor = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                drop(stream);
+            }
+        });
+        let context = Arc::new(ProxyContext {
+            secret: None,
+            tls_connector: None,
+            ring: watch::channel(None).1,
+            refresh_now: mpsc::channel(4).0,
+            drain: watch::channel(false).1,
+            backends: Arc::new(SharedBackends::new()),
+            requests_total: std::sync::atomic::AtomicU64::new(0),
+            upstream_failures_total: std::sync::atomic::AtomicU64::new(0),
+            replica_refusals_total: std::sync::atomic::AtomicU64::new(0),
+        });
+        let reply = timeout(
+            Duration::from_secs(10),
+            context.backends.enqueue(
+                &context,
+                &addr,
+                frame_set(b"", b"k", b"v", None),
+                Expect::Stored,
+            ),
+        )
+        .await
+        .expect("enqueue is bounded by the dial timeout");
+        let error = timeout(Duration::from_secs(10), reply)
+            .await
+            .expect("a failed dial resolves at once")
+            .expect_err("the peer hung up on the handshake");
+        assert!(request_not_sent(&error), "{error}");
+        acceptor.abort();
+
+        // The failure took one line of the address's dial budget.
+        let log = context.backends.exit_log(&addr);
+        let eof = io::Error::new(io::ErrorKind::UnexpectedEof, "eof");
+        let now = tokio::time::Instant::now();
+        for _ in 1..BACKEND_EXIT_LOG_LINES {
+            assert_eq!(
+                backend_dial_failure_lines(&log, &addr, &None, &eof, now).len(),
+                1
+            );
+        }
+        assert!(
+            backend_dial_failure_lines(&log, &addr, &None, &eof, now).is_empty(),
+            "the failed dial was logged under the dial budget"
         );
     }
 

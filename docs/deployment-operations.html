@@ -284,7 +284,9 @@ it is registered with its cache instead; the <a
 href="architecture.html#accepted-behaviour">accepted behaviour</a> list
 says exactly when. Keep the heartbeat path short enough, and the liveness
 timeout long enough, that a pause you expect does not evict it. A node
-heartbeats every 5&nbsp;s, so discovery refuses a
+heartbeats every 5&nbsp;s; a heartbeat that gets no answer within 5&nbsp;s
+is given up on and the node reconnects at once, so one lost heartbeat
+leaves discovery about 10&nbsp;s without word from it. Discovery therefore refuses a
 <code>--liveness-timeout</code> below 15&nbsp;s (three heartbeats): with
 less, one lost heartbeat, or a short pause of discovery itself, would
 evict healthy nodes and cost them their caches.</p>
