@@ -117,6 +117,26 @@ describe("NanocachedClient against a single node", () => {
     }
   });
 
+  it("keeps a leading U+FEFF in a value read back as a string", async () => {
+    const node = await startMockNode();
+    try {
+      const client = await NanocachedClient.connect({ addresses: [{ host: "127.0.0.1", port: node.port }] });
+      try {
+        const value = "\uFEFFabc";
+        await client.set("bom", value);
+        assert.deepEqual(await client.getBytes("bom"), Buffer.from([0xef, 0xbb, 0xbf, 0x61, 0x62, 0x63]));
+        assert.equal(await client.get("bom"), value);
+        assert.equal((await client.getMany(["bom"])).get("bom"), value);
+        assert.equal(await client.getAndTouch("bom", 60), value);
+        assert.equal((await client.getManyAndTouch(["bom"], 60)).get("bom"), value);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await node.close();
+    }
+  });
+
   it("stores with a TTL and rejects invalid TTLs before writing", async () => {
     const node = await startMockNode();
     try {

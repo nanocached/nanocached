@@ -53,8 +53,10 @@ export { contentDigest } from "./protocol.js";
 // A value decoded by get() must be exactly what set() would have encoded —
 // no silent U+FFFD replacement for bytes that aren't valid UTF-8. A single
 // shared instance is fine: decode() carries no state across calls unless
-// `stream: true` is passed, which this SDK never does.
-const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+// `stream: true` is passed, which this SDK never does. `ignoreBOM` keeps a
+// leading U+FEFF in the value: without it decode() drops a leading EF BB BF,
+// so a value set as "\uFEFFabc" would come back as "abc".
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** Thrown by get/set/delete when called after close(). Not thrown by
  * close() itself, which is idempotent (see NanocachedClient.close). */
